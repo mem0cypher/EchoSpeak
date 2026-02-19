@@ -52,6 +52,21 @@ This logic lives in:
   - `_format_pending_action()`
   - `process_query()` confirmation handling
 
+### Action Parser pass (LLM-driven)
+
+EchoSpeak runs an LLM-driven Action Parser pass before heuristic tool routing. The Action Parser interprets the user’s request and returns a single JSON action (or “none”), which is then validated against the current policy and routed into the existing pending-action confirmation flow.
+
+Location:
+
+- `apps/backend/agent/core.py`
+  - `_action_parser_candidate()`
+  - `_normalize_candidate_action()`
+  - `_candidate_to_pending_action()`
+
+Config:
+
+- `ACTION_PARSER_ENABLED=true` (default)
+
 ### Preventing bypass via tool-calling agent
 
 LangChain tool-calling agent (`create_tool_calling_agent`) must not receive action tools.
@@ -127,6 +142,15 @@ Document RAG + context:
 - `SUMMARY_TRIGGER_TURNS`
 - `SUMMARY_KEEP_LAST_TURNS`
 - `ACTION_PLAN_ENABLED`
+
+Action Parser:
+
+- `ACTION_PARSER_ENABLED`
+
+### Workspaces + skills allowlist semantics
+
+- Workspaces define the tool allowlist ceiling for the session.
+- Skills can only further restrict tool access; skills must not expand tools beyond what the workspace allows.
 
 Local STT:
 
@@ -230,9 +254,6 @@ Key Style Modifications (v0.2.0):
   - `colorBg = "0"` (Pure Black)
   - `colorBorder = "255"` (Pure White)
 - **Centering**: Uses `lipgloss.Place` and `lipgloss.JoinVertical(lipgloss.Center, ...)` for the splash screen layout.
-- **Microphone Stack**:
-  - Logic in `windows_mic.go` uses `wca` to resolve default audio endpoints.
-  - `main.go` parses FFmpeg `dshow` output with fallback to lines containing `(audio)`.
 
 ## Embeddings + memory (langchain-huggingface)
 

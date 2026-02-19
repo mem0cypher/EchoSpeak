@@ -33,6 +33,9 @@ apps/backend/tts.wav
 
 *.exe
 
+# Go build artifacts
+apps/tui/echospeak-tui
+
 *.tsbuildinfo
 
 .DS_Store

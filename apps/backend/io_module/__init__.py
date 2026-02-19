@@ -1,1 +1,1 @@
-"""Echo Speak I/O package."""
+"""I/O module for EchoSpeak."""

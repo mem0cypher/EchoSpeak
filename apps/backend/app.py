@@ -7,7 +7,6 @@ Supports multiple LLM providers: OpenAI, Ollama, LM Studio, LocalAI, llama.cpp, 
 import os
 import sys
 import argparse
-import threading
 from loguru import logger
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -16,7 +15,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import config, ModelProvider
 from agent.core import create_agent, list_available_providers, get_provider_requirements
-from io_module.voice import create_voice_manager
 from api.server import start_server
 
 
@@ -36,28 +34,6 @@ def setup_logging():
         level="INFO",
         format="{time:HH:mm:ss} | {level} | {message}"
     )
-
-
-def process_voice_query(voice_manager, agent, query: str) -> str:
-    """
-    Process a voice query through the agent.
-
-    Args:
-        voice_manager: Voice manager instance.
-        agent: Agent instance.
-        query: User query.
-
-    Returns:
-        Agent response.
-    """
-    logger.info(f"Processing query: {query}")
-
-    response, success = agent.process_query(query)
-
-    if success:
-        return response
-    else:
-        return "I encountered an error processing your request. Please try again."
 
 
 def select_provider_interactive() -> ModelProvider:
@@ -101,101 +77,26 @@ def show_provider_info(provider: ModelProvider):
     print(f"Environment variables needed: {', '.join(info.get('env_vars', []))}")
 
 
-def run_voice_mode(agent):
-    """
-    Run the voice interaction mode.
-
-    Args:
-        agent: Agent instance.
-    """
-    # Check if PersonaPlex is enabled
-    if config.personaplex.enabled:
-        logger.info("Starting PersonaPlex voice mode...")
-        try:
-            from io_module.personaplex_client import run_personaplex_voice_mode
-            run_personaplex_voice_mode(agent)
-            return
-        except ImportError as e:
-            logger.warning(f"PersonaPlex dependencies not available: {e}")
-            logger.info("Falling back to standard voice mode")
-        except Exception as e:
-            logger.error(f"PersonaPlex failed: {e}")
-            logger.info("Falling back to standard voice mode")
-
-    logger.info("Starting voice mode...")
-
-    voice_manager = create_voice_manager()
-
-    provider_name = agent.llm_provider.value.upper()
-    voice_manager.output.speak(f"Echo Speak is ready using {provider_name}. Say 'hey echo' to start a conversation.")
-
-    wake_words = ["hey echo", "jarvis"]
-
-    wake_word_active = False
-
-    while True:
-        try:
-            text = voice_manager.input.listen(timeout=5.0)
-
-            if text:
-                text_lower = text.lower()
-
-                if not wake_word_active:
-                    should_respond = any(wake_word in text_lower for wake_word in wake_words)
-
-                    if should_respond:
-                        logger.info(f"Wake word detected: {text}")
-                        voice_manager.output.speak("Yes, I'm listening. What can I help you with?")
-                        wake_word_active = True
-                else:
-                    wake_word_active = False
-                    logger.info(f"User query: {text}")
-                    response = process_voice_query(voice_manager, agent, text)
-                    logger.info(f"Response: {response[:60]}...")
-                    voice_manager.output.speak(response)
-
-            else:
-                logger.debug("No speech detected within timeout")
-
-        except KeyboardInterrupt:
-            logger.info("Voice mode interrupted by user")
-            voice_manager.output.speak("Goodbye!")
-            break
-        except Exception as e:
-            logger.error(f"Error in voice mode: {e}")
-            try:
-                voice_manager.output.speak("An error occurred. Please try again.")
-            except:
-                pass
-
-
 def run_text_mode(agent):
     """
-    Run the text-based interaction mode with voice output.
+    Run the text-based interaction mode.
 
     Args:
         agent: Agent instance.
     """
-    logger.info("Starting text mode with voice...")
-
-    from io_module.voice import create_voice_manager
-    voice_manager = create_voice_manager()
+    logger.info("Starting text mode...")
 
     print("\n" + "=" * 60)
     print("Echo Speak - Voice AI Assistant")
     print("=" * 60)
     print(f"Provider: {agent.llm_provider.value.upper()}")
     print("Commands:")
-    print("  'quit' or 'exit' - Exit the application")
+    print("  'quit' or 'exit' - Exit the program")
     print("  'clear' - Clear conversation history")
     print("  'history' - View conversation history")
     print("  'provider' - Switch model provider")
     print("  'info' - Show provider information")
-    print("  'voice on' - Enable voice output")
-    print("  'voice off' - Disable voice output")
     print("=" * 60 + "\n")
-
-    voice_enabled = True
 
     while True:
         try:
@@ -203,7 +104,6 @@ def run_text_mode(agent):
 
             if user_input.lower() in ["quit", "exit"]:
                 print("Goodbye!")
-                voice_manager.output.speak("Goodbye!")
                 break
 
             if user_input.lower() == "clear":
@@ -231,16 +131,6 @@ def run_text_mode(agent):
                 print(f"Memory Items: {info['memory_count']}\n")
                 continue
 
-            if user_input.lower() == "voice off":
-                voice_enabled = False
-                print("Voice output disabled.\n")
-                continue
-
-            if user_input.lower() == "voice on":
-                voice_enabled = True
-                print("Voice output enabled.\n")
-                continue
-
             if not user_input:
                 continue
 
@@ -248,18 +138,8 @@ def run_text_mode(agent):
 
             if success:
                 print(f"Echo: {response}\n")
-                if voice_enabled:
-                    try:
-                        voice_manager.output.speak(response)
-                    except Exception as e:
-                        logger.warning(f"Voice output failed: {e}")
             else:
                 print(f"Error: {response}\n")
-                if voice_enabled:
-                    try:
-                        voice_manager.output.speak(response)
-                    except:
-                        pass
 
         except KeyboardInterrupt:
             print("\nGoodbye!")
@@ -280,9 +160,9 @@ def main():
     parser = argparse.ArgumentParser(description="Echo Speak - Voice AI Assistant")
     parser.add_argument(
         "--mode",
-        choices=["voice", "text", "api"],
-        default="text",
-        help="Interaction mode: voice, text, or api (default: text)"
+        choices=["text", "api"],
+        default="api",
+        help="Interaction mode: api or text (default: api)"
     )
     parser.add_argument(
         "--provider",
@@ -337,8 +217,6 @@ def main():
 
     if args.mode == "api":
         run_api_mode(args.host, args.port)
-    elif args.mode == "voice":
-        run_voice_mode(agent)
     else:
         run_text_mode(agent)
 

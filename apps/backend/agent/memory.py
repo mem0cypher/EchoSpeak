@@ -26,7 +26,7 @@ from langchain_community.vectorstores import FAISS
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import config
+from config import config, ModelProvider
 
 
 class AgentMemory:
@@ -44,13 +44,37 @@ class AgentMemory:
         self._vector_stores: Dict[str, FAISS] = {}
 
         api_key = config.openai.api_key if config.openai.api_key else os.getenv("OPENAI_API_KEY", "")
+        embedding_provider = getattr(getattr(config, "embedding", None), "provider", None)
+        embedding_model = getattr(getattr(config, "embedding", None), "model", None) or "text-embedding-3-small"
 
         self.embeddings = None
-        if api_key:
+        if embedding_provider in {ModelProvider.OPENAI, ModelProvider.LM_STUDIO}:
             if OpenAIEmbeddings is None:
-                raise ImportError("langchain-openai is required for OpenAI embeddings")
-            self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
-        else:
+                logger.warning("langchain-openai not installed; falling back to local embeddings")
+            else:
+                try:
+                    if embedding_provider == ModelProvider.OPENAI:
+                        if not api_key:
+                            raise RuntimeError("Missing OPENAI_API_KEY")
+                        self.embeddings = OpenAIEmbeddings(model=embedding_model, api_key=api_key)
+                    else:
+                        base_url = getattr(getattr(config, "local", None), "base_url", "http://localhost:1234")
+                        base_url = str(base_url or "").rstrip("/")
+                        if not base_url.endswith("/v1"):
+                            base_url = base_url + "/v1"
+                        self.embeddings = OpenAIEmbeddings(
+                            model=embedding_model,
+                            api_key=api_key or "lm-studio",
+                            base_url=base_url,
+                        )
+                        logger.info(f"Using LM Studio embeddings at {base_url}")
+                except Exception as e:
+                    logger.warning(
+                        f"Embeddings init failed for provider={embedding_provider} ({e}); falling back to local embeddings"
+                    )
+                    self.embeddings = None
+
+        if self.embeddings is None:
             try:
                 try:
                     from langchain_huggingface import HuggingFaceEmbeddings

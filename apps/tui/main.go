@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +23,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/google/uuid"
 )
 
@@ -56,25 +56,6 @@ const (
 	colorComposerFieldBg = "0"
 	colorTick            = "42"
 )
-
-func formatDshowDeviceChoices(raw string) []string {
-	parsed := parseDshowAudioDevices(raw)
-	choices := []string{}
-	for _, d := range parsed {
-		friendly := strings.TrimSpace(d.Friendly)
-		if friendly == "" {
-			continue
-		}
-		alt := strings.TrimSpace(d.Alt)
-		if alt != "" {
-			choices = append(choices, fmt.Sprintf("%s (alt: %s)", friendly, alt))
-		} else {
-			choices = append(choices, friendly)
-		}
-	}
-	return choices
-}
-
 // Stream event payloads from /query/stream (NDJSON).
 type streamEvent struct {
 	Type        string      `json:"type"`
@@ -201,25 +182,30 @@ type chatLine struct {
 }
 
 type model struct {
-	apiBase       string
-	threadID      string
 	width         int
 	height        int
-	input         textinput.Model
+	apiBase       string
+	threadID      string
+	stream        *streamState
+	sending       bool
+	confirmActive bool
+	confirmAction string
+	stickToBottom bool
 	viewport      viewport.Model
 	spinner       spinner.Model
 	lines         []chatLine
 	rendered      []string
 	renderedW     int
-	stream        *streamState
-	sending       bool
+	input         textinput.Model
 	lastError     string
 	lastRequest   string
 	cwd           string
 	commands      []commandItem
 	commandIdx    int
+	commandOffset int
 	providerName  string
 	modelName     string
+	activeWorkspace string
 	isLocal       bool
 	modelLoaded   bool
 	printModelInfo bool
@@ -230,8 +216,6 @@ type model struct {
 	ttsQueue      []string
 	toolRunNames  map[string]string
 	usedTools     []string
-	confirmActive bool
-	confirmAction string
 	vizActive     bool
 	vizState      int
 	vizTriggerT   int
@@ -241,40 +225,41 @@ type model struct {
 
 func initialModel(apiBase string) model {
 	input := textinput.New()
-	input.Placeholder = "Type a message..."
-	input.Prompt = ""
+	input.Placeholder = "Type a message…"
 	input.Focus()
-	input.CharLimit = 0
+	input.CharLimit = 20000
 	input.Cursor.SetMode(cursor.CursorBlink)
 	input.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 	input.Cursor.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 	input.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 	input.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-	input.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
-
 	vp := viewport.New(0, 0)
-
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSpinner))
-
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = ""
 	}
-
 	m := model{
+		width:         0,
+		height:        0,
 		apiBase:       apiBase,
 		threadID:      uuid.NewString(),
 		input:         input,
 		viewport:      vp,
+		stickToBottom: true,
 		spinner:       s,
 		lines:         []chatLine{},
+		lastError:     "",
+		lastRequest:   "",
 		cwd:           cwd,
 		commands:      defaultCommands(),
 		commandIdx:    0,
-		providerName:  "Loading...",
+		commandOffset: 0,
+		providerName:  "Loading…",
 		modelName:     "",
+		activeWorkspace: "",
 		isLocal:       false,
 		modelLoaded:   false,
 		printModelInfo: false,
@@ -283,19 +268,24 @@ func initialModel(apiBase string) model {
 		viewMode:      viewViz,
 		toolRunNames:  map[string]string{},
 		usedTools:     nil,
-		confirmActive: false,
-		confirmAction: "",
+		vizActive:     false,
+		vizState:      vizIdle,
+		vizTriggerT:   10,
+		vizPhase:      0,
+		vizHeight:     0,
 	}
-
 	return m
 }
 
 func defaultCommands() []commandItem {
 	return []commandItem{
 		{Command: "/doctor", Description: "run doctor checks"},
-		{Command: "/mic", Description: "record mic and transcribe"},
 		{Command: "/session", Description: "manage sessions (thread_id)"},
 		{Command: "/sessions", Description: "list active sessions"},
+		{Command: "/onboard", Description: "show/select agent profile (coding/research/chat)"},
+		{Command: "/workspaces", Description: "list available workspaces"},
+		{Command: "/workspace", Description: "set workspace (e.g. /workspace coding)"},
+		{Command: "/skills", Description: "list installed skills"},
 		{Command: "/status", Description: "show status"},
 		{Command: "/model", Description: "show current model"},
 		{Command: "/visualizer", Description: "show synth mouth"},
@@ -374,331 +364,10 @@ func warmupTTSCmd(apiBase string) tea.Cmd {
 	}
 }
 
-func recordAndTranscribeCmd(apiBase string, dur time.Duration) tea.Cmd {
+func micNotSupportedCmd() tea.Cmd {
 	return func() tea.Msg {
-		enabled, err := isSTTEnabled(apiBase)
-		if err != nil {
-			return sttDoneMsg{text: "", err: err}
-		}
-		if !enabled {
-			return sttDoneMsg{text: "", err: fmt.Errorf("local STT is disabled (enable LOCAL_STT_ENABLED=true) or start the backend with STT enabled")}
-		}
-
-		wavOrWebm, err := recordMicToWebm(dur)
-		if err != nil {
-			return sttDoneMsg{text: "", err: err}
-		}
-		defer os.Remove(wavOrWebm)
-
-		f, err := os.Open(wavOrWebm)
-		if err != nil {
-			return sttDoneMsg{text: "", err: err}
-		}
-		defer f.Close()
-		data, err := io.ReadAll(f)
-		if err != nil {
-			return sttDoneMsg{text: "", err: err}
-		}
-
-		var body bytes.Buffer
-		boundary := uuid.NewString()
-		w := bufio.NewWriter(&body)
-		_, _ = w.WriteString("--" + boundary + "\r\n")
-		_, _ = w.WriteString("Content-Disposition: form-data; name=\"audio\"; filename=\"mic.webm\"\r\n")
-		_, _ = w.WriteString("Content-Type: audio/webm\r\n\r\n")
-		_, _ = w.Write(data)
-		_, _ = w.WriteString("\r\n--" + boundary + "--\r\n")
-		_ = w.Flush()
-
-		req, err := http.NewRequest("POST", strings.TrimRight(apiBase, "/")+"/stt", bytes.NewReader(body.Bytes()))
-		if err != nil {
-			return sttDoneMsg{text: "", err: err}
-		}
-		req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
-		client := &http.Client{Timeout: 120 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			return sttDoneMsg{text: "", err: err}
-		}
-		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return sttDoneMsg{text: "", err: fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(respBody)))}
-		}
-		var sttResp struct {
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal(respBody, &sttResp); err != nil {
-			return sttDoneMsg{text: "", err: err}
-		}
-		return sttDoneMsg{text: sttResp.Text, err: nil}
+		return sttDoneMsg{text: "", err: fmt.Errorf("microphone input is not supported in the TUI right now; use the Web UI")}
 	}
-}
-
-func isSTTEnabled(apiBase string) (bool, error) {
-	req, err := http.NewRequest("GET", strings.TrimRight(apiBase, "/")+"/stt/info", nil)
-	if err != nil {
-		return false, err
-	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
-	}
-	var info struct {
-		Enabled bool `json:"enabled"`
-	}
-	if err := json.Unmarshal(body, &info); err != nil {
-		return false, err
-	}
-	return info.Enabled, nil
-}
-
-func micDurationFromEnv() time.Duration {
-	val := strings.TrimSpace(os.Getenv("ECHOSPEAK_MIC_SECONDS"))
-	if val == "" {
-		return 5 * time.Second
-	}
-	f, err := strconv.ParseFloat(val, 64)
-	if err != nil || f <= 0 {
-		return 5 * time.Second
-	}
-	if f > 30 {
-		f = 30
-	}
-	return time.Duration(f * float64(time.Second))
-}
-
-func listDshowAudioDevices(ffmpeg string) ([]string, string) {
-	cmd := exec.Command(ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy")
-	b, _ := cmd.CombinedOutput()
-	out := string(b)
-	lines := strings.Split(out, "\n")
-	devices := []string{}
-	inAudio := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.Contains(trimmed, "DirectShow audio devices") {
-			inAudio = true
-			continue
-		}
-		if strings.Contains(trimmed, "DirectShow video devices") {
-			if inAudio {
-				break
-			}
-			continue
-		}
-		if !inAudio {
-			continue
-		}
-		if strings.Contains(trimmed, "Alternative name") {
-			continue
-		}
-		start := strings.Index(trimmed, "\"")
-		if start == -1 {
-			continue
-		}
-		rest := trimmed[start+1:]
-		end := strings.Index(rest, "\"")
-		if end == -1 {
-			continue
-		}
-		name := strings.TrimSpace(rest[:end])
-		if name != "" {
-			devices = append(devices, name)
-		}
-	}
-	return devices, strings.TrimSpace(out)
-}
-
-type dshowAudioDevice struct {
-	Friendly string
-	Alt      string
-}
-
-func parseDshowAudioDevices(raw string) []dshowAudioDevice {
-	lines := strings.Split(raw, "\n")
-	devices := []dshowAudioDevice{}
-	inAudio := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.Contains(strings.ToLower(trimmed), "directshow audio devices") {
-			inAudio = true
-			continue
-		}
-		if strings.Contains(strings.ToLower(trimmed), "directshow video devices") {
-			inAudio = false
-			continue
-		}
-
-		start := strings.Index(trimmed, "\"")
-		if start == -1 {
-			continue
-		}
-		rest := trimmed[start+1:]
-		end := strings.Index(rest, "\"")
-		if end == -1 {
-			continue
-		}
-		quoted := strings.TrimSpace(rest[:end])
-		if quoted == "" {
-			continue
-		}
-
-		if strings.Contains(trimmed, "Alternative name") {
-			if len(devices) > 0 {
-				devices[len(devices)-1].Alt = quoted
-			}
-			continue
-		}
-
-		// Fallback: if not explicitly in audio section, but line contains (audio), assume it is
-		if inAudio || strings.Contains(trimmed, "(audio)") {
-			devices = append(devices, dshowAudioDevice{Friendly: quoted})
-		}
-	}
-	return devices
-}
-
-func normalizeDshowName(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	if s == "" {
-		return ""
-	}
-	s = strings.ReplaceAll(s, "microphone", "")
-	s = strings.ReplaceAll(s, "mic", "")
-	s = strings.ReplaceAll(s, "(", " ")
-	s = strings.ReplaceAll(s, ")", " ")
-	s = strings.ReplaceAll(s, "-", " ")
-	s = strings.ReplaceAll(s, "_", " ")
-	s = strings.ReplaceAll(s, "\t", " ")
-	s = strings.Join(strings.Fields(s), "")
-	return s
-}
-
-func resolveDshowDevice(ffmpeg, requested string) (string, []string, string) {
-	deviceNames, raw := listDshowAudioDevices(ffmpeg)
-	parsed := parseDshowAudioDevices(raw)
-	requested = strings.TrimSpace(requested)
-	isAuto := requested == "" || strings.EqualFold(requested, "default") || strings.EqualFold(requested, "auto") || strings.EqualFold(requested, "system")
-
-	if isAuto {
-		if len(parsed) > 0 {
-			return parsed[0].Friendly, deviceNames, raw
-		}
-		return "", deviceNames, raw
-	}
-	if strings.HasPrefix(strings.ToLower(requested), "@device_") {
-		for _, d := range parsed {
-			if d.Alt != "" && strings.EqualFold(d.Alt, requested) {
-				return d.Alt, deviceNames, raw
-			}
-		}
-		return requested, deviceNames, raw
-	}
-	for _, d := range parsed {
-		if strings.EqualFold(d.Friendly, requested) {
-			return d.Friendly, deviceNames, raw
-		}
-		if d.Alt != "" && strings.EqualFold(d.Alt, requested) {
-			return d.Alt, deviceNames, raw
-		}
-	}
-
-	requestedNorm := normalizeDshowName(requested)
-	for _, d := range parsed {
-		if d.Friendly != "" && strings.Contains(normalizeDshowName(d.Friendly), requestedNorm) {
-			return d.Friendly, deviceNames, raw
-		}
-		if d.Alt != "" && strings.Contains(normalizeDshowName(d.Alt), requestedNorm) {
-			return d.Alt, deviceNames, raw
-		}
-	}
-
-	requestedLower := strings.ToLower(requested)
-	for _, d := range parsed {
-		if d.Friendly != "" && strings.Contains(strings.ToLower(d.Friendly), requestedLower) {
-			return d.Friendly, deviceNames, raw
-		}
-		if d.Alt != "" && strings.Contains(strings.ToLower(d.Alt), requestedLower) {
-			return d.Alt, deviceNames, raw
-		}
-	}
-
-	return "", deviceNames, raw
-}
-
-func tailText(s string, maxLen int) string {
-	s = strings.TrimSpace(s)
-	if maxLen <= 0 || len(s) <= maxLen {
-		return s
-	}
-	return "..." + s[len(s)-maxLen:]
-}
-
-func recordMicToWebm(dur time.Duration) (string, error) {
-	ffmpeg := strings.TrimSpace(os.Getenv("ECHOSPEAK_FFMPEG"))
-	if ffmpeg == "" {
-		ffmpeg = "ffmpeg"
-	}
-	device := strings.TrimSpace(os.Getenv("ECHOSPEAK_MIC_DSHOW_DEVICE"))
-	if runtime.GOOS == "windows" {
-		autoDevice := device == "" || strings.EqualFold(device, "default") || strings.EqualFold(device, "system") || strings.EqualFold(device, "auto")
-		if autoDevice {
-			if name, err := defaultWindowsMicName(); err == nil && strings.TrimSpace(name) != "" {
-				device = strings.TrimSpace(name)
-			}
-		}
-		resolved, _, raw := resolveDshowDevice(ffmpeg, device)
-		if resolved == "" {
-			available := strings.Join(formatDshowDeviceChoices(raw), "; ")
-			if available == "" {
-				available = tailText(raw, 300)
-			}
-			if autoDevice {
-				return "", fmt.Errorf("default mic not found. Set ECHOSPEAK_MIC_DSHOW_DEVICE to a dshow mic name or alt name (available: %s)", available)
-			}
-			if device == "" {
-				return "", fmt.Errorf("set ECHOSPEAK_MIC_DSHOW_DEVICE to your dshow mic name (available: %s)", available)
-			}
-			return "", fmt.Errorf("mic device '%s' not found. Available: %s", device, available)
-		}
-		device = resolved
-	}
-
-	out, err := os.CreateTemp("", "echospeak-mic-*.webm")
-	if err != nil {
-		return "", err
-	}
-	path := out.Name()
-	_ = out.Close()
-
-	sec := fmt.Sprintf("%.2f", dur.Seconds())
-	if runtime.GOOS == "windows" {
-		inp := strings.TrimSpace(device)
-		inp = strings.TrimSpace(strings.Trim(inp, "[]"))
-		if len(inp) >= 2 {
-			if (inp[0] == '"' && inp[len(inp)-1] == '"') || (inp[0] == '\'' && inp[len(inp)-1] == '\'') {
-				inp = inp[1 : len(inp)-1]
-			}
-		}
-		args := []string{"-hide_banner", "-loglevel", "error", "-y", "-f", "dshow", "-i", "audio=" + inp, "-t", sec, "-c:a", "libopus", "-b:a", "48k", path}
-		cmd := exec.Command(ffmpeg, args...)
-		b, err := cmd.CombinedOutput()
-		if err != nil {
-			_ = os.Remove(path)
-			return "", fmt.Errorf("ffmpeg mic record failed: %v: %s", err, tailText(string(b), 800))
-		}
-		return path, nil
-	}
-
-	_ = os.Remove(path)
-	return "", fmt.Errorf("mic recording not implemented for %s", runtime.GOOS)
 }
 
 func (m model) Init() tea.Cmd {
@@ -779,9 +448,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.closeStream()
 			return m, tea.Quit
 		}
+		if msg.Type == tea.KeyCtrlP {
+			if m.confirmActive || m.sending {
+				break
+			}
+			if m.isCommandPaletteActive() {
+				// Close palette and restore previous input (if any).
+				restore := strings.TrimSpace(m.lastRequest)
+				m.input.SetValue(restore)
+				m.commandIdx = 0
+				m.commandOffset = 0
+				return m, nil
+			}
+			// Open palette. Preserve any non-command draft input for restore.
+			draft := m.input.Value()
+			if strings.TrimSpace(draft) != "" && !strings.HasPrefix(strings.TrimSpace(draft), "/") {
+				m.lastRequest = draft
+			} else if strings.TrimSpace(draft) == "" {
+				m.lastRequest = ""
+			}
+			m.input.SetValue("/")
+			m.commandIdx = 0
+			m.commandOffset = 0
+			return m, nil
+		}
 		if msg.Type == tea.KeyEsc && m.isCommandPaletteActive() {
 			m.input.SetValue("")
 			m.commandIdx = 0
+			m.commandOffset = 0
 			return m, nil
 		}
 		if m.confirmActive && !m.isCommandPaletteActive() && !m.sending {
@@ -813,9 +507,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.String() == "alt+r" {
-			m.lines = append(m.lines, chatLine{kind: lineTool, content: "Mic: recording..."})
+			m.lines = append(m.lines, chatLine{kind: lineError, content: "Mic: not supported in TUI (use Web UI)"})
 			m.rebuildContent()
-			cmds = append(cmds, recordAndTranscribeCmd(m.apiBase, micDurationFromEnv()))
 			break
 		}
 
@@ -826,27 +519,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.commandIdx > 0 {
 					m.commandIdx -= 1
 				}
+				m.syncCommandIdx()
 				return m, nil
 			case tea.KeyDown:
 				if len(filtered) > 0 && m.commandIdx < len(filtered)-1 {
 					m.commandIdx += 1
 				}
+				m.syncCommandIdx()
 				return m, nil
 			case tea.KeyTab:
 				if len(filtered) > 0 {
 					m.commandIdx = (m.commandIdx + 1) % len(filtered)
 				}
+				m.syncCommandIdx()
 				return m, nil
 			case tea.KeyShiftTab:
 				if len(filtered) > 0 {
 					m.commandIdx = (m.commandIdx + len(filtered) - 1) % len(filtered)
 				}
+				m.syncCommandIdx()
 				return m, nil
 			case tea.KeyEnter:
 				if len(filtered) > 0 {
 					selected := filtered[m.commandIdx]
+					// Insert into input and close palette so the user can type args.
 					m.input.SetValue(selected.Command + " ")
 					m.commandIdx = 0
+					m.commandOffset = 0
+					m.input.CursorEnd()
 					return m, nil
 				}
 			}
@@ -874,6 +574,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m, cmd = m.submitMessage(text)
 			cmds = append(cmds, cmd)
+			// After sending a message, keep the viewport pinned.
+			m.stickToBottom = true
+		case tea.KeyPgUp:
+			m.stickToBottom = false
+			page := max(1, m.viewport.Height-1)
+			m.viewport.LineUp(page)
+			return m, nil
+		case tea.KeyPgDown:
+			page := max(1, m.viewport.Height-1)
+			m.viewport.LineDown(page)
+			return m, nil
+		case tea.KeyCtrlU:
+			m.stickToBottom = false
+			m.viewport.HalfViewUp()
+			return m, nil
+		case tea.KeyCtrlD:
+			m.viewport.HalfViewDown()
+			return m, nil
+		case tea.KeyHome:
+			m.stickToBottom = false
+			m.viewport.GotoTop()
+			return m, nil
+		case tea.KeyEnd:
+			m.stickToBottom = true
+			m.viewport.GotoBottom()
+			return m, nil
 		}
 
 		var cmd tea.Cmd
@@ -967,6 +693,64 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lines = append(m.lines, chatLine{kind: lineTool, content: text})
 		}
 		m.rebuildContent()
+	case tea.MouseMsg:
+		if m.isCommandPaletteActive() {
+			filtered := m.filteredCommands()
+			if len(filtered) == 0 {
+				break
+			}
+			maxItems := min(8, len(filtered))
+			hasMore := len(filtered) > maxItems
+			paletteWidth := min(80, max(50, m.width-8))
+			paletteH := commandPaletteHeight(maxItems, hasMore)
+			x0 := (m.width - paletteWidth) / 2
+			y0 := (m.height - paletteH) / 2
+
+			switch msg.Type {
+			case tea.MouseWheelUp:
+				if m.commandIdx > 0 {
+					m.commandIdx--
+					m.syncCommandIdx()
+					return m, nil
+				}
+			case tea.MouseWheelDown:
+				if m.commandIdx < len(filtered)-1 {
+					m.commandIdx++
+					m.syncCommandIdx()
+					return m, nil
+				}
+			case tea.MouseLeft:
+				// Approximate item hit-testing.
+				// Items begin after border+padding and header+blank.
+				// This won't be pixel-perfect, but will make clicking usable.
+				itemStartY := y0 + 4
+				itemEndY := itemStartY + maxItems - 1
+				if msg.X >= x0 && msg.X <= x0+paletteWidth && msg.Y >= itemStartY && msg.Y <= itemEndY {
+					idx := msg.Y - itemStartY
+					absolute := m.commandOffset + idx
+					if absolute >= 0 && absolute < len(filtered) {
+						m.commandIdx = absolute
+						m.syncCommandIdx()
+						selected := filtered[m.commandIdx]
+						m.input.SetValue(selected.Command + " ")
+						m.commandIdx = 0
+						m.commandOffset = 0
+						m.input.CursorEnd()
+						return m, nil
+					}
+				}
+			}
+		}
+		// Mouse wheel scroll for chat output (viewport).
+		switch msg.Type {
+		case tea.MouseWheelUp:
+			m.stickToBottom = false
+			m.viewport.LineUp(3)
+			return m, nil
+		case tea.MouseWheelDown:
+			m.viewport.LineDown(3)
+			return m, nil
+		}
 	}
 
 	if len(cmds) == 0 {
@@ -1027,6 +811,7 @@ func (m *model) dropTrailingThinking() {
 }
 
 func (m *model) rebuildContent() {
+	oldYOffset := m.viewport.YOffset
 	width := max(20, m.viewport.Width-2)
 	if m.renderedW != width || len(m.lines) < len(m.rendered) {
 		m.rendered = nil
@@ -1049,15 +834,27 @@ func (m *model) rebuildContent() {
 		b.WriteString("\n\n")
 	}
 	m.viewport.SetContent(strings.TrimRight(b.String(), "\n"))
-	m.viewport.GotoBottom()
+	if m.stickToBottom {
+		m.viewport.GotoBottom()
+	} else {
+		m.viewport.YOffset = oldYOffset
+	}
 }
 
 func (m *model) isCommandPaletteActive() bool {
-	value := strings.TrimSpace(m.input.Value())
+	// Only trim leading whitespace; trailing whitespace is meaningful because
+	// selecting a command inserts "/cmd " (with a trailing space) to close the palette.
+	raw := m.input.Value()
+	value := strings.TrimLeft(raw, " \t\r\n")
 	if len(value) == 0 {
 		return false
 	}
-	return value[0] == '/'
+	if value[0] != '/' {
+		return false
+	}
+	// Palette should only be active while the user is typing the command token.
+	// Once arguments start (space), allow normal Enter-to-submit.
+	return !strings.Contains(value, " ")
 }
 
 func (m *model) filteredCommands() []commandItem {
@@ -1080,16 +877,61 @@ func (m *model) filteredCommands() []commandItem {
 func (m *model) syncCommandIdx() {
 	if !m.isCommandPaletteActive() {
 		m.commandIdx = 0
+		m.commandOffset = 0
 		return
 	}
 	filtered := m.filteredCommands()
 	if len(filtered) == 0 {
 		m.commandIdx = 0
+		m.commandOffset = 0
 		return
 	}
 	if m.commandIdx >= len(filtered) {
 		m.commandIdx = len(filtered) - 1
 	}
+	if m.commandIdx < 0 {
+		m.commandIdx = 0
+	}
+	maxItems := min(8, len(filtered))
+	if maxItems <= 0 {
+		m.commandOffset = 0
+		return
+	}
+	if m.commandOffset < 0 {
+		m.commandOffset = 0
+	}
+	maxOffset := len(filtered) - maxItems
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if m.commandOffset > maxOffset {
+		m.commandOffset = maxOffset
+	}
+	if m.commandIdx < m.commandOffset {
+		m.commandOffset = m.commandIdx
+	}
+	if m.commandIdx >= m.commandOffset+maxItems {
+		m.commandOffset = m.commandIdx - maxItems + 1
+		if m.commandOffset > maxOffset {
+			m.commandOffset = maxOffset
+		}
+	}
+}
+
+func commandPaletteHeight(visibleItems int, hasMore bool) int {
+	// Rough geometry used for mouse hit-testing.
+	// The palette renders:
+	// - header + blank line
+	// - visibleItems rows
+	// - optional "... and N more" block (3 lines)
+	// - footer (1 line)
+	// - plus border + padding
+	lines := 2 + visibleItems + 1
+	if hasMore {
+		lines += 3
+	}
+	// Border (2) + padding top/bottom (2)
+	return lines + 4
 }
 
 func (m model) submitMessage(text string) (model, tea.Cmd) {
@@ -1097,8 +939,16 @@ func (m model) submitMessage(text string) (model, tea.Cmd) {
 	if text == "" || m.sending {
 		return m, nil
 	}
-
+	// Optimistically update workspace label on local slash commands.
 	fields := strings.Fields(text)
+	if len(fields) >= 2 {
+		cmd := strings.ToLower(strings.TrimSpace(fields[0]))
+		arg := strings.TrimSpace(fields[1])
+		if cmd == "/onboard" || cmd == "/workspace" {
+			m.activeWorkspace = arg
+		}
+	}
+
 	cmd0 := ""
 	if len(fields) > 0 {
 		cmd0 = fields[0]
@@ -1114,14 +964,6 @@ func (m model) submitMessage(text string) (model, tea.Cmd) {
 		m.input.SetValue("")
 		m.commandIdx = 0
 		return m, nil
-	}
-
-	if cmd0 == "/mic" {
-		m.input.SetValue("")
-		m.commandIdx = 0
-		m.lines = append(m.lines, chatLine{kind: lineTool, content: "Mic: recording..."})
-		m.rebuildContent()
-		return m, recordAndTranscribeCmd(m.apiBase, micDurationFromEnv())
 	}
 
 	if text == "/status" || text == "/doctor" {
@@ -1154,7 +996,6 @@ func (m model) submitMessage(text string) (model, tea.Cmd) {
 			"- /status or /doctor     run doctor checks (optionally scoped to current session)\n"+
 			"- /model                 refresh current provider/model\n\n"+
 			"Input:\n"+
-			"- /mic                   record + transcribe (Alt+R)\n"+
 			"- /exit                  quit"})
 		m.rebuildContent()
 		return m, nil
@@ -1300,6 +1141,28 @@ func extractPendingAction(resp string) (string, bool) {
 	return action, true
 }
 
+func extractWorkspaceFromResponse(resp string) string {
+	low := strings.ToLower(resp)
+	prefix := "workspace set to '"
+	startIdx := strings.Index(low, prefix)
+	if startIdx == -1 {
+		return ""
+	}
+	valueStart := startIdx + len(prefix)
+	if valueStart < 0 || valueStart >= len(resp) {
+		return ""
+	}
+	closeRel := strings.Index(low[valueStart:], "'")
+	if closeRel == -1 {
+		return ""
+	}
+	valueEnd := valueStart + closeRel
+	if valueEnd < valueStart || valueEnd > len(resp) {
+		return ""
+	}
+	return strings.TrimSpace(resp[valueStart:valueEnd])
+}
+
 func (m *model) handleStreamEvent(evt streamEvent) {
 	m.dropTrailingThinking()
 
@@ -1350,7 +1213,7 @@ func (m *model) handleStreamEvent(evt streamEvent) {
 		delete(m.toolRunNames, evt.ID)
 	case "memory_saved":
 		m.memoryCount = evt.MemoryCount
-		m.lines = append(m.lines, chatLine{kind: lineTool, content: "💾 Memory saved (" + fmt.Sprintf("%d", m.memoryCount) + " items)"})
+		m.lines = append(m.lines, chatLine{kind: lineTool, content: "Memory saved (" + fmt.Sprintf("%d", m.memoryCount) + " items)"})
 	case "final":
 		m.lastRequest = evt.RequestID
 		m.sending = false
@@ -1365,6 +1228,9 @@ func (m *model) handleStreamEvent(evt streamEvent) {
 		} else {
 			m.confirmActive = false
 			m.confirmAction = ""
+		}
+		if ws := extractWorkspaceFromResponse(response); ws != "" {
+			m.activeWorkspace = ws
 		}
 		formatted := formatResponse(response)
 		m.lines = append(m.lines, chatLine{kind: lineAssistant, content: formatted})
@@ -1598,11 +1464,21 @@ func speakTTSCmd(apiBase, text string, id int) tea.Cmd {
 		client := &http.Client{Timeout: 120 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
+			if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
+				if localErr := speakLocalText(sanitized); localErr == nil {
+					return ttsDoneMsg{id: id, err: nil}
+				}
+			}
 			return ttsDoneMsg{id: id, err: err}
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			body, _ := io.ReadAll(resp.Body)
+			if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
+				if localErr := speakLocalText(sanitized); localErr == nil {
+					return ttsDoneMsg{id: id, err: nil}
+				}
+			}
 			return ttsDoneMsg{id: id, err: fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))}
 		}
 
@@ -1611,10 +1487,38 @@ func speakTTSCmd(apiBase, text string, id int) tea.Cmd {
 			return ttsDoneMsg{id: id, err: err}
 		}
 		if err := playWavBytes(wavBytes); err != nil {
+			if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
+				if localErr := speakLocalText(sanitized); localErr == nil {
+					return ttsDoneMsg{id: id, err: nil}
+				}
+			}
 			return ttsDoneMsg{id: id, err: err}
 		}
 		return ttsDoneMsg{id: id, err: nil}
 	}
+}
+
+func speakLocalText(text string) error {
+	text = sanitizeTTSText(text)
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+
+	// Prefer speech-dispatcher on Linux if available.
+	if path, err := exec.LookPath("spd-say"); err == nil {
+		cmd := exec.Command(path, "-w", text)
+		return cmd.Run()
+	}
+	if path, err := exec.LookPath("espeak-ng"); err == nil {
+		cmd := exec.Command(path, text)
+		return cmd.Run()
+	}
+	if path, err := exec.LookPath("espeak"); err == nil {
+		cmd := exec.Command(path, text)
+		return cmd.Run()
+	}
+
+	return fmt.Errorf("no local TTS command found (install spd-say or espeak)")
 }
 
 func sanitizeTTSText(s string) string {
@@ -1702,7 +1606,15 @@ func playWavBytes(wav []byte) error {
 		ttsMu.Unlock()
 		return err
 	default:
-		cmd := exec.Command("aplay", name)
+		player := ""
+		if _, err := exec.LookPath("pw-play"); err == nil {
+			player = "pw-play"
+		} else if _, err := exec.LookPath("paplay"); err == nil {
+			player = "paplay"
+		} else {
+			player = "aplay"
+		}
+		cmd := exec.Command(player, name)
 		ttsMu.Lock()
 		stopPrevious()
 		activeTTSCmd = cmd
@@ -1772,10 +1684,8 @@ func splashView(m model) string {
 	keyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true)
 
 	sc := []string{
-		keyStyle.Render("ctrl+t") + " variants",
-		keyStyle.Render("tab") + " agents",
+		keyStyle.Render("ctrl+c") + " quit",
 		keyStyle.Render("ctrl+p") + " commands",
-		keyStyle.Render("alt+r") + " mic",
 	}
 	shortcuts := shortcutStyle.Render(strings.Join(sc, "   "))
 
@@ -1795,6 +1705,14 @@ func splashView(m model) string {
 		tip,
 	)
 	centered := lipgloss.Place(m.width, m.height-1, lipgloss.Center, lipgloss.Center, block)
+
+	if m.isCommandPaletteActive() {
+		paletteWidth := min(80, max(50, m.width-8))
+		paletteOverlay := renderCommandPalette(m, paletteWidth)
+		if paletteOverlay != "" {
+			return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, paletteOverlay)
+		}
+	}
 
 	return header + "\n" + centered
 }
@@ -2013,21 +1931,49 @@ func renderLogView(m model, w, h int) string {
 			style = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
 		}
 
-		// Truncate content for single line log
 		content := strings.ReplaceAll(line.content, "\n", " ")
-		if len(content) > w-10 {
-			content = content[:w-10] + "..."
+		content = strings.TrimSpace(content)
+		content = ansi.Strip(content)
+		for _, row := range wrapForLog(content, prefix, w) {
+			logs = append(logs, style.Render(row))
 		}
-
-		logs = append(logs, style.Render(prefix+content))
 	}
 
-	// Pad with empty lines if needed to fill height
+	// Keep only the last h visual lines.
+	if h < 1 {
+		h = 1
+	}
+	if len(logs) > h {
+		logs = logs[len(logs)-h:]
+	}
 	for len(logs) < h {
-		logs = append(logs, "")
+		logs = append([]string{""}, logs...)
 	}
-
 	return strings.Join(logs, "\n")
+}
+
+func wrapForLog(content, prefix string, width int) []string {
+	if width <= 0 {
+		return []string{prefix + content}
+	}
+	indent := strings.Repeat(" ", lipgloss.Width(prefix))
+	avail := width - lipgloss.Width(prefix)
+	if avail < 5 {
+		avail = 5
+	}
+	wrapped := wrapTextWidth(content, avail)
+	if len(wrapped) == 0 {
+		return []string{prefix}
+	}
+	rows := make([]string, 0, len(wrapped))
+	for i, wl := range wrapped {
+		if i == 0 {
+			rows = append(rows, prefix+wl)
+		} else {
+			rows = append(rows, indent+wl)
+		}
+	}
+	return rows
 }
 
 func renderHeaderBar(m model) string {
@@ -2039,6 +1985,23 @@ func renderHeaderBar(m model) string {
 		Bold(true).
 		Padding(0, 1).
 		Render(" EchoSpeak ")
+
+	wsLeft := ""
+	if m.width > 60 {
+		ws := strings.TrimSpace(m.activeWorkspace)
+		if ws != "" {
+			wsLeft = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("255")).
+				Background(lipgloss.Color(colorAccent)).
+				Padding(0, 1).
+				Render(ws)
+		}
+	}
+
+	leftBlock := logoStyle
+	if wsLeft != "" {
+		leftBlock = lipgloss.JoinHorizontal(lipgloss.Center, logoStyle, wsLeft)
+	}
 
 	// Right: Version
 	versionStyle := lipgloss.NewStyle().
@@ -2067,17 +2030,29 @@ func renderHeaderBar(m model) string {
 			Render("● " + statusText)
 	}
 
-	rightBlock := lipgloss.JoinHorizontal(lipgloss.Center, statusBlock, versionStyle)
+	wsBlock := ""
+	if m.width > 60 {
+		ws := strings.TrimSpace(m.activeWorkspace)
+		if ws != "" {
+			wsBlock = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("255")).
+				Background(lipgloss.Color(colorAccent)).
+				Padding(0, 1).
+				Render(ws)
+		}
+	}
+
+	rightBlock := lipgloss.JoinHorizontal(lipgloss.Center, statusBlock, wsBlock, versionStyle)
 
 	// Combine with spacer
-	contentWidth := lipgloss.Width(logoStyle) + lipgloss.Width(rightBlock)
+	contentWidth := lipgloss.Width(leftBlock) + lipgloss.Width(rightBlock)
 	gap := m.width - contentWidth
 	if gap < 0 {
 		gap = 0
 	}
 	spacer := strings.Repeat(" ", gap)
 
-	bar := lipgloss.JoinHorizontal(lipgloss.Center, logoStyle, spacer, rightBlock)
+	bar := lipgloss.JoinHorizontal(lipgloss.Center, leftBlock, spacer, rightBlock)
 
 	return lipgloss.NewStyle().
 		Width(m.width).
@@ -2386,6 +2361,10 @@ func formatMarkdownLine(line string) string {
 
 func renderLine(m model, line chatLine, width int) string {
 	textStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Background(lipgloss.Color(colorPanel))
+	innerWidth := width - 3
+	if innerWidth < 10 {
+		innerWidth = 10
+	}
 
 	switch line.kind {
 	case lineUser:
@@ -2394,8 +2373,7 @@ func renderLine(m model, line chatLine, width int) string {
 		textStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText)).Background(lipgloss.Color(colorPanel))
 	case lineThinking:
 		textStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorThinking)).Background(lipgloss.Color(colorPanel))
-		wrapStyle := lipgloss.NewStyle().Width(width - 3).Background(lipgloss.Color(colorPanel))
-		content := wrapStyle.Render(m.spinner.View() + " " + line.content)
+		content := wrapWithPrefix(m.spinner.View()+" "+line.content, "", innerWidth)
 		return textStyle.Render(content)
 	case lineTool:
 		if strings.HasPrefix(line.content, "▸") {
@@ -2413,9 +2391,118 @@ func renderLine(m model, line chatLine, width int) string {
 		textStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorError)).Background(lipgloss.Color(colorPanel))
 	}
 
-	wrapStyle := lipgloss.NewStyle().Width(width - 3).Background(lipgloss.Color(colorPanel))
-	content := wrapStyle.Render(line.content)
+	prefix := ""
+	if line.kind == lineUser {
+		prefix = "You: "
+	} else if line.kind == lineAssistant {
+		prefix = "AI: "
+	}
+	content := wrapWithPrefix(line.content, prefix, innerWidth)
 	return textStyle.Render(content)
+}
+
+func wrapWithPrefix(content, prefix string, width int) string {
+	if width <= 0 {
+		return prefix + content
+	}
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	lines := strings.Split(content, "\n")
+	indent := strings.Repeat(" ", lipgloss.Width(prefix))
+
+	var out []string
+	for i, ln := range lines {
+		pfx := indent
+		if i == 0 {
+			pfx = prefix
+		}
+		available := width - lipgloss.Width(pfx)
+		if available < 5 {
+			available = 5
+		}
+		wrappedLines := wrapTextWidth(ln, available)
+		for j, wl := range wrappedLines {
+			if j == 0 {
+				out = append(out, pfx+wl)
+			} else {
+				out = append(out, indent+wl)
+			}
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+func wrapTextWidth(s string, width int) []string {
+	s = strings.TrimRight(s, " ")
+	if width <= 0 || s == "" {
+		return []string{s}
+	}
+	if lipgloss.Width(s) <= width {
+		return []string{s}
+	}
+
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return []string{""}
+	}
+
+	var out []string
+	cur := ""
+	for _, w := range words {
+		if cur == "" {
+			if lipgloss.Width(w) <= width {
+				cur = w
+				continue
+			}
+			// Hard-break a single long word.
+			parts := breakLongWord(w, width)
+			out = append(out, parts[:len(parts)-1]...)
+			cur = parts[len(parts)-1]
+			continue
+		}
+
+		candidate := cur + " " + w
+		if lipgloss.Width(candidate) <= width {
+			cur = candidate
+			continue
+		}
+
+		out = append(out, cur)
+		if lipgloss.Width(w) <= width {
+			cur = w
+			continue
+		}
+		parts := breakLongWord(w, width)
+		out = append(out, parts[:len(parts)-1]...)
+		cur = parts[len(parts)-1]
+	}
+	if strings.TrimSpace(cur) != "" {
+		out = append(out, cur)
+	}
+	return out
+}
+
+func breakLongWord(word string, width int) []string {
+	if width <= 0 {
+		return []string{word}
+	}
+	var out []string
+	cur := ""
+	for _, r := range []rune(word) {
+		candidate := cur + string(r)
+		if cur != "" && lipgloss.Width(candidate) > width {
+			out = append(out, cur)
+			cur = string(r)
+			continue
+		}
+		cur = candidate
+	}
+	if cur != "" {
+		out = append(out, cur)
+	}
+	if len(out) == 0 {
+		return []string{word}
+	}
+	return out
 }
 
 func padLine(left, right string, width int) string {
@@ -2442,7 +2529,18 @@ func renderCommandPalette(m model, width int) string {
 		return ""
 	}
 	maxItems := min(8, len(items))
-	displayItems := items[:maxItems]
+	offset := m.commandOffset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(items) {
+		offset = len(items)
+	}
+	end := offset + maxItems
+	if end > len(items) {
+		end = len(items)
+	}
+	displayItems := items[offset:end]
 
 	headerStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color(colorAccent)).
@@ -2455,7 +2553,8 @@ func renderCommandPalette(m model, width int) string {
 	rows := []string{header, ""}
 
 	for idx, item := range displayItems {
-		selected := idx == m.commandIdx
+		absoluteIdx := offset + idx
+		selected := absoluteIdx == m.commandIdx
 		cmdStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorAccent)).Bold(true)
 		descStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted))
 
@@ -2479,7 +2578,13 @@ func renderCommandPalette(m model, width int) string {
 	}
 
 	if len(items) > maxItems {
-		rows = append(rows, "", lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Italic(true).Render(fmt.Sprintf("  ... and %d more", len(items)-maxItems)))
+		remaining := len(items) - end
+		if remaining < 0 {
+			remaining = 0
+		}
+		if remaining > 0 {
+			rows = append(rows, "", lipgloss.NewStyle().Foreground(lipgloss.Color(colorMuted)).Italic(true).Render(fmt.Sprintf("  ... and %d more", remaining)))
+		}
 	}
 
 	footer := lipgloss.NewStyle().
@@ -2582,7 +2687,7 @@ func main() {
 	}
 
 	m := initialModel(apiBase)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if err := p.Start(); err != nil {
 		fmt.Println("error:", err)
 		os.Exit(1)

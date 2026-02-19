@@ -1,0 +1,9 @@
+web_search
+live_web_search
+youtube_transcript
+calculate
+get_system_time
+take_screenshot
+system_info
+analyze_screen
+vision_qa

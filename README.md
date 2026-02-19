@@ -6,8 +6,8 @@ EchoSpeak is a local-first, low-latency voice and chat assistant designed for pr
 
 - **Interfaces**:
   - **Modern Web UI**: React/Vite with streaming chat, research panel, OCR monitor, doc sources, memory/docs management, and provider controls.
-  - **Go TUI (v0.2.0)**: Bubble Tea client with `/session` management, `/doctor`, `/model`, `/mic`, and streaming UI.
-  - **Python CLI**: voice and text modes via `app.py` (wake word + direct chat).
+  - **Go TUI (v0.2.0)**: Bubble Tea client with `/session` management, `/doctor`, `/model`, and streaming UI.
+  - **Python CLI**: optional console text mode via `app.py`.
 - **Retrieval + Memory**:
   - **Document RAG**: PDF/text upload, chunk-level citations, hybrid retrieval (BM25 + FAISS), optional reranking, GraphRAG-lite expansion.
   - **Long-term Memory**: FAISS vector store with optional file-backed logs, auto-summaries, optional memory-flush notes, and partitioning by mode/thread_id.
@@ -24,7 +24,8 @@ EchoSpeak is a local-first, low-latency voice and chat assistant designed for pr
 
 ## 🤖 Agent Routing + Self-Check
 
-- **Query heuristics / tool pre-filtering**: Echo narrows available tools per query (math → `calculate`, YouTube URL → `youtube_transcript`, live/current questions → `live_web_search`).
+- **Action Parser pass (LLM-driven)**: Echo first interprets the user’s request into a single structured action (or “none”), then applies safety/policy checks and (when needed) asks for `confirm` before executing.
+- **Query heuristics / tool pre-filtering (fallback)**: Echo narrows available tools per query (math → `calculate`, YouTube URL → `youtube_transcript`, live/current questions → `live_web_search`).
 - **Live web search for “current” queries**: When Playwright is enabled, Echo prefers `live_web_search` and falls back to `web_search` if needed.
 - **Reflection step after web tool calls**: After `web_search` / `live_web_search`, Echo checks whether the result answered the question and retries or asks a clarifying question when needed.
 
@@ -62,18 +63,35 @@ EchoSpeak is a local-first, low-latency voice and chat assistant designed for pr
 ## ⚡ Quick Start
 
 ### 1. Install Backend
-```powershell
+```bash
 cd apps/backend
-pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Fish shell:
+
+```fish
+cd apps/backend
+python -m venv .venv
+source .venv/bin/activate.fish
+python -m pip install -r requirements.txt
 ```
 
 ### 2. Configure Environment
 Edit `apps/backend/.env` to set your desired model provider and enable optional features like PersonaPlex.
 
 ### 3. Launch
-- **Backend**: `python app.py --mode api`
-- **Go TUI**: `cd ../tui; .\echospeak-tui.exe`
-- **Web UI**: `cd ../web; npm run dev`
+- **Backend** (run from `apps/backend/`): `python app.py --mode api`
+- **Go TUI** (run from `apps/tui/`): `go run .`
+- **Web UI** (run from `apps/web/`): `npm run dev`
+
+### Safety + policy notes
+
+- System actions are confirmation-gated (reply `confirm` / `cancel`).
+- Workspaces define the tool allowlist ceiling; skills can only further restrict tool access.
+- `ACTION_PARSER_ENABLED=true` enables the LLM-driven action parser pass (on by default).
 
 ---
 MIT License

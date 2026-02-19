@@ -220,6 +220,42 @@ class TestTools:
         assert len(tools) > 0
 
 
+class TestActionParser:
+    def test_action_parser_file_write_python_script(self, monkeypatch):
+        """Ensure the action parser can propose a file_write for python script phrasing."""
+        from agent.core import EchoSpeakAgent
+        from config import config
+
+        monkeypatch.setattr(config, "action_parser_enabled", True, raising=False)
+        monkeypatch.setattr(config, "enable_system_actions", True, raising=False)
+        monkeypatch.setattr(config, "allow_file_write", True, raising=False)
+
+        agent = EchoSpeakAgent(memory_path=str(config.memory_path))
+        agent._tool_allowlist_override = {"file_write"}
+
+        class StubLLM:
+            def invoke(self, text: str) -> str:
+                return '{"action":"file_write","confidence":0.9,"path":"hello.py","content":"print(\\"Hello, world!\\")","append":false}'
+
+        agent.llm_wrapper = StubLLM()
+
+        resp, _ok = agent.process_query("create a python script that prints hello world", include_memory=False)
+        assert "pending action" in resp.lower() or "reply 'confirm'" in resp.lower()
+        assert "hello.py" in resp
+
+
+class TestToolAllowlistMerge:
+    def test_skills_cannot_expand_beyond_workspace(self):
+        from agent.skills_registry import merge_tool_allowlists
+
+        # Workspace ceiling only allows file_read.
+        workspace = ["file_read"]
+        # Skill tries to allow terminal_run.
+        skills = [["terminal_run"]]
+        merged = merge_tool_allowlists(workspace, skills)
+        assert merged == set()
+
+
 class TestVoiceIO:
     """Tests for the voice I/O module."""
 

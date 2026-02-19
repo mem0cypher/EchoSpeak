@@ -513,7 +513,7 @@ def _terminal_first_token(command: str) -> str:
     try:
         import shlex
 
-        parts = shlex.split(s, posix=False)
+        parts = shlex.split(s, posix=(os.name != "nt"))
     except Exception:
         parts = s.split()
     if not parts:
@@ -529,8 +529,6 @@ def _terminal_first_token(command: str) -> str:
 def terminal_run(command: str, cwd: Optional[str] = ".", timeout: Optional[int] = None) -> str:
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_terminal_commands", False):
         return "Terminal commands are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_TERMINAL_COMMANDS=true, then restart the API."
-    if os.name != "nt":
-        return "terminal_run is only supported on Windows."
 
     root = _file_tool_root()
     cwd_p = _safe_file_path(cwd or ".")
@@ -559,7 +557,18 @@ def terminal_run(command: str, cwd: Optional[str] = ".", timeout: Optional[int] 
         timeout_s = default_timeout
     timeout_s = max(1, min(120, timeout_s))
 
-    cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
+    cmd: list[str]
+    if os.name == "nt":
+        cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
+    else:
+        try:
+            import shlex
+
+            cmd = shlex.split(command or "", posix=True)
+        except Exception:
+            cmd = (command or "").split()
+        if not cmd:
+            return "Command is empty."
     try:
         proc = subprocess.run(
             cmd,

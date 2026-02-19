@@ -254,6 +254,8 @@ class Config:
         self.summary_keep_last_turns = int(os.getenv("SUMMARY_KEEP_LAST_TURNS", "6"))
         self.action_plan_enabled = os.getenv("ACTION_PLAN_ENABLED", "true").lower() == "true"
 
+        self.action_parser_enabled = os.getenv("ACTION_PARSER_ENABLED", "true").lower() == "true"
+
         self.memory_default_mode = os.getenv("MEMORY_DEFAULT_MODE", "general").strip() or "general"
 
         self.memory_partition_enabled = os.getenv("MEMORY_PARTITION_ENABLED", "false").lower() == "true"

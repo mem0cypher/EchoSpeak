@@ -397,6 +397,30 @@ class QueryResponse(BaseModel):
     doc_sources: Optional[list] = None
 
 
+@app.post("/query", response_model=QueryResponse)
+async def query(request: QueryRequest):
+    agent = get_agent(request.thread_id)
+    request_id = str(uuid.uuid4())
+    try:
+        response, success = agent.process_query(
+            request.message,
+            include_memory=request.include_memory,
+            callbacks=None,
+            thread_id=request.thread_id,
+        )
+        doc_sources = agent.get_last_doc_sources() if request.include_memory else []
+        return QueryResponse(
+            response=response,
+            success=bool(success),
+            memory_count=agent.memory.memory_count,
+            request_id=request_id,
+            doc_sources=doc_sources,
+        )
+    except Exception as exc:
+        _metric_inc("errors", 1)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 class DoctorResponse(BaseModel):
     ok: bool
     report: Dict[str, Any]

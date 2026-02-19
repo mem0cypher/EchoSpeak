@@ -4,14 +4,14 @@ Implements the conversational AI agent with memory and tools.
 Supports multiple LLM providers: OpenAI, Ollama, LM Studio, LocalAI, llama.cpp, vLLM.
 """
 
-import os
-import sys
-import uuid
-import json
 import importlib.util
+import json
+import os
 import re
-import time
+import sys
 import threading
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -384,6 +384,7 @@ class EchoSpeakAgent:
         self._workspace_prompt: str = ""
         self._skills_prompt: str = ""
         self._tool_allowlist_override: Optional[set[str]] = None
+        self._action_parser_enabled = bool(getattr(config, "action_parser_enabled", True))
         self.lc_tools = [
             t
             for t in get_available_tools()
@@ -470,6 +471,179 @@ class EchoSpeakAgent:
             return True
         return name in allowlist
 
+    def _policy_summary(self) -> str:
+        file_root = str(getattr(config, "file_tool_root", "") or ".").strip() or "."
+        term_allow = getattr(config, "terminal_command_allowlist", None) or []
+        allowlist = sorted(list(self._tool_allowlist_override or []))
+        ws = (self._workspace_id or "")
+        ws_name = (self._workspace_name or "")
+        bits = [
+            f"workspace_id={ws}",
+            f"workspace_name={ws_name}",
+            f"file_root={file_root}",
+            f"allowed_tools={', '.join(allowlist) if allowlist else '(unrestricted)'}",
+            f"terminal_allowlist={', '.join(term_allow) if term_allow else '(unrestricted)'}",
+        ]
+        return "\n".join(bits)
+
+    def _parse_action_json(self, raw: str) -> Optional[Dict[str, Any]]:
+        if not raw:
+            return None
+        text = str(raw).strip()
+        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    def _resolve_action_parser_prompt(self, user_input: str) -> str:
+        policy = self._policy_summary()
+        sys_prompt = self._compose_system_prompt()
+        return (
+            "You are an action parser for EchoSpeak.\n"
+            "Your job: decide whether the user is requesting EXACTLY ONE system action, and if so return a JSON object describing it.\n"
+            "If no system action is required, return JSON: {\"action\": \"none\", \"confidence\": 0.0}.\n\n"
+            "Hard rules:\n"
+            "- Return ONLY JSON (no markdown, no commentary).\n"
+            "- Allowed actions: none, file_write, terminal_run, file_read, file_list, file_mkdir, file_move, file_copy, file_delete, web_search, live_web_search.\n"
+            "- Single action only. If user requests multiple actions, pick the single best next action and set needs_followup=true.\n"
+            "- For file_write: include path (relative to file_root unless user gave absolute under file_root), content, append (bool).\n"
+            "- Prefer safe defaults: if user says 'a python script that prints hello world', choose path='hello.py' and content='print(\"Hello, world!\")'.\n"
+            "- If the user did not specify a filename but clearly wants a file, infer a reasonable filename with correct extension.\n"
+            "- Do not invent tools not in the policy summary.\n\n"
+            f"Policy summary:\n{policy}\n\n"
+            f"System + workspace + skills prompt (for context):\n{sys_prompt[:4000]}\n\n"
+            f"User input:\n{user_input}\n\n"
+            "Return JSON with keys:\n"
+            "- action: string\n"
+            "- confidence: number 0..1\n"
+            "- needs_followup: boolean (optional)\n"
+            "- reason: string (optional, short)\n"
+            "- path/content/append/cwd/command/etc depending on action\n"
+        )
+
+    def _action_parser_candidate(self, user_input: str) -> Optional[Dict[str, Any]]:
+        if not self._action_parser_enabled:
+            return None
+        # Only attempt parsing when tool-calling is disabled, otherwise let tool-calling take precedence.
+        if self._allow_llm_tool_calling():
+            return None
+        # If there is no workspace allowlist, we still allow parsing, but will validate via _action_allowed.
+        try:
+            prompt = self._resolve_action_parser_prompt(user_input)
+            raw = self.llm_wrapper.invoke(prompt)
+            data = self._parse_action_json(raw)
+            if not data:
+                return None
+            action = str(data.get("action") or "").strip().lower()
+            if not action or action == "none":
+                return None
+            return data
+        except Exception:
+            return None
+
+    def _normalize_candidate_action(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        action = str(data.get("action") or "").strip().lower()
+        if not action or action == "none":
+            return None
+        try:
+            conf = float(data.get("confidence"))
+        except Exception:
+            conf = 0.5
+        if conf < 0.35:
+            return None
+        out: Dict[str, Any] = {"action": action, "confidence": conf}
+        for k in ("reason", "needs_followup"):
+            if k in data:
+                out[k] = data.get(k)
+
+        if action == "file_write":
+            path = str(data.get("path") or "").strip()
+            content = str(data.get("content") or "").strip()
+            append = bool(data.get("append") is True)
+            if not path or not content:
+                return None
+            out.update({"path": path, "content": content, "append": append})
+            return out
+        if action == "terminal_run":
+            cmd = str(data.get("command") or data.get("cmd") or "").strip()
+            cwd = str(data.get("cwd") or ".").strip() or "."
+            if not cmd:
+                return None
+            out.update({"command": cmd, "cwd": cwd})
+            return out
+        if action in {"file_read", "file_list", "file_mkdir", "file_delete"}:
+            path = str(data.get("path") or "").strip()
+            if not path:
+                return None
+            out.update({"path": path})
+            if action == "file_delete":
+                out["recursive"] = bool(data.get("recursive") is True)
+            return out
+        if action in {"file_move", "file_copy"}:
+            src = str(data.get("src") or data.get("source") or "").strip()
+            dst = str(data.get("dst") or data.get("dest") or data.get("destination") or "").strip()
+            if not src or not dst:
+                return None
+            out.update({"src": src, "dst": dst, "overwrite": bool(data.get("overwrite") is True)})
+            return out
+        if action in {"web_search", "live_web_search"}:
+            q = str(data.get("query") or data.get("q") or "").strip()
+            if not q:
+                q = ""
+            out.update({"query": q})
+            return out
+
+        return None
+
+    def _candidate_to_pending_action(self, candidate: Dict[str, Any], user_input: str) -> Optional[Dict[str, Any]]:
+        action = str(candidate.get("action") or "").strip().lower()
+        tool_name = action
+        if action == "file_write":
+            tool_name = "file_write"
+            if not self._action_allowed(tool_name):
+                return None
+            return {
+                "tool": tool_name,
+                "kwargs": {
+                    "path": candidate.get("path"),
+                    "content": candidate.get("content"),
+                    "append": bool(candidate.get("append") is True),
+                },
+                "original_input": user_input,
+            }
+        if action == "terminal_run":
+            tool_name = "terminal_run"
+            if not self._action_allowed(tool_name):
+                return None
+            return {
+                "tool": tool_name,
+                "kwargs": {"command": candidate.get("command"), "cwd": candidate.get("cwd")},
+                "original_input": user_input,
+            }
+        if action in {"file_read", "file_list", "file_mkdir"}:
+            tool_name = action
+            if not self._tool_allowed(tool_name):
+                return None
+            # These are not confirm-gated in current router except some file ops; keep behavior consistent:
+            # we do not create a pending action for them here.
+            return None
+        if action in {"file_move", "file_copy", "file_delete"}:
+            tool_name = action
+            if not self._action_allowed(tool_name):
+                return None
+            kw: Dict[str, Any] = {}
+            for k in ("src", "dst", "overwrite", "path", "recursive"):
+                if k in candidate:
+                    kw[k] = candidate.get(k)
+            return {"tool": tool_name, "kwargs": kw, "original_input": user_input}
+        return None
+
     def _apply_tool_allowlist(self, tools: frozenset[str]) -> frozenset[str]:
         allowlist = self._tool_allowlist_override
         if allowlist is None:
@@ -487,6 +661,7 @@ class EchoSpeakAgent:
             f"{prefix}skills": "list installed skills",
             f"{prefix}workspaces": "list workspaces",
             f"{prefix}workspace": "set or clear a workspace (ex: /workspace demo or /workspace clear)",
+            f"{prefix}onboard": "show or select an agent profile (ex: /onboard coding)",
             f"{prefix}doctor": "run environment checks",
         }
         allowed = [c for c in getattr(config, "allowed_commands", []) if c]
@@ -542,6 +717,12 @@ class EchoSpeakAgent:
         webhook_ok = not webhook_enabled or bool(webhook_secret)
 
         allowlist = sorted(self._tool_allowlist_override) if self._tool_allowlist_override else []
+        file_root = str(getattr(config, "file_tool_root", "") or ".").strip() or "."
+        term_allow = [
+            str(x).strip().lower()
+            for x in (getattr(config, "terminal_command_allowlist", None) or [])
+            if str(x).strip()
+        ]
         issues: list[str] = []
         if not provider_ok:
             issues.append("provider")
@@ -583,7 +764,12 @@ class EchoSpeakAgent:
                 "allowlist": allowlist,
             },
             "features": {
+                "action_parser_enabled": bool(getattr(config, "action_parser_enabled", True)),
                 "system_actions": bool(getattr(config, "enable_system_actions", False)),
+                "allow_file_write": bool(getattr(config, "allow_file_write", False)),
+                "allow_terminal_commands": bool(getattr(config, "allow_terminal_commands", False)),
+                "terminal_allowlist": term_allow,
+                "file_tool_root": file_root,
                 "cron_enabled": cron_enabled,
                 "croniter_available": cron_available,
                 "webhook_enabled": webhook_enabled,
@@ -619,6 +805,22 @@ class EchoSpeakAgent:
         lines.append(f"Tools: {tools.get('count', 0)} available")
 
         features = report.get("features") or {}
+        lines.append(
+            f"Action Parser: {'enabled' if features.get('action_parser_enabled') else 'disabled'}"
+        )
+        sa = "enabled" if features.get("system_actions") else "disabled"
+        lines.append(
+            "System actions: "
+            + sa
+            + f" (file_write={features.get('allow_file_write')}, terminal={features.get('allow_terminal_commands')})"
+        )
+        lines.append(f"FILE_TOOL_ROOT: {features.get('file_tool_root')}")
+        term_allow = features.get("terminal_allowlist") or []
+        if isinstance(term_allow, list):
+            lines.append(
+                "TERMINAL_COMMAND_ALLOWLIST: "
+                + (", ".join(term_allow) if term_allow else "(empty)")
+            )
         cron_line = "enabled" if features.get("cron_enabled") else "disabled"
         cron_check = "ok" if features.get("croniter_available") else "missing"
         lines.append(f"Cron: {cron_line} (croniter={cron_check})")
@@ -680,6 +882,44 @@ class EchoSpeakAgent:
                 return f"Unknown workspace '{target}'."
             self.configure_workspace(target)
             return f"Workspace set to '{target}'."
+
+        if cmd == f"{prefix}onboard":
+            profiles = [
+                ("coding", "Coding agent (files + terminal + web search; confirmation-gated actions)"),
+                ("research", "Research agent (web search + YouTube; no file/terminal actions)"),
+                ("chat", "Chat-only (minimal tools; safest)"),
+            ]
+            if not args:
+                lines = ["Recommended profiles:"]
+                for pid, desc in profiles:
+                    lines.append(f"- {pid}: {desc}")
+                lines.append("")
+                lines.append(f"Use: {prefix}onboard <profile>")
+                return "\n".join(lines)
+
+            choice = (args[0] or "").strip().lower()
+            known = {p[0] for p in profiles}
+            if choice not in known:
+                return f"Unknown profile '{choice}'. Try: {', '.join(sorted(known))}."
+
+            self.configure_workspace(choice)
+            msg = [
+                f"Profile selected: {choice}",
+                f"Workspace set to '{choice}'.",
+                "",
+                "Notes:",
+                "- .env flags are hard safety switches (deployment gates).",
+                "- Workspaces/skills shape behavior and restrict which tools can be proposed.",
+                "- Skills cannot expand tool access beyond the workspace allowlist.",
+                "- Any system action still requires an explicit 'confirm' before execution.",
+            ]
+            msg.append("")
+            msg.append(f"ACTION_PARSER_ENABLED={bool(getattr(config, 'action_parser_enabled', True))}")
+            msg.append(f"ENABLE_SYSTEM_ACTIONS={bool(getattr(config, 'enable_system_actions', False))}")
+            msg.append(f"ALLOW_FILE_WRITE={bool(getattr(config, 'allow_file_write', False))}")
+            msg.append(f"ALLOW_TERMINAL_COMMANDS={bool(getattr(config, 'allow_terminal_commands', False))}")
+            msg.append(f"FILE_TOOL_ROOT={str(getattr(config, 'file_tool_root', '') or '.').strip() or '.'}")
+            return "\n".join(msg)
 
         if cmd == f"{prefix}doctor":
             report = self.get_doctor_report()
@@ -1685,6 +1925,8 @@ class EchoSpeakAgent:
         }
 
     def _action_allowed(self, tool_name: str) -> bool:
+        if not self._tool_allowed(tool_name):
+            return False
         if tool_name == "open_chrome":
             return bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_open_chrome", False))
         if tool_name == "browse_task":
@@ -2128,7 +2370,16 @@ class EchoSpeakAgent:
                 "make directory",
                 "make a directory",
             ],
-            "terminal_run": ["run command", "execute command", "terminal run", "run in terminal", "powershell:", "cmd:", "ps:"],
+            "terminal_run": [
+                "run command",
+                "execute command",
+                "terminal run",
+                "run in terminal",
+                "powershell:",
+                "cmd:",
+                "ps:",
+                "run ",
+            ],
             "vision_qa": [
                 "what am i looking at",
                 "what do you see",
@@ -2173,124 +2424,124 @@ class EchoSpeakAgent:
 
         if self._is_direct_time_question(query_lower):
             for tool in self.tools:
-                if tool.name == "get_system_time":
+                if tool.name == "get_system_time" and self._tool_allowed(tool.name):
                     return tool
 
         if self._is_hardware_capability_query(query_lower):
             for tool in self.tools:
-                if tool.name == "system_info":
+                if tool.name == "system_info" and self._tool_allowed(tool.name):
                     return tool
 
         if self._is_schedule_time_query(query_lower):
             if self._playwright_enabled() and self._is_live_web_intent(query_lower):
                 for tool in self.tools:
-                    if tool.name == "live_web_search":
+                    if tool.name == "live_web_search" and self._tool_allowed(tool.name):
                         return tool
             for tool in self.tools:
-                if tool.name == "web_search":
+                if tool.name == "web_search" and self._tool_allowed(tool.name):
                     return tool
 
         if self._playwright_enabled() and self._is_live_web_intent(query_lower):
             for tool in self.tools:
-                if tool.name == "live_web_search":
+                if tool.name == "live_web_search" and self._tool_allowed(tool.name):
                     return tool
 
         if self._has_vision_intent(query_lower, has_monitor_ctx=has_monitor_ctx):
             for tool in self.tools:
-                if tool.name == "vision_qa":
+                if tool.name == "vision_qa" and self._tool_allowed(tool.name):
                     return tool
 
         yt_url = self._extract_youtube_url(query_main)
         if yt_url:
             for tool in self.tools:
-                if tool.name == "youtube_transcript":
+                if tool.name == "youtube_transcript" and self._tool_allowed(tool.name):
                     return tool
 
         creator_queries = self._creator_search_queries(query_main)
         if creator_queries:
             for tool in self.tools:
-                if tool.name == "web_search":
+                if tool.name == "web_search" and self._tool_allowed(tool.name):
                     return tool
 
         browse_url = self._extract_url(query_main)
         if browse_url and any(x in query_lower for x in tool_indicators["browse_task"]):
             for tool in self.tools:
-                if tool.name == "browse_task":
+                if tool.name == "browse_task" and self._tool_allowed(tool.name):
                     return tool
 
         if any(x in query_lower for x in tool_indicators["desktop_list_windows"]):
             for tool in self.tools:
-                if tool.name == "desktop_list_windows":
+                if tool.name == "desktop_list_windows" and self._tool_allowed(tool.name):
                     return tool
 
         if any(x in query_lower for x in tool_indicators["desktop_find_control"]):
             for tool in self.tools:
-                if tool.name == "desktop_find_control":
+                if tool.name == "desktop_find_control" and self._tool_allowed(tool.name):
                     return tool
 
         if ("click" in query_lower) and any(x in query_lower for x in ("window", "app", "desktop", " in ")):
             for tool in self.tools:
-                if tool.name == "desktop_click":
+                if tool.name == "desktop_click" and self._tool_allowed(tool.name):
                     return tool
 
         if ("type" in query_lower or "enter" in query_lower) and any(x in query_lower for x in ("window", "app", "desktop", " into ", " in ")):
             for tool in self.tools:
-                if tool.name == "desktop_type_text":
+                if tool.name == "desktop_type_text" and self._tool_allowed(tool.name):
                     return tool
 
         if any(x in query_lower for x in tool_indicators["desktop_activate_window"]):
             for tool in self.tools:
-                if tool.name == "desktop_activate_window":
+                if tool.name == "desktop_activate_window" and self._tool_allowed(tool.name):
                     return tool
 
         if any(x in query_lower for x in tool_indicators["desktop_send_hotkey"]):
             for tool in self.tools:
-                if tool.name == "desktop_send_hotkey":
+                if tool.name == "desktop_send_hotkey" and self._tool_allowed(tool.name):
                     return tool
 
         if any(x in query_lower for x in tool_indicators["file_list"]):
             for tool in self.tools:
-                if tool.name == "file_list":
+                if tool.name == "file_list" and self._tool_allowed(tool.name):
                     return tool
 
         if any(x in query_lower for x in tool_indicators["file_read"]):
             for tool in self.tools:
-                if tool.name == "file_read":
+                if tool.name == "file_read" and self._tool_allowed(tool.name):
                     return tool
 
-        if any(x in query_lower for x in tool_indicators["file_write"]):
+        if any(x in query_lower for x in tool_indicators["file_write"]) or re.search(r"\b(?:create|make)\s+(?:a\s+)?file\b", query_lower):
             for tool in self.tools:
-                if tool.name == "file_write":
+                if tool.name == "file_write" and self._tool_allowed(tool.name):
                     return tool
 
         if any(x in query_lower for x in tool_indicators["file_move"]):
             for tool in self.tools:
-                if tool.name == "file_move":
+                if tool.name == "file_move" and self._tool_allowed(tool.name):
                     return tool
 
         if any(x in query_lower for x in tool_indicators["file_copy"]):
             for tool in self.tools:
-                if tool.name == "file_copy":
+                if tool.name == "file_copy" and self._tool_allowed(tool.name):
                     return tool
 
         if any(x in query_lower for x in tool_indicators["file_delete"]):
             for tool in self.tools:
-                if tool.name == "file_delete":
+                if tool.name == "file_delete" and self._tool_allowed(tool.name):
                     return tool
 
         if any(x in query_lower for x in tool_indicators["file_mkdir"]):
             for tool in self.tools:
-                if tool.name == "file_mkdir":
+                if tool.name == "file_mkdir" and self._tool_allowed(tool.name):
                     return tool
 
         if any(x in query_lower for x in tool_indicators.get("open_application") or []):
             for tool in self.tools:
-                if tool.name == "open_application":
+                if tool.name == "open_application" and self._tool_allowed(tool.name):
                     return tool
 
         if any(x in query_lower for x in tool_indicators["terminal_run"]):
             for tool in self.tools:
-                if tool.name == "terminal_run":
+                if tool.name == "terminal_run" and self._tool_allowed(tool.name):
                     return tool
 
         calc_keywords = tool_indicators["calculate"]
@@ -2298,7 +2549,7 @@ class EchoSpeakAgent:
         has_math_operator = bool(re.search(r"\d\s*[+\-*/^]\s*\d", query_lower))
         if has_calc_keyword or has_math_operator:
             for tool in self.tools:
-                if tool.name == "calculate":
+                if tool.name == "calculate" and self._tool_allowed(tool.name):
                     return tool
 
         for tool_name, indicators in tool_indicators.items():
@@ -2306,7 +2557,7 @@ class EchoSpeakAgent:
                 if tool_name == "live_web_search" and not self._playwright_enabled():
                     continue
                 for tool in self.tools:
-                    if tool.name == tool_name:
+                    if tool.name == tool_name and self._tool_allowed(tool.name):
                         return tool
         return None
 
@@ -2350,6 +2601,58 @@ class EchoSpeakAgent:
         if base:
             return f"{base}/{name}" if base != "." else name
         return name
+
+    def _infer_terminal_command(self, user_input: str) -> str:
+        s = (user_input or "").strip()
+        low = s.lower().strip()
+        if not s:
+            return ""
+
+        # Prefer explicit quoting/backticks.
+        m = re.search(r"`([^`]{1,20000})`", s)
+        if not m:
+            m = re.search(r'"([^"]{1,20000})"', s)
+        if not m:
+            m = re.search(r"\b(?:powershell|ps|cmd)\s*:\s*(.+)$", s, flags=re.IGNORECASE)
+        if m:
+            return (m.group(1) or "").strip()
+
+        # Natural "run <cmd>" / "execute <cmd>".
+        m = re.search(r"\b(?:run|execute)\s+(.+)$", s, flags=re.IGNORECASE)
+        if m:
+            cmd = (m.group(1) or "").strip()
+            cmd = re.split(r"\b(?:in|inside|within)\s+the\s+terminal\b", cmd, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+            return cmd
+
+        # Fallback: if they started with a known command word.
+        if low.startswith("ls") or low.startswith("rg ") or low.startswith("git ") or low.startswith("cat "):
+            return s
+        return ""
+
+    def _infer_file_write_args(self, user_input: str) -> tuple[str, str]:
+        s = (user_input or "").strip()
+        if not s:
+            return "", ""
+
+        # Try to find a filename like hello.txt (simple heuristic).
+        path = ""
+        m = re.search(r"\b([A-Za-z0-9_./-]{1,200}\.[A-Za-z0-9]{1,10})\b", s)
+        if m:
+            path = (m.group(1) or "").strip()
+
+        # Try explicit text/content.
+        content = ""
+        m = re.search(r"\b(?:with\s+(?:the\s+)?text|containing|with\s+content|text)\s+[\"']([^\"']{1,20000})[\"']", s, flags=re.IGNORECASE)
+        if m:
+            content = (m.group(1) or "").strip()
+        if not content:
+            m = re.search(r"\b(?:with\s+(?:the\s+)?text|containing|with\s+content|text)\s+([^\n\r]{1,400})", s, flags=re.IGNORECASE)
+            if m:
+                tail = (m.group(1) or "").strip()
+                tail = re.split(r"\b(?:in|on|at|under|inside|within|and\s+then)\b", tail, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+                content = tail.strip("\"'()[]{}<> ")
+
+        return path, content
 
     def _extract_url(self, user_input: str) -> Optional[str]:
         text = (user_input or "").strip()
@@ -2782,6 +3085,13 @@ class EchoSpeakAgent:
                     return response_text, True
                 self._pending_detail = None
 
+            slash_response = self._handle_slash_command(user_input)
+            if slash_response is not None:
+                response_text = str(slash_response)
+                self._last_tts_text = self._clamp_tts_text(response_text)
+                self._record_turn(user_input, response_text)
+                return response_text, True
+
             low_notepad = self._strip_live_desktop_context(user_input).lower()
             if "notepad" in low_notepad and ("write" in low_notepad or "type" in low_notepad):
                 if not self._action_allowed("notepad_write"):
@@ -2824,6 +3134,44 @@ class EchoSpeakAgent:
                 self._last_tts_text = self._clamp_tts_text(response_text)
                 self._record_turn(user_input, response_text)
                 return response_text, True
+
+            # LLM-driven action parser pass (single-action JSON) to replace brittle heuristics.
+            if self._action_parser_enabled:
+                data = self._action_parser_candidate(user_input)
+                normalized = self._normalize_candidate_action(data) if data else None
+                pending = self._candidate_to_pending_action(normalized, user_input) if normalized else None
+                if self._trace_enabled and (data or normalized):
+                    try:
+                        logger.info(
+                            "ActionParser raw=%s normalized=%s pending=%s",
+                            json.dumps(data or {}, ensure_ascii=False)[:800],
+                            json.dumps(normalized or {}, ensure_ascii=False)[:800],
+                            json.dumps(pending or {}, ensure_ascii=False)[:800],
+                        )
+                    except Exception:
+                        pass
+                if pending is not None:
+                    tool_name = str(pending.get("tool") or "").strip()
+                    kwargs = pending.get("kwargs") or {}
+                    display = self._format_pending_action(pending)
+                    preview = ""
+                    if tool_name == "file_write":
+                        path = (kwargs or {}).get("path")
+                        content = (kwargs or {}).get("content") or ""
+                        append = (kwargs or {}).get("append") is True
+                        preview = f"Write {len(str(content))} chars to {path}" + (" (append)" if append else "")
+                    elif tool_name == "terminal_run":
+                        cmd_val = (kwargs or {}).get("command")
+                        cwd_val = (kwargs or {}).get("cwd")
+                        preview = f"Run terminal command in {cwd_val}: {str(cmd_val).strip()}"
+                    else:
+                        preview = display
+
+                    self._pending_action = pending
+                    response_text = self._action_confirm_message(preview, self._pending_action, user_input)
+                    self._last_tts_text = self._clamp_tts_text(response_text)
+                    self._record_turn(user_input, response_text)
+                    return response_text, True
 
             pre_tool = self._should_use_tool(user_input)
             if pre_tool is not None and pre_tool.name in {"open_chrome", "open_application", "file_list", "file_read", "terminal_run", "file_move", "file_copy", "file_delete", "file_mkdir"}:
@@ -2908,12 +3256,7 @@ class EchoSpeakAgent:
                             kv = self._parse_kv_args(user_input)
                             cmd_val = kv.get("command") or kv.get("cmd") or kv.get("powershell") or kv.get("ps")
                             if not isinstance(cmd_val, str) or not cmd_val.strip():
-                                m = re.search(r"`([^`]{1,20000})`", user_input)
-                                if not m:
-                                    m = re.search(r"\"([^\"]{1,20000})\"", user_input)
-                                if not m:
-                                    m = re.search(r"\b(?:powershell|ps|cmd)\s*:\s*(.+)$", user_input, flags=re.IGNORECASE)
-                                cmd_val = m.group(1).strip() if m else ""
+                                cmd_val = self._infer_terminal_command(user_input)
                             cwd_val = kv.get("cwd") or kv.get("dir") or kv.get("path") or kv.get("workdir")
                             if not isinstance(cwd_val, str) or not cwd_val.strip():
                                 cwd_val = "."
@@ -2925,7 +3268,7 @@ class EchoSpeakAgent:
 
                             if not str(cmd_val).strip():
                                 self._emit_tool_end(callbacks, "Missing command.", run_id)
-                                response_text = "Please specify a command (e.g., command=\"dir\" or put it in quotes/backticks)."
+                                response_text = "Please specify a command (e.g., run ls, or command=\"ls\", or put it in quotes/backticks)."
                             else:
                                 exec_kwargs: dict[str, Any] = {"command": str(cmd_val).strip(), "cwd": str(cwd_val).strip()}
                                 if timeout_i is not None:
@@ -3487,12 +3830,18 @@ class EchoSpeakAgent:
                                 if not text_val:
                                     text_val = (kv.get("content") or "").strip() if isinstance(kv.get("content"), str) else ""
                                 append = kv.get("append") is True
+                                if not path or not text_val:
+                                    inferred_path, inferred_text = self._infer_file_write_args(user_input)
+                                    if not path:
+                                        path = inferred_path
+                                    if not text_val:
+                                        text_val = inferred_text
                                 if not path:
                                     self._emit_tool_end(callbacks, "Missing path.", run_id)
-                                    response_text = "Please specify a file path (path=...)."
+                                    response_text = "Please specify a file path (e.g., create a file hello.txt ... or path=\"hello.txt\")."
                                 elif not text_val:
                                     self._emit_tool_end(callbacks, "Missing content.", run_id)
-                                    response_text = "Please specify text to write (text=...)."
+                                    response_text = "Please specify text to write (e.g., with the text hello or text=\"hello\")."
                                 else:
                                     exec_kwargs = {"path": path, "content": text_val, "append": append}
                                     preview = f"Write {len(text_val)} chars to {path}" + (" (append)" if append else "")

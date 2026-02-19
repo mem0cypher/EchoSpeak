@@ -158,12 +158,18 @@ def merge_tool_allowlists(
     workspace_allowlist: List[str],
     skill_allowlists: List[List[str]],
 ) -> Optional[set[str]]:
-    collected: set[str] = set()
-    for name in workspace_allowlist or []:
-        if name:
-            collected.add(name)
-    for allowlist in skill_allowlists:
-        for name in allowlist or []:
-            if name:
-                collected.add(name)
-    return collected or None
+    base = {name for name in (workspace_allowlist or []) if name}
+
+    # If the workspace doesn't define an allowlist, treat as unrestricted.
+    # Skills can still restrict in that case, but cannot "expand" beyond an explicit workspace ceiling.
+    if not base:
+        skill_union = {name for allowlist in (skill_allowlists or []) for name in (allowlist or []) if name}
+        return skill_union or None
+
+    non_empty_skills = [a for a in (skill_allowlists or []) if a]
+    if not non_empty_skills:
+        return base or None
+
+    skill_union = {name for allowlist in non_empty_skills for name in allowlist if name}
+    restricted = base.intersection(skill_union)
+    return restricted

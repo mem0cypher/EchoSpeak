@@ -16,10 +16,9 @@ pyttsx3>=2.90
 faster-whisper>=1.0.0
 
 # PersonaPlex compatible versions (torch 2.4.x)
-torch>=2.4.0,<2.5.0
-huggingface-hub>=0.24.0,<0.25.0
-sentencepiece==0.2.0
-transformers>=4.40.0,<4.45.0
+torch>=2.9.0
+huggingface-hub>=0.24.0
+transformers>=4.40.0
 
 # Vision and image processing
 opencv-python>=4.8.0
@@ -36,7 +35,7 @@ youtube-transcript-api>=0.6.2
 
 playwright>=1.41.0
 
-pywinauto>=0.6.8
+pywinauto>=0.6.8; platform_system == "Windows"
 pyautogui>=0.9.54
 
 tool-calling-llm>=0.1.2
@@ -55,7 +54,7 @@ loguru>=0.7.0
 
 # Optional: Local LLM support
 langchain-ollama>=0.3,<0.4
-llama-cpp-python>=0.2.0
+llama-cpp-python>=0.2.0; python_version < "3.14"
 
 # Utilities
 python-dateutil>=2.8.2
@@ -66,4 +65,3 @@ websockets>=12.0
 sounddevice>=0.4.6
 sphn>=0.1.0
 numpy>=1.24.0
-moshi-personaplex>=0.1.0

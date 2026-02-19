@@ -19,7 +19,6 @@ EchoSpeak is now a **local-first** assistant with:
 - **Offline local STT** via `/stt` (optional)
 - **Go TUI** (Bubble Tea + Lipgloss) that consumes the same `/query/stream` events
 - **Summary-only TTS playback in the TUI** via the streaming `spoken_text` field
-- **Windows mic recording in the TUI** via FFmpeg + DirectShow (`dshow`) (alt+r)
 - **More reliable tool calling for Ollama** via optional `tool_calling_llm` (opt-in; local tool-calling is OFF by default)
 - **Safer tools** using **Pydantic args schemas** (started with `calculate`)
 - A strict **per-action confirmation** safety flow so the model cannot execute system actions without your approval
@@ -48,6 +47,20 @@ Local LLMs can occasionally:
 
 This safety layer prevents accidental actions.
 
+### Action Parser pass (LLM-driven)
+
+EchoSpeak also runs an Action Parser pass before heuristic tool routing. The Action Parser returns a single structured JSON action (or “none”), then the agent validates that proposed action against:
+
+- env hard gates (`ENABLE_SYSTEM_ACTIONS`, tool-specific `ALLOW_*` flags)
+- workspace tool allowlist (ceiling)
+- file root and terminal allowlist enforcement (tool-level safety)
+
+If valid and confirmation-gated, Echo proposes the action and waits for you to reply `confirm` or `cancel`.
+
+Config:
+
+- `ACTION_PARSER_ENABLED=true` (default)
+
 ### Where it lives
 - `apps/backend/agent/core.py`
   - `_pending_action`
@@ -56,6 +69,11 @@ This safety layer prevents accidental actions.
   - `_format_pending_action()`
   - `process_query()` pending-action flow
   - filtering action tools out of the tool-calling agent (`lc_tools`)
+
+### Workspaces + skills allowlist semantics
+
+- Workspaces define the tool allowlist ceiling.
+- Skills can only further restrict tool access; skills must not expand tool access beyond the workspace.
 
 ### What counts as an action tool
 Current action tools include:
@@ -96,7 +114,7 @@ In `.env`:
 - `USE_LOCAL_MODELS=true`
 - `LOCAL_MODEL_PROVIDER=lmstudio | ollama | localai | llama_cpp | vllm`
 - `LOCAL_MODEL_URL=http://localhost:1234` (LM Studio default)
-- `LOCAL_MODEL_NAME=openai/gpt-oss-20b` (use the model id from `/v1/models`)
+- `LOCAL_MODEL_NAME=qwen/qwen3-coder-30b` (use the model id from `/v1/models`)
 
 ### Model listing
 - `GET /provider/models?provider=ollama` uses Ollama `/api/tags`
@@ -137,15 +155,13 @@ Note: the **Go TUI** uses the same backend `/tts` endpoint, but plays only the b
 
 ---
 
-## Go TUI (Bubble Tea) + streaming + mic (Windows)
+## Go TUI (Bubble Tea) + streaming
 
 ### What it does
 EchoSpeak includes a Go terminal UI under `apps/tui/` that connects to the backend via:
 
 - `POST /query/stream` for newline-delimited JSON events
 - `POST /tts` for speech playback
-
-On Windows, it can also record mic input via FFmpeg DirectShow (`alt+r`) and send the audio to backend `/stt` for local transcription (when enabled).
 
 ### Where it lives
 - `apps/tui/main.go`
@@ -158,19 +174,6 @@ The backend stream `final` event includes:
 - `spoken_text`: a brief TTS summary (used for TTS playback)
 
 This keeps voice playback short without changing the visible chat output.
-
-### Windows mic recording configuration
-In `.env`:
-
-- `ECHOSPEAK_FFMPEG` (optional): full path to `ffmpeg.exe`
-- `ECHOSPEAK_MIC_DSHOW_DEVICE`: exact DirectShow device name
-- `ECHOSPEAK_MIC_SECONDS`: duration in seconds
-
-To list DirectShow devices:
-
-```powershell
-ffmpeg -hide_banner -list_devices true -f dshow -i dummy
-```
 
 Note: fixed catalog voices are the recommended default because they avoid requiring gated voice-cloning weights.
 
@@ -197,12 +200,7 @@ Optional defaults/tuning:
 - `POCKET_TTS_LSD_DECODE_STEPS=1`
 - `POCKET_TTS_EOS_THRESHOLD=-4.0`
 
-CLI voice/text modes can also use Pocket-TTS via:
-
-- `VOICE_ENGINE=pocket`
-
 ### How it improves EchoSpeak
-- Higher quality voice output than `pyttsx3`
 - Local-first (CPU), no external TTS API
 - Unified voice across UI and backend via `/tts`
 
@@ -446,6 +444,9 @@ The current architecture makes adding such systems later straightforward (behind
 - `TERMINAL_COMMAND_TIMEOUT`
 - `TERMINAL_MAX_OUTPUT_CHARS`
 - `FILE_TOOL_ROOT`
+
+### Action Parser
+- `ACTION_PARSER_ENABLED`
 
 ### Multi-session + ops
 - `MULTI_AGENT_ENABLED`

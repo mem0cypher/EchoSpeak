@@ -8,11 +8,12 @@ EchoSpeak works end-to-end like this:
 - The UI sends requests to the FastAPI backend (`apps/backend/api/server.py`) using `POST /query/stream` (newline-delimited JSON events).
 - The backend runs `EchoSpeakAgent` (`apps/backend/agent/core.py`) which can:
   - use LangGraph tool-calling (when enabled)
+  - run an **LLM-driven Action Parser pass** (single-action JSON) to interpret “do something on my machine” requests into a structured action before any tool routing
   - call local-first tools from `apps/backend/agent/tools.py` (search, YouTube transcript, Playwright browse, vision/OCR, Windows desktop automation)
   - store/retrieve long-term memory via FAISS (`apps/backend/agent/memory.py`), optionally partitioned by mode/thread_id
   - maintain conversation summaries + optional memory-flush notes for durable logging
   - write durable memory logs (`FILE_MEMORY_DIR/MEMORY.md` + `FILE_MEMORY_DIR/memory/YYYY-MM-DD.md`) when enabled
-- Any **system action** is previewed and requires an explicit `confirm` (with an optional action plan summary).
+- Any **system action** is previewed and requires an explicit `confirm` (with an optional action plan summary). The Action Parser pass proposes an action; the existing confirmation gate executes it.
 - For ultra-low latency voice, the system uses **PersonaPlex** (`apps/backend/io_module/personaplex_client.py`), a full-duplex WebSocket connection with Opus encoding.
 - For standard voice output, the backend uses **Pocket-TTS** (`apps/backend/io_module/pocket_tts_engine.py`) via `POST /tts`.
 
@@ -47,6 +48,18 @@ Flow:
 
 This prevents accidental automation caused by misroutes or tool-call hallucinations.
 
+### Action Parser pass (LLM-driven)
+
+EchoSpeak runs an Action Parser pass before heuristic tool routing. The Action Parser returns a single JSON action (or “none”) and is then validated against:
+
+- env hard gates (e.g. `ENABLE_SYSTEM_ACTIONS`, `ALLOW_FILE_WRITE`, `ALLOW_TERMINAL_COMMANDS`)
+- workspace tool allowlist (ceiling)
+- file root + terminal allowlist enforcement (tool-level safety)
+
+Config:
+
+- `ACTION_PARSER_ENABLED=true` (default)
+
 ## Architecture Overview
 
 ```
@@ -54,7 +67,7 @@ EchoSpeak/
 ├── apps/web/                 # React/Vite web front-end
 ├── apps/tui/                 # Go TUI (Bubble Tea)
 └── apps/backend/             # Backend core
-    ├── app.py               # Entry point (voice/text/api modes)
+    ├── app.py               # Entry point (text/api modes)
     ├── config.py            # Pydantic configuration
     ├── api/server.py        # FastAPI REST API
     ├── agent/
@@ -63,7 +76,6 @@ EchoSpeak/
     │   ├── memory.py        # FAISS vector memory
     │   └── tools.py         # Tools: search, vision, youtube, browser, desktop automation
     ├── io_module/
-    │   ├── voice.py         # Standard Speech I/O
     │   ├── personaplex_client.py # Low-latency WebSocket Client (Opus/sphn)
     │   ├── stt_engine.py     # Local STT (faster-whisper)
     │   └── vision.py        # Screen capture & OCR
@@ -73,6 +85,51 @@ EchoSpeak/
 ---
 
 ## How It Works
+
+### Query lifecycle (from prompt to action)
+
+When you send a message (web UI, TUI, or API client), the backend runs a consistent flow:
+
+```text
+User message
+  |
+  v
+FastAPI (/query or /query/stream)
+  |
+  v
+EchoSpeakAgent.process_query()
+  |
+  +--> Pending action?
+  |      - Only accept: confirm / cancel
+  |      - If confirm: execute tool
+  |
+  +--> Slash command?
+  |      - /onboard, /workspace, /doctor, ...
+  |
+  +--> Action Parser pass (LLM-driven)
+  |      - Return: single JSON action (or none)
+  |      - Validate against policy and safety gates
+  |      - If system action: create pending action and ask for confirm
+  |
+  +--> Heuristic tool routing (fallback)
+  |
+  +--> Normal assistant response (LLM)
+```
+
+The Action Parser pass is what makes the system feel like it “reasons first, then asks”. It proposes an action, but the existing confirmation gate controls execution.
+
+### What goes into the model context
+
+EchoSpeak composes prompts using:
+
+- system prompt
+- active workspace prompt
+- active skills prompt(s)
+- optional retrieved memory
+- optional document context (RAG)
+- recent conversation turns
+
+Separately, the Action Parser pass also includes a policy summary (workspace/tool allowlist, `FILE_TOOL_ROOT`, terminal allowlist) so the model proposes actions that match the current permissions.
 
 ### 1. Web UI Layer (`apps/web/`)
 
@@ -86,11 +143,10 @@ The React/Vite web application provides:
 ### 2. Backend Layer (`apps/backend/`)
 
 #### `app.py` - Entry Point
-Three modes of operation:
+Two modes of operation:
 ```bash
-python app.py --mode voice     # Full voice mode with wake word
 python app.py --mode text      # Console text chat
-python app.py --mode api       # REST API server (what UI uses)
+python app.py --mode api       # REST API server (default, what UI uses)
 ```
 
 #### `api/server.py` - FastAPI Server
@@ -148,7 +204,11 @@ python app.py --mode api       # REST API server (what UI uses)
 
 #### `agent/memory.py` - Vector Memory
 
-- Uses **FAISS** for semantic search (OpenAI embeddings if `OPENAI_API_KEY` is set; otherwise HuggingFace fallback)
+- Uses **FAISS** for semantic search.
+- Embeddings are selected by `EMBEDDING_PROVIDER`:
+  - `lmstudio`: uses LM Studio's OpenAI-compatible embeddings endpoint (no OpenAI key required)
+  - `openai`: uses OpenAI embeddings (requires `OPENAI_API_KEY`)
+  - otherwise: falls back to local HuggingFace embeddings when available
 - Stores conversation history + metadata; retrieves relevant context for queries
 - Optional per-session partitioning by mode/thread_id (`MEMORY_PARTITION_ENABLED=true`)
 - Rolling summaries (`SUMMARY_TRIGGER_TURNS`) plus optional memory-flush notes to daily/curated logs
@@ -201,12 +261,6 @@ Additional safety controls:
 
 `vision_qa` is only supported when the local provider is Ollama.
 
-#### `io_module/voice.py` - Voice I/O
-
-- **VoiceInput** - Microphone input using `SpeechRecognition`
-- **VoiceOutput** - Text-to-speech using `pyttsx3` or Pocket-TTS (based on `VOICE_ENGINE` + `USE_POCKET_TTS`)
-- Wake word detection: "hey echo"
-
 #### `io_module/vision.py` - Vision Module
 
 - **Screen capture** - Uses `mss` library
@@ -217,18 +271,24 @@ Additional safety controls:
 
 ## Setup & Installation
 
-### 1. Create Conda Environment
+### 1. Create a virtual environment
 
-```powershell
-conda create -n echospeak python=3.11
-conda activate echospeak
+```bash
+cd apps/backend
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
 ```
 
-### 2. Install Dependencies
+Fish shell:
 
-```powershell
+```fish
 cd apps/backend
-pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate.fish
+python -m pip install -U pip
+python -m pip install -r requirements.txt
 ```
 
 Optional (Playwright browser automation):
@@ -288,7 +348,7 @@ MEMORY_PARTITION_ENABLED=false
 
 # LM Studio (GGUF direct, OpenAI-compatible)
 LOCAL_MODEL_PROVIDER=lmstudio
-LOCAL_MODEL_NAME=openai/gpt-oss-20b
+LOCAL_MODEL_NAME=qwen/qwen3-coder-30b
 LOCAL_MODEL_URL=http://localhost:1234
 
 # Ollama (alternative)
@@ -299,10 +359,6 @@ LOCAL_MODEL_URL=http://localhost:1234
 # Temperature (creativity)
 LOCAL_MODEL_TEMPERATURE=0.7
 LOCAL_MODEL_MAX_TOKENS=4096
-
-# Voice engine selection: auto, pyttsx3, pocket
-# (auto uses Pocket-TTS when USE_POCKET_TTS=true)
-VOICE_ENGINE=auto
 
 # Pocket-TTS (backend /tts + web UI playback)
 USE_POCKET_TTS=true
@@ -351,8 +407,6 @@ cd apps/backend
 python app.py --mode api
 ```
 
-Server runs at `http://localhost:8000`
-
 ### 5. Start Web UI
 
 ```powershell
@@ -378,7 +432,6 @@ EchoSpeak includes a high-performance terminal UI (Bubble Tea + Lipgloss) under 
 - **Sleek Branding**: Updated logo with a modern ASCII font and reduced visual weight (non-bold).
 - **In-Box Info**: Real-time display of active **LLM Provider** and **Model** on the splash screen.
 - **Session Commands**: `/session`, `/session new`, `/session use <id>`, and `/sessions` manage thread contexts.
-- **Improved Mic Detection**: Automatic resolution of Windows `dshow` audio devices with intelligent fallback and `.env` override.
 
 ### Start the TUI
 ```powershell
@@ -392,25 +445,12 @@ cd apps/tui
   - Backend base URL for the TUI.
   - Default: `http://127.0.0.1:8000`
 
-### Optional (Windows mic recording)
-
-The TUI supports mic input (`alt+r`) on Windows by recording with FFmpeg using the DirectShow (`dshow`) audio device.
-
-- `ECHOSPEAK_FFMPEG`
-  - Path to `ffmpeg.exe` if it is not on `PATH`.
-- `ECHOSPEAK_MIC_DSHOW_DEVICE`
-  - Exact DirectShow mic device name.
-- `ECHOSPEAK_MIC_SECONDS`
-  - Recording duration in seconds.
-
-The TUI loads `.env` from multiple common locations at startup (including `../backend/.env`), so you can usually set mic variables in `apps/backend/.env`.
-
-### TUI Commands (quick)
+### TUI commands
 
 - `/session` (current), `/session new`, `/session use <id>`, `/sessions`
 - `/model` (show provider/model)
 - `/doctor` or `/status` (diagnostics)
-- `/mic`, `/help`, `/commands`, `/exit`
+- `/help`, `/commands`, `/exit`
 
 ### TTS behavior (summary-only)
 
@@ -420,7 +460,7 @@ The backend stream `final` event includes a `spoken_text` field. The TUI uses `s
 
 ## Usage
 
-### Voice Mode
+### Web UI Mic Input
 1. Click mic button (🎤)
 2. Speak your query (browser `SpeechRecognition`)
 3. Click mic again to submit the captured transcript
@@ -650,7 +690,7 @@ http://localhost:1234
 ```
 LOCAL_MODEL_PROVIDER=lmstudio
 LOCAL_MODEL_URL=http://localhost:1234
-LOCAL_MODEL_NAME=openai/gpt-oss-20b
+LOCAL_MODEL_NAME=qwen/qwen3-coder-30b
 ```
 
 Because provider switching is disabled in LM Studio-only mode, change models by editing
@@ -797,24 +837,6 @@ Web UI mic uses your browser’s `SpeechRecognition`:
 - Ensure mic permission is granted.
 - If you see a “network” mic error, your browser can’t reach its speech service.
 
-CLI voice mode (Python) uses the `SpeechRecognition` package. To list microphones:
-
-```powershell
-python -c "import speech_recognition as sr; print(sr.Microphone.list_microphone_names())"
-```
-
-### TUI mic recording (Windows)
-
-If `alt+r` fails, verify FFmpeg can see your DirectShow audio devices and confirm the exact mic name.
-
-List devices:
-
-```powershell
-ffmpeg -hide_banner -list_devices true -f dshow -i dummy
-```
-
-Set `ECHOSPEAK_MIC_DSHOW_DEVICE` to the exact name shown under audio devices (the TUI will pass it as `-i audio="<name>"`).
-
 ### TTS Audio Issues
 - The web UI speaks using backend `/tts`. If `/tts` fails or Pocket-TTS is disabled, the UI will not have audio.
 - Confirm the backend is running and Pocket-TTS is enabled:
@@ -856,9 +878,13 @@ If actions are refused, check these flags and restart the API.
 ## Development
 
 ### Running Tests
-```powershell
+
+Install dev dependencies into the same venv you run the backend with:
+
+```bash
 cd apps/backend
-pytest
+python -m pip install -r requirements-dev.txt
+python -m pytest
 ```
 
 ### Adding New Tools
@@ -884,8 +910,6 @@ Built with:
 - **LangGraph** - Optional agent routing for tool calls
 - **FastAPI** - REST API
 - **FAISS** - Vector search
-- **SpeechRecognition** - Voice input
-- **pyttsx3** - Voice output
 - **langchain-huggingface** - Local embeddings fallback
 
 ---
