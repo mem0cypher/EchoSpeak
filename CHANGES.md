@@ -7,6 +7,8 @@
 - Added **`_sanitize_response()`** to `HeartbeatManager` — strips any residual plan blocks, confirmation prompts, and action lines from the LLM response before routing to Discord/Telegram/etc.
 - Updated **heartbeat prompt** to explicitly instruct the LLM: text-only output, no tools, no plans, no "confirm" prompts.
 - Added **Discord DM command interception** for tweet approve/reject — typing `approve`, `reject`, `/approve`, `/reject`, or natural language like "reject the tweet" or "can you reject the echospeak tweet" in Discord DM now routes directly to the Twitter autonomous API instead of going through `process_query()`.
+- Fixed **restart-safe Twitter approval state** — pending autonomous/changelog tweet approvals are now restored from `twitter_auto_tweet_state.json` on startup, and `approve_pending_tweet()` / `reject_pending_tweet()` fall back to the persisted pending item if in-memory state is empty.
+- Fixed **Discord DM reply matching** for the tweet queue — replies like `reject please`, `decline`, `deny the twitter notification`, and `can you reject the tweet` now resolve against the pending tweet context instead of falling through to normal chat.
 
 ### Repo Presentation
 - **New README.md** — clean hero section with inline logo + title, tagline ("Your AI. Your machine. Your rules."), quick links bar, highlights, organized feature categories, compact install section. Removed inline changelog.

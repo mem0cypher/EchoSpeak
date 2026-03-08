@@ -513,7 +513,6 @@ class EchoSpeakDiscordBot:
                                 )
                                 return
 
-                            # Strip mention / wake phrase
                             content = raw_content
                             if is_mentioned:
                                 content = content.replace(f"<@{self.client.user.id}>", "").strip()
@@ -528,16 +527,13 @@ class EchoSpeakDiscordBot:
                                 await message.channel.send("Hey! How can I help you?")
                                 return
 
-                            # ── DM Command Interception: Tweet Approve/Reject ──
-                            # Context-aware: checks if a tweet is actually pending,
-                            # then interprets a broad set of approve/reject synonyms.
-                            # Catches: "approve", "reject", "decline", "deny", "no",
-                            #   "yes", "confirm", "cancel", "nah", "kill it",
-                            #   "deny the twitter notification", "reject that", etc.
                             import re as _re
-                            _cmd = content.strip().lower().lstrip("/")
+                            _cmd = _re.sub(
+                                r"^(?:please\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+|will\s+you\s+|can\s+u\s+)",
+                                "",
+                                content.strip().lower().lstrip("/"),
+                            ).strip()
 
-                            # First, check if there's actually a pending tweet
                             _has_pending_tweet = False
                             try:
                                 from twitter_bot import get_twitter_bot as _get_tw
@@ -547,47 +543,46 @@ class EchoSpeakDiscordBot:
                             except Exception:
                                 pass
 
-                            # Approve synonyms
-                            _approve_words = {"approve", "accept", "yes", "confirm", "post it",
-                                              "send it", "go ahead", "ship it", "do it", "sure",
-                                              "yeah", "yep", "ok", "okay", "post", "publish"}
-                            # Reject synonyms
-                            _reject_words = {"reject", "decline", "deny", "no", "cancel",
-                                             "nah", "nope", "kill it", "drop it", "delete it",
-                                             "dont post", "don't post", "discard", "skip",
-                                             "pass", "trash it", "scrap it"}
-                            # Context words that signal this is about a tweet/twitter action
-                            _context_words = {"tweet", "twitter", "notification", "pending",
-                                              "autonomous", "post", "that"}
-
-                            # Determine if this is a tweet action:
-                            # 1) Exact short command (approve/reject/decline/deny/yes/no/etc.)
-                            #    ONLY if there's a pending tweet
-                            # 2) Mentions approve/reject synonyms + context words
-                            _is_approve_word = _cmd in _approve_words or any(w in _cmd for w in _approve_words if len(w) > 3)
-                            _is_reject_word = _cmd in _reject_words or any(w in _cmd for w in _reject_words if len(w) > 3)
-                            _has_context = any(w in _cmd for w in _context_words)
+                            _approve_tokens = {"approve", "accept", "confirm", "post", "publish", "send", "ship", "yes", "sure", "yeah", "yep", "ok", "okay"}
+                            _reject_tokens = {"reject", "decline", "deny", "cancel", "discard", "skip", "pass", "delete", "drop", "trash", "scrap", "kill", "no", "nah", "nope"}
+                            _approve_phrases = {"post it", "send it", "go ahead", "ship it", "do it"}
+                            _reject_phrases = {"kill it", "drop it", "delete it", "dont post", "don't post", "trash it", "scrap it"}
+                            _context_words = {"tweet", "twitter", "notification", "pending", "autonomous", "approval", "queue", "queued", "draft", "post", "that", "it"}
+                            _tokens = set(_re.findall(r"[a-z']+", _cmd))
+                            _short_approve = _cmd in {"yes", "sure", "yeah", "yep", "ok", "okay"}
+                            _short_reject = _cmd in {"no", "nah", "nope"}
+                            _starts_approve = any(
+                                _cmd.startswith(prefix)
+                                for prefix in {"approve", "accept", "confirm", "post", "publish", "send", "ship", "go ahead", "do it"}
+                            )
+                            _starts_reject = any(
+                                _cmd.startswith(prefix)
+                                for prefix in {"reject", "decline", "deny", "cancel", "discard", "skip", "pass", "delete", "drop", "trash", "scrap", "kill", "dont post", "don't post"}
+                            )
+                            _is_approve_word = bool(_tokens & _approve_tokens) or any(phrase in _cmd for phrase in _approve_phrases)
+                            _is_reject_word = bool(_tokens & _reject_tokens) or any(phrase in _cmd for phrase in _reject_phrases)
+                            _has_context = bool(_tokens & _context_words)
 
                             _is_tweet_action = False
                             _is_approve = False
                             if _has_pending_tweet:
-                                if _cmd in _approve_words or _cmd in _reject_words:
-                                    # Short exact command while tweet is pending
+                                if _short_approve or _starts_approve:
                                     _is_tweet_action = True
-                                    _is_approve = _cmd in _approve_words
-                                elif (_is_approve_word or _is_reject_word) and _has_context:
-                                    # Natural language with both action + context
+                                    _is_approve = True
+                                elif _short_reject or _starts_reject:
                                     _is_tweet_action = True
-                                    _is_approve = _is_approve_word and not _is_reject_word
-                                elif bool(_re.search(r"\b(approve|reject|decline|deny|accept|confirm|cancel)\b", _cmd)) and _has_context:
+                                    _is_approve = False
+                                elif _has_context and _is_approve_word and not _is_reject_word:
+                                    _is_tweet_action = True
+                                    _is_approve = True
+                                elif _has_context and _is_reject_word and not _is_approve_word:
+                                    _is_tweet_action = True
+                                    _is_approve = False
+                            else:
+                                if bool(_re.search(r"\b(approve|reject|decline|deny|accept|confirm|cancel)\b.*\b(tweet|twitter|notification)\b", _cmd)) or \
+                                   bool(_re.search(r"\b(tweet|twitter|notification)\b.*\b(approve|reject|decline|deny|accept|confirm|cancel)\b", _cmd)):
                                     _is_tweet_action = True
                                     _is_approve = bool(_re.search(r"\b(approve|accept|confirm)\b", _cmd))
-                            else:
-                                # No pending tweet — only intercept explicit tweet commands
-                                if bool(_re.search(r"\b(approve|reject|decline|deny)\b.*\btweet\b", _cmd)) or \
-                                   bool(_re.search(r"\btweet\b.*\b(approve|reject|decline|deny)\b", _cmd)):
-                                    _is_tweet_action = True
-                                    _is_approve = bool(_re.search(r"\b(approve|accept)\b", _cmd))
 
                             if _is_tweet_action:
                                 try:
@@ -603,8 +598,7 @@ class EchoSpeakDiscordBot:
                                             action = "approved and posted" if _is_approve else "rejected"
                                             await message.channel.send(f"Done — tweet {action}.")
                                         else:
-                                            err = result.get("error", "unknown error") if isinstance(result, dict) else "unknown error"
-                                            await message.channel.send(f"No pending tweet right now.")
+                                            await message.channel.send("No pending tweet right now.")
                                     else:
                                         await message.channel.send("Twitter bot isn't running right now.")
                                 except ImportError:
@@ -639,7 +633,6 @@ class EchoSpeakDiscordBot:
                                         cb = None
 
                                 import asyncio
-
                                 loop = asyncio.get_event_loop()
                                 used_tools = False
 
@@ -655,7 +648,6 @@ class EchoSpeakDiscordBot:
                                     "access_reason": access_reason,
                                 }
 
-                                # Resolve role for security audit trail
                                 _resolved_role_value = "public"
                                 try:
                                     from config import DiscordUserRole, config as _cfg
@@ -677,9 +669,6 @@ class EchoSpeakDiscordBot:
                                 except Exception:
                                     pass
 
-                                # ── Security Gate 1: Prompt Injection Screening ──
-                                # Runs BEFORE rate limiting so blocked messages
-                                # don't waste the user's rate-limit slots.
                                 try:
                                     from agent.security import screen_for_injection, log_security_event, notify_owner_security_event
                                     _inj = screen_for_injection(content, _resolved_role_value)
@@ -707,9 +696,6 @@ class EchoSpeakDiscordBot:
                                 except Exception as _inj_exc:
                                     logger.debug(f"Injection screening skipped: {_inj_exc}")
 
-                                # ── Security Gate 2: Rate Limiting ──
-                                # Only counted AFTER injection check passes so
-                                # blocked messages don't penalise the user.
                                 try:
                                     from agent.security import check_rate_limit, log_security_event, notify_owner_security_event
                                     _rl_ok, _rl_msg = check_rate_limit(
@@ -792,315 +778,309 @@ class EchoSpeakDiscordBot:
             logger.error(f"Failed to start Discord bot: {e}")
             raise
 
-    async def _send_long_message(self, channel, content: str, max_length: int = 2000):
-        """Send a message, safely chunking it if it exceeds Discord's character limit."""
-        if not content:
-            return
+async def _send_long_message(self, channel, content: str, max_length: int = 2000):
+    """Send a message, safely chunking it if it exceeds Discord's character limit."""
+    if not content:
+        return
 
-        if len(content) <= max_length:
-            await channel.send(content)
-            return
+    if len(content) <= max_length:
+        await channel.send(content)
+        return
 
-        # Split by paragraphs first
-        paragraphs = content.split("\n\n")
-        current_msg = ""
+    # Split by paragraphs first
+    paragraphs = content.split("\n\n")
+    current_msg = ""
 
-        for para in paragraphs:
-            # If a single paragraph is too large on its own
-            if len(para) > max_length:
-                # Flush whatever we have so far
-                if current_msg:
-                    await channel.send(current_msg.strip())
-                    current_msg = ""
-                    
-                # Chunk this massive paragraph
-                while len(para) > max_length:
-                    # Find a good break point (space or punctuation) near max_length
-                    break_idx = para.rfind(" ", 0, max_length)
-                    if break_idx <= 0:
-                        break_idx = max_length # Hard break if no spaces found
-                    
-                    chunk = para[:break_idx].strip()
-                    if chunk:
-                        await channel.send(chunk)
-                    para = para[break_idx:].lstrip()
+    for para in paragraphs:
+        # If a single paragraph is too large on its own
+        if len(para) > max_length:
+            # Flush whatever we have so far
+            if current_msg:
+                await channel.send(current_msg.strip())
+                current_msg = ""
                 
-                if para.strip():
-                    current_msg = para.strip()
-                continue
+            # Chunk this massive paragraph
+            while len(para) > max_length:
+                # Find a good break point (space or punctuation) near max_length
+                break_idx = para.rfind(" ", 0, max_length)
+                if break_idx <= 0:
+                    break_idx = max_length # Hard break if no spaces found
+                
+                chunk = para[:break_idx].strip()
+                if chunk:
+                    await channel.send(chunk)
+                para = para[break_idx:].lstrip()
+        
+        if current_msg and len(current_msg) + len(para) + 2 <= max_length:
+            current_msg += "\n\n" + para
+        elif not current_msg and len(para) <= max_length:
+            current_msg = para
+        else:
+            if current_msg:
+                await channel.send(current_msg.strip())
+            current_msg = para
 
-            # Normal paragraph that fits in a message
-            if current_msg and len(current_msg) + len(para) + 2 <= max_length:
-                current_msg += "\n\n" + para
-            elif not current_msg and len(para) <= max_length:
-                current_msg = para
-            else:
-                if current_msg:
-                    await channel.send(current_msg.strip())
-                current_msg = para
+    if current_msg:
+        await channel.send(current_msg.strip())
 
-        if current_msg:
-            await channel.send(current_msg.strip())
+async def _maybe_get_channel_context(self, message, user_text: str) -> str:
+    """Fetch recent channel messages when user is asking what people are saying."""
+    try:
+        import re
 
-    async def _maybe_get_channel_context(self, message, user_text: str) -> str:
-        """Fetch recent channel messages when user is asking what people are saying."""
-        try:
-            import re
+        if not getattr(message, "guild", None):
+            return ""  # Not a server message
 
-            if not getattr(message, "guild", None):
-                return ""  # Not a server message
-
-            low = (user_text or "").lower()
-            wants_context = any(
-                p in low
-                for p in [
-                    "what are people saying",
-                    "what's everyone saying",
-                    "what are they saying",
-                    "catch me up",
-                    "summarize",
-                    "recap",
-                    "check the server",
-                    "check discord",
-                    "read the channel",
-                ]
-            )
-            if not wants_context:
-                return ""
-
-            # In shared server mode, only use the current channel for recap context.
-            # Broader cross-channel read/post behavior is intentionally reserved for
-            # the Web UI or direct-message owner workflows.
-            target = message.channel
-
-            if not hasattr(target, "history"):
-                return ""
-
-            lines = []
-            max_messages = 25
-            max_chars = 1500
-            async for msg in target.history(limit=max_messages, oldest_first=False):
-                if getattr(msg, "author", None) is None:
-                    continue
-                if getattr(msg.author, "bot", False):
-                    continue
-                text = (msg.content or "").strip()
-                if not text:
-                    continue
-                author = getattr(msg.author, "display_name", None) or getattr(msg.author, "name", "unknown")
-                # Basic cleanup
-                text = re.sub(r"\s+", " ", text)
-                lines.append(f"- {author}: {text}")
-                if sum(len(x) for x in lines) > max_chars:
-                    break
-
-            if not lines:
-                return f"Recent messages in #{getattr(target, 'name', 'channel')}: (no recent messages found)"
-
-            chan_name = getattr(target, "name", "channel")
-            return f"Recent messages in #{chan_name} (most recent first):\n" + "\n".join(lines)
-        except Exception as e:
-            logger.info(f"Discord channel context fetch skipped: {e}")
+        low = (user_text or "").lower()
+        wants_context = any(
+            p in low
+            for p in [
+                "what are people saying",
+                "what's everyone saying",
+                "what are they saying",
+                "catch me up",
+                "summarize",
+                "recap",
+                "check the server",
+                "check discord",
+                "read the channel",
+            ]
+        )
+        if not wants_context:
             return ""
 
-    def _is_smalltalk_message(self, user_text: str) -> bool:
-        try:
-            import re
+        # In shared server mode, only use the current channel for recap context.
+        # Broader cross-channel read/post behavior is intentionally reserved for
+        # the Web UI or direct-message owner workflows.
+        target = message.channel
 
-            text = re.sub(r"\s+", " ", str(user_text or "").strip().lower())
+        if not hasattr(target, "history"):
+            return ""
+
+        lines = []
+        max_messages = 25
+        max_chars = 1500
+        async for msg in target.history(limit=max_messages, oldest_first=False):
+            if getattr(msg, "author", None) is None:
+                continue
+            if getattr(msg.author, "bot", False):
+                continue
+            text = (msg.content or "").strip()
             if not text:
-                return False
-            patterns = [
-                r"^(?:yo|hi|hey|hello|sup|what(?:'s|s) up|good morning|good night|later|bye|goodbye|cya|gn|night)\s*[!.?]*$",
-                r"^what(?:\s+are|\s*'re|\s*re)?\s+you\s+up\s+to(?:\s+today)?\s*[!.?]*$",
-                r"^what(?:\s+are|\s*'re|\s*re)?\s+you\s+doing(?:\s+today)?\s*[!.?]*$",
-                r"^wyd(?:\s+today)?\s*[!.?]*$",
+                continue
+            author = getattr(msg.author, "display_name", None) or getattr(msg.author, "name", "unknown")
+            # Basic cleanup
+            text = re.sub(r"\s+", " ", text)
+            lines.append(f"- {author}: {text}")
+            if sum(len(x) for x in lines) > max_chars:
+                break
+
+        if not lines:
+            return f"Recent messages in #{getattr(target, 'name', 'channel')}: (no recent messages found)"
+
+        chan_name = getattr(target, "name", "channel")
+        return f"Recent messages in #{chan_name} (most recent first):\n" + "\n".join(lines)
+    except Exception as e:
+        logger.info(f"Discord channel context fetch skipped: {e}")
+        return ""
+
+def _is_smalltalk_message(self, user_text: str) -> bool:
+    try:
+        import re
+
+        text = re.sub(r"\s+", " ", str(user_text or "").strip().lower())
+        if not text:
+            return False
+        patterns = [
+            r"^(?:yo|hi|hey|hello|sup|what(?:'s|s) up|good morning|good night|later|bye|goodbye|cya|gn|night)\s*[!.?]*$",
+            r"^what(?:\s+are|\s*'re|\s*re)?\s+you\s+up\s+to(?:\s+today)?\s*[!.?]*$",
+            r"^what(?:\s+are|\s*'re|\s*re)?\s+you\s+doing(?:\s+today)?\s*[!.?]*$",
+            r"^wyd(?:\s+today)?\s*[!.?]*$",
+        ]
+        return any(re.fullmatch(pattern, text) is not None for pattern in patterns)
+    except Exception:
+        return False
+
+async def _maybe_get_followup_context(self, message, user_text: str) -> str:
+    """Fetch a small slice of recent bot+user conversation when the message looks like a follow-up.
+
+    This helps resolve references like "that", "everything", "what do you think?" that depend
+    on the immediately prior bot response in the channel.
+    """
+    try:
+        import re
+
+        text = (user_text or "").strip()
+        low = text.lower()
+        if not text:
+            return ""
+        if self._is_smalltalk_message(text):
+            return ""
+
+        followup_markers = [
+            "everything",
+            "all that",
+            "that",
+            "this",
+            "what about",
+            "how about",
+            "your honest opinion",
+            "your opinion",
+            "thoughts",
+            "what do you think",
+            "wtf",
+        ]
+
+        # Implicit continuation phrases — the user is clearly
+        # asking to modify / continue the previous answer even
+        # though no explicit pronoun is used.
+        implicit_followup_phrases = [
+            "simpler version",
+            "shorter version",
+            "longer version",
+            "example",
+            "more detail",
+            "elaborate",
+            "expand",
+            "another",
+            "different",
+            "again",
+            "rephrase",
+            "clarify",
+            "version",
+            "break it down",
+            "dumb it down",
+            "eli5",
+            "in plain english",
+            "in simpler terms",
+            "can you clarify",
+            "what do you mean",
+            "say that again",
+            "one more time",
+            "try again",
+        ]
+
+        has_marker = any(m in low for m in followup_markers)
+        has_implicit_followup = any(p in low for p in implicit_followup_phrases)
+        has_deictic_reference = re.search(
+            r"\b(it|that|this|everything|all of it|them|him|her|hers|their|he|she|they|those|these|we)\b", low
+        ) is not None
+        starts_with_joiner = re.search(r"^(and|but|so|also|then|now|because|cause|cuz|okay|ok|well|wait)\b", low) is not None
+        refers_to_prior_action = re.search(r"\b(?:why|how come)\s+(?:did\s+)?(?:you|u)\s+(?:leave|left|go|went|stop|disappear)\b", low) is not None
+        looks_like_followup = (
+            has_marker
+            or has_implicit_followup
+            or refers_to_prior_action
+            or (len(text) <= 80 and (has_deictic_reference or starts_with_joiner))
+        )
+        if not looks_like_followup:
+            return ""
+
+        if not hasattr(message.channel, "history"):
+            return ""
+
+        def _msg_looks_like_followup(msg_text: str) -> bool:
+            """Check if a user message is a follow-up vs. a new standalone topic."""
+            _low = re.sub(r"<@\d+>\s*", "", (msg_text or "").lower()).strip()
+            if not _low or len(_low) <= 12:
+                return True  # very short → likely follow-up
+            if re.search(r"\b(it|that|this|them|him|her|his|he|she|they|those|these|we)\b", _low):
+                return True
+            if re.search(r"^(and|but|so|also|then|now|because|cause|cuz|okay|ok|well|wait)\b", _low):
+                return True
+            _fup_words = [
+                "simpler", "shorter", "longer", "example", "more detail",
+                "elaborate", "expand", "another", "different", "again",
+                "rephrase", "clarify", "version", "break it down",
+                "dumb it down", "eli5", "in plain english",
+                "in simpler terms", "can you clarify", "what do you mean",
+                "say that again", "one more time", "try again",
             ]
-            return any(re.fullmatch(pattern, text) is not None for pattern in patterns)
-        except Exception:
+            if any(w in _low for w in _fup_words):
+                return True
             return False
 
-    async def _maybe_get_followup_context(self, message, user_text: str) -> str:
-        """Fetch a small slice of recent bot+user conversation when the message looks like a follow-up.
-
-        This helps resolve references like "that", "everything", "what do you think?" that depend
-        on the immediately prior bot response in the channel.
-        """
-        try:
-            import re
-
-            text = (user_text or "").strip()
-            low = text.lower()
-            if not text:
-                return ""
-            if self._is_smalltalk_message(text):
-                return ""
-
-            followup_markers = [
-                "everything",
-                "all that",
-                "that",
-                "this",
-                "what about",
-                "how about",
-                "your honest opinion",
-                "your opinion",
-                "thoughts",
-                "what do you think",
-                "wtf",
-            ]
-
-            # Implicit continuation phrases — the user is clearly
-            # asking to modify / continue the previous answer even
-            # though no explicit pronoun is used.
-            implicit_followup_phrases = [
-                "simpler version",
-                "shorter version",
-                "longer version",
-                "simple version",
-                "make it simpler",
-                "make it shorter",
-                "make it longer",
-                "give me a simpler",
-                "give me a shorter",
-                "give me a longer",
-                "give me an example",
-                "give me another",
-                "give me a different",
-                "give an example",
-                "now explain",
-                "now give",
-                "now show",
-                "now tell",
-                "more detail",
-                "more info",
-                "elaborate",
-                "expand on",
-                "break it down",
-                "dumb it down",
-                "eli5",
-                "in plain english",
-                "in simpler terms",
-                "can you clarify",
-                "what do you mean",
-                "say that again",
-                "one more time",
-                "try again",
-                "rephrase",
-            ]
-
-            has_marker = any(m in low for m in followup_markers)
-            has_implicit_followup = any(p in low for p in implicit_followup_phrases)
-            has_deictic_reference = re.search(
-                r"\b(it|that|this|everything|all of it|them|him|her|his|hers|their|he|she|they|those|these|we)\b", low
-            ) is not None
-            starts_with_joiner = re.search(r"^(and|but|so|also|then|now|because|cause|cuz|okay|ok|well|wait)\b", low) is not None
-            refers_to_prior_action = re.search(r"\b(?:why|how come)\s+(?:did\s+)?(?:you|u)\s+(?:leave|left|go|went|stop|disappear)\b", low) is not None
-            looks_like_followup = (
-                has_marker
-                or has_implicit_followup
-                or refers_to_prior_action
-                or (len(text) <= 80 and (has_deictic_reference or starts_with_joiner))
-            )
-            if not looks_like_followup:
-                return ""
-
-            if not hasattr(message.channel, "history"):
-                return ""
-
-            def _msg_looks_like_followup(msg_text: str) -> bool:
-                """Check if a user message is a follow-up vs. a new standalone topic."""
-                _low = re.sub(r"<@\d+>\s*", "", (msg_text or "").lower()).strip()
-                if not _low or len(_low) <= 12:
-                    return True  # very short → likely follow-up
-                if re.search(r"\b(it|that|this|them|him|her|his|he|she|they|those|these|we)\b", _low):
-                    return True
-                if re.search(r"^(and|but|so|also|then|now|because|cause|cuz|okay|ok|well|wait)\b", _low):
-                    return True
-                _fup_words = [
-                    "simpler", "shorter", "longer", "example", "more detail",
-                    "elaborate", "expand", "another", "different", "again",
-                    "rephrase", "clarify", "version", "break it down",
-                    "dumb it down", "eli5", "in plain english",
-                ]
-                if any(w in _low for w in _fup_words):
-                    return True
-                return False
-
-            # Collect the last few messages between the user and this bot,
-            # stopping at topic boundaries to avoid mixing contexts.
-            lines = []
-            max_messages = 12
-            max_chars = 1200
-            _user_msg_count = 0
-            async for msg in message.channel.history(limit=max_messages, oldest_first=False):
-                try:
-                    if getattr(msg, "id", None) == getattr(message, "id", None):
-                        continue
-                except Exception:
-                    pass
-                author = getattr(msg, "author", None)
-                if author is None:
+        # Collect the last few messages between the user and this bot,
+        # stopping at topic boundaries to avoid mixing contexts.
+        lines = []
+        max_messages = 12
+        max_chars = 1200
+        _user_msg_count = 0
+        async for msg in message.channel.history(limit=max_messages, oldest_first=False):
+            try:
+                if getattr(msg, "id", None) == getattr(message, "id", None):
                     continue
-                # Only include the current user and the bot.
+            except Exception:
+                pass
+            author = getattr(msg, "author", None)
+            if author is None:
+                continue
+            # Only include the current user and the bot.
+            is_bot_author = False
+            try:
+                is_bot_author = bool(getattr(self.client, "user", None) and author == self.client.user)
+            except Exception:
                 is_bot_author = False
-                try:
-                    is_bot_author = bool(getattr(self.client, "user", None) and author == self.client.user)
-                except Exception:
-                    is_bot_author = False
+            is_user_author = False
+            try:
+                is_user_author = bool(getattr(message, "author", None) and author == message.author)
+            except Exception:
                 is_user_author = False
-                try:
-                    is_user_author = bool(getattr(message, "author", None) and author == message.author)
-                except Exception:
-                    is_user_author = False
-                if not (is_bot_author or is_user_author):
-                    continue
+            if not (is_bot_author or is_user_author):
+                continue
 
-                msg_text = (getattr(msg, "content", "") or "").strip()
-                if not msg_text:
-                    continue
-                msg_text = re.sub(r"\s+", " ", msg_text)
-                label = "EchoSpeak" if is_bot_author else "User"
+            msg_text = (getattr(msg, "content", "") or "").strip()
+            if not msg_text:
+                continue
+            msg_text = re.sub(r"\s+", " ", msg_text)
+            label = "EchoSpeak" if is_bot_author else "User"
 
-                # Topic-boundary detection: once we have at least one
-                # exchange pair, a user message that looks like a new
-                # standalone question marks the topic start — include it
-                # and stop so we don't bleed in older unrelated topics.
-                if is_user_author:
-                    _user_msg_count += 1
-                    if _user_msg_count >= 2 and not _msg_looks_like_followup(msg_text):
-                        lines.append(f"User: {msg_text}")
-                        break
-
-                lines.append(f"{label}: {msg_text}")
-                if sum(len(x) for x in lines) > max_chars:
+            # Topic-boundary detection: once we have at least one
+            # exchange pair, a user message that looks like a new
+            # standalone question marks the topic start — include it
+            # and stop so we don't bleed in older unrelated topics.
+            if is_user_author:
+                _user_msg_count += 1
+                if _user_msg_count >= 2 and not _msg_looks_like_followup(msg_text):
+                    lines.append(f"User: {msg_text}")
                     break
 
-            if not lines:
-                return ""
+            lines.append(f"{label}: {msg_text}")
+            if sum(len(x) for x in lines) > max_chars:
+                break
 
-            # Reverse to chronological order.
-            lines = list(reversed(lines))
-            return "Recent conversation context:\n" + "\n".join(lines)
-        except Exception as e:
-            logger.info(f"Discord follow-up context fetch skipped: {e}")
+        if not lines:
             return ""
 
-    async def stop(self):
-        """Stop the Discord bot."""
-        if self.client and self._running:
-            logger.info("Stopping Discord bot...")
-            await self.client.close()
-            self._running = False
+        # Reverse to chronological order.
+        lines = list(reversed(lines))
+        return "Recent conversation context:\n" + "\n".join(lines)
+    except Exception as e:
+        logger.info(f"Discord follow-up context fetch skipped: {e}")
+        return ""
 
-    def is_running(self) -> bool:
-        """Check if the bot is currently running."""
-        return self._running
+async def stop(self):
+    """Stop the Discord bot."""
+    if self.client and self._running:
+        logger.info("Stopping Discord bot...")
+        await self.client.close()
+        self._running = False
 
-    def get_loop(self):
-        """Get the event loop the bot is running on."""
-        return getattr(self, "_loop", None)
+def is_running(self) -> bool:
+    """Check if the bot is currently running."""
+    return self._running
 
+def get_loop(self):
+    """Get the event loop the bot is running on."""
+    return getattr(self, "_loop", None)
+
+EchoSpeakDiscordBot._send_long_message = _send_long_message
+EchoSpeakDiscordBot._maybe_get_channel_context = _maybe_get_channel_context
+EchoSpeakDiscordBot._is_smalltalk_message = _is_smalltalk_message
+EchoSpeakDiscordBot._maybe_get_followup_context = _maybe_get_followup_context
+EchoSpeakDiscordBot.stop = stop
+EchoSpeakDiscordBot.is_running = is_running
+EchoSpeakDiscordBot.get_loop = get_loop
 
 async def start_discord_bot(token: str, process_query_func: Callable, agent_name: str = "EchoSpeak") -> EchoSpeakDiscordBot:
     """

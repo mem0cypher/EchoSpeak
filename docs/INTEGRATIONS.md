@@ -571,15 +571,8 @@ Notes:
 - Channel recap reads now fail fast with a short timeout when Discord history fetch health is degraded, instead of blocking the full request path for a long time.
 - Background Discord delivery for routines / heartbeat / proactive output is opt-in by channel config and now prefers `DISCORD_BOT_OWNER_ID`.
 - Discord DM command interception (v7.1.1): typing `approve`, `reject`, `/approve`, `/reject`, or natural-language variants like "reject the tweet" in Discord DM routes directly to the Twitter autonomous approve/reject API instead of `process_query()`.
-
-Discord bot context wrapping:
-
-- The Discord bot injects optional context blocks like `Recent conversation context:` and always prefixes the latest message with `User request:`.
-- The agent extracts the actual user request before any routing/tool selection to prevent context from triggering false tool calls.
-
-Discord confirmation UX:
-
-- For confirmation-gated actions in Discord DM, the bot returns a minimal `confirm`/`cancel` prompt and does not expose internal action planning text.
+- Pending autonomous/changelog tweet approvals are persisted in `twitter_auto_tweet_state.json`, restored on Twitter bot startup, and used as the source of truth for Discord DM approve/reject replies after restart.
+- Discord DM reply matching now handles restart-safe pending approvals plus short/polite owner replies like `reject please`, `decline`, `deny the twitter notification`, and `can you reject the tweet`.
 - Shared server-channel mode does not auto-confirm actions and does not expose the broader admin-style tool surface.
 
 This routing is implemented in both `_allowed_lc_tool_names` and `_should_use_tool` in `core.py`.

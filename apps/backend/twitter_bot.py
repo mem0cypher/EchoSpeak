@@ -502,6 +502,7 @@ class EchoSpeakTwitterBot:
         )
         self._running = True
         self._stop_event.clear()
+        self._rehydrate_pending_tweet()
 
         me = self._api.get_me()
         if isinstance(me, dict) and me.get("id"):
@@ -680,8 +681,9 @@ class EchoSpeakTwitterBot:
     def _maybe_changelog_tweet(self, max_daily: int) -> bool:
         """Handle pending/new git changelog work for Discord and Twitter.
 
-        Returns True if there is changelog work in progress or completed on this tick,
-        False if there is no changelog work to handle.
+        Returns True when the Discord leg is fully handled.
+        That includes intentionally skipped cases (Discord bot disabled, feature disabled,
+        or no channels configured) so changelog delivery doesn't stall forever.
         """
         try:
             from agent.git_changelog import (
@@ -903,8 +905,8 @@ class EchoSpeakTwitterBot:
             msg = (
                 f"🐦 **EchoSpeak wants to tweet:**\n"
                 f"```text\n{preview[:280]}\n```\n"
-                f"Reply in the Web UI or use `POST /twitter/autonomous/approve` to approve, "
-                f"or `POST /twitter/autonomous/reject` to reject."
+                f"Reply `approve` or `reject` here in Discord DM, use the Web UI, "
+                f"or call `POST /twitter/autonomous/approve` / `POST /twitter/autonomous/reject`."
             )
             route_message(msg, ["discord"], label="Autonomous Tweet")
         except Exception:
@@ -973,19 +975,39 @@ class EchoSpeakTwitterBot:
             if len(self._auto_tweet_history) > 50:
                 self._auto_tweet_history = self._auto_tweet_history[-50:]
 
+    def _pending_tweet_from_state(self) -> Optional[str]:
+        state = _load_auto_tweet_state()
+        pending = state.get("pending_approval")
+        if isinstance(pending, dict):
+            text = str(pending.get("text") or "").strip()
+            return text or None
+        if isinstance(pending, str):
+            text = pending.strip()
+            return text or None
+        return None
+
+    def _rehydrate_pending_tweet(self) -> None:
+        persisted = self._pending_tweet_from_state()
+        with self._pending_tweet_lock:
+            self._pending_tweet = persisted
+        if persisted:
+            logger.info("Twitter autonomous pending tweet restored from disk")
+
     # ── Autonomous tweet approval/rejection ────────────────────────
 
     def approve_pending_tweet(self) -> Dict[str, Any]:
         """Approve and post the pending autonomous tweet."""
         with self._pending_tweet_lock:
             text = self._pending_tweet
+            if not text:
+                text = self._pending_tweet_from_state()
             self._pending_tweet = None
 
         if not text:
             return {"ok": False, "error": "No pending tweet to approve"}
 
         if not self._api:
-            return {"ok": False, "error": "Twitter API not initialized"}
+            return {"ok": False, "error": "Twitter API client not initialized"}
 
         result = self._api.post_tweet(text)
         if "error" not in result:
@@ -1016,6 +1038,8 @@ class EchoSpeakTwitterBot:
         """Reject the pending autonomous tweet."""
         with self._pending_tweet_lock:
             text = self._pending_tweet
+            if not text:
+                text = self._pending_tweet_from_state()
             self._pending_tweet = None
 
         if not text:
@@ -1032,7 +1056,10 @@ class EchoSpeakTwitterBot:
     def get_pending_tweet(self) -> Optional[str]:
         """Get the currently pending autonomous tweet, if any."""
         with self._pending_tweet_lock:
-            return self._pending_tweet
+            text = self._pending_tweet
+        if text:
+            return text
+        return self._pending_tweet_from_state()
 
     def get_auto_tweet_history(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Get recent autonomous tweet history (newest first)."""
