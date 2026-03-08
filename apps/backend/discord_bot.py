@@ -528,20 +528,68 @@ class EchoSpeakDiscordBot:
                                 await message.channel.send("Hey! How can I help you?")
                                 return
 
-                            # ── DM Command Interception ──
-                            # Catch approve/reject commands before they hit
-                            # process_query() so tweet approvals actually work.
-                            # Handles: "approve", "/reject", "reject the tweet",
-                            #          "can you reject the echospeak tweet", etc.
+                            # ── DM Command Interception: Tweet Approve/Reject ──
+                            # Context-aware: checks if a tweet is actually pending,
+                            # then interprets a broad set of approve/reject synonyms.
+                            # Catches: "approve", "reject", "decline", "deny", "no",
+                            #   "yes", "confirm", "cancel", "nah", "kill it",
+                            #   "deny the twitter notification", "reject that", etc.
                             import re as _re
                             _cmd = content.strip().lower().lstrip("/")
-                            _is_tweet_action = (
-                                _cmd in {"approve", "reject", "approve tweet", "reject tweet"}
-                                or bool(_re.search(r"\b(approve|reject)\b.*\btweet\b", _cmd))
-                                or bool(_re.search(r"\btweet\b.*\b(approve|reject)\b", _cmd))
-                            )
+
+                            # First, check if there's actually a pending tweet
+                            _has_pending_tweet = False
+                            try:
+                                from twitter_bot import get_twitter_bot as _get_tw
+                                _tw = _get_tw()
+                                if _tw and getattr(_tw, "is_running", False):
+                                    _has_pending_tweet = bool(_tw.get_pending_tweet())
+                            except Exception:
+                                pass
+
+                            # Approve synonyms
+                            _approve_words = {"approve", "accept", "yes", "confirm", "post it",
+                                              "send it", "go ahead", "ship it", "do it", "sure",
+                                              "yeah", "yep", "ok", "okay", "post", "publish"}
+                            # Reject synonyms
+                            _reject_words = {"reject", "decline", "deny", "no", "cancel",
+                                             "nah", "nope", "kill it", "drop it", "delete it",
+                                             "dont post", "don't post", "discard", "skip",
+                                             "pass", "trash it", "scrap it"}
+                            # Context words that signal this is about a tweet/twitter action
+                            _context_words = {"tweet", "twitter", "notification", "pending",
+                                              "autonomous", "post", "that"}
+
+                            # Determine if this is a tweet action:
+                            # 1) Exact short command (approve/reject/decline/deny/yes/no/etc.)
+                            #    ONLY if there's a pending tweet
+                            # 2) Mentions approve/reject synonyms + context words
+                            _is_approve_word = _cmd in _approve_words or any(w in _cmd for w in _approve_words if len(w) > 3)
+                            _is_reject_word = _cmd in _reject_words or any(w in _cmd for w in _reject_words if len(w) > 3)
+                            _has_context = any(w in _cmd for w in _context_words)
+
+                            _is_tweet_action = False
+                            _is_approve = False
+                            if _has_pending_tweet:
+                                if _cmd in _approve_words or _cmd in _reject_words:
+                                    # Short exact command while tweet is pending
+                                    _is_tweet_action = True
+                                    _is_approve = _cmd in _approve_words
+                                elif (_is_approve_word or _is_reject_word) and _has_context:
+                                    # Natural language with both action + context
+                                    _is_tweet_action = True
+                                    _is_approve = _is_approve_word and not _is_reject_word
+                                elif bool(_re.search(r"\b(approve|reject|decline|deny|accept|confirm|cancel)\b", _cmd)) and _has_context:
+                                    _is_tweet_action = True
+                                    _is_approve = bool(_re.search(r"\b(approve|accept|confirm)\b", _cmd))
+                            else:
+                                # No pending tweet — only intercept explicit tweet commands
+                                if bool(_re.search(r"\b(approve|reject|decline|deny)\b.*\btweet\b", _cmd)) or \
+                                   bool(_re.search(r"\btweet\b.*\b(approve|reject|decline|deny)\b", _cmd)):
+                                    _is_tweet_action = True
+                                    _is_approve = bool(_re.search(r"\b(approve|accept)\b", _cmd))
+
                             if _is_tweet_action:
-                                _is_approve = "approve" in _cmd
                                 try:
                                     from twitter_bot import get_twitter_bot
                                     tw_bot = get_twitter_bot()
@@ -556,7 +604,7 @@ class EchoSpeakDiscordBot:
                                             await message.channel.send(f"Done — tweet {action}.")
                                         else:
                                             err = result.get("error", "unknown error") if isinstance(result, dict) else "unknown error"
-                                            await message.channel.send(f"No pending tweet to {'approve' if _is_approve else 'reject'}. {err}")
+                                            await message.channel.send(f"No pending tweet right now.")
                                     else:
                                         await message.channel.send("Twitter bot isn't running right now.")
                                 except ImportError:
