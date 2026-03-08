@@ -583,12 +583,15 @@ class Config:
         self.heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL", "30") or 30)
         self.heartbeat_prompt = os.getenv(
             "HEARTBEAT_PROMPT",
-            "You are Echo, running a system pulse check. Review the SYSTEM PULSE data above and decide if anything is worth reporting to mem0cypher. "
+            "You are Echo, running a system pulse check. Review the SYSTEM PULSE data above and decide if anything is worth reporting. "
             "Things worth reporting: high-priority todos that are stale or overdue, a pending tweet awaiting approval, notable new git commits the owner should know about, "
             "interesting patterns in recent activity, or a brief status nudge if things have been quiet for a while. "
-            "Keep it short (1-3 sentences max), casual, in your normal voice. Do not repeat things you already reported in a recent heartbeat. "
+            "Keep it short (1-3 sentences max), casual, in your normal voice. "
+            "IMPORTANT: Reply with ONLY your message text. Do NOT use tools. Do NOT plan actions. Do NOT suggest posting to Discord or any channel. "
+            "Do NOT include 'Plan:', bullet lists of steps, or 'confirm'/'cancel' prompts. "
+            "Message delivery is handled automatically — just write what you want to say. "
             "Do not fabricate details. Only reference data from the SYSTEM PULSE. "
-            "If there is genuinely nothing interesting or actionable, reply with NO_HEARTBEAT.",
+            "If there is genuinely nothing interesting or actionable, reply with exactly: NO_HEARTBEAT",
         ).strip()
         raw_heartbeat_channels = os.getenv("HEARTBEAT_CHANNELS", "web")
         self.heartbeat_channels = [

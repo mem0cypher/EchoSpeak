@@ -334,11 +334,59 @@ class HeartbeatManager:
         return "\n".join(sections)
 
     # ------------------------------------------------------------------
+    # Response sanitization
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sanitize_response(text: str) -> str:
+        """Strip plan noise, confirmation prompts, and tool chatter from the LLM response.
+
+        The LLM is called without tools, but it may still hallucinate
+        tool-call syntax, plan bullet lists, or confirmation prompts
+        from its training data.  This method strips all of that so
+        only the clean message text reaches Discord / Telegram / etc.
+        """
+        import re
+
+        if not text:
+            return ""
+
+        out = text.strip()
+
+        # Remove "Plan:" / "Planned action:" blocks (bullet lists that follow)
+        out = re.sub(
+            r"(?:^|\n)\s*(?:Plan|Planned action|Actions?|Steps?):\s*\n(?:\s*[-*•]\s*.+\n?)+",
+            "\n", out, flags=re.IGNORECASE,
+        )
+
+        # Remove "I can do this: …" / "Reply 'confirm' …" confirmation prompts
+        out = re.sub(
+            r"(?:I can do this|I'll do this|Shall I|Want me to|Reply\s+['\"]?confirm).*$",
+            "", out, flags=re.IGNORECASE | re.MULTILINE,
+        )
+
+        # Remove "Post to Discord channel #…" action lines
+        out = re.sub(
+            r"(?:^|\n)\s*Post to (?:Discord|Telegram|email|WhatsApp).*$",
+            "", out, flags=re.IGNORECASE | re.MULTILINE,
+        )
+
+        # Collapse multiple blank lines
+        out = re.sub(r"\n{3,}", "\n\n", out)
+
+        return out.strip()
+
+    # ------------------------------------------------------------------
     # Tick
     # ------------------------------------------------------------------
 
     def _tick(self) -> None:
-        """Fire one heartbeat: gather system state, query the agent, route the result."""
+        """Fire one heartbeat: gather system state, call the LLM directly, route the result.
+
+        Uses llm_wrapper.invoke() instead of process_query() so the agent
+        cannot plan actions, invoke tools, or generate confirmation prompts.
+        The heartbeat produces *text only* — routing is handled by _route().
+        """
         now = datetime.now(timezone.utc)
         self.last_tick = now.isoformat()
         logger.debug(f"HeartbeatManager: tick at {self.last_tick}")
@@ -359,18 +407,17 @@ class HeartbeatManager:
         else:
             enriched_prompt = self._prompt
 
+        # Call LLM directly — no tools, no planning, no confirmation gates
         try:
-            response_text, _ = self._agent.process_query(
-                enriched_prompt,
-                source="heartbeat",
-                thread_id="heartbeat",
-            )
+            response_text = self._agent.llm_wrapper.invoke(enriched_prompt)
         except Exception as exc:
-            logger.warning(f"HeartbeatManager: agent query failed — {exc}")
+            logger.warning(f"HeartbeatManager: LLM call failed — {exc}")
             return
 
+        # Sanitize: strip plan noise, confirmation prompts, tool output
+        response_stripped = self._sanitize_response(response_text)
+
         # Detect silence sentinel
-        response_stripped = (response_text or "").strip()
         is_silent = (
             not response_stripped
             or _NO_HEARTBEAT_SENTINEL in response_stripped.upper()
