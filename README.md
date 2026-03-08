@@ -2,7 +2,7 @@
   <img src="assets/echospeak-real-logo.png" alt="EchoSpeak" width="120" />
 </p>
 <p align="center">
-  <strong>Your own local-first AI agent. Any model. Any channel. Your data stays yours.</strong>
+  <strong>Your AI. Your machine. Your rules.</strong>
 </p>
 
 <p align="center">
@@ -23,9 +23,9 @@
 
 ---
 
-EchoSpeak is a privacy-focused agent platform that runs on your machine. It combines LLM orchestration, persistent memory, governed tool use, and multi-channel delivery so you can research, automate, and manage information without handing your data to a hosted assistant.
+EchoSpeak is a personal AI agent that runs on your hardware — not in someone else's cloud. It combines persistent memory, governed tool use, and multi-channel delivery across Discord, Telegram, Twitter, Twitch, and the web. Research, automate, and manage your world without giving up your data.
 
-If you want a personal, single-user AI assistant that feels local, fast, and always-on — this is it.
+If you want an AI assistant that feels local, fast, and always-on — this is it.
 
 ## Install (recommended)
 
