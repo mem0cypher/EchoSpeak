@@ -9,11 +9,8 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
@@ -26,9 +23,6 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/google/uuid"
 )
-
-var ttsMu sync.Mutex
-var activeTTSCmd *exec.Cmd
 
 const (
 	defaultAPIBase       = "http://localhost:8000"
@@ -347,19 +341,6 @@ func fetchSessionsCmd(apiBase string) tea.Cmd {
 
 func warmupTTSCmd(apiBase string) tea.Cmd {
 	return func() tea.Msg {
-		payload, _ := json.Marshal(map[string]string{"text": "warmup"})
-		req, err := http.NewRequest("POST", strings.TrimRight(apiBase, "/")+"/tts", bytes.NewReader(payload))
-		if err != nil {
-			return nil
-		}
-		req.Header.Set("Content-Type", "application/json")
-		client := &http.Client{Timeout: 120 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil
-		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
 		return nil
 	}
 }
@@ -1444,81 +1425,8 @@ func speakTTSCmd(apiBase, text string, id int) tea.Cmd {
 		if strings.TrimSpace(sanitized) == "" {
 			return ttsDoneMsg{id: id, err: nil}
 		}
-
-		type ttsRequest struct {
-			Text string `json:"text"`
-		}
-
-		payload, err := json.Marshal(ttsRequest{Text: sanitized})
-		if err != nil {
-			return ttsDoneMsg{id: id, err: err}
-		}
-
-		req, err := http.NewRequest("POST", strings.TrimRight(apiBase, "/")+"/tts", bytes.NewReader(payload))
-		if err != nil {
-			return ttsDoneMsg{id: id, err: err}
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-EchoSpeak-Client", "tui")
-
-		client := &http.Client{Timeout: 120 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
-				if localErr := speakLocalText(sanitized); localErr == nil {
-					return ttsDoneMsg{id: id, err: nil}
-				}
-			}
-			return ttsDoneMsg{id: id, err: err}
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			body, _ := io.ReadAll(resp.Body)
-			if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
-				if localErr := speakLocalText(sanitized); localErr == nil {
-					return ttsDoneMsg{id: id, err: nil}
-				}
-			}
-			return ttsDoneMsg{id: id, err: fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))}
-		}
-
-		wavBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return ttsDoneMsg{id: id, err: err}
-		}
-		if err := playWavBytes(wavBytes); err != nil {
-			if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
-				if localErr := speakLocalText(sanitized); localErr == nil {
-					return ttsDoneMsg{id: id, err: nil}
-				}
-			}
-			return ttsDoneMsg{id: id, err: err}
-		}
 		return ttsDoneMsg{id: id, err: nil}
 	}
-}
-
-func speakLocalText(text string) error {
-	text = sanitizeTTSText(text)
-	if strings.TrimSpace(text) == "" {
-		return nil
-	}
-
-	// Prefer speech-dispatcher on Linux if available.
-	if path, err := exec.LookPath("spd-say"); err == nil {
-		cmd := exec.Command(path, "-w", text)
-		return cmd.Run()
-	}
-	if path, err := exec.LookPath("espeak-ng"); err == nil {
-		cmd := exec.Command(path, text)
-		return cmd.Run()
-	}
-	if path, err := exec.LookPath("espeak"); err == nil {
-		cmd := exec.Command(path, text)
-		return cmd.Run()
-	}
-
-	return fmt.Errorf("no local TTS command found (install spd-say or espeak)")
 }
 
 func sanitizeTTSText(s string) string {
@@ -1547,86 +1455,6 @@ func sanitizeTTSText(s string) string {
 		b.WriteRune(r)
 	}
 	return strings.TrimSpace(b.String())
-}
-
-func playWavBytes(wav []byte) error {
-	f, err := os.CreateTemp("", "echospeak-tts-*.wav")
-	if err != nil {
-		return err
-	}
-	name := f.Name()
-	if _, err := f.Write(wav); err != nil {
-		_ = f.Close()
-		_ = os.Remove(name)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(name)
-		return err
-	}
-	defer os.Remove(name)
-
-	stopPrevious := func() {
-		if activeTTSCmd == nil {
-			return
-		}
-		if activeTTSCmd.Process != nil {
-			_ = activeTTSCmd.Process.Kill()
-		}
-		activeTTSCmd = nil
-	}
-
-	switch runtime.GOOS {
-	case "windows":
-		escaped := strings.ReplaceAll(name, "'", "''")
-		ps := "(New-Object Media.SoundPlayer '" + escaped + "').PlaySync()"
-		cmd := exec.Command("powershell", "-NoProfile", "-Command", ps)
-		ttsMu.Lock()
-		stopPrevious()
-		activeTTSCmd = cmd
-		ttsMu.Unlock()
-		err := cmd.Run()
-		ttsMu.Lock()
-		if activeTTSCmd == cmd {
-			activeTTSCmd = nil
-		}
-		ttsMu.Unlock()
-		return err
-	case "darwin":
-		cmd := exec.Command("afplay", name)
-		ttsMu.Lock()
-		stopPrevious()
-		activeTTSCmd = cmd
-		ttsMu.Unlock()
-		err := cmd.Run()
-		ttsMu.Lock()
-		if activeTTSCmd == cmd {
-			activeTTSCmd = nil
-		}
-		ttsMu.Unlock()
-		return err
-	default:
-		player := ""
-		if _, err := exec.LookPath("pw-play"); err == nil {
-			player = "pw-play"
-		} else if _, err := exec.LookPath("paplay"); err == nil {
-			player = "paplay"
-		} else {
-			player = "aplay"
-		}
-		cmd := exec.Command(player, name)
-		ttsMu.Lock()
-		stopPrevious()
-		activeTTSCmd = cmd
-		ttsMu.Unlock()
-		err := cmd.Run()
-		ttsMu.Lock()
-		if activeTTSCmd == cmd {
-			activeTTSCmd = nil
-		}
-		ttsMu.Unlock()
-		return err
-	}
 }
 
 func splashView(m model) string {

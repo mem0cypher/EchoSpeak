@@ -1,0 +1,10 @@
+{
+    "name": "Skill Writer",
+    "description": "Self-writing skill system — lets the agent create, list, and manage its own skill modules at runtime.",
+    "prompt_file": "SKILL.md",
+    "tools": [
+        "skill_create",
+        "skill_list",
+        "skill_enable"
+    ]
+}

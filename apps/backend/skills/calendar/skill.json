@@ -1,0 +1,11 @@
+{
+    "name": "Google Calendar",
+    "description": "Google Calendar integration — list events, create meetings, check availability, get today's schedule.",
+    "prompt_file": "SKILL.md",
+    "tools": [
+        "calendar_get_today",
+        "calendar_list_events",
+        "calendar_create_event",
+        "calendar_delete_event"
+    ]
+}

@@ -14,9 +14,9 @@ import re
 import time
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
-from typing import Optional
+from typing import Optional, Dict, Any
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import urlparse
 from loguru import logger
 from pydantic import BaseModel, Field, AliasChoices
 
@@ -26,6 +26,55 @@ from pytesseract import pytesseract
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import config, ModelProvider
+
+
+def _ensure_playwright_browsers() -> bool:
+    """Ensure Playwright browsers are installed. Returns True if browsers are available."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            # Check if chromium executable exists
+            exec_path = p.chromium.executable_path
+            if exec_path and Path(exec_path).exists():
+                return True
+    except Exception:
+        pass
+    
+    # Try to install browsers
+    logger.info("Playwright browsers missing, attempting auto-install...")
+    try:
+        venv_python = Path(__file__).parent.parent / ".venv" / "bin" / "python"
+        if venv_python.exists():
+            result = subprocess.run([str(venv_python), "-m", "playwright", "install", "chromium"], 
+                                    capture_output=True, timeout=300)
+        else:
+            result = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                                    capture_output=True, timeout=300)
+        if result.returncode == 0:
+            logger.info("Playwright browsers installed successfully")
+            return True
+    except Exception as e:
+        logger.warning(f"Failed to auto-install Playwright browsers: {e}")
+    return False
+
+
+def _with_playwright_retry(func, *args, **kwargs):
+    """Execute a Playwright function with auto-retry if browsers are missing."""
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        error_msg = str(e)
+        if "Executable doesn't exist" in error_msg or "playwright install" in error_msg:
+            logger.info("Playwright browser missing, attempting auto-install and retry...")
+            if _ensure_playwright_browsers():
+                # Retry after installing
+                try:
+                    return func(*args, **kwargs)
+                except Exception as retry_e:
+                    return f"Playwright error after retry: {retry_e}"
+            else:
+                return f"Playwright browsers not available. Run: playwright install chromium"
+        raise
 
 try:
     from io_module.vision import capture_screen, perform_ocr
@@ -92,7 +141,11 @@ def _get_desktop_backend():
 
 
 def _file_tool_root() -> Path:
-    root = Path(getattr(config, "file_tool_root", "") or ".").expanduser()
+    configured = str(getattr(config, "file_tool_root", "") or "").strip()
+    if configured:
+        root = Path(configured).expanduser()
+    else:
+        root = Path(__file__).resolve().parents[3]
     try:
         return root.resolve()
     except Exception:
@@ -191,12 +244,6 @@ def _collect_system_info() -> dict[str, str]:
 
 
 class WebSearchArgs(BaseModel):
-    query: str = Field(
-        ..., validation_alias=AliasChoices("query", "q", "search", "keywords"), description="Search query text."
-    )
-
-
-class LiveWebSearchArgs(BaseModel):
     query: str = Field(
         ..., validation_alias=AliasChoices("query", "q", "search", "keywords"), description="Search query text."
     )
@@ -697,7 +744,7 @@ def open_application(app: str, args: Optional[str] = None) -> str:
         return "Failed to resolve application command."
     try:
         subprocess.Popen(cmd)
-        return f"Opened application: {app}"
+        return "Opened application."
     except Exception as e:
         return f"Failed to open application: {str(e)}"
 
@@ -1263,7 +1310,7 @@ def _encode_image_b64(img: "np.ndarray") -> str:
 @tool(args_schema=WebSearchArgs, description="Search the web for current information.")
 def web_search(query: str) -> str:
     """
-    Search the web for current information using DuckDuckGo.
+    Search the web for current information using Tavily.
 
     Args:
         query: The search query.
@@ -1274,34 +1321,22 @@ def web_search(query: str) -> str:
     try:
         query_low = (query or "").lower()
 
-        def _is_schedule_like(q: str) -> bool:
+        # Detect news-related queries and add current date for better results
+        def _is_news_query(q: str) -> bool:
             low = (q or "").lower().strip()
-            if not low:
-                return False
-            schedule_terms = [
-                "game",
-                "match",
-                "fixture",
-                "schedule",
-                "event",
-                "concert",
-                "show",
-                "episode",
-                "season",
-                "flight",
-                "departure",
-                "arrival",
-                "release",
-                "launch",
-                "plays",
-                "play",
-            ]
-            if any(t in low for t in ["next", "upcoming"]) and any(term in low for term in schedule_terms):
-                return True
-            if any(t in low for t in ["when is", "when's", "when does", "start time", "starts at", "kickoff", "tipoff"]):
-                if any(term in low for term in schedule_terms):
-                    return True
-            return False
+            news_terms = ["news", "latest", "recent", "today", "update", "breaking", "headline", "war", "conflict", "crisis"]
+            return any(term in low for term in news_terms)
+
+        def _add_date_to_query(q: str) -> str:
+            if not _is_news_query(q):
+                return q
+            from datetime import datetime
+            now = datetime.now()
+            date_suffix = f" {now.strftime('%B %Y')}"  # e.g., "March 2026"
+            return f"{q}{date_suffix}"
+
+        # Enrich news queries with date
+        query = _add_date_to_query(query)
 
         def _split_queries(q: str) -> list[str]:
             raw = (q or "").strip()
@@ -1420,91 +1455,26 @@ def web_search(query: str) -> str:
                 out = out[:max_chars].rstrip() + "…"
             return out
 
-        def _enrich_with_scrapling(items: list[dict]) -> list[dict]:
-            if not bool(getattr(config, "web_search_use_scrapling", False)):
-                return items
-            if _is_schedule_like(query_low):
-                return items
-            try:
-                from scrapling.fetchers import Fetcher  # type: ignore
-            except Exception as exc:
-                logger.warning(f"Scrapling unavailable; skipping enrichment: {exc}")
-                return items
-
-            try:
-                top_k = int(getattr(config, "web_search_scrapling_top_k", 2) or 2)
-            except Exception:
-                top_k = 2
-            try:
-                timeout_s = int(getattr(config, "web_search_scrapling_timeout", 20) or 20)
-            except Exception:
-                timeout_s = 20
-            try:
-                max_chars = int(getattr(config, "web_search_scrapling_max_chars", 1500) or 1500)
-            except Exception:
-                max_chars = 1500
-
-            stealthy_headers = bool(getattr(config, "web_search_scrapling_stealthy_headers", True))
-            impersonate = (getattr(config, "web_search_scrapling_impersonate", "chrome") or "chrome").strip() or "chrome"
-
-            for item in items[: max(0, top_k)]:
-                url = (item.get("url") or "").strip()
-                if not url:
-                    continue
-                try:
-                    page = Fetcher.get(
-                        url,
-                        timeout=timeout_s,
-                        stealthy_headers=stealthy_headers,
-                        impersonate=impersonate,
-                        follow_redirects=True,
-                    )
-                    if getattr(page, "status", 0) != 200:
-                        continue
-
-                    title = ""
-                    try:
-                        title = str(page.css_first("title::text") or "").strip()
-                    except Exception:
-                        title = ""
-
-                    extracted = ""
-                    try:
-                        extracted = str(page.get_all_text(strip=True, valid_values=True)).strip()
-                    except Exception:
-                        extracted = ""
-
-                    if extracted and max_chars > 0 and len(extracted) > max_chars:
-                        extracted = extracted[:max_chars].rstrip() + "…"
-
-                    if title:
-                        item["page_title"] = title
-                    if extracted:
-                        item["extract"] = extracted
-                except Exception as exc:
-                    logger.debug(f"Scrapling fetch failed for {url}: {exc}")
-                    continue
-            return items
-
-        def _search_searxng(q: str) -> list[dict]:
-            searx_url = (getattr(config, "searxng_url", "") or "").strip().rstrip("/")
-            if not searx_url:
-                return []
+        def _search_tavily(q: str) -> tuple[list[dict], str]:
+            api_key = str(getattr(config, "tavily_api_key", "") or "").strip()
+            if not api_key:
+                return [], "Tavily search is not available. Set TAVILY_API_KEY."
             try:
                 import requests
+                from requests import exceptions as requests_exc
 
-                endpoint = searx_url
-                if not endpoint.lower().endswith("/search"):
-                    endpoint = endpoint + "/search"
-
-                timeout_s = int(getattr(config, "searxng_timeout", getattr(config, "web_search_timeout", 10)) or 10)
-                resp = requests.get(
-                    endpoint,
-                    params={
-                        "q": q,
-                        "format": "json",
-                        "language": "en",
-                        "safesearch": 1,
+                timeout_s = int(getattr(config, "web_search_timeout", 10) or 10)
+                max_results = int(getattr(config, "tavily_max_results", 8) or 8)
+                search_depth = str(getattr(config, "tavily_search_depth", "advanced") or "advanced").strip().lower() or "advanced"
+                resp = requests.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key": api_key,
+                        "query": q,
+                        "search_depth": search_depth,
+                        "max_results": max(1, min(max_results, 10)),
+                        "include_answer": False,
+                        "include_raw_content": True,
                     },
                     timeout=timeout_s,
                 )
@@ -1512,61 +1482,40 @@ def web_search(query: str) -> str:
                 data = resp.json() or {}
                 results = data.get("results") or []
                 items = []
-                for result in results[:5]:
-                    title = (result.get("title") or "No title").strip()
-                    link = (result.get("url") or "").strip()
-                    snippet = (result.get("content") or "").strip()
-                    date = (
-                        result.get("publishedDate")
-                        or result.get("published_date")
-                        or result.get("published")
-                        or result.get("date")
-                        or ""
+                for result in results[:10]:
+                    title = str(result.get("title") or "No title").strip()
+                    link = str(result.get("url") or "").strip()
+                    snippet = str(result.get("content") or "").strip()
+                    extract = str(result.get("raw_content") or "").strip()
+                    date = str(result.get("published_date") or result.get("published_at") or "").strip()
+                    items.append(
+                        {
+                            "title": title,
+                            "url": link,
+                            "snippet": snippet,
+                            "extract": extract,
+                            "date": date,
+                            "_query": q,
+                        }
                     )
-                    items.append({"title": title, "url": link, "snippet": snippet, "date": str(date).strip(), "_query": q})
-                return items
+                return items, ""
+            except requests_exc.Timeout:
+                msg = f"Tavily search timed out after {timeout_s}s."
+                logger.warning(msg)
+                return [], msg
+            except requests_exc.HTTPError as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                msg = f"Tavily search failed with HTTP {status}." if status else f"Tavily search failed: {e}"
+                logger.warning(msg)
+                return [], msg
+            except requests_exc.RequestException as e:
+                msg = f"Tavily search failed: {e}"
+                logger.warning(msg)
+                return [], msg
             except Exception as e:
-                logger.warning(f"SearxNG search failed, falling back to DuckDuckGo: {e}")
-                return []
-
-        def _search_ddg(q: str) -> list[dict]:
-            DDGS = None
-            try:
-                from ddgs import DDGS  # type: ignore
-            except Exception:
-                from duckduckgo_search import DDGS  # type: ignore
-
-            results = []
-            with DDGS() as ddgs:
-                try:
-                    results = list(ddgs.news(q, max_results=5))
-                except Exception:
-                    results = list(ddgs.text(q, max_results=5))
-
-            if not results:
-                refined = f"{q} latest news"
-                with DDGS() as ddgs:
-                    try:
-                        results = list(ddgs.news(refined, max_results=5))
-                    except Exception:
-                        results = list(ddgs.text(refined, max_results=5))
-
-            items = []
-            for result in results[:5]:
-                title = result.get("title") or "No title"
-                link = result.get("url") or result.get("href") or ""
-                snippet = result.get("body") or result.get("description") or ""
-                date = result.get("date") or result.get("published") or result.get("published_date") or ""
-                items.append(
-                    {
-                        "title": str(title).strip(),
-                        "url": str(link).strip(),
-                        "snippet": str(snippet).strip(),
-                        "date": str(date).strip(),
-                        "_query": q,
-                    }
-                )
-            return items
+                msg = f"Tavily search failed: {e}"
+                logger.warning(msg)
+                return [], msg
 
         queries = _split_queries(query)
         if not queries:
@@ -1663,10 +1612,11 @@ def web_search(query: str) -> str:
 
         merged = []
         seen_urls = set()
+        tavily_errors = []
         for q in queries:
-            items = _search_searxng(q)
-            if not items:
-                items = _search_ddg(q)
+            items, err = _search_tavily(q)
+            if err and err not in tavily_errors:
+                tavily_errors.append(err)
             for it in items:
                 url = (it.get("url") or "").strip()
                 if not url:
@@ -1683,9 +1633,9 @@ def web_search(query: str) -> str:
                 break
 
         if not merged:
+            if tavily_errors:
+                return tavily_errors[0]
             return "No search results found."
-
-        merged = _enrich_with_scrapling(merged)
 
         base_q = " ".join(queries)
         merged.sort(
@@ -1724,90 +1674,9 @@ def web_search(query: str) -> str:
             formatted_results.append("\n".join(block))
 
         return "\n\n".join(formatted_results) if formatted_results else "No search results found."
-
-    except ImportError:
-        logger.error("ddgs/duckduckgo-search not installed")
-        return "Web search is not available. Please install ddgs (preferred) or duckduckgo-search."
     except Exception as e:
         logger.error(f"Web search failed: {e}")
         return f"Search failed: {str(e)}"
-
-
-@tool(args_schema=LiveWebSearchArgs, description="Browse live/dynamic pages with Playwright for real-time info (scores, weather, stocks).")
-def live_web_search(query: str) -> str:
-    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_playwright", False):
-        return "System actions are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_PLAYWRIGHT=true, then restart the API."
-
-    try:
-        from playwright.sync_api import sync_playwright  # type: ignore
-    except Exception:
-        return "Playwright is not available. Please install playwright and run 'playwright install'."
-
-    q = (query or "").strip()
-    if not q:
-        return "No search query provided."
-
-    urls: list[str] = []
-    try:
-        try:
-            from ddgs import DDGS  # type: ignore
-        except Exception:
-            from duckduckgo_search import DDGS  # type: ignore
-
-        with DDGS() as ddgs:
-            results = list(ddgs.text(q, max_results=5))
-        for r in results:
-            link = (r.get("href") or r.get("url") or "").strip()
-            if link and link not in urls:
-                urls.append(link)
-            if len(urls) >= 2:
-                break
-    except Exception as exc:
-        logger.warning(f"live_web_search query results failed; falling back to DuckDuckGo HTML: {exc}")
-
-    if not urls:
-        urls = [f"https://duckduckgo.com/?q={quote_plus(q)}"]
-
-    extracts: list[str] = []
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-
-            for u in urls[:2]:
-                try:
-                    page.goto(u, wait_until="domcontentloaded", timeout=45000)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=10000)
-                    except Exception:
-                        pass
-                    try:
-                        page.wait_for_timeout(1200)
-                    except Exception:
-                        pass
-
-                    title = ""
-                    try:
-                        title = page.title() or ""
-                    except Exception:
-                        title = ""
-
-                    try:
-                        body_text = page.inner_text("body")
-                    except Exception:
-                        body_text = page.content() or ""
-
-                    body_text = re.sub(r"\s+", " ", (body_text or "")).strip()
-                    if len(body_text) > 8000:
-                        body_text = body_text[:8000].rstrip() + "…"
-                    extracts.append(f"Title: {title}\nURL: {u}\n\nContent:\n{body_text}")
-                except Exception as exc:
-                    extracts.append(f"URL: {u}\n\nContent:\nFailed to load page: {exc}")
-            browser.close()
-    except Exception as exc:
-        return f"Live browse failed: {exc}"
-
-    return "\n\n---\n\n".join([x for x in extracts if x.strip()]) or "No results found."
 
 
 @tool(args_schema=AnalyzeScreenArgs, description="Capture the screen, run OCR, and return relevant text.")
@@ -2182,12 +2051,12 @@ class BrowseTaskArgs(BaseModel):
     url: str = Field(
         ...,
         validation_alias=AliasChoices("url", "link", "website"),
-        description="Website URL to open in an automated browser.",
+        description="The URL to browse.",
     )
     task: Optional[str] = Field(
         default=None,
-        validation_alias=AliasChoices("task", "instruction", "instructions", "goal"),
-        description="What to look for or extract from the page.",
+        validation_alias=AliasChoices("task", "goal", "instructions"),
+        description="Optional task/instructions for the browsing operation.",
     )
 
 
@@ -2239,6 +2108,1099 @@ def browse_task(url: str, task: Optional[str] = None) -> str:
         return f"Title: {title}\nURL: {target}\n\nContent:\n{body_text}"
     except Exception as e:
         return f"Browse failed: {str(e)}"
+
+
+class DiscordWebSendArgs(BaseModel):
+    url: str = Field(
+        default="",
+        validation_alias=AliasChoices("url", "channel_url", "dm_url", "link"),
+        description="Discord channel/DM URL (ex: https://discord.com/channels/<guild>/<channel>).",
+    )
+    recipient: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("recipient", "to", "user", "person", "name"),
+        description="Optional recipient key to resolve via DISCORD_CONTACTS_JSON / DISCORD_CONTACTS_PATH (ex: mayo).",
+    )
+    message: str = Field(
+        ...,
+        validation_alias=AliasChoices("message", "content", "text", "msg"),
+        description="Message content to send.",
+    )
+    headless: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("headless", "hidden"),
+        description="Run browser headless. If false, the window may appear and can be used for login.",
+    )
+
+
+class DiscordWebReadRecentArgs(BaseModel):
+    url: str = Field(
+        default="",
+        validation_alias=AliasChoices("url", "channel_url", "dm_url", "link"),
+        description="Discord channel/DM URL (ex: https://discord.com/channels/<guild>/<channel>).",
+    )
+    recipient: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("recipient", "to", "user", "person", "name"),
+        description="Optional recipient key to resolve via DISCORD_CONTACTS_JSON / DISCORD_CONTACTS_PATH (ex: mayo).",
+    )
+    limit: int = Field(
+        default=20,
+        ge=1,
+        le=50,
+        validation_alias=AliasChoices("limit", "n", "count"),
+        description="Number of most recent messages to return (max 50).",
+    )
+    headless: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("headless", "hidden"),
+        description="Run browser headless. If false, the window may appear and can be used for login.",
+    )
+
+
+class DiscordContactsAddArgs(BaseModel):
+    key: str = Field(
+        ...,
+        validation_alias=AliasChoices("key", "name", "recipient", "user", "to"),
+        description="Contact key to add/update (ex: mayo).",
+    )
+    url: str = Field(
+        default="",
+        validation_alias=AliasChoices("url", "link", "dm_url", "channel_url"),
+        description="Discord DM/channel URL to store for this key (ex: https://discord.com/channels/@me/<dm_id>).",
+    )
+    message_link: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("message_link", "message_url", "copy_link", "message"),
+        description="Optional Discord 'Copy Message Link' URL. If provided, the tool will derive the channel/DM URL automatically.",
+    )
+
+
+class DiscordContactsDiscoverArgs(BaseModel):
+    key: str = Field(
+        ...,
+        validation_alias=AliasChoices("key", "name", "recipient", "user", "to"),
+        description="Contact name to discover (ex: mayo).",
+    )
+    headless: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("headless", "hidden"),
+        description="Run browser headless. If false, the window may appear and can be used for login.",
+    )
+
+
+@tool(args_schema=DiscordContactsAddArgs, description="Add/update a Discord contact mapping (recipient -> DM/channel URL).")
+def discord_contacts_add(key: str, url: str = "", message_link: Optional[str] = None) -> str:
+    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_file_write", False):
+        return "Discord contacts update is disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
+
+    k = (key or "").strip()
+    v = (url or "").strip().strip('"\' ')
+    if not k:
+        return "Missing contact key."
+
+    if (message_link or "").strip() and not v:
+        ml = str(message_link or "").strip().strip('"\' ')
+        m = re.match(r"^https?://(?:www\.)?discord\.com/channels/([^/]+)/([^/]+)(?:/([^/?#]+))?", ml, flags=re.IGNORECASE)
+        if not m:
+            return "Invalid Discord message link. Expected a discord.com/channels/... URL."
+        guild = (m.group(1) or "").strip()
+        channel = (m.group(2) or "").strip()
+        if not guild or not channel:
+            return "Invalid Discord message link."
+        v = f"https://discord.com/channels/{guild}/{channel}"
+
+    if not v:
+        return "Missing Discord URL (or message_link)."
+    if not re.match(r"^https?://(?:www\.)?discord\.com/", v, flags=re.IGNORECASE):
+        return "Invalid Discord URL. Expected a discord.com URL."
+
+    contacts_path = (os.getenv("DISCORD_CONTACTS_PATH", "") or "").strip()
+    if not contacts_path:
+        root = Path(getattr(config, "artifacts_dir", "") or "").expanduser()
+        if not str(root).strip():
+            root = Path(__file__).resolve().parents[1] / "data" / "artifacts"
+        contacts_path = str(root.parent / "discord_contacts.json")
+
+    p = Path(contacts_path).expanduser()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    data: dict = {}
+    try:
+        if p.exists():
+            loaded = json.loads(p.read_text(encoding="utf-8") or "{}")
+            if isinstance(loaded, dict):
+                data = loaded
+    except Exception:
+        data = {}
+
+    data[k] = v
+    try:
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return f"Saved Discord contact '{k}' -> {v}"
+    except Exception as e:
+        return f"Failed to write contacts: {str(e)}"
+
+
+@tool(args_schema=DiscordContactsDiscoverArgs, description="Discover a Discord contact automatically via Playwright by searching for the user and extracting a DM message link.")
+def discord_contacts_discover(key: str, headless: bool = False) -> str:
+    """Automatically discover a Discord contact by navigating Discord Web UI.
+
+    Flow:
+    1. Open Discord Web with persistent profile
+    2. Check if logged in
+    3. Use search (Ctrl+K) to find user
+    4. Open DM channel
+    5. Find a message, right-click, and extract "Copy Message Link"
+    6. Derive channel URL and save to contacts
+
+    Args:
+        key: Contact name to search for.
+        headless: Run browser headless.
+
+    Returns:
+        Status message with discovered URL or error.
+    """
+    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_playwright", False):
+        return "System actions are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_PLAYWRIGHT=true, then restart the API."
+
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception:
+        return "Playwright is not available. Please install playwright and run 'playwright install'."
+
+    # Ensure Playwright browsers are installed
+    _ensure_playwright_browsers()
+
+    k = (key or "").strip()
+    if not k:
+        return "Missing contact name."
+
+    root = Path(getattr(config, "artifacts_dir", "") or "").expanduser()
+    if not str(root).strip():
+        root = Path(__file__).resolve().parents[1] / "data" / "artifacts"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    profile_dir = Path(os.getenv("DISCORD_PLAYWRIGHT_PROFILE_DIR", str(root.parent / "discord_profile"))).expanduser()
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=bool(headless),
+            )
+            page = context.new_page()
+
+            # Navigate to Discord
+            page.goto("https://discord.com/app", wait_until="domcontentloaded", timeout=60000)
+
+            # Check for login page
+            try:
+                if page.locator('input[name="email"]').count() > 0 or page.locator('input[type="email"]').count() > 0:
+                    context.close()
+                    return (
+                        "Discord Web is not logged in. Re-run with headless=false, log in once in the opened browser, then retry. "
+                        f"Profile dir: {profile_dir}"
+                    )
+            except Exception:
+                pass
+
+            # Wait for Discord to load
+            try:
+                page.wait_for_selector('div[class*="sidebar"]', timeout=30000)
+            except Exception:
+                context.close()
+                return "Discord UI did not load properly. Try again or run with headless=false."
+
+            # Open quick switcher (Ctrl+K)
+            page.keyboard.press("Control+K")
+            page.wait_for_timeout(500)  # Wait for quick switcher to open
+
+            # Type the username to search directly (focus is automatically on the input)
+            page.keyboard.type(k, delay=50)
+            page.wait_for_timeout(1500)  # Wait for results
+
+            # Look for user in results - try to find a DM or user entry
+            # Discord's quick switcher shows users with @ prefix or DM icon
+            found = False
+            dm_url = None
+
+            # Try clicking on the first result that looks like a user/DM
+            try:
+                # Results appear in a list - look for clickable items
+                results = page.locator('div[role="option"], div[class*="result"]').all()
+                for i, result in enumerate(results[:5]):  # Check first 5 results
+                    text = result.inner_text(timeout=500) or ""
+                    # Look for the username in the result text
+                    if k.lower() in text.lower():
+                        result.click()
+                        found = True
+                        page.wait_for_timeout(1000)
+                        break
+            except Exception:
+                pass
+
+            if not found:
+                # Try pressing Enter to select first result
+                try:
+                    page.keyboard.press("Enter")
+                    page.wait_for_timeout(1000)
+                    found = True
+                except Exception:
+                    pass
+
+            if not found:
+                context.close()
+                return f"Could not find user '{k}' in Discord search results."
+
+            # Now we should be in the DM - wait for the page to navigate/render
+            page.wait_for_timeout(2000)
+
+            current_url = page.url
+            if "discord.com/channels/@me/" in current_url:
+                dm_url = current_url.split("?")[0].split("#")[0]  # Clean URL
+            else:
+                # Try to extract from the page
+                try:
+                    # Look for message elements and wait for at least one to be visible
+                    try:
+                        page.wait_for_selector('div[class*="message"]', timeout=5000)
+                    except Exception:
+                        pass
+                        
+                    messages = page.locator('div[class*="message"]').all()
+                    if len(messages) == 0:
+                        context.close()
+                        return f"Found user '{k}' but no messages in DM. Send a message first, then retry."
+
+                    # Right-click on the first message
+                    first_msg = messages[0]
+                    first_msg.click(button="right")
+                    page.wait_for_timeout(1000)
+
+                    # Look for "Copy Message Link" option in context menu
+                    context_menu = page.locator('div[id*="menu"], div[class*="menu"]').first
+                    try:
+                        context_menu.wait_for(timeout=2000)
+                    except Exception:
+                        context.close()
+                        return "Failed to open message context menu."
+
+                    # Find and click "Copy Message Link"
+                    copy_link_option = None
+                    menu_items = context_menu.locator('div[role="menuitem"]').all()
+                    for item in menu_items:
+                        text = item.inner_text(timeout=200) or ""
+                        if "copy message link" in text.lower():
+                            copy_link_option = item
+                            break
+
+                    if copy_link_option:
+                        copy_link_option.click()
+                        page.wait_for_timeout(500)
+
+                        # Read clipboard - this requires special handling
+                        # Discord copies the link to clipboard, we need to read it
+                        # Use a workaround: paste into a text area
+                        page.evaluate("navigator.clipboard.readText().then(t => window.__discord_clipboard = t)")
+                        page.wait_for_timeout(300)
+                        clipboard_text = page.evaluate("window.__discord_clipboard") or ""
+
+                        if clipboard_text and "discord.com/channels/" in clipboard_text:
+                            # Parse the message link to get DM URL
+                            m = re.match(r"^https?://(?:www\.)?discord\.com/channels/([^/]+)/([^/]+)", clipboard_text, flags=re.IGNORECASE)
+                            if m:
+                                guild = (m.group(1) or "").strip()
+                                channel = (m.group(2) or "").strip()
+                                dm_url = f"https://discord.com/channels/{guild}/{channel}"
+                        else:
+                            # Alternative: get URL from address bar after clicking message
+                            dm_url = page.url.split("?")[0].split("#")[0]
+                    else:
+                        # Fallback: just use current URL
+                        dm_url = page.url.split("?")[0].split("#")[0]
+                except Exception as e:
+                    context.close()
+                    return f"Failed to extract message link: {str(e)}"
+
+            context.close()
+
+            if not dm_url or "discord.com/channels" not in dm_url:
+                return f"Failed to discover DM URL for '{k}'."
+
+            # Now save to contacts using the same logic as discord_contacts_add
+            contacts_path = (os.getenv("DISCORD_CONTACTS_PATH", "") or "").strip()
+            if not contacts_path:
+                contacts_path = str(root.parent / "discord_contacts.json")
+
+            p = Path(contacts_path).expanduser()
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+            data: dict = {}
+            try:
+                if p.exists():
+                    loaded = json.loads(p.read_text(encoding="utf-8") or "{}")
+                    if isinstance(loaded, dict):
+                        data = loaded
+            except Exception:
+                data = {}
+
+            data[k] = dm_url
+            try:
+                p.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                return f"Discovered and saved Discord contact '{k}' -> {dm_url}"
+            except Exception as e:
+                return f"Discovered DM URL {dm_url} but failed to save: {str(e)}"
+
+    except Exception as e:
+        return f"Discord contact discovery failed: {str(e)}"
+
+
+class DiscordReadChannelArgs(BaseModel):
+    channel: str = Field(
+        ...,
+        validation_alias=AliasChoices("channel", "channel_name", "name", "channel_id"),
+        description="Discord channel name (e.g., 'general') or channel ID to read messages from.",
+    )
+    server: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("server", "guild", "guild_id", "server_name"),
+        description="Optional server/guild name or ID. If not provided, uses the first available server.",
+    )
+    limit: int = Field(
+        default=25,
+        ge=1,
+        le=100,
+        validation_alias=AliasChoices("limit", "n", "count"),
+        description="Number of most recent messages to return (max 100).",
+    )
+
+
+@tool(args_schema=DiscordReadChannelArgs, description="Read recent messages from a Discord server channel. CALL THIS TOOL whenever the user asks about Discord messages, what people are saying on Discord, or to check/read a Discord channel. The bot must be running. Parameters: channel (e.g., 'general' or 'updates'), optional server name, limit (default 25). Returns recent human messages with author names.")
+def discord_read_channel(channel: str, server: Optional[str] = None, limit: int = 25) -> str:
+    """
+    Read recent messages from a Discord channel via the bot's direct API access.
+    This works from the Web UI without needing browser automation.
+    """
+    # Check if Discord bot is enabled
+    if not getattr(config, "allow_discord_bot", False):
+        return "Discord bot is not enabled. To enable: set ALLOW_DISCORD_BOT=true and configure DISCORD_BOT_TOKEN, then restart the API."
+
+    # Get the bot instance
+    try:
+        from discord_bot import get_bot
+        bot = get_bot()
+    except ImportError:
+        return "Discord bot module not available."
+    
+    if bot is None or not bot.is_running():
+        return "Discord bot is not running. Make sure the bot is started and connected to Discord."
+    
+    client = getattr(bot, "client", None)
+    if client is None:
+        return "Discord bot client not available."
+    try:
+        if hasattr(client, "is_ready") and not client.is_ready():
+            return "Discord bot is still connecting. Try again in a few seconds."
+    except Exception:
+        pass
+
+    try:
+        import asyncio
+        import discord
+        import concurrent.futures
+
+        read_timeout_seconds = 6.0
+
+        # Find the target guild (server)
+        guild = None
+        if server:
+            # Try to find by ID first
+            if server.isdigit():
+                guild = client.get_guild(int(server))
+            # Then by name
+            if guild is None:
+                guild = next((g for g in client.guilds if (g.name or "").lower() == server.lower()), None)
+        else:
+            # Use first available guild
+            guild = next(iter(client.guilds), None) if client.guilds else None
+
+        if guild is None:
+            available = [g.name for g in client.guilds] if client.guilds else []
+            if available:
+                return f"Server '{server}' not found. Available servers: {', '.join(available)}"
+            return "The bot is not connected to any Discord servers."
+
+        # Find the target channel
+        target_channel = None
+        channel_lower = (channel or "").lower().strip()
+        
+        # Remove # prefix if present
+        if channel_lower.startswith("#"):
+            channel_lower = channel_lower[1:]
+        
+        # Try to find by ID first
+        if channel.isdigit():
+            target_channel = guild.get_channel(int(channel))
+        
+        # Helper to strip emojis and special chars for fuzzy matching
+        def strip_emojis(name: str) -> str:
+            # Discord channel names may start with emojis/symbols like "💬-general".
+            # For fuzzy matching, drop leading non-alphanumeric characters and normalize separators.
+            cleaned = (name or "").lower().strip()
+            cleaned = re.sub(r"^[^a-z0-9]+", "", cleaned)
+            cleaned = re.sub(r"[-_]", " ", cleaned)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            return cleaned
+        
+        # Then by exact name match
+        if target_channel is None:
+            for ch in guild.text_channels:
+                if (ch.name or "").lower() == channel_lower:
+                    target_channel = ch
+                    break
+        
+        # Fuzzy match: channel name contains the search term
+        if target_channel is None:
+            for ch in guild.text_channels:
+                ch_name_lower = (ch.name or "").lower()
+                if channel_lower in ch_name_lower:
+                    target_channel = ch
+                    break
+        
+        # Fuzzy match: search term contains the channel name (after stripping emojis)
+        if target_channel is None:
+            for ch in guild.text_channels:
+                stripped = strip_emojis(ch.name or "")
+                if stripped and (channel_lower in stripped or stripped in channel_lower):
+                    target_channel = ch
+                    break
+        
+        # Fuzzy match: stripped channel name equals search term
+        if target_channel is None:
+            for ch in guild.text_channels:
+                stripped = strip_emojis(ch.name or "")
+                if stripped == channel_lower:
+                    target_channel = ch
+                    break
+
+        if target_channel is None:
+            available = [f"#{ch.name}" for ch in guild.text_channels]
+            return f"Channel '{channel}' not found in server '{guild.name}'. Available channels: {', '.join(available[:10])}"
+
+        if not isinstance(target_channel, discord.TextChannel):
+            return f"'{channel}' is not a text channel."
+
+        async def _collect_messages():
+            lines = []
+            max_chars = 3000
+            total_chars = 0
+            async for msg in target_channel.history(limit=limit, oldest_first=False):
+                if getattr(msg, "author", None) is None:
+                    continue
+                if getattr(msg.author, "bot", False):
+                    continue
+                text = (msg.content or "").strip()
+                if not text:
+                    continue
+                author = getattr(msg.author, "display_name", None) or getattr(msg.author, "name", "unknown")
+                # Basic cleanup
+                text_clean = re.sub(r"\s+", " ", text)
+                line = f"- {author}: {text_clean}"
+                lines.append(line)
+                total_chars += len(line)
+                if total_chars > max_chars:
+                    break
+            return lines
+
+        async def _fetch_messages():
+            return await asyncio.wait_for(_collect_messages(), timeout=read_timeout_seconds)
+
+        # Run the coroutine on the Discord client's event loop.
+        # The agent runs in a worker thread (via run_in_executor), so we need to
+        # schedule the coroutine on the Discord client's loop using run_coroutine_threadsafe.
+        # Note: client.loop is a sentinel in discord.py 2.0+, so we use bot.get_loop() instead.
+        bot_loop = bot.get_loop() if bot else None
+        
+        if bot_loop is not None:
+            try:
+                if hasattr(bot_loop, "is_closed") and bot_loop.is_closed():
+                    return "Discord bot event loop is unavailable right now."
+                if hasattr(bot_loop, "is_running") and not bot_loop.is_running():
+                    return "Discord bot loop is not running right now."
+            except Exception:
+                pass
+            # We're in a worker thread, schedule on the bot's loop
+            try:
+                fut = asyncio.run_coroutine_threadsafe(_fetch_messages(), bot_loop)
+                lines = fut.result(timeout=read_timeout_seconds + 1.0)
+            except concurrent.futures.TimeoutError:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                return f"Timed out reading messages from #{target_channel.name} on '{guild.name}' after {int(read_timeout_seconds)} seconds."
+            except Exception as e:
+                if isinstance(e, asyncio.TimeoutError):
+                    try:
+                        fut.cancel()
+                    except Exception:
+                        pass
+                    return f"Timed out reading messages from #{target_channel.name} on '{guild.name}' after {int(read_timeout_seconds)} seconds."
+                logger.error(f"Discord read channel coroutine error: {e}")
+                return f"Failed to read Discord channel: {str(e)}"
+        else:
+            # Fallback: try to get the running loop
+            try:
+                loop = asyncio.get_running_loop()
+                fut = asyncio.run_coroutine_threadsafe(_fetch_messages(), loop)
+                lines = fut.result(timeout=read_timeout_seconds + 1.0)
+            except RuntimeError:
+                # No running loop, create one
+                lines = asyncio.run(_fetch_messages())
+            except concurrent.futures.TimeoutError:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                return f"Timed out reading messages from #{target_channel.name} on '{guild.name}' after {int(read_timeout_seconds)} seconds."
+            except Exception as e:
+                if isinstance(e, asyncio.TimeoutError):
+                    try:
+                        fut.cancel()
+                    except Exception:
+                        pass
+                    return f"Timed out reading messages from #{target_channel.name} on '{guild.name}' after {int(read_timeout_seconds)} seconds."
+                logger.error(f"Discord read channel fallback error: {e}")
+                return f"Failed to read Discord channel: {str(e)}"
+
+        if not lines:
+            return f"No recent human messages found in #{target_channel.name} on '{guild.name}'."
+
+        return f"Recent messages in #{target_channel.name} on '{guild.name}' (most recent first):\n" + "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Discord read channel error: {e}")
+        return f"Failed to read Discord channel: {str(e)}"
+
+
+class DiscordSendChannelArgs(BaseModel):
+    channel: str = Field(
+        ...,
+        validation_alias=AliasChoices("channel", "channel_name", "name", "channel_id"),
+        description="Discord channel name (e.g., 'general') or channel ID to send message to.",
+    )
+    message: str = Field(
+        ...,
+        validation_alias=AliasChoices("message", "content", "text", "msg"),
+        description="Message content to send to the channel.",
+    )
+    server: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("server", "guild", "guild_id", "server_name"),
+        description="Optional server/guild name or ID. If not provided, uses the first available server.",
+    )
+
+
+@tool(args_schema=DiscordSendChannelArgs, description="Send a message to a Discord server channel. CALL THIS TOOL whenever the user asks to post, send, announce, or say something on Discord. The message is sent as the bot account. Parameters: channel (e.g., 'general'), message content, optional server name.")
+def discord_send_channel(channel: str, message: str, server: Optional[str] = None) -> str:
+    """
+    Send a message to a Discord channel via the bot's direct API access.
+    This works from the Web UI without needing browser automation.
+    The message is sent as the bot, not as the user's personal account.
+    """
+    # Check if Discord bot is enabled
+    if not getattr(config, "allow_discord_bot", False):
+        return "Discord bot is not enabled. To enable: set ALLOW_DISCORD_BOT=true and configure DISCORD_BOT_TOKEN, then restart the API."
+
+    # Get the bot instance
+    try:
+        from discord_bot import get_bot
+        bot = get_bot()
+    except ImportError:
+        return "Discord bot module not available."
+    
+    if bot is None or not bot.is_running():
+        return "Discord bot is not running. Make sure the bot is started and connected to Discord."
+    
+    client = getattr(bot, "client", None)
+    if client is None:
+        return "Discord bot client not available."
+
+    # Validate message
+    msg = (message or "").strip()
+    if not msg:
+        return "Message content is required."
+    
+    if len(msg) > 2000:
+        msg = msg[:1997] + "..."
+
+    try:
+        import asyncio
+        import discord
+
+        # Find the target guild (server)
+        guild = None
+        if server:
+            # Try to find by ID first
+            if server.isdigit():
+                guild = client.get_guild(int(server))
+            # Then by name
+            if guild is None:
+                guild = next((g for g in client.guilds if (g.name or "").lower() == server.lower()), None)
+        else:
+            # Use first available guild
+            guild = next(iter(client.guilds), None) if client.guilds else None
+
+        if guild is None:
+            available = [g.name for g in client.guilds] if client.guilds else []
+            if available:
+                return f"Server '{server}' not found. Available servers: {', '.join(available)}"
+            return "The bot is not connected to any Discord servers."
+
+        # Find the target channel
+        target_channel = None
+        channel_lower = (channel or "").lower().strip()
+        
+        # Remove # prefix if present
+        if channel_lower.startswith("#"):
+            channel_lower = channel_lower[1:]
+        
+        # Try to find by ID first
+        if channel.isdigit():
+            target_channel = guild.get_channel(int(channel))
+        
+        # Helper to strip emojis and special chars for fuzzy matching
+        def strip_emojis(name: str) -> str:
+            # Discord channel names may start with emojis/symbols like "💬-general".
+            # For fuzzy matching, drop leading non-alphanumeric characters and normalize separators.
+            cleaned = (name or "").lower().strip()
+            cleaned = re.sub(r"^[^a-z0-9]+", "", cleaned)
+            cleaned = re.sub(r"[-_]", " ", cleaned)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            return cleaned
+        
+        # Then by exact name match
+        if target_channel is None:
+            for ch in guild.text_channels:
+                if (ch.name or "").lower() == channel_lower:
+                    target_channel = ch
+                    break
+        
+        # Fuzzy match: channel name contains the search term
+        if target_channel is None:
+            for ch in guild.text_channels:
+                ch_name_lower = (ch.name or "").lower()
+                if channel_lower in ch_name_lower:
+                    target_channel = ch
+                    break
+        
+        # Fuzzy match: search term contains the channel name (after stripping emojis)
+        if target_channel is None:
+            for ch in guild.text_channels:
+                stripped = strip_emojis(ch.name or "")
+                if stripped and (channel_lower in stripped or stripped in channel_lower):
+                    target_channel = ch
+                    break
+        
+        # Fuzzy match: stripped channel name equals search term
+        if target_channel is None:
+            for ch in guild.text_channels:
+                stripped = strip_emojis(ch.name or "")
+                if stripped == channel_lower:
+                    target_channel = ch
+                    break
+
+        if target_channel is None:
+            available = [f"#{ch.name}" for ch in guild.text_channels]
+            return f"Channel '{channel}' not found in server '{guild.name}'. Available channels: {', '.join(available[:10])}"
+
+        if not isinstance(target_channel, discord.TextChannel):
+            return f"'{channel}' is not a text channel."
+
+        async def _send_message():
+            await target_channel.send(msg)
+            return True
+
+        # Run the coroutine on the Discord client's event loop.
+        # The agent runs in a worker thread (via run_in_executor), so we need to
+        # schedule the coroutine on the Discord client's loop using run_coroutine_threadsafe.
+        # Note: client.loop is a sentinel in discord.py 2.0+, so we use bot.get_loop() instead.
+        bot_loop = bot.get_loop() if bot else None
+        
+        if bot_loop is not None:
+            # We're in a worker thread, schedule on the bot's loop
+            import concurrent.futures
+            try:
+                fut = asyncio.run_coroutine_threadsafe(_send_message(), bot_loop)
+                fut.result(timeout=30)
+            except concurrent.futures.TimeoutError:
+                fut.cancel()
+                return f"Timed out sending message to #{target_channel.name} on '{guild.name}'."
+            except Exception as e:
+                logger.error(f"Discord send channel coroutine error: {e}")
+                err = str(e) or ""
+                if "403" in err and "Missing Permissions" in err:
+                    return (
+                        "Failed to send Discord message: 403 Forbidden (Missing Permissions). "
+                        "This happens in the Web UI too because it uses the same Discord bot API. "
+                        "Fix: in your Discord server, open #"
+                        f"{target_channel.name} -> Edit Channel -> Permissions, and ensure the bot role has: "
+                        "View Channel, Send Messages, and Read Message History. Also check role hierarchy: the bot's role must be above any roles it needs to interact with."
+                    )
+                return f"Failed to send Discord message: {err}"
+        else:
+            # Fallback: try to get the running loop
+            try:
+                loop = asyncio.get_running_loop()
+                import concurrent.futures
+                fut = asyncio.run_coroutine_threadsafe(_send_message(), loop)
+                fut.result(timeout=30)
+            except RuntimeError:
+                # No running loop, create one
+                asyncio.run(_send_message())
+            except Exception as e:
+                logger.error(f"Discord send channel fallback error: {e}")
+                err = str(e) or ""
+                if "403" in err and "Missing Permissions" in err:
+                    return (
+                        "Failed to send Discord message: 403 Forbidden (Missing Permissions). "
+                        "This happens in the Web UI too because it uses the same Discord bot API. "
+                        "Fix: in your Discord server, open #"
+                        f"{target_channel.name} -> Edit Channel -> Permissions, and ensure the bot role has: "
+                        "View Channel, Send Messages, and Read Message History. Also check role hierarchy: the bot's role must be above any roles it needs to interact with."
+                    )
+                return f"Failed to send Discord message: {err}"
+
+        return f"Message sent to #{target_channel.name} on '{guild.name}' via bot account."
+
+    except Exception as e:
+        logger.error(f"Discord send channel error: {e}")
+        return f"Failed to send message to Discord channel: {str(e)}"
+
+
+@tool(args_schema=DiscordWebReadRecentArgs, description="Read recent Discord messages from a DM or channel using Playwright browser automation. USE THIS TOOL when the user asks to read/check/view Discord messages and discord_read_channel is not available. Provide either a Discord channel/DM URL or a recipient key from saved contacts. Returns the last N messages with author and content.")
+def discord_web_read_recent(url: str = "", recipient: Optional[str] = None, limit: int = 20, headless: bool = True) -> str:
+    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_playwright", False):
+        return "System actions are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_PLAYWRIGHT=true, then restart the API."
+
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception:
+        return "Playwright is not available. Please install playwright and run 'playwright install'."
+
+    # Ensure Playwright browsers are installed
+    _ensure_playwright_browsers()
+
+    root = Path(getattr(config, "artifacts_dir", "") or "").expanduser()
+    if not str(root).strip():
+        root = Path(__file__).resolve().parents[1] / "data" / "artifacts"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    def _load_contacts() -> dict:
+        raw_json = (os.getenv("DISCORD_CONTACTS_JSON", "") or "").strip()
+        if raw_json:
+            try:
+                data = json.loads(raw_json)
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+
+        contacts_path = (os.getenv("DISCORD_CONTACTS_PATH", "") or "").strip()
+        if not contacts_path:
+            contacts_path = str(root.parent / "discord_contacts.json")
+        try:
+            p = Path(contacts_path).expanduser()
+            if not p.exists():
+                return {}
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    target = (url or "").strip().strip("\"' ")
+    if not target:
+        key = (recipient or "").strip()
+        if not key:
+            return (
+                "Missing Discord target. Provide a channel/DM url=... or set a recipient mapping via "
+                "DISCORD_CONTACTS_PATH / DISCORD_CONTACTS_JSON and call with recipient=..."
+            )
+        contacts = _load_contacts()
+        raw = contacts.get(key)
+        if raw is None:
+            raw = contacts.get(key.lower())
+        target = str(raw or "").strip()
+        if raw is None:
+            return (
+                f"Unknown Discord recipient '{key}'. Add it via discord_contacts_add(key=\"{key}\", url=\"https://discord.com/channels/...\") "
+                "or pass url=... directly."
+            )
+        if not target:
+            return (
+                f"Discord recipient '{key}' exists but has a blank URL in DISCORD_CONTACTS_PATH. "
+                f"Update it via discord_contacts_add(key=\"{key}\", url=\"https://discord.com/channels/...\")."
+            )
+
+    try:
+        limit_n = int(limit)
+    except Exception:
+        limit_n = 20
+    limit_n = max(1, min(50, limit_n))
+
+    profile_dir = Path(os.getenv("DISCORD_PLAYWRIGHT_PROFILE_DIR", str(root.parent / "discord_profile"))).expanduser()
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=bool(headless),
+            )
+            page = context.new_page()
+            page.goto(target, wait_until="domcontentloaded", timeout=60000)
+
+            try:
+                if page.locator('input[name="email"]').count() > 0 or page.locator('input[type="email"]').count() > 0:
+                    context.close()
+                    return (
+                        "Discord Web is not logged in. Re-run with headless=false, log in once in the opened browser, then retry. "
+                        f"Profile dir: {profile_dir}"
+                    )
+            except Exception:
+                pass
+
+            page.wait_for_timeout(1200)
+
+            selectors = [
+                'li[id^="chat-messages-"]',
+                'div[class*="messageListItem"]',
+                'div[class*="message"]',
+            ]
+            msg_locator = None
+            for sel in selectors:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        msg_locator = loc
+                        break
+                except Exception:
+                    continue
+
+            if msg_locator is None:
+                context.close()
+                return "No messages found (Discord UI not loaded or selectors changed)."
+
+            total = msg_locator.count()
+            if total <= 0:
+                context.close()
+                return "No messages found."
+
+            start = max(0, total - limit_n)
+            lines: list[str] = []
+            for i in range(start, total):
+                msg = msg_locator.nth(i)
+                author = ""
+                content = ""
+                timestamp = ""
+
+                for sel in ['span[class*="username"]', 'h3 span', 'strong']:
+                    try:
+                        a = (msg.locator(sel).first.inner_text(timeout=200) or "").strip()
+                        if a:
+                            author = a
+                            break
+                    except Exception:
+                        continue
+
+                try:
+                    t = msg.locator("time").first
+                    timestamp = (t.get_attribute("datetime") or "").strip()
+                except Exception:
+                    timestamp = ""
+
+                for sel in ['div[id^="message-content-"]', 'div[class*="markup"]']:
+                    try:
+                        c = (msg.locator(sel).first.inner_text(timeout=200) or "").strip()
+                        if c:
+                            content = c
+                            break
+                    except Exception:
+                        continue
+
+                if not author and not content:
+                    continue
+
+                # Just collect author and content, no timestamps
+                if author and content:
+                    lines.append(f"{author}: {content}")
+                elif content:
+                    lines.append(content)
+
+            context.close()
+
+            if not lines:
+                return "No messages found."
+            
+            # Return simple format for agent to summarize naturally
+            return "\n".join(lines[-limit_n:])
+    except Exception as e:
+        return f"Discord web read failed: {str(e)}"
+
+
+@tool(args_schema=DiscordWebSendArgs, description="Send a Discord message via Playwright (requires a logged-in browser profile).")
+def discord_web_send(url: str = "", recipient: Optional[str] = None, message: str = "", headless: bool = False) -> str:
+    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_playwright", False):
+        return "System actions are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_PLAYWRIGHT=true, then restart the API."
+
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception:
+        return "Playwright is not available. Please install playwright and run 'playwright install'."
+
+    # Ensure Playwright browsers are installed
+    _ensure_playwright_browsers()
+
+    root = Path(getattr(config, "artifacts_dir", "") or "").expanduser()
+    if not str(root).strip():
+        root = Path(__file__).resolve().parents[1] / "data" / "artifacts"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    def _load_contacts() -> dict:
+        raw_json = (os.getenv("DISCORD_CONTACTS_JSON", "") or "").strip()
+        if raw_json:
+            try:
+                data = json.loads(raw_json)
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+
+        contacts_path = (os.getenv("DISCORD_CONTACTS_PATH", "") or "").strip()
+        if not contacts_path:
+            contacts_path = str(root.parent / "discord_contacts.json")
+        try:
+            p = Path(contacts_path).expanduser()
+            if not p.exists():
+                return {}
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    target = (url or "").strip().strip("\"' ")
+    if not target:
+        key = (recipient or "").strip()
+        if not key:
+            return (
+                "Missing Discord target. Provide a channel/DM url=... or set a recipient mapping via "
+                "DISCORD_CONTACTS_PATH / DISCORD_CONTACTS_JSON and call with recipient=..."
+            )
+        contacts = _load_contacts()
+        raw = contacts.get(key)
+        if raw is None:
+            raw = contacts.get(key.lower())
+        target = str(raw or "").strip()
+        if raw is None:
+            return (
+                f"Unknown Discord recipient '{key}'. Add it via discord_contacts_add(key=\"{key}\", url=\"https://discord.com/channels/...\") "
+                "or pass url=... directly."
+            )
+        if not target:
+            return (
+                f"Discord recipient '{key}' exists but has a blank URL in DISCORD_CONTACTS_PATH. "
+                f"Update it via discord_contacts_add(key=\"{key}\", url=\"https://discord.com/channels/...\")."
+            )
+    msg = (message or "").strip()
+    if not msg:
+        return "Message is empty."
+    profile_dir = Path(os.getenv("DISCORD_PLAYWRIGHT_PROFILE_DIR", str(root.parent / "discord_profile"))).expanduser()
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=bool(headless),
+            )
+            page = context.new_page()
+            page.goto(target, wait_until="domcontentloaded", timeout=60000)
+
+            try:
+                if page.locator('input[name="email"]').count() > 0 or page.locator('input[type="email"]').count() > 0:
+                    context.close()
+                    return (
+                        "Discord Web is not logged in. Re-run with headless=false, log in once in the opened browser, then retry. "
+                        f"Profile dir: {profile_dir}"
+                    )
+            except Exception:
+                pass
+
+            page.wait_for_timeout(750)
+            box = page.locator('div[role="textbox"][contenteditable="true"][aria-label*="Message"]')
+            if box.count() <= 0:
+                box = page.locator('div[role="textbox"][contenteditable="true"]')
+            if box.count() <= 0:
+                box = page.locator('div[role="textbox"]')
+            box = box.first
+            box.wait_for(timeout=45000)
+            box.scroll_into_view_if_needed()
+            box.click(force=True)
+            page.wait_for_timeout(100)
+            try:
+                box.press("Control+A")
+                box.press("Backspace")
+            except Exception:
+                try:
+                    page.keyboard.press("Control+A")
+                    page.keyboard.press("Backspace")
+                except Exception:
+                    pass
+            try:
+                page.evaluate(
+                    """(el) => {
+                      try {
+                        if (!el) return;
+                        el.focus();
+                        el.textContent = '';
+                      } catch (e) {}
+                    }""",
+                    box,
+                )
+            except Exception:
+                pass
+            page.wait_for_timeout(100)
+            box.type(msg, delay=15)
+            page.wait_for_timeout(100)
+            page.keyboard.press("Enter")
+            context.close()
+            return f"Sent Discord message ({len(msg)} chars) via Playwright."
+    except Exception as e:
+        return f"Discord web send failed: {str(e)}"
 
 
 @tool(args_schema=TakeScreenshotArgs, description="Take a screenshot and save it to disk.")
@@ -2355,6 +3317,852 @@ def open_chrome(url: Optional[str] = None) -> str:
         return f"Failed to open Google Chrome: {str(e)}"
 
 
+# Tool metadata for capabilities panel and safety UI
+# risk_level: "safe" (read-only), "moderate" (writes/changes), "destructive" (deletes/irreversible)
+# requires_confirmation: True for action tools that need user approval
+# policy_flags: env flags required to enable this tool (for action tools)
+# ============================================================================
+# EMAIL TOOLS (v5.4.0 — IMAP / SMTP)
+# ============================================================================
+
+class EmailReadInboxArgs(BaseModel):
+    count: int = Field(default=10, ge=1, le=50, description="Number of most recent emails to return")
+    unread_only: bool = Field(default=False, description="If true, only return unread emails")
+
+
+class EmailSearchArgs(BaseModel):
+    query: str = Field(..., description="Search term to look for in emails (sender, subject, or body)")
+    folder: str = Field(default="INBOX", description="Mail folder to search")
+    count: int = Field(default=10, ge=1, le=50, description="Max results")
+
+
+class EmailGetThreadArgs(BaseModel):
+    message_id: str = Field(..., description="Message-ID to fetch the full thread for")
+
+
+class EmailSendArgs(BaseModel):
+    to: str = Field(..., description="Recipient email address")
+    subject: str = Field(..., description="Email subject line")
+    body: str = Field(..., description="Email body text")
+
+
+class EmailReplyArgs(BaseModel):
+    message_id: str = Field(..., description="Message-ID or UID of the email to reply to")
+    body: str = Field(..., description="Reply body text")
+
+
+def _retry_email(max_retries: int = 3, base_delay: float = 1.0):
+    """Decorator that retries email operations with exponential backoff."""
+    import functools
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (ConnectionError, TimeoutError, OSError) as exc:
+                    last_exc = exc
+                    if attempt < max_retries:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(f"Email retry {attempt + 1}/{max_retries} for {func.__name__}: {exc} (wait {delay}s)")
+                        time.sleep(delay)
+                except Exception as exc:
+                    # Check for IMAP/SMTP specific transient errors
+                    exc_str = str(type(exc).__name__).lower()
+                    if any(k in exc_str for k in ("imap", "smtp", "connection", "timeout")):
+                        last_exc = exc
+                        if attempt < max_retries:
+                            delay = base_delay * (2 ** attempt)
+                            logger.warning(f"Email retry {attempt + 1}/{max_retries} for {func.__name__}: {exc} (wait {delay}s)")
+                            time.sleep(delay)
+                    else:
+                        raise
+            raise last_exc  # type: ignore[misc]  # always set after loop
+        return wrapper
+    return decorator
+
+
+@_retry_email(max_retries=3, base_delay=1.0)
+def _get_imap_connection():
+    """Connect to IMAP server using config credentials (with automatic retry)."""
+    import imaplib
+    host = getattr(config, "email_imap_host", "imap.gmail.com")
+    port = int(getattr(config, "email_imap_port", 993))
+    username = getattr(config, "email_username", "")
+    password = getattr(config, "email_password", "")
+    if not username or not password:
+        raise ValueError("EMAIL_USERNAME and EMAIL_PASSWORD must be set")
+    use_tls = getattr(config, "email_use_tls", True)
+    if use_tls:
+        conn = imaplib.IMAP4_SSL(host, port)
+    else:
+        conn = imaplib.IMAP4(host, port)
+    conn.login(username, password)
+    return conn
+
+
+def _parse_email_message(raw_msg_bytes):
+    """Parse raw email bytes into a summary dict."""
+    import email
+    from email.header import decode_header
+    msg = email.message_from_bytes(raw_msg_bytes)
+
+    def _decode_hdr(hdr):
+        parts = decode_header(hdr or "")
+        result = []
+        for part, charset in parts:
+            if isinstance(part, bytes):
+                result.append(part.decode(charset or "utf-8", errors="replace"))
+            else:
+                result.append(str(part))
+        return " ".join(result)
+
+    subject = _decode_hdr(msg.get("Subject", ""))
+    sender = _decode_hdr(msg.get("From", ""))
+    date_str = msg.get("Date", "")
+    message_id = msg.get("Message-ID", "")
+    in_reply_to = msg.get("In-Reply-To", "")
+
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            if ctype == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    body = payload.decode("utf-8", errors="replace")
+                    break
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            body = payload.decode("utf-8", errors="replace")
+
+    # Truncate long bodies
+    if len(body) > 1500:
+        body = body[:1500] + "..."
+
+    return {
+        "subject": subject,
+        "from": sender,
+        "date": date_str,
+        "message_id": message_id,
+        "in_reply_to": in_reply_to,
+        "body_preview": body.strip(),
+    }
+
+
+@tool(args_schema=EmailReadInboxArgs, description="Read recent emails from your inbox. Returns subject, sender, date, and a body preview for each email.")
+def email_read_inbox(count: int = 10, unread_only: bool = False) -> str:
+    """Read recent emails from the inbox."""
+    if not getattr(config, "allow_email", False):
+        return "Email integration is not enabled. Set ALLOW_EMAIL=true and configure EMAIL_* settings."
+    try:
+        conn = _get_imap_connection()
+        conn.select("INBOX")
+        search_criteria = "UNSEEN" if unread_only else "ALL"
+        _, data = conn.search(None, search_criteria)
+        msg_ids = data[0].split()
+        if not msg_ids:
+            return "No emails found." if not unread_only else "No unread emails."
+        # Get most recent N
+        recent_ids = msg_ids[-count:]
+        recent_ids.reverse()
+        results = []
+        for mid in recent_ids:
+            _, raw = conn.fetch(mid, "(RFC822)")
+            if raw and raw[0] and isinstance(raw[0], tuple):
+                parsed = _parse_email_message(raw[0][1])
+                results.append(parsed)
+        conn.close()
+        conn.logout()
+        if not results:
+            return "No emails found."
+        lines = []
+        for i, e in enumerate(results, 1):
+            lines.append(f"--- Email {i} ---")
+            lines.append(f"From: {e['from']}")
+            lines.append(f"Subject: {e['subject']}")
+            lines.append(f"Date: {e['date']}")
+            lines.append(f"ID: {e['message_id']}")
+            lines.append(f"Preview: {e['body_preview'][:300]}")
+            lines.append("")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Email read failed: {exc}"
+
+
+@tool(args_schema=EmailSearchArgs, description="Search emails by keyword in sender, subject, or body.")
+def email_search(query: str, folder: str = "INBOX", count: int = 10) -> str:
+    """Search emails by keyword."""
+    if not getattr(config, "allow_email", False):
+        return "Email integration is not enabled. Set ALLOW_EMAIL=true."
+    try:
+        conn = _get_imap_connection()
+        conn.select(folder)
+        # IMAP search — OR across subject, from, body
+        _, data = conn.search(None, f'(OR OR SUBJECT "{query}" FROM "{query}" BODY "{query}")')
+        msg_ids = data[0].split()
+        if not msg_ids:
+            conn.close()
+            conn.logout()
+            return f"No emails matching '{query}' found."
+        recent_ids = msg_ids[-count:]
+        recent_ids.reverse()
+        results = []
+        for mid in recent_ids:
+            _, raw = conn.fetch(mid, "(RFC822)")
+            if raw and raw[0] and isinstance(raw[0], tuple):
+                parsed = _parse_email_message(raw[0][1])
+                results.append(parsed)
+        conn.close()
+        conn.logout()
+        lines = [f"Found {len(results)} email(s) matching '{query}':"]
+        for i, e in enumerate(results, 1):
+            lines.append(f"{i}. {e['from']} — {e['subject']} ({e['date']})")
+            lines.append(f"   ID: {e['message_id']}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Email search failed: {exc}"
+
+
+@tool(args_schema=EmailGetThreadArgs, description="Get the full email thread by Message-ID.")
+def email_get_thread(message_id: str) -> str:
+    """Get full email thread."""
+    if not getattr(config, "allow_email", False):
+        return "Email integration is not enabled."
+    try:
+        conn = _get_imap_connection()
+        conn.select("INBOX")
+        # Search for the specific message and any replies
+        _, data = conn.search(None, f'(OR HEADER Message-ID "{message_id}" HEADER In-Reply-To "{message_id}")')
+        msg_ids = data[0].split()
+        if not msg_ids:
+            conn.close()
+            conn.logout()
+            return f"No emails found for thread {message_id}"
+        results = []
+        for mid in msg_ids:
+            _, raw = conn.fetch(mid, "(RFC822)")
+            if raw and raw[0] and isinstance(raw[0], tuple):
+                parsed = _parse_email_message(raw[0][1])
+                results.append(parsed)
+        conn.close()
+        conn.logout()
+        lines = [f"Thread ({len(results)} message(s)):"]
+        for e in results:
+            lines.append(f"\n--- {e['from']} ({e['date']}) ---")
+            lines.append(f"Subject: {e['subject']}")
+            lines.append(e['body_preview'])
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Email get_thread failed: {exc}"
+
+
+@tool(args_schema=EmailSendArgs, description="Send a new email. Requires recipient, subject, and body.")
+def email_send(to: str, subject: str, body: str) -> str:
+    """Send a new email via SMTP."""
+    if not getattr(config, "allow_email", False):
+        return "Email integration is not enabled."
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+
+        host = getattr(config, "email_smtp_host", "smtp.gmail.com")
+        port = int(getattr(config, "email_smtp_port", 587))
+        username = getattr(config, "email_username", "")
+        password = getattr(config, "email_password", "")
+
+        msg = MIMEMultipart()
+        msg["From"] = username
+        msg["To"] = to
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP(host, port) as server:
+            server.ehlo()
+            if getattr(config, "email_use_tls", True):
+                server.starttls()
+            server.login(username, password)
+            server.send_message(msg)
+
+        return f"Email sent to {to}: '{subject}'"
+    except Exception as exc:
+        return f"Email send failed: {exc}"
+
+
+@tool(args_schema=EmailReplyArgs, description="Reply to an email by its Message-ID.")
+def email_reply(message_id: str, body: str) -> str:
+    """Reply to an existing email."""
+    if not getattr(config, "allow_email", False):
+        return "Email integration is not enabled."
+    try:
+        # First, fetch the original message to get sender and subject
+        conn = _get_imap_connection()
+        conn.select("INBOX")
+        _, data = conn.search(None, f'(HEADER Message-ID "{message_id}")')
+        msg_ids = data[0].split()
+        if not msg_ids:
+            conn.close()
+            conn.logout()
+            return f"Original email {message_id} not found."
+        _, raw = conn.fetch(msg_ids[0], "(RFC822)")
+        original = _parse_email_message(raw[0][1])
+        conn.close()
+        conn.logout()
+
+        # Now send the reply via SMTP
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+
+        host = getattr(config, "email_smtp_host", "smtp.gmail.com")
+        port = int(getattr(config, "email_smtp_port", 587))
+        username = getattr(config, "email_username", "")
+        password = getattr(config, "email_password", "")
+
+        reply_to = original.get("from", "")
+        subject = original.get("subject", "")
+        if not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
+
+        msg = MIMEMultipart()
+        msg["From"] = username
+        msg["To"] = reply_to
+        msg["Subject"] = subject
+        msg["In-Reply-To"] = message_id
+        msg["References"] = message_id
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP(host, port) as server:
+            server.ehlo()
+            if getattr(config, "email_use_tls", True):
+                server.starttls()
+            server.login(username, password)
+            server.send_message(msg)
+
+        return f"Reply sent to {reply_to}: '{subject}'"
+    except Exception as exc:
+        return f"Email reply failed: {exc}"
+
+
+class ProjectUpdateContextArgs(BaseModel):
+    limit: int = Field(default=5, ge=1, le=10, description="How many recent commits to summarize")
+
+
+@tool(args_schema=ProjectUpdateContextArgs, description="Read a grounded, public-safe summary of recent EchoSpeak project updates.")
+def project_update_context(limit: int = 5) -> str:
+    try:
+        from agent.update_context import get_update_context_service
+
+        block = get_update_context_service().build_context_block(
+            limit=max(1, min(int(limit or 5), 10)),
+            public=True,
+            include_diff=False,
+            heading="Grounded EchoSpeak project updates",
+        )
+        return block or "No recent grounded project updates were found."
+    except Exception as exc:
+        return f"Failed to read project updates: {exc}"
+
+
+class TodoManageArgs(BaseModel):
+    action: str = Field(..., description="Action: 'list', 'add', 'update', 'delete'")
+    title: str = Field(default="", description="Title for add/update")
+    description: str = Field(default="", description="Description for add/update")
+    todo_id: str = Field(default="", description="ID of todo for update/delete")
+    status: str = Field(default="pending", description="Status: 'pending', 'in_progress', 'done'")
+    priority: str = Field(default="medium", description="Priority: 'low', 'medium', 'high'")
+
+
+@tool(args_schema=TodoManageArgs, description="Manage the shared todo list. Actions: list (show all), add (create new), update (change status/title/description), delete (remove by id).")
+def todo_manage(action: str, title: str = "", description: str = "", todo_id: str = "", status: str = "pending", priority: str = "medium") -> str:
+    """Manage the shared todo list that is visible in the Web UI."""
+    import json as _json
+    import uuid as _uuid
+    from datetime import datetime as _dt
+    from pathlib import Path as _Path
+
+    todo_file = _Path(__file__).parent.parent / "data" / "todos.json"
+
+    def _load() -> list:
+        if todo_file.exists():
+            try:
+                return _json.loads(todo_file.read_text(encoding="utf-8"))
+            except Exception:
+                return []
+        return []
+
+    def _save(items: list) -> None:
+        todo_file.parent.mkdir(parents=True, exist_ok=True)
+        todo_file.write_text(_json.dumps(items, indent=2, default=str), encoding="utf-8")
+
+    action = (action or "list").lower().strip()
+
+    if action == "list":
+        todos = _load()
+        if not todos:
+            return "Todo list is empty."
+        lines = []
+        for t in todos:
+            mark = "✅" if t.get("status") == "done" else "🔄" if t.get("status") == "in_progress" else "⬜"
+            pri = t.get("priority", "medium")
+            lines.append(f"{mark} [{pri.upper()}] {t.get('title', '?')} (id: {t.get('id', '?')}, status: {t.get('status', '?')})")
+            if t.get("description"):
+                lines.append(f"   {t['description']}")
+        return "\n".join(lines)
+
+    elif action == "add":
+        if not title:
+            return "Error: 'title' is required to add a todo."
+        todos = _load()
+        now = _dt.utcnow().isoformat()
+        entry = {
+            "id": str(_uuid.uuid4())[:8],
+            "title": title,
+            "description": description,
+            "status": status,
+            "priority": priority,
+            "created_at": now,
+            "updated_at": now,
+        }
+        todos.append(entry)
+        _save(todos)
+        return f"Added todo '{title}' (id: {entry['id']}, priority: {priority}, status: {status})"
+
+    elif action == "update":
+        if not todo_id:
+            return "Error: 'todo_id' is required to update a todo."
+        todos = _load()
+        for t in todos:
+            if t.get("id") == todo_id:
+                if title:
+                    t["title"] = title
+                if description:
+                    t["description"] = description
+                t["status"] = status
+                t["priority"] = priority
+                t["updated_at"] = _dt.utcnow().isoformat()
+                _save(todos)
+                return f"Updated todo '{t['title']}' (id: {todo_id}) -> status: {status}, priority: {priority}"
+        return f"Error: Todo with id '{todo_id}' not found."
+
+    elif action == "delete":
+        if not todo_id:
+            return "Error: 'todo_id' is required to delete a todo."
+        todos = _load()
+        filtered = [t for t in todos if t.get("id") != todo_id]
+        if len(filtered) == len(todos):
+            return f"Error: Todo with id '{todo_id}' not found."
+        _save(filtered)
+        return f"Deleted todo with id '{todo_id}'."
+
+    return f"Unknown action '{action}'. Use: list, add, update, delete."
+
+
+TOOL_METADATA: Dict[str, Dict[str, Any]] = {
+    # Read-only / safe tools
+    "web_search": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "get_system_time": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "calculate": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "project_update_context": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "todo_manage": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "youtube_transcript": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "desktop_list_windows": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_DESKTOP_AUTOMATION"]},
+    "desktop_find_control": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_DESKTOP_AUTOMATION"]},
+    "file_list": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "file_read": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "system_info": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "analyze_screen": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+     "vision_qa": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+     "take_screenshot": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+     "discord_read_channel": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": ["ALLOW_DISCORD_BOT"]},
+     "discord_send_channel": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ALLOW_DISCORD_BOT"]},
+     "discord_web_read_recent": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_PLAYWRIGHT"]},
+     # Email tools (v5.4.0)
+     "email_read_inbox": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": ["ALLOW_EMAIL"]},
+     "email_search": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": ["ALLOW_EMAIL"]},
+    "email_get_thread": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": ["ALLOW_EMAIL"]},
+    "email_send": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ALLOW_EMAIL"]},
+    "email_reply": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ALLOW_EMAIL"]},
+    # Moderate risk tools (write/create)
+    "browse_task": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_PLAYWRIGHT"]},
+    "file_write": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_FILE_WRITE"]},
+    "file_move": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_FILE_WRITE"]},
+    "file_copy": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_FILE_WRITE"]},
+    "file_mkdir": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_FILE_WRITE"]},
+    "artifact_write": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_FILE_WRITE"]},
+    "notepad_write": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_OPEN_APPLICATION", "ALLOW_DESKTOP_AUTOMATION", "ALLOW_FILE_WRITE"]},
+    "open_chrome": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_OPEN_CHROME"]},
+    "open_application": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_OPEN_APPLICATION"]},
+    "desktop_click": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_DESKTOP_AUTOMATION"]},
+    "desktop_type_text": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_DESKTOP_AUTOMATION"]},
+    "desktop_activate_window": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_DESKTOP_AUTOMATION"]},
+    "desktop_send_hotkey": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_DESKTOP_AUTOMATION"]},
+    "discord_web_send": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_PLAYWRIGHT"]},
+    "discord_contacts_add": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_PLAYWRIGHT"]},
+    "discord_contacts_discover": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_PLAYWRIGHT"]},
+    # Destructive risk tools (delete/terminal)
+    "file_delete": {"risk_level": "destructive", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_FILE_WRITE"]},
+    "terminal_run": {"risk_level": "destructive", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_TERMINAL_COMMANDS"]},
+    # Self-modification tools
+    "self_edit": {"risk_level": "destructive", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_SELF_MODIFICATION"]},
+    "self_rollback": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_SELF_MODIFICATION"]},
+    "self_git_status": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_SELF_MODIFICATION"]},
+    "self_read": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_SELF_MODIFICATION"]},
+    "self_grep": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_SELF_MODIFICATION"]},
+    "self_list": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_SELF_MODIFICATION"]},
+}
+
+
+# ============================================================================
+# SELF-MODIFICATION TOOLS
+# ============================================================================
+
+PROJECT_ROOT = Path(__file__).parent.parent.parent  # apps/backend -> apps -> project root
+
+
+class SelfEditArgs(BaseModel):
+    file_path: str = Field(..., description="Relative path from project root, e.g., 'apps/backend/agent/core.py'")
+    old_content: str = Field(..., description="Exact content to replace (must match exactly)")
+    new_content: str = Field(..., description="New content to write")
+    commit_message: str = Field(default="self_edit: automated change", description="Git commit message for rollback")
+
+
+class SelfRollbackArgs(BaseModel):
+    steps: int = Field(default=1, ge=1, le=10, description="Number of commits to roll back")
+
+
+@tool(args_schema=SelfEditArgs, description="Edit EchoSpeak's own code with automatic git commit for rollback. USE WITH CAUTION.")
+def self_edit(file_path: str, old_content: str, new_content: str, commit_message: str = "self_edit: automated change") -> str:
+    """
+    Edit a file in EchoSpeak's codebase with automatic git commit.
+    This allows the agent to modify itself with rollback capability.
+    
+    Safety:
+    - Creates a git commit before each change
+    - Only works if ALLOW_SELF_MODIFICATION is enabled
+    - File must be within project root
+    """
+    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_self_modification", False):
+        return "Self-modification is disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_SELF_MODIFICATION=true"
+    
+    # Resolve and validate path
+    target = (PROJECT_ROOT / file_path).resolve()
+    try:
+        target.relative_to(PROJECT_ROOT)
+    except ValueError:
+        return f"Path must be within project root. Got: {file_path}"
+    
+    if not target.exists():
+        return f"File not found: {file_path}"
+    
+    # Read current content
+    try:
+        current = target.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Failed to read file: {str(e)}"
+    
+    # Verify old_content matches
+    if old_content not in current:
+        # Show a snippet to help debug
+        snippet = current[:500] if len(current) > 500 else current
+        return f"old_content not found in file. File starts with:\n{snippet}"
+    
+    # Create git commit for rollback
+    try:
+        # Check if file is tracked
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", str(target)],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            # File not tracked, add it
+            subprocess.run(["git", "add", str(target)], cwd=PROJECT_ROOT, check=True)
+        
+        # Commit current state
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", f"[self_edit backup] {commit_message}"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            check=True
+        )
+    except subprocess.CalledProcessError as e:
+        return f"Failed to create backup commit: {e.stderr or str(e)}"
+    except Exception as e:
+        return f"Git error: {str(e)}"
+    
+    # Apply the edit
+    try:
+        new_text = current.replace(old_content, new_content, 1)
+        target.write_text(new_text, encoding="utf-8")
+    except Exception as e:
+        return f"Failed to write file: {str(e)}"
+    
+    return f"Edited {file_path}. Backup commit created. Use self_rollback to undo if needed."
+
+
+@tool(args_schema=SelfRollbackArgs, description="Roll back recent self-modification commits. Restores previous code state.")
+def self_rollback(steps: int = 1) -> str:
+    """
+    Roll back the last N commits made by self_edit.
+    This restores the codebase to a previous state.
+    
+    Args:
+        steps: Number of commits to roll back (1-10)
+    """
+    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_self_modification", False):
+        return "Self-modification is disabled."
+    
+    try:
+        # Get list of recent commits
+        result = subprocess.run(
+            ["git", "log", "--oneline", "-n", str(steps + 1)],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        commits = result.stdout.strip().split("\n")
+        
+        if len(commits) <= steps:
+            return f"Not enough commits to roll back {steps} steps."
+        
+        # Perform rollback (keep changes in working dir, don't commit)
+        result = subprocess.run(
+            ["git", "reset", "--hard", f"HEAD~{steps}"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        return f"Rolled back {steps} commit(s). Code restored to previous state. Restart server to apply."
+    except subprocess.CalledProcessError as e:
+        return f"Git rollback failed: {e.stderr or str(e)}"
+    except Exception as e:
+        return f"Rollback error: {str(e)}"
+
+
+@tool(description="Show git status and recent commits for self-modification tracking.")
+def self_git_status() -> str:
+    """
+    Show git status and recent commits.
+    Useful for seeing what changes have been made and can be rolled back.
+    """
+    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_self_modification", False):
+        return "Self-modification is disabled."
+    
+    try:
+        # Get status
+        status_result = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        # Get recent commits
+        log_result = subprocess.run(
+            ["git", "log", "--oneline", "-n", "10"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        return f"=== Git Status ===\n{status_result.stdout}\n=== Recent Commits ===\n{log_result.stdout}"
+    except subprocess.CalledProcessError as e:
+        return f"Git error: {e.stderr or str(e)}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+class SelfReadArgs(BaseModel):
+    file_path: str = Field(..., description="Relative path from project root, e.g., 'apps/backend/agent/core.py'")
+    start_line: int = Field(default=1, ge=1, description="Start line number (1-indexed)")
+    end_line: int = Field(default=100, ge=1, description="End line number (1-indexed)")
+
+
+class SelfGrepArgs(BaseModel):
+    pattern: str = Field(..., description="Search pattern (regex supported)")
+    path: str = Field(default="", description="Relative path to search in (empty = whole project)")
+
+
+class SelfListArgs(BaseModel):
+    path: str = Field(default="", description="Relative path to list (empty = project root)")
+
+
+@tool(args_schema=SelfReadArgs, description="Read a file from EchoSpeak's own codebase. Use this to understand code before editing.")
+def self_read(file_path: str, start_line: int = 1, end_line: int = 100) -> str:
+    """
+    Read a file from EchoSpeak's codebase.
+    Useful for understanding code before making edits.
+    """
+    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_self_modification", False):
+        return "Self-modification is disabled."
+    
+    target = (PROJECT_ROOT / file_path).resolve()
+    try:
+        target.relative_to(PROJECT_ROOT)
+    except ValueError:
+        return f"Path must be within project root. Got: {file_path}"
+    
+    if not target.exists():
+        return f"File not found: {file_path}"
+    
+    if not target.is_file():
+        return f"Not a file: {file_path}"
+    
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines()
+        total_lines = len(lines)
+        
+        # Clamp line numbers
+        start = max(1, start_line)
+        end = min(total_lines, end_line)
+        
+        if start > total_lines:
+            return f"File has {total_lines} lines. Start line {start_line} is out of range."
+        
+        # Format with line numbers
+        result_lines = []
+        for i in range(start - 1, end):
+            result_lines.append(f"{i+1:4d}: {lines[i]}")
+        
+        header = f"=== {file_path} (lines {start}-{end} of {total_lines}) ===\n"
+        return header + "\n".join(result_lines)
+    except Exception as e:
+        return f"Failed to read file: {str(e)}"
+
+
+@tool(args_schema=SelfGrepArgs, description="Search for patterns in EchoSpeak's codebase. Use this to find code before editing.")
+def self_grep(pattern: str, path: str = "") -> str:
+    """
+    Search for a pattern in EchoSpeak's codebase.
+    Useful for finding code locations before making edits.
+    """
+    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_self_modification", False):
+        return "Self-modification is disabled."
+    
+    search_path = (PROJECT_ROOT / path).resolve() if path else PROJECT_ROOT
+    try:
+        search_path.relative_to(PROJECT_ROOT)
+    except ValueError:
+        return f"Path must be within project root. Got: {path}"
+    
+    if not search_path.exists():
+        return f"Path not found: {path or 'project root'}"
+    
+    try:
+        # Use ripgrep if available, fallback to grep
+        result = subprocess.run(
+            ["rg", "-n", "--no-heading", "-C", "2", pattern, str(search_path)],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            lines = result.stdout.strip().split("\n")
+            # Limit output
+            if len(lines) > 50:
+                return f"Found {len(lines)} matches (showing first 50):\n" + "\n".join(lines[:50]) + f"\n... ({len(lines) - 50} more)"
+            return f"Found {len(lines)} matches:\n" + result.stdout
+        elif result.returncode == 1:
+            return f"No matches found for pattern: {pattern}"
+        else:
+            # Fallback to Python grep
+            import re as regex
+            matches = []
+            for py_file in search_path.rglob("*.py"):
+                try:
+                    for i, line in enumerate(py_file.read_text(encoding="utf-8").splitlines(), 1):
+                        if regex.search(pattern, line):
+                            rel_path = py_file.relative_to(PROJECT_ROOT)
+                            matches.append(f"{rel_path}:{i}: {line.strip()}")
+                            if len(matches) >= 50:
+                                break
+                except:
+                    continue
+                if len(matches) >= 50:
+                    break
+            
+            if matches:
+                return f"Found {len(matches)} matches:\n" + "\n".join(matches)
+            return f"No matches found for pattern: {pattern}"
+    except subprocess.TimeoutExpired:
+        return "Search timed out. Try a more specific path or pattern."
+    except FileNotFoundError:
+        # rg not found, use Python fallback
+        import re as regex
+        matches = []
+        for py_file in search_path.rglob("*.py"):
+            try:
+                for i, line in enumerate(py_file.read_text(encoding="utf-8").splitlines(), 1):
+                    if regex.search(pattern, line):
+                        rel_path = py_file.relative_to(PROJECT_ROOT)
+                        matches.append(f"{rel_path}:{i}: {line.strip()}")
+                        if len(matches) >= 50:
+                            break
+            except:
+                continue
+            if len(matches) >= 50:
+                break
+        
+        if matches:
+            return f"Found {len(matches)} matches:\n" + "\n".join(matches)
+        return f"No matches found for pattern: {pattern}"
+    except Exception as e:
+        return f"Search error: {str(e)}"
+
+
+@tool(args_schema=SelfListArgs, description="List files in EchoSpeak's codebase. Use this to explore the project structure.")
+def self_list(path: str = "") -> str:
+    """
+    List files and directories in EchoSpeak's codebase.
+    Useful for exploring project structure.
+    """
+    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_self_modification", False):
+        return "Self-modification is disabled."
+    
+    list_path = (PROJECT_ROOT / path).resolve() if path else PROJECT_ROOT
+    try:
+        list_path.relative_to(PROJECT_ROOT)
+    except ValueError:
+        return f"Path must be within project root. Got: {path}"
+    
+    if not list_path.exists():
+        return f"Path not found: {path or 'project root'}"
+    
+    if not list_path.is_dir():
+        return f"Not a directory: {path}"
+    
+    try:
+        items = sorted(list_path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+        lines = []
+        for item in items:
+            # Skip hidden and common ignore patterns
+            if item.name.startswith(".") or item.name in ["__pycache__", "node_modules", ".git", ".venv", "venv", "*.pyc"]:
+                continue
+            if item.is_dir():
+                lines.append(f"📁 {item.name}/")
+            else:
+                size = item.stat().st_size
+                size_str = f"{size}B" if size < 1024 else f"{size//1024}KB"
+                lines.append(f"📄 {item.name} ({size_str})")
+        
+        header = f"=== {path or 'project root'} ({len(lines)} items) ===\n"
+        return header + "\n".join(lines) if lines else f"Empty directory: {path or 'project root'}"
+    except Exception as e:
+        return f"Failed to list directory: {str(e)}"
+
+
 def get_available_tools() -> list:
     """
     Get list of available tools based on dependencies.
@@ -2363,12 +4171,18 @@ def get_available_tools() -> list:
         List of tool functions.
     """
     tools = [
-        live_web_search,
         web_search,
         get_system_time,
         calculate,
+        project_update_context,
         youtube_transcript,
         browse_task,
+        discord_contacts_add,
+        discord_contacts_discover,
+        discord_read_channel,  # Bot-based channel reader (works from Web UI)
+        discord_send_channel,  # Bot-based channel sender (works from Web UI)
+        discord_web_read_recent,
+        discord_web_send,
         desktop_list_windows,
         desktop_find_control,
         desktop_click,
@@ -2386,6 +4200,19 @@ def get_available_tools() -> list:
         notepad_write,
         terminal_run,
         system_info,
+        # Self-modification tools
+        self_edit,
+        self_rollback,
+        self_git_status,
+        self_read,
+        self_grep,
+        self_list,
+        # Email tools (v5.4.0)
+        email_read_inbox,
+        email_search,
+        email_get_thread,
+        email_send,
+        email_reply,
     ]
 
     tools.append(open_chrome)

@@ -1,0 +1,9 @@
+{
+    "name": "A2A Agents",
+    "description": "Agent-to-Agent protocol tools — discover remote agents and delegate tasks to them.",
+    "prompt_file": "SKILL.md",
+    "tools": [
+        "a2a_discover",
+        "a2a_delegate"
+    ]
+}

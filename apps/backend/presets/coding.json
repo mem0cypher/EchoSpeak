@@ -1,0 +1,13 @@
+{
+  "name": "Coding Assistant",
+  "description": "Terminal, files, web tools - technical personality",
+  "skills": ["restart"],
+  "soul_style": "technical",
+  "env": {
+    "ENABLE_SYSTEM_ACTIONS": "true",
+    "ALLOW_FILE_WRITE": "true",
+    "ALLOW_TERMINAL_COMMANDS": "true",
+    "ALLOW_PLAYWRIGHT": "false",
+    "ALLOW_DESKTOP_AUTOMATION": "false"
+  }
+}

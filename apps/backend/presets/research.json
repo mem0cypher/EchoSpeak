@@ -1,0 +1,12 @@
+{
+  "name": "Research Assistant",
+  "description": "Search, browse, documents - analytical personality",
+  "skills": ["restart"],
+  "soul_style": "analytical",
+  "env": {
+    "ENABLE_SYSTEM_ACTIONS": "true",
+    "ALLOW_FILE_WRITE": "false",
+    "ALLOW_TERMINAL_COMMANDS": "false",
+    "ALLOW_PLAYWRIGHT": "true"
+  }
+}

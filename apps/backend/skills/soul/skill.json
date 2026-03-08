@@ -1,0 +1,7 @@
+{
+  "name": "Soul Management",
+  "description": "Manage and discuss the agent's personality configuration",
+  "version": "1.0.0",
+  "prompt_file": "SKILL.md",
+  "tools": ["file_read", "file_write"]
+}

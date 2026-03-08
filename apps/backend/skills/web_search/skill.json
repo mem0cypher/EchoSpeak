@@ -1,0 +1,9 @@
+{
+  "name": "Web Search",
+  "description": "Search the web for information. Handle multi-part queries with multiple searches. Do follow-up searches when results are incomplete. Use system time for news/sports context.",
+  "prompt_file": "SKILL.md",
+  "tools": [
+    "web_search",
+    "get_system_time"
+  ]
+}

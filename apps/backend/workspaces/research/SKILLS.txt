@@ -1,0 +1,4 @@
+# Skills loaded in research workspace
+web_search
+system_monitor
+daily_briefing

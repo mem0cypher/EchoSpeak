@@ -1,0 +1,12 @@
+{
+    "name": "Smart Home",
+    "description": "Home Assistant integration — control lights, switches, sensors, and scenes via the HA REST API.",
+    "prompt_file": "SKILL.md",
+    "tools": [
+        "ha_list_entities",
+        "ha_get_state",
+        "ha_turn_on",
+        "ha_turn_off",
+        "ha_call_service"
+    ]
+}

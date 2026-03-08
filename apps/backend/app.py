@@ -7,9 +7,31 @@ Supports multiple LLM providers: OpenAI, Ollama, LM Studio, LocalAI, llama.cpp, 
 import os
 import sys
 import argparse
+import subprocess
+from pathlib import Path
 from loguru import logger
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+
+def ensure_playwright_browsers():
+    """Ensure Playwright browsers are installed."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            # This will fail if browsers aren't installed
+            p.chromium.executable_path
+    except Exception:
+        logger.info("Playwright browsers not found, installing...")
+        try:
+            venv_python = Path(__file__).parent / ".venv" / "bin" / "python"
+            if venv_python.exists():
+                subprocess.run([str(venv_python), "-m", "playwright", "install", "chromium"], check=True)
+            else:
+                subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+            logger.info("Playwright browsers installed successfully")
+        except Exception as e:
+            logger.warning(f"Failed to auto-install Playwright browsers: {e}")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -205,19 +227,21 @@ def main():
 
     logger.info(f"Starting Echo Speak")
 
-    if args.provider:
-        provider = ModelProvider(args.provider)
-        show_provider_info(provider)
-        agent = create_agent(provider=provider)
-    else:
-        if config.use_local_models:
-            agent = create_agent(provider=config.local.provider)
-        else:
-            agent = create_agent()
+    # Ensure Playwright browsers are installed for Discord/tools
+    ensure_playwright_browsers()
 
     if args.mode == "api":
         run_api_mode(args.host, args.port)
     else:
+        if args.provider:
+            provider = ModelProvider(args.provider)
+            show_provider_info(provider)
+            agent = create_agent(provider=provider)
+        else:
+            if config.use_local_models:
+                agent = create_agent(provider=config.local.provider)
+            else:
+                agent = create_agent()
         run_text_mode(agent)
 
 

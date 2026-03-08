@@ -1,0 +1,14 @@
+{
+  "name": "Discord Desktop",
+  "description": "Control Discord desktop app via Windows UI automation. Send messages, navigate channels, and interact with Discord without webhooks.",
+  "prompt_file": "SKILL.md",
+  "tools": [
+    "desktop_activate_window",
+    "desktop_click",
+    "desktop_type_text",
+    "desktop_send_hotkey",
+    "desktop_list_windows",
+    "desktop_find_control",
+    "discord_web_read_recent"
+  ]
+}

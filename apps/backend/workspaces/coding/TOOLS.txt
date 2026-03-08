@@ -1,5 +1,4 @@
 web_search
-live_web_search
 youtube_transcript
 calculate
 get_system_time
@@ -13,6 +12,16 @@ file_delete
 terminal_run
 take_screenshot
 artifact_write
+discord_contacts_add
+discord_contacts_discover
+discord_web_read_recent
+discord_web_send
+desktop_activate_window
+desktop_click
+desktop_type_text
+desktop_send_hotkey
+desktop_list_windows
+desktop_find_control
 system_info
 analyze_screen
 vision_qa

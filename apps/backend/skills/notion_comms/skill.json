@@ -1,0 +1,12 @@
+{
+    "name": "Notion",
+    "description": "Notion workspace integration — list pages, search, create pages, and append content blocks.",
+    "prompt_file": "SKILL.md",
+    "tools": [
+        "notion_search",
+        "notion_get_page",
+        "notion_list_pages",
+        "notion_create_page",
+        "notion_append_block"
+    ]
+}

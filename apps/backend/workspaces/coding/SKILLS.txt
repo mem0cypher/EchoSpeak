@@ -1,0 +1,6 @@
+# Skills loaded in coding workspace
+discord
+discord_contacts
+self_modify
+system_monitor
+daily_briefing

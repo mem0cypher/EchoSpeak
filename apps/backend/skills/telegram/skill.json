@@ -1,0 +1,18 @@
+{
+    "name": "telegram",
+    "display_name": "Telegram Bot",
+    "description": "Native Telegram bot integration — messages route through agent pipeline",
+    "version": "5.4.0",
+    "status": "active",
+    "tools": [],
+    "config_keys": [
+        "allow_telegram_bot",
+        "telegram_bot_token",
+        "telegram_allowed_users",
+        "telegram_auto_confirm"
+    ],
+    "policy_flags": [
+        "ALLOW_TELEGRAM_BOT"
+    ],
+    "dependency": "python-telegram-bot"
+}

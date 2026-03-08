@@ -1,0 +1,16 @@
+{
+  "id": "slack_comms",
+  "name": "Slack Communications",
+  "description": "Send messages to Slack channels via webhook integration",
+  "version": "1.0.0",
+  "tools": [
+    "slack_send_message",
+    "slack_list_channels",
+    "slack_search_users"
+  ],
+  "tool_allowlist": [
+    "slack_send_message",
+    "slack_list_channels",
+    "slack_search_users"
+  ]
+}

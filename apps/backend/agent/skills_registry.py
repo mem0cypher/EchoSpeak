@@ -80,6 +80,10 @@ def load_skills(skills_dir: Path) -> Dict[str, SkillDefinition]:
     for entry in sorted(skills_dir.iterdir()):
         if not entry.is_dir():
             continue
+        # Skip disabled skills (created by skill_enable tool)
+        if (entry / ".disabled").exists():
+            logger.debug(f"Skipping disabled skill: {entry.name}")
+            continue
         meta = _load_json(entry / "skill.json")
         prompt_file = str(meta.get("prompt_file") or "SKILL.md")
         prompt = _read_text(entry / prompt_file)
@@ -173,3 +177,132 @@ def merge_tool_allowlists(
     skill_union = {name for allowlist in non_empty_skills for name in allowlist if name}
     restricted = base.intersection(skill_union)
     return restricted
+
+
+# ── Skill → Tool Bridge ────────────────────────────────────────────
+
+_loaded_skill_tool_modules: set[str] = set()
+
+
+def load_skill_tools(skill_dir: Path) -> List[str]:
+    """Load custom tools from a skill's ``tools.py`` file.
+
+    If ``<skill_dir>/tools.py`` exists, it is dynamically imported.
+    Any functions decorated with ``@ToolRegistry.register(...)`` inside
+    that module will auto-register into the global Tool Registry.
+
+    Args:
+        skill_dir: Path to the skill directory (e.g. ``skills/weather/``).
+
+    Returns:
+        List of tool names that were registered by this skill's tools module.
+        Empty list if no ``tools.py`` exists or on import error.
+    """
+    tools_file = skill_dir / "tools.py"
+    if not tools_file.exists():
+        return []
+
+    module_key = str(tools_file.resolve())
+    if module_key in _loaded_skill_tool_modules:
+        # Already loaded — return names from registry that match this skill
+        logger.debug(f"Skill tools already loaded: {skill_dir.name}")
+        return []
+
+    # Capture registry state before import to detect new registrations
+    try:
+        from agent.tool_registry import ToolRegistry
+        before_names = set(ToolRegistry.get_names())
+    except ImportError:
+        logger.warning("ToolRegistry not available — skipping skill tool loading")
+        return []
+
+    # Dynamically import the skill's tools module
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location(
+            f"skill_tools_{skill_dir.name}",
+            str(tools_file),
+        )
+        if spec is None or spec.loader is None:
+            logger.warning(f"Could not load spec for {tools_file}")
+            return []
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _loaded_skill_tool_modules.add(module_key)
+
+        # Detect newly registered tools
+        after_names = set(ToolRegistry.get_names())
+        new_tools = sorted(after_names - before_names)
+
+        # Enforce policy_flags — remove tools whose config flags aren't enabled
+        if new_tools:
+            try:
+                from config import config as _cfg
+            except ImportError:
+                _cfg = None
+            approved: list[str] = []
+            for tname in new_tools:
+                flags = ToolRegistry.get_permission_flags(tname)
+                if flags and _cfg:
+                    missing = [f for f in flags if not getattr(_cfg, f.lower(), False)]
+                    if missing:
+                        logger.debug(
+                            f"Skill tool '{tname}' blocked: missing config flags {missing}"
+                        )
+                        # Remove from registry so LLM can't access it
+                        ToolRegistry._entries.pop(tname, None)
+                        continue
+                approved.append(tname)
+            if approved:
+                logger.info(f"Skill '{skill_dir.name}' registered tools: {approved}")
+            return approved
+        return new_tools  # empty list — no new tools registered
+
+    except Exception as exc:
+        logger.warning(f"Failed to load skill tools from {tools_file}: {exc}")
+        return []
+
+
+_loaded_skill_plugin_modules: set[str] = set()
+
+
+def load_skill_plugin(skill_dir: Path) -> bool:
+    """Load a pipeline plugin from a skill's ``plugin.py`` file.
+
+    If ``<skill_dir>/plugin.py`` exists, it is dynamically imported.
+    The module should register plugins via ``PluginRegistry.register(MyPlugin())``.
+
+    Args:
+        skill_dir: Path to the skill directory.
+
+    Returns:
+        True if a plugin module was loaded, False otherwise.
+    """
+    plugin_file = skill_dir / "plugin.py"
+    if not plugin_file.exists():
+        return False
+
+    module_key = str(plugin_file.resolve())
+    if module_key in _loaded_skill_plugin_modules:
+        logger.debug(f"Skill plugin already loaded: {skill_dir.name}")
+        return False
+
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location(
+            f"skill_plugin_{skill_dir.name}",
+            str(plugin_file),
+        )
+        if spec is None or spec.loader is None:
+            logger.warning(f"Could not load spec for {plugin_file}")
+            return False
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _loaded_skill_plugin_modules.add(module_key)
+        logger.info(f"Loaded pipeline plugin from skill '{skill_dir.name}'")
+        return True
+
+    except Exception as exc:
+        logger.warning(f"Failed to load skill plugin from {plugin_file}: {exc}")
+        return False
+

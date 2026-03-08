@@ -1,0 +1,6 @@
+{
+  "name": "self_modify",
+  "description": "Allow EchoSpeak to modify its own code with git-based rollback",
+  "tools": ["self_edit", "self_rollback", "self_git_status", "self_read", "self_grep", "self_list"],
+  "enabled": true
+}

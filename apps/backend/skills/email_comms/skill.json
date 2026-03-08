@@ -1,0 +1,27 @@
+{
+  "name": "email_comms",
+  "display_name": "Email Communications",
+  "description": "Native IMAP/SMTP email integration — read, search, send, reply",
+  "version": "5.4.0",
+  "status": "active",
+  "tools": [
+    "email_read_inbox",
+    "email_search",
+    "email_get_thread",
+    "email_send",
+    "email_reply"
+  ],
+  "config_keys": [
+    "allow_email",
+    "email_imap_host",
+    "email_imap_port",
+    "email_smtp_host",
+    "email_smtp_port",
+    "email_username",
+    "email_password",
+    "email_use_tls"
+  ],
+  "policy_flags": [
+    "ALLOW_EMAIL"
+  ]
+}

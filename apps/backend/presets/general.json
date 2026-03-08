@@ -1,0 +1,14 @@
+{
+  "name": "General Assistant",
+  "description": "All tools enabled, balanced personality",
+  "skills": ["discord", "discord_contacts", "email_comms", "slack_comms", "soul", "restart"],
+  "soul_style": "balanced",
+  "env": {
+    "ENABLE_SYSTEM_ACTIONS": "true",
+    "ALLOW_FILE_WRITE": "true",
+    "ALLOW_TERMINAL_COMMANDS": "true",
+    "ALLOW_PLAYWRIGHT": "true",
+    "ALLOW_DESKTOP_AUTOMATION": "true",
+    "ALLOW_OPEN_CHROME": "true"
+  }
+}

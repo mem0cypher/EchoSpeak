@@ -1,0 +1,10 @@
+# Skills loaded in chat workspace
+web_search
+discord
+discord_bot
+discord_contacts
+soul
+system_monitor
+daily_briefing
+email_comms
+telegram

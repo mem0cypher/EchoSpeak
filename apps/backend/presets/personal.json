@@ -1,0 +1,11 @@
+{
+  "name": "Personal Assistant",
+  "description": "Discord, Email, Slack - friendly personality",
+  "skills": ["discord", "discord_contacts", "email_comms", "slack_comms", "soul", "restart"],
+  "soul_style": "friendly",
+  "env": {
+    "ENABLE_SYSTEM_ACTIONS": "true",
+    "ALLOW_FILE_WRITE": "true",
+    "ALLOW_PLAYWRIGHT": "true"
+  }
+}

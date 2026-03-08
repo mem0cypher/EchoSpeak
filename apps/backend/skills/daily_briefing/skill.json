@@ -1,0 +1,8 @@
+{
+    "name": "Daily Briefing",
+    "description": "Automated daily briefing with news, weather, and trending topics. Custom tool auto-registers via Skill-Tool Bridge.",
+    "prompt_file": "SKILL.md",
+    "tools": [
+        "daily_briefing"
+    ]
+}

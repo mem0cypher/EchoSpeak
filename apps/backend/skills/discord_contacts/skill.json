@@ -1,0 +1,6 @@
+{
+  "name": "Discord Contacts",
+  "description": "Add or update Discord recipient -> DM/channel URL mappings so natural-language recipients (e.g. 'mayo') can be used.",
+  "prompt_file": "SKILL.md",
+  "tools": ["discord_contacts_add", "discord_contacts_discover", "discord_web_read_recent"]
+}

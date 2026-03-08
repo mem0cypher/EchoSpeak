@@ -1,0 +1,10 @@
+{
+    "name": "WhatsApp Bridge",
+    "description": "WhatsApp messaging integration via the whatsapp-web.js bridge — send and read messages.",
+    "prompt_file": "SKILL.md",
+    "tools": [
+        "whatsapp_send",
+        "whatsapp_read_recent",
+        "whatsapp_list_chats"
+    ]
+}

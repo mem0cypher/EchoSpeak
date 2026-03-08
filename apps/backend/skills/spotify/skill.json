@@ -1,0 +1,14 @@
+{
+    "name": "Spotify Control",
+    "description": "Spotify playback control and search — play, pause, skip, queue tracks, and search music.",
+    "prompt_file": "SKILL.md",
+    "tools": [
+        "spotify_current_track",
+        "spotify_play",
+        "spotify_pause",
+        "spotify_next",
+        "spotify_prev",
+        "spotify_search",
+        "spotify_queue"
+    ]
+}
