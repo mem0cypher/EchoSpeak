@@ -1,9 +1,6 @@
 <p align="center">
   <img src="assets/echospeak-real-logo.png" alt="EchoSpeak" width="120" />
 </p>
-
-<h1 align="center">EchoSpeak</h1>
-
 <p align="center">
   <strong>Your own local-first AI agent. Any model. Any channel. Your data stays yours.</strong>
 </p>
