@@ -528,6 +528,43 @@ class EchoSpeakDiscordBot:
                                 await message.channel.send("Hey! How can I help you?")
                                 return
 
+                            # ── DM Command Interception ──
+                            # Catch approve/reject commands before they hit
+                            # process_query() so tweet approvals actually work.
+                            # Handles: "approve", "/reject", "reject the tweet",
+                            #          "can you reject the echospeak tweet", etc.
+                            import re as _re
+                            _cmd = content.strip().lower().lstrip("/")
+                            _is_tweet_action = (
+                                _cmd in {"approve", "reject", "approve tweet", "reject tweet"}
+                                or bool(_re.search(r"\b(approve|reject)\b.*\btweet\b", _cmd))
+                                or bool(_re.search(r"\btweet\b.*\b(approve|reject)\b", _cmd))
+                            )
+                            if _is_tweet_action:
+                                _is_approve = "approve" in _cmd
+                                try:
+                                    from twitter_bot import get_twitter_bot
+                                    tw_bot = get_twitter_bot()
+                                    if tw_bot and getattr(tw_bot, "is_running", False):
+                                        if _is_approve:
+                                            result = tw_bot.approve_pending_tweet()
+                                        else:
+                                            result = tw_bot.reject_pending_tweet()
+                                        ok = result.get("ok", False) if isinstance(result, dict) else False
+                                        if ok:
+                                            action = "approved and posted" if _is_approve else "rejected"
+                                            await message.channel.send(f"Done — tweet {action}.")
+                                        else:
+                                            err = result.get("error", "unknown error") if isinstance(result, dict) else "unknown error"
+                                            await message.channel.send(f"No pending tweet to {'approve' if _is_approve else 'reject'}. {err}")
+                                    else:
+                                        await message.channel.send("Twitter bot isn't running right now.")
+                                except ImportError:
+                                    await message.channel.send("Twitter module isn't available.")
+                                except Exception as _tw_exc:
+                                    await message.channel.send(f"Tweet action failed: {_tw_exc}")
+                                return
+
                             async with message.channel.typing():
                                 channel_ctx = await self._maybe_get_channel_context(message, content)
                                 followup_ctx = await self._maybe_get_followup_context(message, content)

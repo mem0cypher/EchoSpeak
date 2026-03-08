@@ -1,5 +1,19 @@
 # Changes
 
+## v7.1.1 — Heartbeat Fix, Discord Tweet Approve/Reject, and Repo Presentation
+
+### Backend
+- **Heartbeat uses `llm_wrapper.invoke()` directly** instead of `process_query()` — the heartbeat no longer has access to tools, cannot plan actions, and cannot generate confirmation prompts. It produces text only; routing is handled by `route_message()`.
+- Added **`_sanitize_response()`** to `HeartbeatManager` — strips any residual plan blocks, confirmation prompts, and action lines from the LLM response before routing to Discord/Telegram/etc.
+- Updated **heartbeat prompt** to explicitly instruct the LLM: text-only output, no tools, no plans, no "confirm" prompts.
+- Added **Discord DM command interception** for tweet approve/reject — typing `approve`, `reject`, `/approve`, `/reject`, or natural language like "reject the tweet" or "can you reject the echospeak tweet" in Discord DM now routes directly to the Twitter autonomous API instead of going through `process_query()`.
+
+### Repo Presentation
+- **New README.md** — clean hero section with inline logo + title, tagline ("Your AI. Your machine. Your rules."), quick links bar, highlights, organized feature categories, compact install section. Removed inline changelog.
+- Added **MIT LICENSE** file.
+- Created **git tag `v7.1.0`** and first GitHub Release.
+- Removed hardcoded `/home/mem0` filesystem path from `WorkspaceExplorer.tsx`.
+
 ## v7.1.0 — Inline Code Diff, Accept/Decline Flow, and Efficient Editing
 
 ### Frontend

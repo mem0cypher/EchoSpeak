@@ -483,11 +483,13 @@ Notes:
 - `WEBHOOK_SECRET`
 - `WEBHOOK_SECRET_PATH`
 
-### Heartbeat (v5.4.0)
+### Heartbeat (v5.4.0, updated v7.1.1)
 - `HEARTBEAT_ENABLED`
 - `HEARTBEAT_INTERVAL`
-- `HEARTBEAT_PROMPT`
+- `HEARTBEAT_PROMPT` — text-only prompt; the heartbeat calls `llm_wrapper.invoke()` directly (no tools, no planning)
 - `HEARTBEAT_CHANNELS`
+
+As of v7.1.1, the heartbeat bypasses `process_query()` entirely. It calls the LLM directly to generate a short status message, then `route_message()` delivers it to the configured channels. This prevents the agent from planning actions, using tools, or generating confirmation prompts during heartbeat ticks.
 
 ### Email (v5.4.0)
 - `ALLOW_EMAIL`
@@ -518,7 +520,7 @@ Notes:
 - `apps/backend/agent/tool_registry.py`
   - Tool Registry + Plugin Registry (v5.3.0)
 - `apps/backend/agent/heartbeat.py`
-  - HeartbeatManager — proactive heartbeat scheduler (v5.4.0)
+  - HeartbeatManager — proactive heartbeat scheduler (v5.4.0). As of v7.1.1, uses `llm_wrapper.invoke()` directly instead of `process_query()` to avoid tool/planning/confirmation leakage.
 - `apps/backend/agent/skills_registry.py`
   - skill/workspace loading + `load_skill_tools()` + `load_skill_plugin()` (v5.3.0)
 - `apps/backend/agent/router.py`
@@ -568,6 +570,7 @@ Notes:
 - Bot-based channel read/send tools run their async work on the Discord client's running event loop to avoid cross-loop `asyncio/aiohttp` failures.
 - Channel recap reads now fail fast with a short timeout when Discord history fetch health is degraded, instead of blocking the full request path for a long time.
 - Background Discord delivery for routines / heartbeat / proactive output is opt-in by channel config and now prefers `DISCORD_BOT_OWNER_ID`.
+- Discord DM command interception (v7.1.1): typing `approve`, `reject`, `/approve`, `/reject`, or natural-language variants like "reject the tweet" in Discord DM routes directly to the Twitter autonomous approve/reject API instead of `process_query()`.
 
 Discord bot context wrapping:
 
