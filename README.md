@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="assets/echospeak-real-logo.png" alt="" width="36" /> EchoSpeak
+  <img src="assets/echospeak/logo.png" alt="" width="36" /> EchoSpeak
 </h1>
 
 <p align="center">
