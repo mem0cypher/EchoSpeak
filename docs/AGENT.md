@@ -5,6 +5,9 @@ This file is for developers extending EchoSpeak’s agent.
 ---
 
 ## Recent Updates
+- **Agentic baseline (v7.1.3 docs)**: Added `docs/AGENTIC_BASELINE_2026.md`, comparing EchoSpeak against current Claude Code, Letta, LangGraph, OpenAI Agents SDK, OpenHands, CrewAI, and MCP patterns. The next roadmap target is reliability: provider readiness, coding lifecycle, memory doctor, MCP trust center, and evaluation scenarios.
+- **Agentic tool loop hardening (v7.1.2)**: Terminal execution now uses a denylist, coding/project prompts auto-promote into the coding workspace, `Desktop/...` resolves through configured extra file roots, and operational lessons can be injected into the system prompt without saving every conversation as memory.
+- **Transparent reasoning trace (v7.1.2)**: Thinking/reasoning and task-plan UI render as transparent chat timeline activity with clearer live tool text, while internal five-stage pipeline logging stays out of the user-facing reasoning stream.
 - **Inline code diff (v7.1.0)**: New `InlineCodeDiff.tsx` component renders a unified one-pane diff in the Code panel with green additions and red deletions. Per-file session model (`codeSessions`) replaces the old `codeBlocks` snapshot array. Accept/Decline buttons appear in the diff header when a `file_write` is pending confirmation.
 - **Efficient SEARCH/REPLACE editing (v7.1.0)**: File-edit pipeline now prompts the LLM for targeted `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` blocks instead of full-file rewrites, saving 80–95% of output tokens. Automatic fallback to full-file if parsing fails. Exact-match + fuzzy whitespace fallback matching.
 - **Context Ring (v7.1.0)**: Circular SVG token-usage gauge in the chat input bar with color-coded thresholds (blue/amber/red) and hover tooltip.

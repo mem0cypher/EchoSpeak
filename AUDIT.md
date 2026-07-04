@@ -1,8 +1,8 @@
 # EchoSpeak Architecture Audit
 
 **Generated:** 2025-01-20  
-**Updated:** 2026-03-07 (v7.1.0 inline code diff, accept/decline flow, efficient editing)  
-**Version:** 7.1.0  
+**Updated:** 2026-07-04 (v7.1.2 agentic tool loop, transparent reasoning trace, safety cleanup)  
+**Version:** 7.1.2  
 **Auditor:** Cascade AI
 
 ---
@@ -43,6 +43,10 @@ EchoSpeak is a local-first agent platform with a strong backend foundation and a
 - **Efficient SEARCH/REPLACE Editing (v7.1.0)** — file-edit pipeline prompts LLM for targeted SEARCH/REPLACE blocks instead of full-file rewrites; `_parse_search_replace_blocks()` + `_apply_search_replace()` with exact-match and fuzzy fallback; automatic fallback to full-file if parsing fails
 - **Context Ring (v7.1.0)** — circular SVG token-usage gauge in the chat input bar with color-coded thresholds and hover tooltip
 - **Workspace Explorer (v7.1.0)** — new `WorkspaceExplorer.tsx` component renders a visual file tree of the agent's `FILE_TOOL_ROOT` in the Code panel with recursive folder expansion, file icons, size labels, permission badges (WRITE/TERM), and a "cd" button to change the working directory at runtime; permanent "📂 Files" tab always accessible alongside code sessions; new `GET/POST /workspace` and `GET /workspace/browse` API endpoints
+
+- **Agentic Tool Loop Hardening (v7.1.2)** - terminal execution now uses a denylist instead of a narrow allowlist, coding/project prompts promote into the coding workspace, `Desktop/...` resolves through configured extra file roots, and stale project paths were corrected.
+- **Transparent Reasoning Trace (v7.1.2)** - thinking/reasoning and task-plan UI now render as transparent chat timeline activity with live tool trace text instead of boxed panels.
+- **Operational Lessons (v7.1.2)** - repeated tool-quality corrections are persisted as compact lessons and injected into the system prompt, while raw conversation auto-memory remains disabled by default.
 
 Discord integration highlights:
 
@@ -750,7 +754,7 @@ ALLOW_PLAYWRIGHT=false
 ALLOW_DESKTOP_AUTOMATION=false
 ALLOW_OPEN_CHROME=false
 FILE_TOOL_ROOT=/path/to/allowed/directory
-TERMINAL_COMMAND_ALLOWLIST=git,ls,cat,python
+TERMINAL_COMMAND_DENYLIST=rm,del,format,shutdown,reboot
 ```
 
 ---
@@ -790,8 +794,8 @@ User responds
 
 ### 12.4 Terminal Safety
 
-- `TERMINAL_COMMAND_ALLOWLIST` restricts which commands can run
-- Commands not in the allowlist are rejected
+- `TERMINAL_COMMAND_DENYLIST` blocks known-dangerous command names
+- Commands outside the denylist can run when terminal actions are enabled and confirmation policy allows them
 - Timeout and output limits apply
 
 ---

@@ -15,7 +15,6 @@ import type { TaskPlanState } from "./components/TaskChecklist";
 import type { EchoReaction } from "./components/echoAnimationUtils";
 import { TodoPanel } from "./components/TodoPanel";
 import { AvatarEditor } from "./components/AvatarEditor";
-import { ResearchPanel } from "./features/research/ResearchPanel";
 import { buildResearchRunFromToolEvent, normalizeResearchRun } from "./features/research/buildResearchRun";
 import { useResearchStore } from "./features/research/store";
 import type { ResearchRun } from "./features/research/types";
@@ -58,6 +57,7 @@ type AgentStreamEvent =
   | { type: "tool_end"; id: string; name?: string; output: string; research?: ResearchRun; at: number; request_id?: string }
   | { type: "tool_error"; id: string; error: string; at: number; request_id?: string }
   | { type: "thinking"; content: string; at: number; request_id?: string }
+  | { type: "thinking_step"; step_type: string; content: string; status: string; at: number; request_id?: string }
   | { type: "memory_saved"; memory_count: number; at: number; request_id?: string }
   | { type: "task_plan"; data: any[]; at?: number; request_id?: string }
   | { type: "task_step"; data: { index: number; status: string; description?: string; tool?: string; result_preview?: string; total?: number }; at?: number; request_id?: string }
@@ -81,14 +81,30 @@ type DiscordLiveEvent = {
 };
 
 type ActivityItem =
-  | { kind: "thinking"; id: string; content: string; at: number }
+  | { kind: "thinking"; id: string; content: string; at: number; steps?: ThinkingStep[]; request_id?: string }
   | { kind: "tool"; id: string; name: string; input: string; status: "running" | "done" | "error"; output?: string; at: number }
   | { kind: "memory"; id: string; memoryCount: number; at: number }
   | { kind: "error"; id: string; message: string; at: number };
 
+type ThinkingStep = {
+  id: string;
+  type: "thought" | "search" | "read" | "tool";
+  content: string;
+  status: "running" | "done";
+  at: number;
+};
+
+type TaskPlanEntry = {
+  id: string;
+  at: number;
+  plan: TaskPlanState;
+  request_id?: string;
+};
+
 type TimelineItem =
   | { kind: "message"; id: string; at: number; msg: Message }
-  | { kind: "activity"; id: string; at: number; item: ActivityItem };
+  | { kind: "activity"; id: string; at: number; item: ActivityItem }
+  | { kind: "task_plan"; id: string; at: number; entry: TaskPlanEntry };
 
 type ProviderListItem = {
   id: string;
@@ -230,7 +246,7 @@ type VisionAnalyzeResponse = {
 };
 
 const openaiModelOptions = ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1", "gpt-3.5-turbo"];
-const geminiModelOptions = ["gemini-3.1-flash-lite-preview", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro"];
+const geminiModelOptions = ["gemini-3.5-flash", "gemini-3.5-pro", "gemini-3.1-flash-lite-preview", "gemini-3.1-pro-preview", "gemini-2.5-pro"];
 const listableProviders = ["ollama", "lmstudio", "localai", "vllm"];
 const isLmStudioOnlyLocked = (info: ProviderInfo | null): boolean => {
   const providers = info?.available_providers || [];
@@ -433,6 +449,7 @@ const globalCss = `
           gap: 24px;
         }
         .research-panel {
+          position: relative;
           display: flex;
           flex-direction: column;
           height: 100%;
@@ -590,9 +607,10 @@ const globalCss = `
          .input-row {
            display: flex;
            gap: 12px;
-           align-items: center;
+           align-items: flex-end;
          }
          .input-field {
+           box-sizing: border-box;
            flex: 1;
            min-width: 0;
            background: linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01));
@@ -611,6 +629,14 @@ const globalCss = `
            background: linear-gradient(135deg, rgba(45,108,255,0.08), rgba(255,255,255,0.02));
            border-color: rgba(140,180,255,0.4);
            box-shadow: inset 0 2px 4px rgba(0,0,0,0.2), 0 0 0 2px rgba(45,108,255,0.2), 0 4px 16px -4px rgba(0,0,0,0.3);
+         }
+         textarea.input-field {
+           min-height: 52px;
+           max-height: 156px;
+           resize: none;
+           line-height: 1.45;
+           overflow-y: auto;
+           font-family: inherit;
          }
          .send-button {
            width: 52px;
@@ -691,8 +717,9 @@ const globalCss = `
 
          .input-side-tools {
            display: flex;
-           align-items: center;
+           align-items: flex-end;
            gap: 10px;
+           padding-bottom: 4px;
          }
 
          /* Liquid Metal Base for Bottom Controls */
@@ -1433,7 +1460,7 @@ const ChatBubble: React.FC<{
       <div
         style={{
           position: "relative",
-          maxWidth: isUser ? "88%" : "94%",
+          maxWidth: isUser ? "78%" : "84%",
           background: isUser
             ? "linear-gradient(135deg, rgba(45,108,255,0.18), rgba(45,108,255,0.06))"
             : "linear-gradient(135deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02))",
@@ -1501,12 +1528,59 @@ const ChatBubble: React.FC<{
   );
 };
 
-const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; content: string; at: number } }> = ({ item }) => {
-  const [expanded, setExpanded] = useState(false);
-  const badge = { label: "Thinking", color: "rgba(140,160,255,0.9)", bg: "rgba(45,108,255,0.12)", border: "rgba(45,108,255,0.3)" };
+const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; content: string; at: number; steps?: ThinkingStep[]; request_id?: string } }> = ({ item }) => {
+  const [expanded, setExpanded] = useState(true);
+  const badge = { label: "Thinking", color: "rgba(140,160,255,0.9)" };
   const content = (item.content || "").trim();
-  const preview = content.length > 280 ? `${content.slice(0, 280).trimEnd()}…` : content;
-  const body = expanded ? content : preview;
+  const steps = item.steps || [];
+  const hasContent = content.length > 0;
+  const title = "Reasoning live";
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Typewriter effect state
+  const [displayedContent, setDisplayedContent] = useState("");
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval>;
+    const target = content;
+    if (displayedContent.length < target.length) {
+      const interval = 15;
+      const charsPerTick = 4;
+      timer = setInterval(() => {
+        setDisplayedContent((prev) => {
+          if (prev.length >= target.length) {
+            clearInterval(timer);
+            return target;
+          }
+          // Self-correct if target changed and diverged
+          if (!target.startsWith(prev)) {
+            return target.slice(0, charsPerTick);
+          }
+          return prev + target.slice(prev.length, prev.length + charsPerTick);
+        });
+      }, interval);
+    } else if (displayedContent !== target) {
+      setDisplayedContent(target);
+    }
+    return () => clearInterval(timer);
+  }, [content, displayedContent.length]);
+
+  const isPipeline = content.startsWith("###");
+  const preview = displayedContent.length > 280 && !isPipeline ? `${displayedContent.slice(0, 280).trimEnd()}…` : displayedContent;
+  const body = expanded || isPipeline ? displayedContent : preview;
+
+  // Auto-scroll when content or steps change
+  useEffect(() => {
+    const el = containerRef.current?.closest(".chat-scroll");
+    if (el) {
+      const threshold = 150;
+      const distFromBottom = el.scrollHeight - Math.ceil(el.scrollTop) - el.clientHeight;
+      if (distFromBottom <= threshold) {
+        el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
+      }
+    }
+  }, [displayedContent, steps]);
+
   return (
     <motion.div
       layout
@@ -1515,62 +1589,106 @@ const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; con
       exit={{ opacity: 0, y: -8 }}
       transition={{ duration: 0.22, ease: "easeOut" }}
       style={{ display: "flex", justifyContent: "flex-start" }}
+      ref={containerRef}
     >
       <div
         style={{
-          maxWidth: "96%",
+          maxWidth: "84%",
+          minWidth: steps.length || hasContent ? 260 : 160,
           width: "fit-content",
-          background: "linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01))",
-          backdropFilter: "blur(12px)",
-          WebkitBackdropFilter: "blur(12px)",
           color: colors.text,
-          border: "1px solid rgba(255,255,255,0.1)",
-          borderRadius: 12,
-          padding: "12px 16px",
-          boxShadow: "0 4px 16px -4px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.05)",
+          padding: "2px 8px 4px 8px",
+          background: "transparent",
+          border: "none",
+          borderRadius: 0,
+          boxShadow: "none",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 10, justifyContent: "space-between", flexWrap: "wrap" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between", flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <div
               style={{
-                fontSize: 10.5,
+                fontSize: 10,
                 fontWeight: 700,
                 letterSpacing: 0.5,
                 textTransform: "uppercase",
-                padding: "4px 8px",
-                borderRadius: 6,
+                padding: 0,
+                borderRadius: 0,
                 color: badge.color,
-                background: badge.bg,
-                border: `1px solid ${badge.border}`,
-                boxShadow: `inset 0 1px 0 rgba(255,255,255,0.1), 0 0 12px ${badge.border}`,
+                background: "transparent",
               }}
             >
               <span>{badge.label}</span>
             </div>
-            <div style={{ fontSize: 13, fontWeight: 650 }}>Model reasoning captured</div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: colors.textDim }}>
+              {title}
+            </div>
           </div>
-          {content.length > preview.length ? (
+          {!isPipeline && (content.length > 280 || steps.length > 0) ? (
             <button
               type="button"
               onClick={() => setExpanded((v) => !v)}
               style={{
-                border: `1px solid ${badge.border}`,
-                background: badge.bg,
+                background: "transparent",
                 color: badge.color,
-                borderRadius: 999,
-                padding: "4px 10px",
-                fontSize: 11,
+                border: "none",
+                padding: "2px 6px",
+                fontSize: 12,
                 fontWeight: 700,
                 cursor: "pointer",
+                opacity: 0.7,
               }}
+              onMouseEnter={(e) => e.currentTarget.style.opacity = "1"}
+              onMouseLeave={(e) => e.currentTarget.style.opacity = "0.7"}
             >
               {expanded ? "Hide" : "Show"}
             </button>
           ) : null}
         </div>
-        <div style={{ marginTop: 8, fontSize: 12.5, lineHeight: 1.5, color: colors.textDim, whiteSpace: "pre-wrap" }}>{body}</div>
+        
+        {/* Show reasoning steps when expanded */}
+        {expanded && steps.length > 0 && (
+          <div style={{ marginTop: 8, fontSize: 12, lineHeight: 1.55, color: colors.textDim }}>
+            {steps.map((step, idx) => (
+              <motion.div
+                key={step.id}
+                initial={{ opacity: 0, x: -10 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ duration: 0.3, delay: idx * 0.1 }}
+                style={{ marginBottom: 5, display: "flex", alignItems: "flex-start", gap: 8 }}
+              >
+                <span style={{ color: badge.color, minWidth: 20 }}>
+                  {step.type === "thought" ? "💭" : step.type === "search" ? "🔍" : step.type === "read" ? "📖" : "🔧"}
+                </span>
+                <span style={{ flex: 1 }}>
+                  {step.content}
+                  {step.status === "running" && <span style={{ animation: "pulse 1s infinite", marginLeft: 4 }}>...</span>}
+                </span>
+              </motion.div>
+            ))}
+          </div>
+        )}
+        
+        {hasContent ? (
+          <div className="chat-markdown" style={{ marginTop: 8, fontSize: 13, lineHeight: 1.6, color: colors.textDim }}>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>
+            {displayedContent.length < content.length && (
+              <span style={{ display: "inline-block", width: 6, height: 14, background: badge.color, animation: "pulse 0.8s infinite", verticalAlign: "text-bottom", marginLeft: 2, borderRadius: 1 }} />
+            )}
+          </div>
+        ) : steps.length === 0 ? (
+          <div style={{ marginTop: 8, fontSize: 12, color: colors.textDim, display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ width: 6, height: 6, borderRadius: 999, background: badge.color, animation: "pulse 0.8s infinite" }} />
+            Thinking...
+          </div>
+        ) : null}
       </div>
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.5; }
+        }
+      `}</style>
     </motion.div>
   );
 };
@@ -2077,10 +2195,17 @@ export const Dashboard: React.FC = () => {
     }
   });
   const [activities, setActivities] = useState<ActivityItem[]>([]);
-  const [taskPlan, setTaskPlan] = useState<TaskPlanState>(createEmptyTaskPlan());
+  const [taskPlans, setTaskPlans] = useState<TaskPlanEntry[]>([]);
+  const activeTaskPlanIdRef = useRef<string | null>(null);
   const [echoReaction, setEchoReaction] = useState<EchoReaction | null>(null);
   const [userIsTyping, setUserIsTyping] = useState(false);
   const userTypingTimerRef = useRef<number>(0);
+  const updateComposerInput = useCallback((value: string) => {
+    setInput(value);
+    setUserIsTyping(true);
+    if (userTypingTimerRef.current) clearTimeout(userTypingTimerRef.current);
+    userTypingTimerRef.current = window.setTimeout(() => setUserIsTyping(false), 1500);
+  }, []);
   const research = useResearchStore((state) => state.runs);
   const prependResearchRun = useResearchStore((state) => state.prependRun);
   const replaceResearchRuns = useResearchStore((state) => state.replaceRuns);
@@ -2381,7 +2506,8 @@ export const Dashboard: React.FC = () => {
       setActiveThreadId(nextThread.id);
       useAppStore.setState({ messages: [] });
       setActivities([]);
-      setTaskPlan(createEmptyTaskPlan());
+      setTaskPlans([]);
+      activeTaskPlanIdRef.current = null;
       clearResearchRuns();
       latestCodeFilenameRef.current = null;
       setCodeSessions([]);
@@ -2402,7 +2528,8 @@ export const Dashboard: React.FC = () => {
     // For now, we'll clear local state to start fresh in the new context.
     useAppStore.setState({ messages: [] });
     setActivities([]);
-    setTaskPlan(createEmptyTaskPlan());
+    setTaskPlans([]);
+    activeTaskPlanIdRef.current = null;
     clearResearchRuns();
     latestCodeFilenameRef.current = null;
     setCodeSessions([]);
@@ -2502,6 +2629,17 @@ export const Dashboard: React.FC = () => {
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (el) {
+      el.style.height = "auto";
+      const nextHeight = Math.min(el.scrollHeight, 156);
+      el.style.height = `${nextHeight}px`;
+      el.style.overflowY = el.scrollHeight > 156 ? "auto" : "hidden";
+    }
+  }, [input]);
 
   const lastAppliedProviderRef = useRef<{ provider: string; model: string } | null>(null);
   const suppressAutoApplyRef = useRef(true);
@@ -2955,13 +3093,22 @@ export const Dashboard: React.FC = () => {
           item: a,
         })
       ),
+      ...taskPlans.map(
+        (entry): TimelineItem => ({
+          kind: "task_plan",
+          id: entry.id,
+          at: entry.at,
+          entry,
+        })
+      ),
     ];
     merged.sort((a, b) => a.at - b.at);
     return merged;
-  }, [messages, activities]);
+  }, [messages, activities, taskPlans]);
 
   const lastMsgLen = messages.length ? (messages[messages.length - 1]?.text || "").length : 0;
   const activityLen = activities.length;
+  const taskPlanLen = taskPlans.reduce((sum, entry) => sum + entry.plan.tasks.length + entry.plan.reflections.length, 0);
 
   const scrollChatToBottom = (behavior: ScrollBehavior = "smooth", force: boolean = false) => {
     try {
@@ -2991,14 +3138,25 @@ export const Dashboard: React.FC = () => {
   }, [leftTab]);
 
   useEffect(() => {
-    // new messages/activities should keep you pinned to bottom unless you scrolled up
+    // new messages/activities/speech states should keep you pinned to bottom unless you scrolled up
     if (leftTab !== "chat") return;
-    const timerId = setTimeout(() => {
-      scrollChatToBottom(streaming ? "auto" : "smooth");
+    
+    // Immediate/short delay scroll
+    const timerId1 = setTimeout(() => {
+      scrollChatToBottom(streaming || speaking ? "auto" : "smooth");
     }, 50);
-    return () => clearTimeout(timerId);
+    
+    // Safety fallback for longer Markdown rendering/layout times
+    const timerId2 = setTimeout(() => {
+      scrollChatToBottom(streaming || speaking ? "auto" : "smooth");
+    }, 150);
+
+    return () => {
+      clearTimeout(timerId1);
+      clearTimeout(timerId2);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeline.length, lastMsgLen, activityLen, streaming]);
+  }, [timeline.length, lastMsgLen, activityLen, taskPlanLen, streaming, speaking]);
 
   const sendText = async (overrideText?: string) => {
     const raw = overrideText ?? input;
@@ -3031,7 +3189,7 @@ export const Dashboard: React.FC = () => {
     setUserIsTyping(false);
     if (userTypingTimerRef.current) clearTimeout(userTypingTimerRef.current);
     setDocSources([]);
-    setActivities([]);
+    activeTaskPlanIdRef.current = null;
     setStreaming(true);
     try {
       const resp = await fetch(`${apiBase}/query/stream`, {
@@ -3056,21 +3214,81 @@ export const Dashboard: React.FC = () => {
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      const upsertTool = (evt: AgentStreamEvent) => {
-        if (evt.type === "tool_start") {
-          toolInfoRef.current[evt.id] = { name: evt.name, input: evt.input };
-          setActivities((prev) => {
+      const runRequestId = crypto.randomUUID();
+      const eventRequestId = (evt: { request_id?: string }) => evt.request_id || runRequestId;
+      const appendThinkingStep = (evt: { request_id?: string }, step: ThinkingStep) => {
+        const reqId = eventRequestId(evt);
+        setActivities((prev) => {
+          const existingIdx = prev.findIndex((p) => p.kind === "thinking" && p.request_id === reqId);
+          if (existingIdx !== -1) {
+            const updated = [...prev];
+            const existing = updated[existingIdx] as Extract<ActivityItem, { kind: "thinking" }>;
+            updated[existingIdx] = {
+              ...existing,
+              at: Math.min(existing.at, step.at || Date.now()),
+              steps: [...(existing.steps || []), step],
+            };
+            return updated;
+          }
+          return [
+            ...prev,
+            {
+              kind: "thinking",
+              id: crypto.randomUUID(),
+              content: "",
+              at: step.at || Date.now(),
+              steps: [step],
+              request_id: reqId,
+            },
+          ];
+        });
+      };
+      const upsertTaskPlan = (evt: AgentStreamEvent) => {
+        const reqId = eventRequestId(evt);
+        const eventAt = normalizeTimestampMs("at" in evt ? evt.at : Date.now());
+        setTaskPlans((prev) => {
+          if (evt.type === "task_plan") {
+            const id = crypto.randomUUID();
+            activeTaskPlanIdRef.current = id;
             return [
               ...prev,
               {
-                kind: "tool",
-                id: evt.id,
-                name: evt.name,
-                input: evt.input,
-                status: "running",
-                at: Date.now(),
+                id,
+                at: eventAt,
+                request_id: reqId,
+                plan: taskPlanReducer(createEmptyTaskPlan(), evt),
               },
             ];
+          }
+
+          const activeId =
+            activeTaskPlanIdRef.current ||
+            [...prev].reverse().find((entry) => entry.request_id === reqId)?.id;
+          if (!activeId) return prev;
+
+          return prev.map((entry) =>
+            entry.id === activeId
+              ? { ...entry, plan: taskPlanReducer(entry.plan, evt) }
+              : entry
+          );
+        });
+      };
+      const upsertTool = (evt: AgentStreamEvent) => {
+        if (evt.type === "tool_start") {
+          toolInfoRef.current[evt.id] = { name: evt.name, input: evt.input };
+          const toolVerb =
+            evt.name === "web_search" ? "Searching" :
+            evt.name === "file_read" ? "Reading" :
+            evt.name === "file_write" ? "Writing" :
+            evt.name === "terminal_run" ? "Running" :
+            "Using";
+          const inputPreview = String(evt.input || "").replace(/\s+/g, " ").trim();
+          appendThinkingStep(evt, {
+            id: evt.id,
+            type: evt.name === "web_search" ? "search" : evt.name === "file_read" ? "read" : "tool",
+            content: inputPreview ? `${toolVerb} ${evt.name}: ${inputPreview}` : `${toolVerb} ${evt.name}`,
+            status: "running",
+            at: normalizeTimestampMs(evt.at || Date.now()),
           });
           return;
         }
@@ -3085,7 +3303,17 @@ export const Dashboard: React.FC = () => {
             const count = normalized?.evidence_count || 0;
             const summary = count ? `Captured ${count} sources (see Research panel)` : "No sources found";
             setActivities((prev) =>
-              prev.map((p) => (p.kind === "tool" && p.id === evt.id ? { ...p, status: "done", output: summary } : p))
+              prev.map((p) => {
+                if (p.kind === "thinking" && p.steps) {
+                  return {
+                    ...p,
+                    steps: p.steps.map((s) =>
+                      s.id === evt.id ? { ...s, status: "done", content: `Used web_search (${summary})` } : s
+                    ),
+                  };
+                }
+                return p;
+              })
             );
             return;
           }
@@ -3148,21 +3376,42 @@ export const Dashboard: React.FC = () => {
               setVisualizerPin("coding");
             }
           }
-          // For file tools, show a short summary in the activity feed (full content is in code panel)
+          // For file tools, show a short summary in the activity feed
           const toolName = info?.name || "";
           const isFileOp = codingTools.has(toolName);
           const activityOutput = isFileOp && (evt.output || "").length > 200
-            ? `${toolName === "file_read" ? "Read" : "Wrote"} ${(evt.output || "").length} chars → Code panel`
-            : evt.output;
+            ? `${toolName === "file_read" ? "Read" : "Wrote"} ${(evt.output || "").length} chars`
+            : evt.output || "done";
           setActivities((prev) =>
-            prev.map((p) => (p.kind === "tool" && p.id === evt.id ? { ...p, status: "done", output: activityOutput } : p))
+            prev.map((p) => {
+              if (p.kind === "thinking" && p.steps) {
+                return {
+                  ...p,
+                  steps: p.steps.map((s) =>
+                    s.id === evt.id ? { ...s, status: "done", content: `Used ${toolName} (${activityOutput})` } : s
+                  ),
+                };
+              }
+              return p;
+            })
           );
           return;
         }
 
         if (evt.type === "tool_error") {
+          const info = toolInfoRef.current[evt.id];
           setActivities((prev) =>
-            prev.map((p) => (p.kind === "tool" && p.id === evt.id ? { ...p, status: "error", output: evt.error } : p))
+            prev.map((p) => {
+              if (p.kind === "thinking" && p.steps) {
+                return {
+                  ...p,
+                  steps: p.steps.map((s) =>
+                    s.id === evt.id ? { ...s, status: "done", content: `Failed ${info?.name || "tool"}: ${evt.error}` } : s
+                  ),
+                };
+              }
+              return p;
+            })
           );
           setEchoReaction("error");
         }
@@ -3187,15 +3436,35 @@ export const Dashboard: React.FC = () => {
           }
 
           if (evt.type === "task_plan" || evt.type === "task_step" || evt.type === "task_reflection") {
-            setTaskPlan((prev) => taskPlanReducer(prev, evt));
+            upsertTaskPlan(evt);
           } else if (evt.type === "tool_start" || evt.type === "tool_end" || evt.type === "tool_error") {
             upsertTool(evt);
+          } else if (evt.type === "thinking_step") {
+            appendThinkingStep(evt, {
+              id: evt.step_type + "_" + Date.now(),
+              type: evt.step_type as "thought" | "search" | "read" | "tool",
+              content: evt.content,
+              status: evt.status as "running" | "done",
+              at: normalizeTimestampMs(evt.at || Date.now()),
+            });
           } else if (evt.type === "thinking") {
             const content = (evt.content || "").trim();
+            const reqId = eventRequestId(evt);
             if (content) {
               setActivities((prev) => {
-                if (prev.some((p) => p.kind === "thinking" && p.content === content)) return prev;
-                return [...prev, { kind: "thinking", id: crypto.randomUUID(), content, at: Date.now() }];
+                const existingIdx = prev.findIndex((p) => p.kind === "thinking" && p.request_id === reqId);
+                if (existingIdx !== -1) {
+                  const updated = [...prev];
+                  const existing = updated[existingIdx] as Extract<ActivityItem, { kind: "thinking" }>;
+                  updated[existingIdx] = {
+                    ...existing,
+                    content: content,
+                    at: Math.min(existing.at, normalizeTimestampMs(evt.at || Date.now())),
+                  } as ActivityItem;
+                  return updated;
+                }
+                if (prev.some((p) => p.kind === "thinking" && p.request_id === reqId && p.content === content)) return prev;
+                return [...prev, { kind: "thinking" as const, id: crypto.randomUUID(), content, at: normalizeTimestampMs(evt.at || Date.now()), request_id: reqId }];
               });
             }
           } else if (evt.type === "memory_saved") {
@@ -3220,6 +3489,9 @@ export const Dashboard: React.FC = () => {
           } else if (evt.type === "final") {
             const reply = evt.response || "(no response)";
             const spoken = (evt.spoken_text || "").trim();
+            if (typeof evt.memory_count === "number") {
+              setMemoryCount(evt.memory_count);
+            }
             setDocSources(Array.isArray(evt.doc_sources) ? evt.doc_sources : []);
             if (evt.thread_state) {
               setThreadState(evt.thread_state);
@@ -3617,6 +3889,20 @@ export const Dashboard: React.FC = () => {
     ? (providerDraft.provider === "openai" ? openaiModelOptions : providerDraft.provider === "gemini" ? geminiModelOptions : providerModels)
     : [providerDraft.model || "Default model"];
   const modelPickerValue = showModelPicker ? providerDraft.model : modelPickerOptions[0];
+  const studioTabs: { id: typeof leftTab; label: string; group: string }[] = [
+    { id: "memory", label: "Memory", group: "Knowledge" },
+    { id: "docs", label: "Docs", group: "Knowledge" },
+    { id: "settings", label: "Settings", group: "Config" },
+    { id: "capabilities", label: "Tools", group: "Config" },
+    { id: "soul", label: "Soul", group: "Config" },
+    { id: "avatar_editor", label: "Avatar", group: "Config" },
+    { id: "approvals", label: "Approvals", group: "Automation" },
+    { id: "executions", label: "Executions", group: "Automation" },
+    { id: "projects", label: "Projects", group: "Automation" },
+    { id: "routines", label: "Routines", group: "Automation" },
+    { id: "services", label: "Services", group: "Automation" },
+  ];
+  const studioOpen = leftTab !== "chat" && leftTab !== "research";
 
   return (
     <div
@@ -3889,7 +4175,7 @@ export const Dashboard: React.FC = () => {
           <div className="panel-header">
             <div className="title">
               <img src="/logo.png" alt="Logo" style={{ width: 14, height: 14, borderRadius: 2 }} />
-              <span>{leftTab === "chat" ? "EchoSpeak" : leftTab === "research" ? "Research" : leftTab === "memory" ? "Memory" : leftTab === "capabilities" ? "Capabilities" : leftTab === "approvals" ? "Approvals" : leftTab === "executions" ? "Executions" : leftTab === "projects" ? "Projects" : leftTab === "routines" ? "Routines" : leftTab === "settings" ? "Settings" : leftTab === "soul" ? "Soul" : leftTab === "avatar_editor" ? "Avatar Editor" : leftTab === "services" ? "Services" : "Documents"}</span>
+              <span>EchoSpeak</span>
               {activeProjectId && leftTab === "chat" && (
                 <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6, background: "linear-gradient(135deg, rgba(34,197,94,0.15), rgba(34,197,94,0.05))", border: "1px solid rgba(34,197,94,0.25)", color: "#22c55e", fontWeight: 600, marginLeft: 8 }}>
                   📁 {projects.find(p => p.id === activeProjectId)?.name || "Project Active"}
@@ -3897,6 +4183,30 @@ export const Dashboard: React.FC = () => {
               )}
             </div>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button
+                type="button"
+                className="icon-button"
+                onClick={() => {
+                  if (studioOpen) {
+                    setLeftTab("chat");
+                    return;
+                  }
+                  setShowVisualizer(true);
+                  setLeftTab("memory");
+                }}
+                title={studioOpen ? "Close Studio" : "Open Studio"}
+                style={{
+                  height: 32,
+                  padding: "0 12px",
+                  fontSize: 12,
+                  fontWeight: 700,
+                  color: "#fff",
+                  background: studioOpen ? "rgba(140,180,255,0.16)" : "transparent",
+                  border: `1px solid ${studioOpen ? "rgba(140,180,255,0.38)" : colors.line}`,
+                }}
+              >
+                Studio
+              </button>
               <div
                 className={`switcher-dot ${backendOnline ? "online" : "offline"}`}
                 title={backendOnline ? "Connected" : "Disconnected"}
@@ -3948,6 +4258,7 @@ export const Dashboard: React.FC = () => {
           <div className="panel-body">
             <div className="research-panel">
               <div className="tab-bar" style={{
+                display: "none",
                 position: "relative",
                 overflow: "visible",
                 marginBottom: "16px",
@@ -4089,12 +4400,9 @@ export const Dashboard: React.FC = () => {
                 : null}
 
               {/* Chat Tab */}
-              {leftTab === "chat" && (
+              {true && (
                 <>
                   <div className="chat-scroll" style={{ flex: 1 }} ref={chatScrollRef} onScroll={onChatScroll}>
-                    {taskPlan.active && taskPlan.tasks.length > 0 && (
-                      <TaskChecklist plan={taskPlan} />
-                    )}
                     <AnimatePresence initial={false}>
                       {timeline.map((t) =>
                         t.kind === "message" ? (
@@ -4111,6 +4419,8 @@ export const Dashboard: React.FC = () => {
                               sendText(text);
                             }}
                           />
+                        ) : t.kind === "task_plan" ? (
+                          <TaskChecklist key={`plan-${t.id}`} plan={t.entry.plan} />
                         ) : (
                           <ActivityCard key={`act-${t.id}`} item={t.item} />
                         )
@@ -4142,16 +4452,15 @@ export const Dashboard: React.FC = () => {
                           </svg>
                         </button>
                       </div>
-                      <input
+                      <textarea
+                        ref={textareaRef}
                         className="input-field"
                         value={input}
-                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
-                          setInput(e.target.value);
-                          setUserIsTyping(true);
-                          if (userTypingTimerRef.current) clearTimeout(userTypingTimerRef.current);
-                          userTypingTimerRef.current = window.setTimeout(() => setUserIsTyping(false), 1500);
+                        rows={1}
+                        onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => {
+                          updateComposerInput(e.target.value);
                         }}
-                        onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
+                        onKeyDown={(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
                           if (e.key === "Enter" && !e.shiftKey) {
                             e.preventDefault();
                             sendText();
@@ -4346,17 +4655,72 @@ export const Dashboard: React.FC = () => {
                 </>
               )}
 
-              {/* Research Tab */}
-              {leftTab === "research" && (
-                <ResearchPanel
-                  colors={colors}
-                  runs={research}
-                  selectedVoice={selectedVoice}
-                  voices={voices}
-                  onSelectedVoiceChange={setSelectedVoice}
-                  onClear={clearResearchRuns}
-                />
-              )}
+              {studioOpen && (
+                <motion.div
+                  layout
+                  initial={{ opacity: 0, y: 12 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: 8 }}
+                  transition={{ duration: 0.18 }}
+                  style={{
+                    position: "fixed",
+                    top: 68,
+                    left: 16,
+                    bottom: 16,
+                    width: showVisualizer ? "calc(50vw - 28px)" : "min(640px, calc(100vw - 32px))",
+                    maxWidth: 680,
+                    zIndex: 80,
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 12,
+                    padding: 14,
+                    background: "rgba(5,8,16,0.92)",
+                    backdropFilter: "blur(18px)",
+                    WebkitBackdropFilter: "blur(18px)",
+                    border: `1px solid ${colors.line}`,
+                    borderRadius: 16,
+                    boxShadow: "0 22px 80px rgba(0,0,0,0.45)",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                      <div style={{ fontSize: 13, fontWeight: 800, color: colors.text }}>Studio</div>
+                      <div style={{ fontSize: 11, color: colors.textDim }}>
+                        Knowledge, configuration, and automation stay on the left while chat remains open.
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="icon-button"
+                      onClick={() => setLeftTab("chat")}
+                      style={{ height: 30, padding: "0 12px", fontSize: 12, fontWeight: 700 }}
+                    >
+                      Close
+                    </button>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 2 }}>
+                    {studioTabs.map((tab) => (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        className="icon-button"
+                        onClick={() => setLeftTab(tab.id)}
+                        title={tab.group}
+                        style={{
+                          height: 30,
+                          padding: "0 10px",
+                          fontSize: 12,
+                          flex: "0 0 auto",
+                          borderColor: leftTab === tab.id ? "rgba(140,180,255,0.42)" : colors.line,
+                          background: leftTab === tab.id ? "rgba(140,180,255,0.14)" : "rgba(255,255,255,0.04)",
+                        }}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
 
               {/* Memory Tab */}
               {leftTab === "memory" && (
@@ -4404,7 +4768,6 @@ export const Dashboard: React.FC = () => {
                       onChange={(e) => setMemoryFilterType(e.target.value)}
                     >
                       <option value="">All Types</option>
-                      <option value="conversation">Conversation</option>
                       <option value="preference">Preference</option>
                       <option value="profile">Profile</option>
                       <option value="project">Project</option>
@@ -4420,9 +4783,11 @@ export const Dashboard: React.FC = () => {
                         style={{ height: 28, padding: "0 10px", fontSize: 12 }}
                         type="button"
                         onClick={async () => {
-                          for (const id of selectedMemoryIds) {
-                            await fetch(`${apiBase}/memory/${id}?thread_id=${activeThreadId}`, { method: "DELETE" });
-                          }
+                          await fetch(`${apiBase}/memory/delete`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ ids: selectedMemoryIds, thread_id: activeThreadId }),
+                          });
                           setSelectedMemoryIds([]);
                           refreshMemory();
                         }}
@@ -4437,10 +4802,10 @@ export const Dashboard: React.FC = () => {
                           const newType = e.target.value;
                           if (newType) {
                             for (const id of selectedMemoryIds) {
-                              await fetch(`${apiBase}/memory/${id}?thread_id=${activeThreadId}`, {
-                                method: "PUT",
+                              await fetch(`${apiBase}/memory/update`, {
+                                method: "POST",
                                 headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ memory_type: newType }),
+                                body: JSON.stringify({ id, thread_id: activeThreadId, memory_type: newType }),
                               });
                             }
                             setSelectedMemoryIds([]);
@@ -4449,7 +4814,6 @@ export const Dashboard: React.FC = () => {
                         }}
                       >
                         <option value="">Set Type</option>
-                        <option value="conversation">Conversation</option>
                         <option value="preference">Preference</option>
                         <option value="profile">Profile</option>
                         <option value="project">Project</option>
@@ -4516,7 +4880,6 @@ export const Dashboard: React.FC = () => {
                                     }}
                                   >
                                     <option value="">No Type</option>
-                                    <option value="conversation">Conversation</option>
                                     <option value="preference">Preference</option>
                                     <option value="profile">Profile</option>
                                     <option value="project">Project</option>
@@ -4566,10 +4929,10 @@ export const Dashboard: React.FC = () => {
                                     style={{ height: 32, padding: "0 14px", fontSize: 13, alignSelf: "flex-end" }}
                                     type="button"
                                     onClick={async () => {
-                                      await fetch(`${apiBase}/memory/${m.id}?thread_id=${activeThreadId}`, {
-                                        method: "PUT",
+                                      await fetch(`${apiBase}/memory/update`, {
+                                        method: "POST",
                                         headers: { "Content-Type": "application/json" },
-                                        body: JSON.stringify({ text: editingMemoryText }),
+                                        body: JSON.stringify({ id: m.id, thread_id: activeThreadId, text: editingMemoryText }),
                                       });
                                       setEditingMemoryId(null);
                                       refreshMemory();
@@ -4950,15 +5313,15 @@ export const Dashboard: React.FC = () => {
                           </div>
 
                           <div>
-                            <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>Terminal Allowlist (first token)</label>
+                            <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>Terminal Denylist (first token)</label>
                             <input
                               type="text"
                               className="input-field"
-                              value={Array.isArray(settingsDraft.terminal_command_allowlist) ? settingsDraft.terminal_command_allowlist.join(",") : ""}
-                              placeholder="git,rg,ls,cat,find,grep,python,python3,uv,pytest,npm,npx,node,go,make"
+                              value={Array.isArray(settingsDraft.terminal_command_denylist) ? settingsDraft.terminal_command_denylist.join(",") : ""}
+                              placeholder="rm,del,erase,rmdir,format,shutdown,regedit,diskpart,powershell,cmd"
                               onChange={(e) =>
                                 updateDraft(
-                                  "terminal_command_allowlist",
+                                  "terminal_command_denylist",
                                   e.target.value
                                     .split(",")
                                     .map((x) => x.trim().toLowerCase())
@@ -5750,11 +6113,13 @@ export const Dashboard: React.FC = () => {
                             marginBottom: "20px"
                           }}>
                             <div style={{ fontSize: 12, fontWeight: 600, color: colors.accent, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 12 }}>Web Search</div>
+                            <div style={{ fontSize: 11, color: colors.textDim, marginBottom: 12, lineHeight: 1.5 }}>
+                              Web search uses DuckDuckGo (free, no API key required) as the default. You can optionally configure Tavily for enhanced results.
+                            </div>
                             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
                               <div style={{ flex: "2 1 340px" }}>
                                 <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>
-                                  Tavily API key
-                                  <RequiredBadge issueKey="tavily_api_key" />
+                                  Tavily API key (optional)
                                 </label>
                                 <div style={{ display: "flex", gap: 8 }}>
                                   <input
@@ -5864,6 +6229,7 @@ export const Dashboard: React.FC = () => {
                               <Toggle label="File Memory" checked={Boolean(settingsDraft.file_memory_enabled)} onChange={(v) => updateDraft("file_memory_enabled", v)} />
                               <Toggle label="Memory Flush" checked={Boolean(settingsDraft.memory_flush_enabled)} onChange={(v) => updateDraft("memory_flush_enabled", v)} />
                               <Toggle label="Memory Partitioning" checked={Boolean(settingsDraft.memory_partition_enabled)} onChange={(v) => updateDraft("memory_partition_enabled", v)} />
+                              <Toggle label="Store Raw Conversation Turns" checked={Boolean(settingsDraft.memory_auto_store_conversations)} onChange={(v) => updateDraft("memory_auto_store_conversations", v)} />
                               <Toggle label="Memory Importance Auto-save" checked={Boolean(settingsDraft.memory_importance_enabled)} onChange={(v) => updateDraft("memory_importance_enabled", v)} />
                               <Toggle label="Log Raw Memory Conversations" checked={Boolean(settingsDraft.file_memory_log_conversations)} onChange={(v) => updateDraft("file_memory_log_conversations", v)} />
                             </div>
@@ -7299,6 +7665,9 @@ I am EchoSpeak, a personal AI assistant...
                   </div>
                 </div>
               )}
+                  </div>
+                </motion.div>
+              )}
             </div>
           </div>
         </div>
@@ -7312,4 +7681,3 @@ I am EchoSpeak, a personal AI assistant...
     </div>
   );
 };
-

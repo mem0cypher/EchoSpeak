@@ -165,14 +165,16 @@ export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
   return (
     <div
       style={{
-        margin: "8px 0",
-        padding: "12px 16px",
-        borderRadius: "10px",
-        background: "rgba(30, 30, 46, 0.85)",
-        border: "1px solid rgba(255,255,255,0.08)",
+        margin: "4px 0 8px",
+        padding: "4px 8px",
+        borderRadius: 0,
+        background: "transparent",
+        border: "none",
+        boxShadow: "none",
         fontFamily: "'Inter', 'SF Pro', system-ui, sans-serif",
-        fontSize: "13px",
-        maxWidth: "480px",
+        fontSize: "12px",
+        maxWidth: "420px",
+        width: "fit-content",
       }}
     >
       {/* Header */}
@@ -181,19 +183,19 @@ export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          marginBottom: "10px",
-          paddingBottom: "8px",
-          borderBottom: "1px solid rgba(255,255,255,0.06)",
+          marginBottom: "8px",
+          paddingBottom: "7px",
+          borderBottom: "1px solid rgba(255,255,255,0.05)",
         }}
       >
-        <span style={{ color: "#e2e8f0", fontWeight: 600, fontSize: "13px" }}>
+        <span style={{ color: "#e2e8f0", fontWeight: 700, fontSize: "12px" }}>
           Task Plan
         </span>
         <span
           style={{
             color: allDone ? "#4ade80" : hasFailed ? "#f87171" : "#94a3b8",
-            fontSize: "12px",
-            fontWeight: 500,
+            fontSize: "11px",
+            fontWeight: 700,
           }}
         >
           {completedCount}/{totalCount} {allDone ? "complete" : "in progress"}
@@ -218,8 +220,8 @@ export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
               style={{
                 display: "flex",
                 alignItems: "flex-start",
-                gap: "10px",
-                padding: "6px 0",
+                gap: "8px",
+                padding: "5px 0",
               }}
             >
               {/* Icon */}
@@ -227,7 +229,7 @@ export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
                 style={{
                   color,
                   fontSize: "14px",
-                  lineHeight: "20px",
+                  lineHeight: "18px",
                   minWidth: "18px",
                   textAlign: "center",
                   fontWeight: 700,
@@ -259,6 +261,7 @@ export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
                     textDecoration:
                       task.status === "done" ? "line-through" : "none",
                     textDecorationColor: "rgba(148,163,184,0.4)",
+                    overflowWrap: "anywhere",
                   }}
                 >
                   {task.description}
@@ -274,7 +277,7 @@ export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       whiteSpace: "nowrap",
-                      maxWidth: "380px",
+                      maxWidth: "340px",
                     }}
                   >
                     {task.resultPreview}

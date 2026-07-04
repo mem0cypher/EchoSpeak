@@ -232,7 +232,7 @@ class LocalModelConfig(BaseModel):
     """Configuration for local model providers."""
     provider: ModelProvider = ModelProvider.OLLAMA
     base_url: str = "http://localhost:11434"
-    model_name: str = "llama3.2"
+    model_name: str = "qwen3.5-2b-uncensored-hauhaucs-aggressive"
     temperature: float = 0.7
     max_tokens: int = 4096
     context_length: int = 8192
@@ -253,7 +253,7 @@ class OpenAIConfig(BaseModel):
 class GeminiConfig(BaseModel):
     """Configuration for Google Gemini models."""
     api_key: str = ""
-    model: str = "gemini-3.1-flash-lite-preview"
+    model: str = "gemini-3.5-flash"
     temperature: float = 0.7
     max_tokens: int = 8192
 
@@ -347,7 +347,7 @@ class Config:
 
         self.gemini = GeminiConfig(
             api_key=os.getenv("GEMINI_API_KEY", ""),
-            model=os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview"),
+            model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
             temperature=float(os.getenv("GEMINI_TEMPERATURE", "0.7")),
             max_tokens=int(os.getenv("GEMINI_MAX_TOKENS", "8192"))
         )
@@ -367,7 +367,7 @@ class Config:
         self.local = LocalModelConfig(
             provider=local_provider,
             base_url=os.getenv("LOCAL_MODEL_URL", "http://localhost:11434"),
-            model_name=os.getenv("LOCAL_MODEL_NAME", "llama3.2"),
+            model_name=os.getenv("LOCAL_MODEL_NAME", "qwen3.5-2b-uncensored-hauhaucs-aggressive"),
             temperature=float(os.getenv("LOCAL_MODEL_TEMPERATURE", "0.7")),
             max_tokens=int(os.getenv("LOCAL_MODEL_MAX_TOKENS", "4096")),
             context_length=int(os.getenv("LOCAL_MODEL_CONTEXT", "8192")),
@@ -473,6 +473,12 @@ class Config:
         self.action_plan_enabled = os.getenv("ACTION_PLAN_ENABLED", "true").lower() == "true"
 
         self.action_parser_enabled = os.getenv("ACTION_PARSER_ENABLED", "true").lower() == "true"
+        # Max tokens for the action-parser LLM call — it only outputs a tiny JSON
+        # object so a small budget prevents thinking-model over-reasoning.
+        self.action_parser_max_tokens = int(os.getenv("ACTION_PARSER_MAX_TOKENS", "256"))
+        self.action_parser_heuristic_bypass = os.getenv("ACTION_PARSER_HEURISTIC_BYPASS", "true").lower() == "true"
+        self.memory_extraction_async = os.getenv("MEMORY_EXTRACTION_ASYNC", "true").lower() == "true"
+
 
         # Multi-step planning + reflection
         self.multi_task_planner_enabled = os.getenv("MULTI_TASK_PLANNER_ENABLED", "true").lower() == "true"
@@ -482,6 +488,7 @@ class Config:
         self.memory_default_mode = os.getenv("MEMORY_DEFAULT_MODE", "general").strip() or "general"
 
         self.memory_partition_enabled = os.getenv("MEMORY_PARTITION_ENABLED", "false").lower() == "true"
+        self.memory_auto_store_conversations = os.getenv("MEMORY_AUTO_STORE_CONVERSATIONS", "false").lower() == "true"
 
         self.file_memory_enabled = os.getenv("FILE_MEMORY_ENABLED", "false").lower() == "true"
         self.file_memory_dir = os.getenv("FILE_MEMORY_DIR", str(FILE_MEMORY_DIR)).strip() or str(FILE_MEMORY_DIR)
@@ -535,13 +542,13 @@ class Config:
             c.strip() for c in raw_discord_changelog_channels.replace("\n", ",").split(",") if c.strip()
         ]
         self.discord_changelog_server = os.getenv("DISCORD_CHANGELOG_SERVER", "").strip()
-        raw_terminal_allow = os.getenv(
-            "TERMINAL_COMMAND_ALLOWLIST",
-            "git,rg,ls,cat,find,grep,sed,awk,head,tail,pwd,jq,python,python3,uv,pytest,npm,npx,node,pip,pip3,go,make,pnpm,yarn,bun,cargo",
+        raw_terminal_deny = os.getenv(
+            "TERMINAL_COMMAND_DENYLIST",
+            "rm,del,erase,rmdir,rd,format,shutdown,restart-computer,stop-computer,reg,regedit,diskpart,bcdedit,cipher,takeown,icacls,powershell,pwsh,cmd,bash,sh,wsl",
         )
-        self.terminal_command_allowlist = [
+        self.terminal_command_denylist = [
             a.strip().lower()
-            for a in raw_terminal_allow.replace("\n", ",").split(",")
+            for a in raw_terminal_deny.replace("\n", ",").split(",")
             if a.strip()
         ]
         self.terminal_command_timeout = int(os.getenv("TERMINAL_COMMAND_TIMEOUT", "20") or 20)
@@ -555,11 +562,28 @@ class Config:
             if a.strip()
         ]
         self.file_tool_root = _resolve_repo_path(os.getenv("FILE_TOOL_ROOT", str(REPO_ROOT)), REPO_ROOT)
+        raw_file_extra_roots = os.getenv("FILE_TOOL_EXTRA_ROOTS", str(Path.home() / "Desktop"))
+        self.file_tool_extra_roots = [
+            str(Path(p.strip()).expanduser())
+            for p in raw_file_extra_roots.replace("\n", ";").replace(",", ";").split(";")
+            if p.strip()
+        ]
         self.artifacts_dir = os.getenv("ARTIFACTS_DIR", str(ARTIFACTS_DIR)).strip() or str(ARTIFACTS_DIR)
 
         self.skills_dir = os.getenv("SKILLS_DIR", str(SKILLS_DIR)).strip() or str(SKILLS_DIR)
         self.workspaces_dir = os.getenv("WORKSPACES_DIR", str(WORKSPACES_DIR)).strip() or str(WORKSPACES_DIR)
         self.default_workspace = os.getenv("DEFAULT_WORKSPACE", "chat").strip() or "chat"
+        mcp_servers_env = os.getenv("MCP_SERVERS", "").strip()
+        if mcp_servers_env:
+            try:
+                self.mcp_servers = json.loads(mcp_servers_env)
+            except Exception as e:
+                logger.warning(f"Failed to parse MCP_SERVERS env var: {e}")
+                self.mcp_servers = {}
+        else:
+            self.mcp_servers = {}
+        self.terminal_execution_mode = os.getenv("TERMINAL_EXECUTION_MODE", "host").strip().lower()
+        self.skill_curator_interval_minutes = int(os.getenv("SKILL_CURATOR_INTERVAL_MINUTES", "120") or 120)
         raw_notification_channels = os.getenv("NOTIFICATION_CHANNELS", "web")
         self.notification_channels = [
             c.strip().lower() for c in raw_notification_channels.replace("\n", ",").split(",") if c.strip()
@@ -882,11 +906,14 @@ class Config:
             "summary_keep_last_turns",
             "action_plan_enabled",
             "action_parser_enabled",
+            "action_parser_heuristic_bypass",
+            "memory_extraction_async",
             "multi_task_planner_enabled",
             "web_task_reflection_enabled",
             "web_task_max_retries",
             "memory_default_mode",
             "memory_partition_enabled",
+            "memory_auto_store_conversations",
             "file_memory_enabled",
             "file_memory_dir",
             "file_memory_log_conversations",
@@ -921,13 +948,14 @@ class Config:
             "discord_changelog_enabled",
             "discord_changelog_channels",
             "discord_changelog_server",
-            "terminal_command_allowlist",
+            "terminal_command_denylist",
             "terminal_command_timeout",
             "terminal_max_output_chars",
             "allow_open_application",
             "allow_self_modification",
             "open_application_allowlist",
             "file_tool_root",
+            "file_tool_extra_roots",
             "artifacts_dir",
             "skills_dir",
             "workspaces_dir",
@@ -1028,6 +1056,9 @@ class Config:
             "twitter_autonomous_max_daily",
             "twitter_autonomous_require_approval",
             "twitter_autonomous_prompt",
+            "mcp_servers",
+            "terminal_execution_mode",
+            "skill_curator_interval_minutes",
         }
 
     def write_runtime_overrides(self, overrides: dict[str, Any]) -> None:

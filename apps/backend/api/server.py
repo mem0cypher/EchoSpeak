@@ -223,11 +223,9 @@ def _validate_settings_effective(effective: dict) -> list[dict]:
                 issues.append({"key": k, "message": "Enable System Actions must be ON to enable this permission.", "severity": "error"})
 
     if bool(s.get("allow_terminal_commands")):
-        allowlist = s.get("terminal_command_allowlist")
-        if not isinstance(allowlist, list) or not any(str(x).strip() for x in allowlist):
-            issues.append({"key": "terminal_command_allowlist", "message": "Terminal commands are enabled but TERMINAL_COMMAND_ALLOWLIST is empty.", "severity": "error"})
-        elif any(str(x).strip() == "*" for x in allowlist):
-            issues.append({"key": "terminal_command_allowlist", "message": "TERMINAL_COMMAND_ALLOWLIST contains '*', which effectively disables first-token command restrictions.", "severity": "warning"})
+        denylist = s.get("terminal_command_denylist")
+        if not isinstance(denylist, list):
+            issues.append({"key": "terminal_command_denylist", "message": "Terminal commands are enabled but TERMINAL_COMMAND_DENYLIST is missing.", "severity": "warning"})
         root = str(s.get("file_tool_root") or "").strip()
         if not root:
             issues.append({"key": "file_tool_root", "message": "Set FILE_TOOL_ROOT to restrict terminal/file operations.", "severity": "warning"})
@@ -724,10 +722,93 @@ class _StreamingHandler(BaseCallbackHandler):
         self._tool_started_at: dict = {}
         self._tool_input_map: dict = {}
         self._research_runs: list[dict[str, Any]] = []
+        self._in_think_block = False
+        self._loop_blocks: list[str] = []
+        self._current_reasoning = ""
+        # No-progress detection: track repeated tool call signatures
+        self._tool_call_signatures: dict[str, int] = {}  # hash -> count
+        self._loop_warning_sent = False
 
     @property
     def research_runs(self) -> list[dict[str, Any]]:
         return list(self._research_runs)
+
+    def _start_new_generation(self):
+        # Save previous loop's reasoning before starting a new one
+        if self._current_reasoning.strip():
+            loop_idx = len(self._loop_blocks) + 1
+            header = f"### 💭 Model Thoughts (Loop {loop_idx})"
+            self._loop_blocks.append(f"{header}\n{self._current_reasoning.strip()}")
+        self._current_reasoning = ""
+
+    def on_llm_start(self, serialized: dict, prompts: Any, run_id: str, parent_run_id: Optional[str] = None, **kwargs):
+        self._start_new_generation()
+
+    def on_chat_model_start(self, serialized: dict, messages: Any, run_id: str, parent_run_id: Optional[str] = None, **kwargs):
+        self._start_new_generation()
+
+    def _process_token_or_reasoning(self, token: str, reasoning: str):
+        # 1. Extract inline <think> tags from main content stream if no native reasoning is provided
+        if not reasoning and token:
+            t_low = token.lower()
+            if "<think>" in t_low:
+                self._in_think_block = True
+                parts = token.split("<think>", 1)
+                if len(parts) > 1:
+                    reasoning = parts[1]
+            elif "</think>" in t_low:
+                self._in_think_block = False
+                parts = token.split("</think>", 1)
+                reasoning = parts[0]
+            elif self._in_think_block:
+                reasoning = token
+
+        # 2. Push accumulated loops + current reasoning to UI
+        if reasoning:
+            self._current_reasoning += reasoning
+            blocks = list(self._loop_blocks)
+            loop_idx = len(self._loop_blocks) + 1
+            if loop_idx > 1 or len(self._loop_blocks) > 0:
+                current_header = f"### 💭 Model Thoughts (Loop {loop_idx})"
+            else:
+                current_header = "### 💭 Model Thoughts"
+            blocks.append(f"{current_header}\n{self._current_reasoning}")
+            
+            self._q.put({
+                "type": "thinking",
+                "content": "\n\n".join(blocks),
+                "at": time.time(),
+                "request_id": self._request_id
+            })
+
+    def on_llm_new_token(self, token: str, **kwargs):
+        chunk = kwargs.get("chunk")
+        reasoning = ""
+        if chunk:
+            if hasattr(chunk, "message") and chunk.message:
+                msg = chunk.message
+                if hasattr(msg, "additional_kwargs") and msg.additional_kwargs:
+                    reasoning = msg.additional_kwargs.get("reasoning_content") or ""
+            if not reasoning and hasattr(chunk, "additional_kwargs") and chunk.additional_kwargs:
+                reasoning = chunk.additional_kwargs.get("reasoning_content") or ""
+        self._process_token_or_reasoning(token, reasoning)
+
+    def on_llm_chunk(self, chunk: Any, **kwargs: Any) -> Any:
+        token = ""
+        reasoning = ""
+        if hasattr(chunk, "message") and chunk.message:
+            msg = chunk.message
+            if hasattr(msg, "content"):
+                token = str(msg.content or "")
+            if hasattr(msg, "additional_kwargs") and msg.additional_kwargs:
+                reasoning = msg.additional_kwargs.get("reasoning_content") or ""
+        elif hasattr(chunk, "text"):
+            token = str(chunk.text or "")
+        
+        if not reasoning and hasattr(chunk, "additional_kwargs") and chunk.additional_kwargs:
+            reasoning = chunk.additional_kwargs.get("reasoning_content") or ""
+        
+        self._process_token_or_reasoning(token, reasoning)
 
     def on_tool_start(self, serialized: dict, input_str: str, run_id: str, parent_run_id: Optional[str] = None, **kwargs):
         tool_name = (serialized or {}).get("name") or (serialized or {}).get("id") or "tool"
@@ -737,6 +818,21 @@ class _StreamingHandler(BaseCallbackHandler):
         raw_input = input_str if isinstance(input_str, str) else str(input_str)
         self._tool_input_map[call_id] = raw_input
         _metric_inc("tool_calls", 1)
+
+        # No-progress detection: hash tool name + input to detect repeated identical calls
+        import hashlib as _hl
+        sig = _hl.md5(f"{tool_name}:{raw_input}".encode("utf-8", errors="ignore")).hexdigest()
+        self._tool_call_signatures[sig] = self._tool_call_signatures.get(sig, 0) + 1
+        repeat_count = self._tool_call_signatures[sig]
+        if repeat_count >= 3 and not self._loop_warning_sent:
+            self._loop_warning_sent = True
+            self._q.put({
+                "type": "thinking",
+                "content": f"### ⚠️ Loop Detected\nThe model has called `{tool_name}` with the same arguments {repeat_count} times. The agent will be stopped after the current iteration to prevent infinite looping.",
+                "at": time.time(),
+                "request_id": self._request_id,
+            })
+            logger.warning("No-progress detected: tool '%s' called %d times with identical input", tool_name, repeat_count)
 
         inp = raw_input
         inp = " ".join((inp or "").split())
@@ -798,6 +894,7 @@ def _start_agent_thread(
         try:
             handler = _StreamingHandler(q, request_id)
             thread_state = _apply_thread_scope(agent, thread_id, workspace)
+            memory_before = int(getattr(agent.memory, "memory_count", 0) or 0)
             response, success = agent.process_query(
                 message,
                 include_memory=include_memory,
@@ -813,13 +910,15 @@ def _start_agent_thread(
                 spoken_text = str(agent.get_last_tts_text() or "")
             except Exception:
                 spoken_text = ""
-            q.put({"type": "memory_saved", "memory_count": agent.memory.memory_count, "at": time.time(), "request_id": request_id})
+            memory_after = int(getattr(agent.memory, "memory_count", 0) or 0)
+            if memory_after > memory_before:
+                q.put({"type": "memory_saved", "memory_count": memory_after, "at": time.time(), "request_id": request_id})
             q.put(
                 {
                     "type": "final",
                     "response": response,
                     "success": success,
-                    "memory_count": agent.memory.memory_count,
+                    "memory_count": memory_after,
                     "doc_sources": doc_sources,
                     "research": handler.research_runs,
                     "spoken_text": spoken_text,

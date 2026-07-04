@@ -1,5 +1,34 @@
 # Changes
 
+## v7.1.3 - Agentic Baseline Documentation
+
+### Docs
+- Added `docs/AGENTIC_BASELINE_2026.md`, a July 4, 2026 baseline comparing EchoSpeak with current Claude Code, Letta, LangGraph, OpenAI Agents SDK, OpenHands, CrewAI, and MCP patterns.
+- Updated `ROADMAP.md` with proposed v7.2 priorities: provider readiness, coding lifecycle, memory doctor, MCP trust center, and evaluation harness.
+- Updated `docs/AGENT.md` so developers can find the new baseline and understand the v7.1.2/v7.1.3 direction.
+
+## v7.1.2 - Agentic Tool Loop, Transparent Reasoning Trace, and Safety Cleanup
+
+### Backend
+- Replaced the terminal command allowlist model with a **terminal denylist**. Common harmless commands such as `echo` are no longer blocked just because they were not prelisted, while destructive command names still stay blocked by default.
+- Added **coding/project intent promotion** so requests like "build a website", "create files on my desktop", or "start coding" enter the coding workspace with file and terminal tools available.
+- Added **extra file roots** via `file_tool_extra_roots`; `Desktop/...` now resolves to the user's real desktop while the main project root stays at `C:\Projects\EchoSpeak-main\EchoSpeak-main`.
+- Corrected stale runtime paths in settings so Echo no longer points at the old desktop project copy for file and terminal work.
+- Hardened web-search reflection for **live sports score queries**. Date-only or schedule-only search results are rejected, the query is rewritten toward "live score/current score/result", and the UI receives a thinking step explaining the retry.
+- Added a compact **operational lesson store** (`data/agent_lessons.json`) for repeated tool-quality lessons. These are injected into the system prompt as distilled lessons instead of saving every chat turn as memory.
+- Kept raw conversation memory disabled by default so Echo stops building a huge memory bank from ordinary conversations. Explicit/profile memories remain available.
+
+### Frontend
+- Made the thinking/reasoning stream transparent again instead of rendering it in a blue card, while preserving the typewriter-style live text.
+- Made the task plan checklist transparent so it blends into the chat timeline and remains at the bottom with new activity.
+- Improved live tool trace text so users see action-oriented lines such as "Searching web_search: ..." or "Reading file_read: ..." instead of generic tool labels.
+
+### Docs & Verification
+- Updated architecture/audit documentation for the denylist, operational lessons, and live-score reflection changes.
+- Python compile passed for the touched backend modules.
+- Web TypeScript typecheck passed for the React app and Vite config.
+- Focused live-score smoke check confirmed that date-only results are rejected and actual score-style results are accepted.
+
 ## v7.1.1 — Heartbeat Fix, Discord Tweet Approve/Reject, and Repo Presentation
 
 ### Backend
