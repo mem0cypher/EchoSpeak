@@ -1,5 +1,13 @@
 # Changes
 
+## v7.2.0 - Provider Readiness Preflight
+
+### Backend
+- Added a fast provider readiness preflight before `/query` and `/query/stream` start full agent execution. If LM Studio, Ollama, LocalAI, or vLLM is selected but unreachable, Echo now returns a clear recovery message instead of falling through to a generic connection error.
+- Added readiness metadata to `/provider` (`ready`, `readiness_message`, `readiness_detail`) so the UI can surface provider status without starting a chat request.
+- Added a read-only `/memory/doctor` report that summarizes memory count, type distribution, pinned/profile coverage, duplicate-looking groups, raw conversation auto-store status, warnings, and recommendations.
+- Added focused tests for LM Studio unreachable, OpenAI key-ready readiness checks, and memory-doctor duplicate/conversation-dominance warnings.
+
 ## v7.1.3 - Agentic Baseline Documentation
 
 ### Docs

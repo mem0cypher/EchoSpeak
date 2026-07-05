@@ -5,6 +5,7 @@ This file is for developers extending EchoSpeak’s agent.
 ---
 
 ## Recent Updates
+- **Provider readiness + memory doctor (v7.2.0)**: `/query` and `/query/stream` now preflight the configured model provider before starting the agent loop, returning a clear `provider_unavailable` response when LM Studio/Ollama/LocalAI/vLLM/API keys are not ready. `GET /provider` includes readiness metadata, and `GET /memory/doctor` reports duplicate memory groups, type coverage, pinned/profile counts, and raw conversation auto-store status.
 - **Agentic baseline (v7.1.3 docs)**: Added `docs/AGENTIC_BASELINE_2026.md`, comparing EchoSpeak against current Claude Code, Letta, LangGraph, OpenAI Agents SDK, OpenHands, CrewAI, and MCP patterns. The next roadmap target is reliability: provider readiness, coding lifecycle, memory doctor, MCP trust center, and evaluation scenarios.
 - **Agentic tool loop hardening (v7.1.2)**: Terminal execution now uses a denylist, coding/project prompts auto-promote into the coding workspace, `Desktop/...` resolves through configured extra file roots, and operational lessons can be injected into the system prompt without saving every conversation as memory.
 - **Transparent reasoning trace (v7.1.2)**: Thinking/reasoning and task-plan UI render as transparent chat timeline activity with clearer live tool text, while internal five-stage pipeline logging stays out of the user-facing reasoning stream.
@@ -355,7 +356,7 @@ Routines fire through `process_query()` — same tool access, safety gating, and
 
 Terminal command safety:
 
-- `TERMINAL_COMMAND_ALLOWLIST` (comma-separated allowlist of command first-tokens)
+- `TERMINAL_COMMAND_DENYLIST` (comma-separated denylist of blocked command first-tokens)
 - `TERMINAL_COMMAND_TIMEOUT` (seconds)
 - `TERMINAL_MAX_OUTPUT_CHARS`
 

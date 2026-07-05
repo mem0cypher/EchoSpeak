@@ -113,6 +113,165 @@ def _default_cloud_provider() -> "ModelProvider":
     return ModelProvider.OPENAI
 
 
+def _resolve_runtime_provider() -> "ModelProvider":
+    """Resolve the provider the next query would use without creating an agent."""
+    if _is_lmstudio_only_enabled():
+        return ModelProvider.LM_STUDIO
+    if _runtime_provider is not None:
+        return _runtime_provider
+    return config.local.provider if config.use_local_models else _default_cloud_provider()
+
+
+def _provider_default_base_url(provider: "ModelProvider") -> str:
+    if provider == ModelProvider.OLLAMA:
+        return "http://localhost:11434"
+    if provider == ModelProvider.LM_STUDIO:
+        return LM_STUDIO_DEFAULT_URL
+    if provider == ModelProvider.LOCALAI:
+        return "http://localhost:8080"
+    if provider == ModelProvider.VLLM:
+        return "http://localhost:8000"
+    return ""
+
+
+def _local_provider_models_url(provider: "ModelProvider", base_url: str) -> str:
+    base = (base_url or _provider_default_base_url(provider)).rstrip("/")
+    if provider == ModelProvider.OLLAMA:
+        return f"{base}/api/tags"
+    if base.endswith("/v1"):
+        return f"{base}/models"
+    return f"{base}/v1/models"
+
+
+def _provider_recovery_message(provider: "ModelProvider", detail: str = "") -> str:
+    name = provider.value
+    if provider == ModelProvider.LM_STUDIO:
+        return (
+            "LM Studio is selected, but I cannot reach its local server. "
+            f"Start LM Studio, load a model, enable the local server at {LM_STUDIO_DEFAULT_URL}, "
+            "then try again. You can also switch EchoSpeak to another provider."
+        )
+    if provider == ModelProvider.OLLAMA:
+        return (
+            "Ollama is selected, but I cannot reach the Ollama server. "
+            "Start Ollama, make sure a model is installed, then try again."
+        )
+    if provider in (ModelProvider.LOCALAI, ModelProvider.VLLM):
+        return (
+            f"{name} is selected, but I cannot reach its local model server. "
+            "Start the server or switch EchoSpeak to another provider, then try again."
+        )
+    if provider == ModelProvider.OPENAI:
+        return "OpenAI is selected, but no OpenAI API key is configured. Add an API key or switch provider."
+    if provider == ModelProvider.GEMINI:
+        return "Gemini is selected, but Gemini is not ready. Add a Gemini API key/dependency or switch provider."
+    if provider == ModelProvider.LLAMA_CPP:
+        return "llama.cpp is selected, but its local model path is not ready. Check the model path or switch provider."
+    return f"Model provider {name} is not ready. {detail}".strip()
+
+
+def _check_provider_readiness(provider: Optional["ModelProvider"] = None, timeout: float = 1.5) -> dict[str, Any]:
+    """Fast query preflight so provider outages become clear user-facing failures."""
+    p = provider or _resolve_runtime_provider()
+    try:
+        _assert_provider_available(p)
+    except HTTPException as exc:
+        return {
+            "ok": False,
+            "provider": p.value,
+            "message": _provider_recovery_message(p, str(exc.detail)),
+            "detail": str(exc.detail),
+        }
+
+    if p == ModelProvider.OPENAI:
+        key = str(getattr(getattr(config, "openai", None), "api_key", "") or "").strip()
+        return {
+            "ok": bool(key),
+            "provider": p.value,
+            "message": "" if key else _provider_recovery_message(p),
+            "detail": "" if key else "Missing OPENAI_API_KEY",
+        }
+
+    if p == ModelProvider.GEMINI:
+        key = str(getattr(getattr(config, "gemini", None), "api_key", "") or "").strip()
+        return {
+            "ok": bool(key),
+            "provider": p.value,
+            "message": "" if key else _provider_recovery_message(p),
+            "detail": "" if key else "Missing GEMINI_API_KEY",
+        }
+
+    if p == ModelProvider.LLAMA_CPP:
+        model_path = str(getattr(getattr(config, "local", None), "model_name", "") or "").strip()
+        ok = bool(model_path and Path(model_path).exists())
+        return {
+            "ok": ok,
+            "provider": p.value,
+            "message": "" if ok else _provider_recovery_message(p),
+            "detail": "" if ok else f"Model path not found: {model_path or '(empty)'}",
+        }
+
+    if p in (ModelProvider.OLLAMA, ModelProvider.LM_STUDIO, ModelProvider.LOCALAI, ModelProvider.VLLM):
+        base_url = str(getattr(getattr(config, "local", None), "base_url", "") or "").strip()
+        if not base_url or (_is_lmstudio_only_enabled() and p == ModelProvider.LM_STUDIO):
+            base_url = _provider_default_base_url(p)
+        url = _local_provider_models_url(p, base_url)
+        try:
+            req = UrlRequest(url, headers={"Accept": "application/json"})
+            with urlopen(req, timeout=timeout) as resp:
+                status = int(getattr(resp, "status", 200) or 200)
+                if 200 <= status < 300:
+                    return {"ok": True, "provider": p.value, "message": "", "detail": ""}
+                detail = f"HTTP {status} from {url}"
+        except HTTPError as exc:
+            detail = f"HTTP {getattr(exc, 'code', '')} from {url}".strip()
+        except URLError as exc:
+            detail = f"Cannot connect to {url}: {getattr(exc, 'reason', exc)}"
+        except TimeoutError:
+            detail = f"Timed out connecting to {url}"
+        except Exception as exc:
+            detail = f"Cannot connect to {url}: {exc}"
+        return {
+            "ok": False,
+            "provider": p.value,
+            "message": _provider_recovery_message(p, detail),
+            "detail": detail,
+        }
+
+    return {"ok": True, "provider": p.value, "message": "", "detail": ""}
+
+
+def _should_preflight_provider(message: str) -> bool:
+    """Skip preflight for lightweight confirmation/control replies."""
+    low = str(message or "").strip().lower()
+    if low in {"confirm", "cancel", "yes", "no", "approve", "reject"}:
+        return False
+    return True
+
+
+def _provider_unavailable_payload(request_id: str, readiness: dict[str, Any]) -> dict[str, Any]:
+    message = str(readiness.get("message") or "The selected model provider is not ready.")
+    detail = str(readiness.get("detail") or "").strip()
+    if detail and detail not in message:
+        message = f"{message}\n\nDetails: {detail}"
+    return {
+        "type": "final",
+        "response": message,
+        "success": False,
+        "memory_count": 0,
+        "doc_sources": [],
+        "research": [],
+        "spoken_text": message,
+        "execution_id": None,
+        "trace_id": None,
+        "thread_state": None,
+        "request_id": request_id,
+        "at": time.time(),
+        "error_code": "provider_unavailable",
+        "provider": readiness.get("provider"),
+    }
+
+
 _agent = None
 _agent_pool: "OrderedDict[str, Any]" = OrderedDict()
 _agent_pool_lock = threading.Lock()
@@ -1776,6 +1935,21 @@ class MemoryListResponse(BaseModel):
     use_faiss: bool
 
 
+class MemoryDoctorResponse(BaseModel):
+    ok: bool
+    memory_count: int
+    scanned: int
+    use_faiss: bool
+    auto_store_conversations: bool
+    type_counts: Dict[str, int]
+    pinned_count: int
+    profile_fact_count: int
+    missing_type_count: int
+    duplicate_groups: List[Dict[str, Any]]
+    warnings: List[str]
+    recommendations: List[str]
+
+
 class MemoryDeleteRequest(BaseModel):
     ids: List[str]
     thread_id: Optional[str] = None
@@ -1809,6 +1983,9 @@ class ProviderInfoResponse(BaseModel):
     available_providers: list
     context_window: int = 0
     max_output_tokens: int = 0
+    ready: bool = True
+    readiness_message: str = ""
+    readiness_detail: str = ""
 
 
 class SwitchProviderRequest(BaseModel):
@@ -1872,6 +2049,27 @@ async def query(request: QueryRequest):
             bool(request.include_memory),
             len((request.message or "")),
         )
+        if _should_preflight_provider(request.message):
+            readiness = _check_provider_readiness()
+            if not bool(readiness.get("ok")):
+                logger.warning(
+                    "Provider preflight failed for /query request_id=%s provider=%s detail=%s",
+                    request_id,
+                    readiness.get("provider"),
+                    readiness.get("detail"),
+                )
+                payload = _provider_unavailable_payload(request_id, readiness)
+                return QueryResponse(
+                    response=str(payload["response"]),
+                    success=False,
+                    memory_count=0,
+                    request_id=request_id,
+                    doc_sources=[],
+                    research=[],
+                    execution_id=None,
+                    trace_id=None,
+                    thread_state=None,
+                )
         agent = get_agent(request.thread_id)
         thread_state = _apply_thread_scope(agent, request.thread_id, request.workspace)
         q: queue.Queue = queue.Queue()
@@ -3216,8 +3414,6 @@ async def clear_documents():
 
 @app.post("/query/stream")
 async def query_stream(request: QueryRequest):
-    agent = get_agent(request.thread_id)
-    _apply_thread_scope(agent, request.thread_id, request.workspace)
     q: queue.Queue = queue.Queue()
     request_id = str(uuid.uuid4())
     _metric_inc("requests", 1)
@@ -3229,6 +3425,33 @@ async def query_stream(request: QueryRequest):
         bool(request.include_memory),
         len((request.message or "")),
     )
+
+    if _should_preflight_provider(request.message):
+        readiness = _check_provider_readiness()
+        if not bool(readiness.get("ok")):
+            logger.warning(
+                "Provider preflight failed for /query/stream request_id=%s provider=%s detail=%s",
+                request_id,
+                readiness.get("provider"),
+                readiness.get("detail"),
+            )
+
+            async def unavailable_gen():
+                yield (json.dumps(
+                    {
+                        "type": "status",
+                        "agent_mode": "idle",
+                        "at": time.time(),
+                        "request_id": request_id,
+                    },
+                    ensure_ascii=False,
+                ) + "\n").encode("utf-8")
+                yield (json.dumps(_provider_unavailable_payload(request_id, readiness), ensure_ascii=False) + "\n").encode("utf-8")
+
+            return StreamingResponse(unavailable_gen(), media_type="application/x-ndjson")
+
+    agent = get_agent(request.thread_id)
+    _apply_thread_scope(agent, request.thread_id, request.workspace)
 
     _start_agent_thread(
         agent=agent,
@@ -3915,6 +4138,137 @@ async def list_memory(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _normalize_memory_audit_text(text: str) -> str:
+    cleaned = " ".join(str(text or "").lower().split())
+    return cleaned[:500]
+
+
+def _build_memory_doctor_report(agent, thread_id: Optional[str], max_scan: int = 300) -> MemoryDoctorResponse:
+    max_scan = max(10, min(int(max_scan or 300), 1000))
+    memory = getattr(agent, "memory", None)
+    if memory is None:
+        return MemoryDoctorResponse(
+            ok=False,
+            memory_count=0,
+            scanned=0,
+            use_faiss=False,
+            auto_store_conversations=bool(getattr(config, "memory_auto_store_conversations", False)),
+            type_counts={},
+            pinned_count=0,
+            profile_fact_count=0,
+            missing_type_count=0,
+            duplicate_groups=[],
+            warnings=["Memory manager is not initialized."],
+            recommendations=["Restart the backend or check memory initialization logs."],
+        )
+
+    items = memory.list_items(offset=0, limit=max_scan, thread_id=thread_id)
+    type_counts: Dict[str, int] = {}
+    pinned_count = 0
+    missing_type_count = 0
+    duplicate_map: Dict[str, list[dict[str, Any]]] = {}
+
+    for item in items:
+        payload = item if isinstance(item, dict) else {}
+        text = str(payload.get("text") or "")
+        meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        mem_type = str(meta.get("type") or "").strip() or "unknown"
+        type_counts[mem_type] = type_counts.get(mem_type, 0) + 1
+        if mem_type == "unknown":
+            missing_type_count += 1
+        if bool(meta.get("pinned")):
+            pinned_count += 1
+        norm = _normalize_memory_audit_text(text)
+        if len(norm) >= 24:
+            duplicate_map.setdefault(norm, []).append(
+                {
+                    "id": str(payload.get("id") or ""),
+                    "type": mem_type,
+                    "preview": text[:180],
+                    "timestamp": payload.get("timestamp"),
+                }
+            )
+
+    duplicate_groups = []
+    for norm, group in duplicate_map.items():
+        if len(group) > 1:
+            duplicate_groups.append(
+                {
+                    "count": len(group),
+                    "preview": group[0].get("preview", ""),
+                    "items": group[:8],
+                }
+            )
+    duplicate_groups.sort(key=lambda g: int(g.get("count") or 0), reverse=True)
+    duplicate_groups = duplicate_groups[:12]
+
+    profile = getattr(memory, "_profile", None)
+    profile_fact_count = 0
+    if isinstance(profile, dict):
+        for val in profile.values():
+            if isinstance(val, dict):
+                profile_fact_count += len([v for v in val.values() if str(v or "").strip()])
+            elif isinstance(val, list):
+                profile_fact_count += len([v for v in val if str(v or "").strip()])
+            elif str(val or "").strip():
+                profile_fact_count += 1
+
+    memory_count = int(getattr(memory, "memory_count", 0) or 0)
+    auto_store = bool(getattr(config, "memory_auto_store_conversations", False))
+    conversation_count = int(type_counts.get("conversation", 0))
+    warnings: list[str] = []
+    recommendations: list[str] = []
+
+    if auto_store:
+        warnings.append("Raw conversation auto-store is enabled.")
+        recommendations.append("Keep raw conversation auto-store off unless explicitly debugging; prefer profile facts and curated memories.")
+    if duplicate_groups:
+        warnings.append(f"Found {len(duplicate_groups)} exact duplicate-looking memory group(s) in the scanned items.")
+        recommendations.append("Run memory compaction or review duplicate groups before injecting more long-term memory.")
+    if missing_type_count:
+        warnings.append(f"{missing_type_count} scanned memory item(s) are missing a typed memory category.")
+        recommendations.append("Backfill missing memory types so retrieval can distinguish profile, preference, project, contacts, and notes.")
+    if conversation_count > max(20, len(items) // 2):
+        warnings.append("Conversation memories dominate the scanned sample.")
+        recommendations.append("Prefer searchable chat history plus curated durable memories instead of storing every conversation turn.")
+    if profile_fact_count == 0:
+        recommendations.append("Add deterministic profile facts for stable personal recall, such as name and core preferences.")
+    if memory_count > 250:
+        warnings.append("Memory count is high enough that retrieval quality and startup cost may degrade.")
+        recommendations.append("Use memory doctor plus compaction to reduce stale or duplicated memories.")
+    if not warnings:
+        recommendations.append("Memory looks healthy in the scanned sample.")
+
+    return MemoryDoctorResponse(
+        ok=not bool(warnings),
+        memory_count=memory_count,
+        scanned=len(items),
+        use_faiss=bool(getattr(memory, "use_faiss", False)),
+        auto_store_conversations=auto_store,
+        type_counts=type_counts,
+        pinned_count=pinned_count,
+        profile_fact_count=profile_fact_count,
+        missing_type_count=missing_type_count,
+        duplicate_groups=duplicate_groups,
+        warnings=warnings,
+        recommendations=recommendations,
+    )
+
+
+@app.get("/memory/doctor", response_model=MemoryDoctorResponse)
+async def memory_doctor(
+    thread_id: Optional[str] = Query(default=None),
+    max_scan: int = Query(default=300, ge=10, le=1000),
+):
+    """Read-only memory health report for duplicate/stale/untyped memory diagnosis."""
+    try:
+        agent = get_agent(thread_id)
+        return _build_memory_doctor_report(agent, thread_id, max_scan=max_scan)
+    except Exception as e:
+        logger.error(f"Memory doctor error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/memory/delete")
 async def delete_memory(request: MemoryDeleteRequest):
     try:
@@ -3996,6 +4350,7 @@ async def get_provider_info():
         _force_lmstudio_config()
         providers = [p for p in providers if p.get("id") == ModelProvider.LM_STUDIO.value]
         ctx_w, max_out = _estimate_context_window(ModelProvider.LM_STUDIO, config.local.model_name)
+        readiness = _check_provider_readiness(ModelProvider.LM_STUDIO)
         return ProviderInfoResponse(
             provider=ModelProvider.LM_STUDIO.value,
             model=config.local.model_name,
@@ -4004,6 +4359,9 @@ async def get_provider_info():
             available_providers=providers,
             context_window=ctx_w,
             max_output_tokens=max_out,
+            ready=bool(readiness.get("ok")),
+            readiness_message=str(readiness.get("message") or ""),
+            readiness_detail=str(readiness.get("detail") or ""),
         )
 
     # Do not instantiate the agent here; provider can be misconfigured (e.g. missing deps)
@@ -4018,6 +4376,7 @@ async def get_provider_info():
         model = config.local.model_name
     base_url = None if provider in (ModelProvider.OPENAI, ModelProvider.GEMINI, ModelProvider.LLAMA_CPP) else config.local.base_url
     ctx_w, max_out = _estimate_context_window(provider, model)
+    readiness = _check_provider_readiness(provider)
 
     return ProviderInfoResponse(
         provider=provider.value,
@@ -4027,6 +4386,9 @@ async def get_provider_info():
         available_providers=providers,
         context_window=ctx_w,
         max_output_tokens=max_out,
+        ready=bool(readiness.get("ok")),
+        readiness_message=str(readiness.get("message") or ""),
+        readiness_detail=str(readiness.get("detail") or ""),
     )
 
 
