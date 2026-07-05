@@ -134,6 +134,14 @@ class ReflectionEngine:
         if any(sig in result_lower for sig in failure_signals):
             return True
 
+        telemetry = getattr(self.agent, "_verification_telemetry", None)
+        if telemetry is not None:
+            try:
+                if telemetry.verification_level(tool_name) == "high" and tool_name not in TRIVIAL_TOOLS:
+                    return True
+            except Exception:
+                pass
+
         # Substantial non-error results are usually fine
         result_len = len(str(result or ""))
         if result_len > SUBSTANTIAL_RESULT_LENGTH:

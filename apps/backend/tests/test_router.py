@@ -156,6 +156,18 @@ class TestWebSearchRouting:
         decision = router.route("can you search for the latest news?")
         assert decision.intent == "chat"
 
+    def test_topic_specific_capability_gap_uses_real_pipeline(self, make_router):
+        router = make_router()
+        decision = router.route("how could you get access to live sports odds, do you need a skill for that?")
+        assert decision.intent == "web_search"
+
+    def test_reworded_capability_gap_not_canned_chat(self, make_router):
+        router = make_router()
+        first = router.route("how could you get access to live sports odds?")
+        second = router.route("do you need a skill for betting odds?")
+        assert first.intent == "web_search"
+        assert second.intent == "web_search"
+
 
 # ---------------------------------------------------------------------------
 # Time query
