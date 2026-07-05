@@ -26,6 +26,8 @@ class VerificationTelemetry:
     HIGH_WEIGHT_KINDS = {
         "search_query_rejected",
         "search_evidence_irrelevant",
+        "search_evidence_insufficient",
+        "tool_call_syntax_unrecognized",
         "action_args_invalid",
         "terminal_nonzero",
         "file_operation_failed",
@@ -69,10 +71,25 @@ class VerificationTelemetry:
                 pass
         return event
 
+    def verification_level(self, tool: str, kind: str = "") -> str:
+        event_kind = str(kind or "")
+        tool_name = str(tool or "")
+        if event_kind in self.HIGH_WEIGHT_KINDS:
+            return "high"
+        if tool_name in {"web_search", "terminal_run", "file_write", "file_move", "file_copy", "file_delete", "artifact_write"}:
+            return "high"
+        if event_kind and self.counts.get(event_kind, 0) >= 2:
+            return "high"
+        if tool_name and self.counts.get(tool_name, 0) >= 2:
+            return "medium"
+        if tool_name in self.LOW_WEIGHT_TOOLS:
+            return "low"
+        return "medium"
+
     def should_verify(self, tool: str, kind: str = "") -> bool:
-        if str(kind or "") in self.HIGH_WEIGHT_KINDS:
+        if self.verification_level(tool, kind) in {"high", "medium"}:
             return True
-        return str(tool or "") not in self.LOW_WEIGHT_TOOLS
+        return False
 
     def report(self, limit: int = 12) -> Dict[str, Any]:
         recent_items: List[Dict[str, Any]] = [asdict(e) for e in list(self.recent)[-limit:]]
@@ -83,4 +100,5 @@ class VerificationTelemetry:
             "clusters": dict(self.counts.most_common(20)),
             "recent": recent_items,
             "high_weight_kinds": sorted(self.HIGH_WEIGHT_KINDS),
+            "low_weight_tools": sorted(self.LOW_WEIGHT_TOOLS),
         }

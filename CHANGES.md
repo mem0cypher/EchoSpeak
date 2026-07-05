@@ -1,5 +1,25 @@
 # Changes
 
+## v7.3.2 - Reliability Contract Cleanup
+
+### Backend
+- Added a unified printed-tool-call interceptor for weak local models. Echo now catches `|TOOL|`, `<execute_tool>...</execute_tool>`, `<tool_call>...</tool_call>`, fenced JSON/tool blocks, and function-style calls such as `terminal_run(command="...", cwd=".")` before chat display. Recognized actions become pending confirmations; malformed tool-looking output becomes a clear blocked parse message instead of raw fake tool text.
+- Hardened printed file-tool recovery for weak-model near misses such as `<execute_tool> file_write(file_path="index.html", content="...") </execute_tool>` with `file_path` aliases or a missing final parenthesis, so the output becomes a pending file action instead of fake chat text.
+- Added recovery for LM-Studio/harmony-style printed tool tokens such as `<|tool_call>call:file_write{path:<|"|>index.html<|"|>, content:<|"|>...<|"|>}`. If the model provides file content but omits the path, Echo can infer the requested filename from the user prompt and still convert the output into a confirmation-gated pending action.
+- Generalized search evidence sufficiency beyond live scores. Current-day schedules, events, odds, availability, releases, and "who plays today" style requests now require snippets or fetched page text that actually contains the requested answer.
+- Added bounded read-only full-page extraction as a fallback for promising search URLs when snippets are date/nav-only or otherwise too shallow.
+- Narrowed capability shortcuts in both the router and core tool-selection path. Generic "what can you do?" questions still stay lightweight; topic-specific capability-gap questions such as live sports odds now route through normal reasoning/search.
+- Fixed workspace allowlist policy drift: workspace allowlists remain the ceiling and are no longer intersected with every active skill, which keeps safe workspace tools such as `web_search`, `calculate`, `get_system_time`, and `project_update_context` visible where intended.
+- Made TaskPlanner action execution confirmation-gated by default for local/web use. Planner-created file, terminal, and social actions now pause for confirmation unless a future explicit autonomy mode enables auto-run.
+- Preserved LangGraph thread-id behavior while still passing the system/context message into pre-model-hook graph runs.
+- Added explicit graduated context-pressure stages (`none`, `soft_trim`, `summarize`, `compact`) and protected pending actions, active task plans, current subject, profile, pinned memory, and session memory from low-priority trimming.
+- Added mid-task context pressure checks before tool steps and after large tool outputs.
+- Made verification weighting active: printed tool syntax, search sufficiency, action args, terminal, file writes, and retry exhaustion are high-weight clusters; simple time/calculator/project-update reads remain low-weight.
+
+### Verification
+- Updated stale LangChain tool tests to assert `.invoke(...)`/metadata instead of Python callability.
+- Added regression tests for printed tool syntax interception, schedule evidence insufficiency, full-page search fallback, capability-gap routing, context pressure stages, and verification weighting.
+
 ## v7.3.1 - Reliability Architecture Pass
 
 ### Backend

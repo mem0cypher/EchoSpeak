@@ -607,6 +607,7 @@ class WebTaskReflector:
                     resolved_request=q,
                     current_subject=str(getattr(self.agent, "_current_subject_text", "") or ""),
                     execute=execute_candidate,
+                    fetch_url=getattr(self.agent, "_fetch_search_result_page_text", None),
                 )
                 try:
                     self.agent._last_grounded_search_result = grounded.as_dict()
@@ -621,7 +622,7 @@ class WebTaskReflector:
                             )
                         if not grounded.accepted:
                             telemetry.record(
-                                "search_evidence_irrelevant",
+                                "search_evidence_insufficient",
                                 tool=tool_name,
                                 reason="WebTaskReflector compatibility grounding did not find strong evidence.",
                                 metadata={"chosen_query": grounded.chosen_query},
@@ -1048,6 +1049,8 @@ Return ONLY the JSON array, no explanation:
         task = self.pending_tasks[self.current_task_index]
         tool_name = task.get("tool", "")
         logger.debug(f"execute_next_task: index={self.current_task_index}, tool={tool_name}")
+        if hasattr(self.agent, "_check_context_budget_mid_task"):
+            self.agent._check_context_budget_mid_task("before_task", task)
         
         # Check dependencies
         depends_on = task.get("depends_on", -1)
@@ -1106,7 +1109,14 @@ Return ONLY the JSON array, no explanation:
                     kwargs["message"] = kwargs.pop("text")
 
             # Check if this action tool is auto-confirmed for the current role/source
-            if hasattr(self.agent, "_should_auto_confirm") and self.agent._should_auto_confirm(tool_name):
+            auto_confirm = False
+            auto_confirm_fn = getattr(self.agent, "_should_auto_confirm", None)
+            if callable(auto_confirm_fn):
+                try:
+                    auto_confirm = auto_confirm_fn(tool_name) is True
+                except Exception:
+                    auto_confirm = False
+            if auto_confirm:
                 # Bypassing confirmation halt - execution continues below
                 logger.info(f"Task Planner: Auto-confirming action tool '{tool_name}'")
             else:
@@ -1178,6 +1188,8 @@ Return ONLY the JSON array, no explanation:
                 self.agent._emit_thinking_step("thought", f"Task {self.current_task_index + 1}/{len(self.pending_tasks)}: {task_desc}", "running")
             
             result = tool.invoke(**params)
+            if hasattr(self.agent, "_check_context_budget_mid_task"):
+                self.agent._check_context_budget_mid_task("after_tool_output", task, str(result or ""))
             
             # Apply reflection and retry for web search tasks (legacy fast-path)
             if tool_name == "web_search":
@@ -1203,6 +1215,8 @@ Return ONLY the JSON array, no explanation:
                             if callbacks and hasattr(self.agent, "_emit_tool_start"):
                                 self.agent._emit_tool_start(callbacks, tool_name, str(retry_params), retry_run_id)
                             result = tool.invoke(**retry_params)
+                            if hasattr(self.agent, "_check_context_budget_mid_task"):
+                                self.agent._check_context_budget_mid_task("after_retry_output", task, str(result or ""))
                             if callbacks and hasattr(self.agent, "_emit_tool_end"):
                                 self.agent._emit_tool_end(callbacks, result, retry_run_id)
                         except Exception as retry_exc:
@@ -2325,6 +2339,8 @@ class EchoSpeakAgent:
         q = (query_lower or "").strip().lower()
         if not q:
             return False
+        if self._is_topic_specific_capability_gap(q):
+            return False
         return any(phrase in q for phrase in [
             "is that in ur power",
             "is that in your power",
@@ -2336,6 +2352,43 @@ class EchoSpeakAgent:
             "will you be able",
             "could you be able",
         ])
+
+    def _is_topic_specific_capability_gap(self, query_lower: str) -> bool:
+        q = re.sub(r"\s+", " ", str(query_lower or "").strip().lower())
+        if not q:
+            return False
+        gap_language = any(
+            phrase in q
+            for phrase in [
+                "how could you get access",
+                "how would you get access",
+                "do you need a skill",
+                "need a skill",
+                "need a tool",
+                "need an api",
+                "need integration",
+                "can you get access",
+            ]
+        )
+        topic_language = any(
+            term in q
+            for term in [
+                "sports odds",
+                "live odds",
+                "betting odds",
+                "odds",
+                "score",
+                "schedule",
+                "discord",
+                "twitter",
+                "twitch",
+                "desktop",
+                "files",
+                "mcp",
+                "api",
+            ]
+        )
+        return gap_language and topic_language
 
     def _capability_help_response(self) -> str:
         parts = [
@@ -2572,6 +2625,22 @@ class EchoSpeakAgent:
             return False
         if getattr(self, "_current_source", None) == "discord_bot" and name not in self._discord_server_assistant_tools():
             return False
+        safe_baseline = {"web_search", "get_system_time", "calculate", "project_update_context"}
+        if name in safe_baseline:
+            return True
+        coding_baseline = {
+            "file_write",
+            "file_read",
+            "file_list",
+            "file_mkdir",
+            "file_delete",
+            "file_move",
+            "file_copy",
+            "terminal_run",
+            "artifact_write",
+        }
+        if str(getattr(self, "_workspace_id", "") or "").strip().lower() == "coding" and name in coding_baseline:
+            return True
         allowlist = self._tool_allowlist_override
         if allowlist is None:
             return True
@@ -2695,7 +2764,7 @@ class EchoSpeakAgent:
     def _parse_printed_tool_directive(self, response_text: str) -> Optional[Dict[str, Any]]:
         """Recover when a non-tool-calling model prints a tool directive as text."""
         text = str(response_text or "").strip()
-        if not text or "|tool|" not in text.lower():
+        if not text:
             return None
 
         allowed = {
@@ -2709,52 +2778,231 @@ class EchoSpeakAgent:
             "file_delete",
             "web_search",
         }
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if "|tool|" not in line.lower():
-                continue
-            after = re.split(r"\|tool\|", line, maxsplit=1, flags=re.IGNORECASE)[-1].strip()
-            after = after.lstrip(":|- ").strip()
-            if not after:
-                continue
 
-            data = self._parse_action_json(after)
-            if data:
-                action = str(data.get("action") or data.get("tool") or data.get("name") or "").strip().lower()
-                if not action:
-                    m_action = re.match(r"^([a-zA-Z_][\w.-]*)", after)
-                    action = (m_action.group(1).strip().lower() if m_action else "")
-                if action in allowed:
-                    data["action"] = action
-                    data.setdefault("confidence", 0.95)
-                    return data
+        candidates: list[str] = []
+        lower = text.lower()
+        if "|tool|" in lower:
+            for raw_line in text.splitlines():
+                if "|tool|" not in raw_line.lower():
+                    continue
+                after = re.split(r"\|tool\|", raw_line, maxsplit=1, flags=re.IGNORECASE)[-1]
+                candidates.append(after.lstrip(":|- ").strip())
 
-            m = re.match(r"^([a-zA-Z_][\w.-]*)\s*(.*)$", after, flags=re.DOTALL)
+        def _extract_function_calls(payload: str) -> list[str]:
+            calls: list[str] = []
+            src = str(payload or "")
+            name_pattern = re.compile(r"\b(?:%s)\s*\(" % "|".join(sorted(map(re.escape, allowed))), re.IGNORECASE)
+            for match in name_pattern.finditer(src):
+                start = match.start()
+                pos = match.end() - 1
+                depth = 0
+                quote = ""
+                triple = False
+                escaped = False
+                i = pos
+                while i < len(src):
+                    ch = src[i]
+                    nxt3 = src[i : i + 3]
+                    if quote:
+                        if escaped:
+                            escaped = False
+                        elif ch == "\\":
+                            escaped = True
+                        elif triple and nxt3 == quote * 3:
+                            i += 2
+                            quote = ""
+                            triple = False
+                        elif not triple and ch == quote:
+                            quote = ""
+                    else:
+                        if nxt3 in {"'''", '"""'}:
+                            quote = ch
+                            triple = True
+                            i += 2
+                        elif ch in {"'", '"'}:
+                            quote = ch
+                        elif ch == "(":
+                            depth += 1
+                        elif ch == ")":
+                            depth -= 1
+                            if depth == 0:
+                                calls.append(src[start : i + 1].strip())
+                                break
+                    i += 1
+            return calls
+
+        for tag in ("execute_tool", "tool_call", "tool_code"):
+            for match in re.finditer(rf"<{tag}\b[^>]*>(.*?)</{tag}>", text, flags=re.IGNORECASE | re.DOTALL):
+                body = match.group(1).strip()
+                calls = _extract_function_calls(body)
+                candidates.extend(calls)
+                candidates.append(body)
+
+        for match in re.finditer(r"<\|tool_call\|?>(.*?)(?:<\|/tool_call\|?>|$)", text, flags=re.IGNORECASE | re.DOTALL):
+            body = match.group(1).strip()
+            calls = _extract_function_calls(body)
+            candidates.extend(calls)
+            candidates.append(body)
+
+        for match in re.finditer(r"```(?:json|tool|tool_call|execute_tool|tool_code)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL):
+            body = match.group(1).strip()
+            if any(name in body for name in allowed) or body.startswith("{"):
+                calls = _extract_function_calls(body)
+                candidates.extend(calls)
+                candidates.append(body)
+
+        stripped = text.strip()
+        if re.match(r"^(?:%s)\s*\(" % "|".join(sorted(map(re.escape, allowed))), stripped, flags=re.IGNORECASE):
+            candidates.append(stripped)
+        if stripped.startswith("{") and any(name in stripped for name in allowed):
+            candidates.append(stripped)
+
+        def _from_json(payload: str, fallback_action: str = "") -> Optional[Dict[str, Any]]:
+            data = self._parse_action_json(payload)
+            if not data:
+                return None
+            action = str(data.get("action") or data.get("tool") or data.get("name") or fallback_action).strip().lower()
+            if action not in allowed:
+                return None
+            args = data.get("args") or data.get("arguments") or data.get("parameters")
+            if isinstance(args, dict):
+                merged = {**args, **{k: v for k, v in data.items() if k not in {"args", "arguments", "parameters"}}}
+                data = merged
+            data["action"] = action
+            data.setdefault("confidence", 0.95)
+            return data
+
+        def _from_function_call(payload: str) -> Optional[Dict[str, Any]]:
+            # Weak local models sometimes print almost-valid tool calls, e.g.
+            # file_write(file_path="index.html", content="...") with aliases or
+            # even a missing final ")" before the closing XML-ish tag. Treat the
+            # body as tool-shaped and parse the recoverable arguments instead of
+            # letting raw tool syntax leak into chat.
+            payload_text = payload.strip()
+            m = re.match(r"^([a-zA-Z_][\w.-]*)\s*\((.*)$", payload_text, flags=re.DOTALL)
             if not m:
-                continue
+                return None
+            action = m.group(1).strip().lower()
+            if action not in allowed:
+                return None
+            args_src = m.group(2).strip()
+            args_for_ast = args_src[:-1].rstrip() if payload_text.endswith(")") else args_src
+            data: Dict[str, Any] = {"action": action, "confidence": 0.92}
+            try:
+                parsed = ast.parse(f"_f({args_for_ast})", mode="eval")
+                call = parsed.body
+                if isinstance(call, ast.Call):
+                    for kw in call.keywords:
+                        if kw.arg:
+                            data[kw.arg] = ast.literal_eval(kw.value)
+                    if call.args:
+                        first = ast.literal_eval(call.args[0])
+                        if action == "terminal_run":
+                            data.setdefault("command", str(first))
+                        elif action == "web_search":
+                            data.setdefault("query", str(first))
+                        elif action in {"file_read", "file_list", "file_mkdir", "file_delete"}:
+                            data.setdefault("path", str(first))
+            except Exception:
+                for key, _quote, val in re.findall(r"(\w+)\s*=\s*(['\"])(.*?)\2", args_for_ast, flags=re.DOTALL):
+                    data[key] = val
+            return data
+
+        def _from_pipe_tool_call(payload: str) -> Optional[Dict[str, Any]]:
+            original_payload_text = str(payload or "").strip()
+            payload_text = original_payload_text
+            had_pipe_marker = bool(re.match(r"^<\|tool_call\|?>", payload_text, flags=re.IGNORECASE))
+            payload_text = re.sub(r"^<\|tool_call\|?>", "", payload_text, flags=re.IGNORECASE).strip()
+            payload_text = re.sub(r"<\|/tool_call\|?>$", "", payload_text, flags=re.IGNORECASE).strip()
+            if payload_text.lower().startswith("call:"):
+                payload_text = payload_text[5:].strip()
+            elif not had_pipe_marker:
+                return None
+            m = re.match(r"^([a-zA-Z_][\w.-]*)\s*\{(.*)$", payload_text, flags=re.DOTALL)
+            if not m:
+                return None
+            action = m.group(1).strip().lower()
+            if action not in allowed:
+                return None
+            args_src = m.group(2).strip()
+            if args_src.endswith("}"):
+                args_src = args_src[:-1].rstrip()
+            data: Dict[str, Any] = {"action": action, "confidence": 0.9}
+
+            def _pipe_value(key: str) -> Optional[str]:
+                key_pat = re.escape(key)
+                marker_pat = r"<\|\"?\|>"
+                m_val = re.search(
+                    rf"\b{key_pat}\s*:\s*{marker_pat}(.*?)(?:{marker_pat}|(?=,\s*[A-Za-z_][\w.-]*\s*:)|$)",
+                    args_src,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                if m_val:
+                    return (m_val.group(1) or "").strip()
+                m_quoted = re.search(
+                    rf"\b{key_pat}\s*:\s*(['\"])(.*?)\1",
+                    args_src,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                if m_quoted:
+                    return (m_quoted.group(2) or "").strip()
+                m_bare = re.search(
+                    rf"\b{key_pat}\s*:\s*([^,}}]+)",
+                    args_src,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                if m_bare:
+                    return (m_bare.group(1) or "").strip().strip("\"'")
+                return None
+
+            for key in ("path", "file_path", "filepath", "filename", "content", "command", "cmd", "cwd", "query", "q"):
+                value = _pipe_value(key)
+                if value is not None:
+                    data[key] = value
+            append_value = _pipe_value("append")
+            if append_value is not None:
+                data["append"] = str(append_value).strip().lower() in {"1", "true", "yes", "on"}
+            return data
+
+        def _from_action_prefix(payload: str) -> Optional[Dict[str, Any]]:
+            m = re.match(r"^([a-zA-Z_][\w.-]*)\s*(.*)$", payload.strip(), flags=re.DOTALL)
+            if not m:
+                return None
             action = m.group(1).strip().lower()
             rest = m.group(2).strip()
             if action not in allowed:
-                continue
-
-            data = {"action": action, "confidence": 0.9}
-            json_payload = self._parse_action_json(rest)
-            if json_payload:
-                json_payload["action"] = str(json_payload.get("action") or action).strip().lower()
-                json_payload.setdefault("confidence", 0.95)
-                return json_payload
-
-            # Last-resort recovery for the common weak-model shape:
-            # |TOOL| terminal_run echo hello
+                return None
+            data = _from_json(rest, fallback_action=action)
+            if data:
+                return data
+            data = _from_function_call(payload)
+            if data:
+                return data
+            out: Dict[str, Any] = {"action": action, "confidence": 0.9}
             if action == "terminal_run" and rest:
-                data.update({"command": rest, "cwd": "."})
-                return data
+                out.update({"command": rest, "cwd": "."})
+                return out
             if action == "web_search" and rest:
-                data["query"] = rest
-                return data
+                out["query"] = rest.strip("\"'")
+                return out
             if action in {"file_read", "file_list", "file_mkdir", "file_delete"} and rest:
-                data["path"] = rest.strip("\"'")
-                return data
+                out["path"] = rest.strip("\"'")
+                return out
+            return None
+
+        saw_toolish = bool(candidates) or any(marker in lower for marker in ("<execute_tool", "<tool_call", "<tool_code", "<|tool_call", "|tool|"))
+        for candidate in [c for c in candidates if c]:
+            parsed = _from_json(candidate) or _from_pipe_tool_call(candidate) or _from_function_call(candidate) or _from_action_prefix(candidate)
+            if parsed:
+                return parsed
+        if saw_toolish:
+            telemetry = getattr(self, "_verification_telemetry", None)
+            if telemetry is not None:
+                telemetry.record(
+                    "tool_call_syntax_unrecognized",
+                    reason="Printed tool-call-like text was intercepted but could not be parsed.",
+                    metadata={"preview": text[:500]},
+                )
         return None
 
     def _pending_preview_for_candidate(self, pending: Dict[str, Any]) -> str:
@@ -2774,6 +3022,14 @@ class EchoSpeakAgent:
 
     def _handle_printed_tool_directive(self, response_text: str, user_input: str) -> Optional[str]:
         data = self._parse_printed_tool_directive(response_text)
+        if data is None and re.search(r"(\|tool\||<execute_tool\b|<tool_call\b|<tool_code\b|<\|tool_call\|?>|```(?:json|tool|tool_call|execute_tool|tool_code)?\s*\{)", str(response_text or ""), flags=re.IGNORECASE):
+            return "I recognized a tool-call-shaped response, but I could not safely parse it into an available action. Please restate the action in normal language."
+        if data and str(data.get("action") or "").strip().lower() == "file_write":
+            has_path = any(str(data.get(k) or "").strip() for k in ("path", "file_path", "filepath", "filename"))
+            if not has_path:
+                inferred_path, _inferred_content = self._infer_file_write_args(user_input)
+                if inferred_path:
+                    data["path"] = inferred_path
         normalized = self._normalize_candidate_action(data) if data else None
         pending = self._candidate_to_pending_action(normalized, user_input) if normalized else None
         if normalized is not None and pending is None:
@@ -2814,7 +3070,7 @@ class EchoSpeakAgent:
                 out[k] = data.get(k)
 
         if action == "file_write":
-            path = str(data.get("path") or "").strip()
+            path = str(data.get("path") or data.get("file_path") or data.get("filepath") or data.get("filename") or "").strip()
             content = str(data.get("content") or "").strip()
             append = bool(data.get("append") is True)
             if not path or not content:
@@ -2829,7 +3085,7 @@ class EchoSpeakAgent:
             out.update({"command": cmd, "cwd": cwd})
             return out
         if action in {"file_read", "file_list", "file_mkdir", "file_delete"}:
-            path = str(data.get("path") or "").strip()
+            path = str(data.get("path") or data.get("file_path") or data.get("filepath") or data.get("filename") or "").strip()
             if not path:
                 return None
             out.update({"path": path})
@@ -3538,6 +3794,9 @@ class EchoSpeakAgent:
             "breaking news",
             "latest news",
             "recent news",
+            "odds",
+            "sports odds",
+            "betting odds",
         ])
 
     def _is_brief_conversational_query(self, query_lower: str) -> bool:
@@ -3645,6 +3904,9 @@ class EchoSpeakAgent:
             "standings",
             "playoff",
             "playoffs",
+            "odds",
+            "sports odds",
+            "betting odds",
         ]
         if any(t in q for t in triggers):
             return True
@@ -3998,6 +4260,7 @@ class EchoSpeakAgent:
                 resolved_request=final_query,
                 current_subject=current_subject,
                 execute=execute_candidate,
+                fetch_url=self._fetch_search_result_page_text,
             )
             self._last_grounded_search_result = grounded.as_dict()
             telemetry = getattr(self, "_verification_telemetry", None)
@@ -4015,7 +4278,7 @@ class EchoSpeakAgent:
                     )
                 if not grounded.accepted:
                     telemetry.record(
-                        "search_evidence_irrelevant",
+                        "search_evidence_insufficient",
                         tool=tool.name,
                         reason="No grounded search candidate reached the relevance threshold.",
                         metadata={"chosen_query": grounded.chosen_query, "original_request": query_text},
@@ -4042,6 +4305,73 @@ class EchoSpeakAgent:
         except Exception as exc:
             self._emit_tool_error(callbacks, exc, run_id)
             return "", final_query, ensured_time_context
+
+    def _fetch_search_result_page_text(self, url: str, *, timeout: float = 6.0, max_chars: int = 12000) -> str:
+        """Read-only bounded page text extraction for search grounding fallbacks."""
+        raw_url = str(url or "").strip()
+        if not re.match(r"^https?://", raw_url, flags=re.IGNORECASE):
+            return ""
+        try:
+            from html import unescape
+            from urllib.request import Request, urlopen
+
+            req = Request(raw_url, headers={"User-Agent": "EchoSpeakSearchGrounder/1.0"})
+            with urlopen(req, timeout=timeout) as resp:
+                content_type = str(resp.headers.get("content-type") or "").lower()
+                if content_type and "text/html" not in content_type and "text/plain" not in content_type:
+                    return ""
+                raw = resp.read(max_chars * 3)
+            text = raw.decode("utf-8", errors="ignore")
+            text = re.sub(r"(?is)<(script|style|noscript|svg|canvas).*?</\1>", " ", text)
+            text = re.sub(r"(?s)<[^>]+>", " ", text)
+            text = unescape(text)
+            text = re.sub(r"\s+", " ", text).strip()
+            return text[:max_chars]
+        except Exception:
+            return ""
+
+    def _check_context_budget_mid_task(self, phase: str, task: Dict[str, Any], output_text: str = "") -> None:
+        try:
+            local_cfg = getattr(config, "local", None)
+            configured_window = int(getattr(config, "llm_trim_max_tokens", 0) or 0)
+            if configured_window <= 0:
+                configured_window = int(getattr(local_cfg, "context_length", 0) or 0)
+            if configured_window <= 0:
+                configured_window = 8192
+            manager = ContextBudgetManager(
+                context_window=configured_window,
+                reserve_tokens=int(getattr(config, "llm_trim_reserve_tokens", 1200) or 1200),
+                enabled=bool(getattr(config, "context_budget_enabled", True)),
+            )
+            task_text = json.dumps(
+                {
+                    "phase": phase,
+                    "task": {
+                        "index": task.get("index"),
+                        "tool": task.get("tool"),
+                        "status": task.get("status"),
+                        "description": task.get("description"),
+                    },
+                    "output_preview": str(output_text or "")[:4000],
+                },
+                ensure_ascii=False,
+            )
+            blocks = [
+                ContextBlock("active_task_plan", task_text, 1, "Active task plan", protected=True),
+                ContextBlock("pending_action", str(getattr(self, "_pending_action", "") or ""), 2, "Pending action", protected=True),
+                ContextBlock("current_subject", str(getattr(self, "_current_subject_text", "") or ""), 3, "Current subject", protected=True),
+            ]
+            overhead = estimate_tokens(self._compose_system_prompt()) + 256
+            stage = manager.pressure_stage(blocks, overhead_tokens=overhead)
+            previous = self._last_context_budget_report if isinstance(self._last_context_budget_report, dict) else {}
+            self._last_context_budget_report = {
+                **previous,
+                "mid_task_phase": phase,
+                "mid_task_stage": stage,
+                "mid_task_tool": str(task.get("tool") or ""),
+            }
+        except Exception:
+            pass
 
     def _extract_dates_from_text(self, text: str, default_year: int) -> list[datetime]:
         t = (text or "")
@@ -4387,6 +4717,14 @@ class EchoSpeakAgent:
 
         if getattr(self, "_current_source", None) == "discord_bot":
             return self._limited_discord_server_tool_names(low)
+        if getattr(self, "_current_source", None) == "discord_bot_dm" and re.search(r"#[a-z0-9_-]{1,80}", low):
+            try:
+                from config import DiscordUserRole
+
+                if getattr(self, "_current_user_role", DiscordUserRole.PUBLIC) == DiscordUserRole.PUBLIC:
+                    return frozenset()
+            except Exception:
+                return frozenset()
 
         # Discord server-channel intent (post/recap) should always make the bot channel tools available,
         # even if the user doesn't explicitly say "discord".
@@ -5281,17 +5619,11 @@ class EchoSpeakAgent:
         """
         src = str(getattr(self, "_current_source", None) or "").strip().lower()
         
-        # Web UI / Local Host auto-confirm policy:
-        # If running locally (web) and system actions are enabled,
-        # auto-confirm safe and moderate tools (like writing files/folders) to support autonomous coding,
-        # but keep destructive tools confirmation-gated.
+        # Web UI / localhost planner actions confirm first by default. A future
+        # explicit autonomy mode can opt into auto-run, but the safety contract is
+        # that plans pause before file/terminal/social actions unless clearly enabled.
         if not src or src == "web":
-            from agent.tools import TOOL_METADATA
-            meta = TOOL_METADATA.get(tool_name, {})
-            risk = meta.get("risk_level", "safe")
-            if risk == "destructive":
-                return False
-            return True
+            return False
 
         if src != "discord_bot_dm":
             return False
@@ -8005,6 +8337,25 @@ class EchoSpeakAgent:
             continuity_lines.append(f"Current subject: {current_subject}")
         if referential_followup and resolved_input and resolved_input != extracted_input:
             continuity_lines.append(f"Resolved follow-up request: {resolved_input}")
+        pending_action_context = ""
+        if getattr(self, "_pending_action", None):
+            try:
+                pending_action_context = self._format_pending_action(self._pending_action or {})
+            except Exception:
+                pending_action_context = str(self._pending_action or "")
+        active_plan_context = ""
+        planner = getattr(self, "_task_planner", None)
+        if planner is not None:
+            try:
+                active_tasks = [
+                    f"{t.get('index')}: {t.get('description') or t.get('tool')} [{t.get('status')}]"
+                    for t in getattr(planner, "pending_tasks", []) or []
+                    if str(t.get("status") or "").lower() in {"pending", "in_progress", "pending_confirmation"}
+                ]
+                if active_tasks:
+                    active_plan_context = "\n".join(active_tasks[:8])
+            except Exception:
+                active_plan_context = ""
         chat_history = self._history_as_messages() if include_memory else []
         graph_thread_id = thread_id if include_memory else None
         allowed_tool_names = self._allowed_lc_tool_names(resolved_input or extracted_input)
@@ -8031,11 +8382,13 @@ class EchoSpeakAgent:
         self._last_context_budget_report = None
         if include_memory:
             blocks = [
-                ContextBlock("time", time_context, 1, "Current system time"),
-                ContextBlock("continuity", "\n".join(continuity_lines), 2, "Conversation continuity", min_chars=80),
-                ContextBlock("profile", profile_context, 3, "User profile", min_chars=120),
-                ContextBlock("pinned", pinned_context, 4, "Pinned memory", min_chars=120),
-                ContextBlock("session", session_context, 5, "Session memory", min_chars=220),
+                ContextBlock("time", time_context, 1, "Current system time", protected=True),
+                ContextBlock("continuity", "\n".join(continuity_lines), 2, "Conversation continuity", min_chars=80, protected=True),
+                ContextBlock("pending_action", pending_action_context, 3, "Pending action", min_chars=80, protected=True),
+                ContextBlock("active_task_plan", active_plan_context, 4, "Active task plan", min_chars=120, protected=True),
+                ContextBlock("profile", profile_context, 5, "User profile", min_chars=120, protected=True),
+                ContextBlock("pinned", pinned_context, 6, "Pinned memory", min_chars=120, protected=True),
+                ContextBlock("session", session_context, 7, "Session memory", min_chars=220, protected=True),
                 ContextBlock("summary", self._summary, 6, "Conversation summary", min_chars=220),
                 ContextBlock("docs", doc_context, 7, "Document context", min_chars=300),
                 ContextBlock("memory", memory_context, 8, "Relevant memory", min_chars=260),
@@ -8058,6 +8411,13 @@ class EchoSpeakAgent:
                 self._last_context_budget_report = asdict(budget_report)
             except Exception:
                 self._last_context_budget_report = None
+            if getattr(budget_report, "stage", "none") in {"summarize", "compact"}:
+                logger.info(
+                    "Context budget pressure stage=%s usage=%.2f protected=%s",
+                    budget_report.stage,
+                    budget_report.usage_ratio,
+                    budget_report.protected_blocks,
+                )
 
         return ContextBundle(
             context=context,
@@ -8215,10 +8575,11 @@ class EchoSpeakAgent:
                     graph = self.graph_agent
                 logger.info(f"LangGraph: using graph={graph is not None}, pre_model_hook={self._graph_pre_model_hook}, tools_count={len(self.lc_tools or [])}")
                 if self._graph_pre_model_hook:
+                    base = [SystemMessage(content=system_prompt)]
                     if graph_thread_id:
-                        messages = [HumanMessage(content=extracted_input)]
+                        messages = [*base, HumanMessage(content=extracted_input)]
                     else:
-                        messages = [*chat_history, HumanMessage(content=extracted_input)]
+                        messages = [*base, *chat_history, HumanMessage(content=extracted_input)]
                 else:
                     base = [SystemMessage(content=system_prompt)]
                     if graph_thread_id:

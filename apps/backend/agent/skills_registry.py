@@ -164,19 +164,15 @@ def merge_tool_allowlists(
 ) -> Optional[set[str]]:
     base = {name for name in (workspace_allowlist or []) if name}
 
-    # If the workspace doesn't define an allowlist, treat as unrestricted.
-    # Skills can still restrict in that case, but cannot "expand" beyond an explicit workspace ceiling.
+    # Workspace allowlists are the runtime policy ceiling. Skill allowlists describe
+    # what each loaded skill may use, but they must not shrink the workspace's own
+    # safe defaults. The old intersection behavior hid tools like web_search and
+    # project_update_context whenever active skills did not all list them.
     if not base:
         skill_union = {name for allowlist in (skill_allowlists or []) for name in (allowlist or []) if name}
         return skill_union or None
 
-    non_empty_skills = [a for a in (skill_allowlists or []) if a]
-    if not non_empty_skills:
-        return base or None
-
-    skill_union = {name for allowlist in non_empty_skills for name in allowlist if name}
-    restricted = base.intersection(skill_union)
-    return restricted
+    return base or None
 
 
 # ── Skill → Tool Bridge ────────────────────────────────────────────

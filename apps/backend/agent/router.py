@@ -111,6 +111,7 @@ class IntentRouter:
         "last night", "yesterday", "last game",
         "won", "lost", "beat", "defeated",
         "standings", "playoff", "playoffs",
+        "odds", "betting odds", "sports odds",
     ]
 
     DIRECT_TIME_PHRASES: List[str] = [
@@ -284,7 +285,50 @@ class IntentRouter:
     # -----------------------------------------------------------------------
 
     def is_capability_question(self, query_lower: str) -> bool:
-        return any(phrase in query_lower for phrase in self.CAPABILITY_PHRASES)
+        q = re.sub(r"\s+", " ", str(query_lower or "").strip().lower())
+        if not q:
+            return False
+        if self.is_topic_specific_capability_gap(q):
+            return False
+        return any(phrase in q for phrase in self.CAPABILITY_PHRASES)
+
+    def is_topic_specific_capability_gap(self, query_lower: str) -> bool:
+        """Capability wording plus a concrete missing domain should use the real pipeline."""
+        q = re.sub(r"\s+", " ", str(query_lower or "").strip().lower())
+        if not q:
+            return False
+        gap_language = any(
+            phrase in q
+            for phrase in [
+                "how could you get access",
+                "how would you get access",
+                "do you need a skill",
+                "need a skill",
+                "need a tool",
+                "need an api",
+                "need integration",
+                "can you get access",
+            ]
+        )
+        topic_language = any(
+            term in q
+            for term in [
+                "sports odds",
+                "live odds",
+                "betting odds",
+                "odds",
+                "score",
+                "schedule",
+                "discord",
+                "twitter",
+                "twitch",
+                "desktop",
+                "files",
+                "mcp",
+                "api",
+            ]
+        )
+        return gap_language and topic_language
 
     def is_small_talk(self, query_lower: str) -> bool:
         q = re.sub(r"\s+", " ", str(query_lower or "").strip().lower())
@@ -327,6 +371,9 @@ class IntentRouter:
             "breaking news",
             "latest news",
             "recent news",
+            "odds",
+            "sports odds",
+            "betting odds",
         ])
 
     def is_conversational(self, query_lower: str) -> bool:

@@ -192,25 +192,29 @@ class TestTools:
         """Test web search tool is available."""
         from agent.tools import web_search
 
-        assert callable(web_search)
+        assert getattr(web_search, "name", "") == "web_search"
+        assert hasattr(web_search, "invoke")
 
     def test_analyze_screen_tool_exists(self):
         """Test analyze screen tool is available."""
         from agent.tools import analyze_screen
 
-        assert callable(analyze_screen)
+        assert getattr(analyze_screen, "name", "") == "analyze_screen"
+        assert hasattr(analyze_screen, "invoke")
 
     def test_get_system_time_tool_exists(self):
         """Test get system time tool is available."""
         from agent.tools import get_system_time
 
-        assert callable(get_system_time)
+        assert getattr(get_system_time, "name", "") == "get_system_time"
+        assert hasattr(get_system_time, "invoke")
 
     def test_calculate_tool_exists(self):
         """Test calculate tool is available."""
         from agent.tools import calculate
 
-        assert callable(calculate)
+        assert getattr(calculate, "name", "") == "calculate"
+        assert hasattr(calculate, "invoke")
 
     def test_get_available_tools(self):
         """Test getting list of available tools."""
@@ -464,6 +468,124 @@ class TestDiscordHardening:
         assert agent._pending_action is not None
         assert agent._pending_action["tool"] == "terminal_run"
         assert agent._pending_action["kwargs"]["command"] == "echo hello"
+
+    def test_execute_tool_function_call_becomes_pending_file_action(self, tmp_path, monkeypatch):
+        from agent.core import EchoSpeakAgent
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+
+        response = agent._handle_printed_tool_directive(
+            '<execute_tool>file_write(path="index.html", content="<h1>Hello</h1>", append=False)</execute_tool>',
+            "create an html file",
+        )
+
+        assert response is not None
+        assert "<execute_tool>" not in response
+        assert "Reply 'confirm'" in response
+        assert agent._pending_action["tool"] == "file_write"
+        assert agent._pending_action["kwargs"]["path"] == "index.html"
+
+    def test_malformed_execute_tool_file_path_alias_becomes_pending_file_action(self, tmp_path, monkeypatch):
+        from agent.core import EchoSpeakAgent
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+
+        response = agent._handle_printed_tool_directive(
+            '<execute_tool> file_write(file_path="index.html", '
+            'content="<!DOCTYPE html>\\n<html><body><h1>Hello</h1></body></html>" </execute_tool>',
+            "Create an index.html file for a simple landing page",
+        )
+
+        assert response is not None
+        assert "<execute_tool>" not in response
+        assert "Reply 'confirm'" in response
+        assert agent._pending_action["tool"] == "file_write"
+        assert agent._pending_action["kwargs"]["path"] == "index.html"
+        assert "<!DOCTYPE html>" in agent._pending_action["kwargs"]["content"]
+
+    def test_tool_call_json_tag_becomes_pending_terminal_action(self, tmp_path, monkeypatch):
+        from agent.core import EchoSpeakAgent
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+
+        response = agent._handle_printed_tool_directive(
+            '<tool_call>{"tool":"terminal_run","args":{"command":"npm test","cwd":"."}}</tool_call>',
+            "run tests",
+        )
+
+        assert response is not None
+        assert "<tool_call>" not in response
+        assert agent._pending_action["tool"] == "terminal_run"
+        assert agent._pending_action["kwargs"]["command"] == "npm test"
+
+    def test_pipe_token_tool_call_becomes_pending_file_action(self, tmp_path, monkeypatch):
+        from agent.core import EchoSpeakAgent
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+
+        response = agent._handle_printed_tool_directive(
+            '<|tool_call>call:file_write{path:<|"|>index.html<|"|>, '
+            'content:<|"|><!DOCTYPE html>\\n<html><body><h1>Hello</h1></body></html><|"|>}',
+            "Create an index.html file for a simple landing page",
+        )
+
+        assert response is not None
+        assert "<|tool_call>" not in response
+        assert "Reply 'confirm'" in response
+        assert agent._pending_action["tool"] == "file_write"
+        assert agent._pending_action["kwargs"]["path"] == "index.html"
+        assert "<!DOCTYPE html>" in agent._pending_action["kwargs"]["content"]
+
+    def test_pipe_token_file_write_infers_missing_path_from_prompt(self, tmp_path, monkeypatch):
+        from agent.core import EchoSpeakAgent
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+
+        response = agent._handle_printed_tool_directive(
+            '<|tool_call>call:file_write{content:<|"|><!DOCTYPE html>\\n<html></html><|"|>}',
+            "Create an index.html file for a simple landing page",
+        )
+
+        assert response is not None
+        assert "<|tool_call>" not in response
+        assert agent._pending_action["tool"] == "file_write"
+        assert agent._pending_action["kwargs"]["path"] == "index.html"
+
+    def test_tool_code_block_extracts_first_function_call_as_pending_action(self, tmp_path, monkeypatch):
+        from agent.core import EchoSpeakAgent
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+
+        response = agent._handle_printed_tool_directive(
+            '<tool_code> file_write(path="movement_demo/index.html", content="""<html></html>""") '
+            'file_write(path="movement_demo/script.js", content="""console.log(1)""") </tool_code>',
+            "write a tiny JavaScript movement demo",
+        )
+
+        assert response is not None
+        assert "<tool_code>" not in response
+        assert agent._pending_action["tool"] == "file_write"
+        assert agent._pending_action["kwargs"]["path"] == "movement_demo/index.html"
+        assert "<html></html>" in agent._pending_action["kwargs"]["content"]
+
+    def test_unrecognized_tool_call_shape_is_blocked_not_displayed(self, tmp_path):
+        from agent.core import EchoSpeakAgent
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        response = agent._handle_printed_tool_directive(
+            "<execute_tool>totally_unknown_tool(foo='bar')</execute_tool>",
+            "do a thing",
+        )
+
+        assert response is not None
+        assert "<execute_tool>" not in response
+        assert "could not safely parse" in response.lower()
 
     def test_direct_fallback_uses_full_discord_prompt_and_wrapped_followup(self, tmp_path):
         from agent.core import EchoSpeakAgent, ContextBundle
@@ -835,6 +957,24 @@ class TestUpdateContextParity:
         assert "SHARED_UPDATE_CONTEXT_BLOCK" in captured["prompt"]
 
 
+class TestCodingWorkspaceToolAvailability:
+    def test_coding_workspace_keeps_file_and_terminal_tools_available_with_stale_allowlist(self, tmp_path, monkeypatch):
+        from agent.core import EchoSpeakAgent
+        from config import config
+
+        monkeypatch.setattr(config, "enable_system_actions", True, raising=False)
+        monkeypatch.setattr(config, "allow_file_write", True, raising=False)
+        monkeypatch.setattr(config, "allow_terminal_commands", True, raising=False)
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        agent._workspace_id = "coding"
+        agent._tool_allowlist_override = set()
+
+        allowed = agent._allowed_lc_tool_names("Write a tiny JavaScript movement demo and verify the files exist.")
+
+        assert {"file_write", "file_read", "file_list", "file_mkdir", "terminal_run"}.issubset(allowed)
+
+
 class TestConversationAndResearchRouting:
     def test_news_intent_forces_web_search_and_refinement(self, tmp_path, monkeypatch):
         from agent.core import EchoSpeakAgent
@@ -1098,15 +1238,15 @@ class TestNoSearchOnSocialIntro:
 
 
 class TestToolAllowlistMerge:
-    def test_skills_cannot_expand_beyond_workspace(self):
+    def test_skills_cannot_expand_or_shrink_workspace_ceiling(self):
         from agent.skills_registry import merge_tool_allowlists
 
         # Workspace ceiling only allows file_read.
         workspace = ["file_read"]
-        # Skill tries to allow terminal_run.
+        # Skill tries to allow terminal_run, but must not hide workspace-safe file_read.
         skills = [["terminal_run"]]
         merged = merge_tool_allowlists(workspace, skills)
-        assert merged == set()
+        assert merged == {"file_read"}
 
 
 class TestEmbeddingsConfig:

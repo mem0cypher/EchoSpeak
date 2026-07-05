@@ -33,7 +33,21 @@ _LIVE_SCORE_TERMS = {
     "current score",
 }
 
-_SCHEDULE_TERMS = {"schedule", "next game", "next match", "upcoming", "kickoff", "start time", "fixture"}
+_SCHEDULE_TERMS = {
+    "schedule",
+    "next game",
+    "next match",
+    "upcoming",
+    "kickoff",
+    "start time",
+    "fixture",
+    "who plays",
+    "playing today",
+    "games today",
+    "matches today",
+    "what games",
+    "what matches",
+}
 
 
 @dataclass
@@ -45,6 +59,8 @@ class SearchIntent:
     recency_need: bool = False
     live_score_need: bool = False
     schedule_need: bool = False
+    specific_answer_need: bool = False
+    current_day_need: bool = False
     ambiguous: bool = False
 
 
@@ -65,6 +81,7 @@ class GroundedEvidence:
     recency_bucket: str = "unknown"
     matched_terms: list[str] = field(default_factory=list)
     rejection_reason: str = ""
+    fetched_full_page: bool = False
 
 
 @dataclass
@@ -196,6 +213,16 @@ def build_search_intent(original_request: str, resolved_request: str = "", curre
         for sport in ["game", "match", "fifa", "world cup", "soccer", "football", "nhl", "nba", "nfl", "mlb", "canada", "morocco"]
     )
     schedule = any(term in low for term in _SCHEDULE_TERMS)
+    current_day = any(term in low for term in ["today", "tonight", "right now", "currently", "current"])
+    specific_answer = bool(
+        live_score
+        or schedule
+        or (
+            current_day
+            and any(term in low for term in ["who plays", "what games", "what matches", "events", "available", "odds", "release", "released"])
+        )
+        or any(term in low for term in ["odds", "availability", "released", "release date", "score", "scores"])
+    )
     ambiguous = bool(current_subject and re.search(r"\b(deeper|more|again|that|this|it|continue|go further)\b", original.lower()))
     mode = "recent" if recency else "general"
     if live_score:
@@ -210,6 +237,8 @@ def build_search_intent(original_request: str, resolved_request: str = "", curre
         recency_need=recency,
         live_score_need=live_score,
         schedule_need=schedule,
+        specific_answer_need=specific_answer,
+        current_day_need=current_day,
         ambiguous=ambiguous,
     )
 
@@ -261,6 +290,7 @@ class SearchGrounder:
         resolved_request: str = "",
         current_subject: str = "",
         execute: Callable[[str], str],
+        fetch_url: Optional[Callable[[str], str]] = None,
     ) -> GroundedSearchResult:
         intent = build_search_intent(original_request, resolved_request, current_subject)
         candidates = self.build_candidates(intent)
@@ -273,6 +303,8 @@ class SearchGrounder:
         for candidate in candidates:
             output = str(execute(candidate.query) or "")
             evidence = self.score_evidence(output, candidate.query, intent)
+            if intent.specific_answer_need and fetch_url:
+                evidence, output = self._maybe_fetch_full_page(evidence, output, intent, fetch_url)
             top_score = max([e.relevance_score for e in evidence], default=0.0)
             if top_score > best_score:
                 best_score = top_score
@@ -302,6 +334,42 @@ class SearchGrounder:
             accepted=False,
         )
 
+    def _maybe_fetch_full_page(
+        self,
+        evidence: list[GroundedEvidence],
+        output: str,
+        intent: SearchIntent,
+        fetch_url: Callable[[str], str],
+    ) -> tuple[list[GroundedEvidence], str]:
+        if not evidence or self._accept_evidence(evidence, intent):
+            return evidence, output
+        top = evidence[0]
+        if not top.url or self._has_specific_answer_signal(top.summary.lower() + " " + top.title.lower(), intent):
+            return evidence, output
+        try:
+            page_text = _normalize_text(fetch_url(top.url) or "")
+        except Exception:
+            page_text = ""
+        if not page_text:
+            return evidence, output
+        combined = f"{top.title} {page_text}".lower()
+        if not self._has_specific_answer_signal(combined, intent):
+            top.rejection_reason = "Snippet and fetched page did not contain the requested specific answer."
+            return evidence, output
+        boosted = min(1.0, max(top.relevance_score, self.relevance_threshold + 0.12))
+        enriched = GroundedEvidence(
+            title=top.title,
+            url=top.url,
+            summary=page_text[:700],
+            relevance_score=boosted,
+            recency_bucket=top.recency_bucket,
+            matched_terms=top.matched_terms,
+            rejection_reason="",
+            fetched_full_page=True,
+        )
+        rest = [e for e in evidence[1:]]
+        return [enriched, *rest], f"{output.rstrip()}\n\nFetched page text from {top.url}:\n{page_text[:1800]}"
+
     def score_evidence(self, output: str, query: str, intent: SearchIntent) -> list[GroundedEvidence]:
         items = [_normalize_evidence(item, tool_name="web_search", fallback_query=query, position=i) for i, item in enumerate(_parse_numbered_blocks(output), start=1)]
         if not items and output.strip():
@@ -323,6 +391,10 @@ class SearchGrounder:
             if intent.live_score_need:
                 score += 0.55 if self._has_score_signal(hay) else -0.25
                 if any(t in hay for t in ["schedule", "date", "kickoff", "start time"]) and not self._has_score_signal(hay):
+                    score -= 0.25
+            elif intent.specific_answer_need:
+                score += 0.38 if self._has_specific_answer_signal(hay, intent) else -0.22
+                if self._looks_like_date_or_nav_only(hay, intent):
                     score -= 0.25
             if intent.recency_need and str(item.get("recency_bucket") or "") in {"breaking", "recent"}:
                 score += 0.18
@@ -361,6 +433,9 @@ class SearchGrounder:
         top = evidence[0]
         if intent.live_score_need:
             return top.relevance_score >= self.relevance_threshold and self._has_score_signal(top.summary.lower() + " " + top.title.lower())
+        if intent.specific_answer_need:
+            hay = top.summary.lower() + " " + top.title.lower()
+            return top.relevance_score >= self.relevance_threshold and self._has_specific_answer_signal(hay, intent)
         return top.relevance_score >= self.relevance_threshold or (len(evidence) >= 2 and top.relevance_score >= 0.25)
 
     def _rejection_reason(self, evidence: list[GroundedEvidence], intent: SearchIntent) -> str:
@@ -368,6 +443,8 @@ class SearchGrounder:
             return "No usable evidence returned."
         if intent.live_score_need:
             return "Evidence did not look like a live/current score result."
+        if intent.specific_answer_need:
+            return "Evidence did not contain the requested specific current answer."
         return evidence[0].rejection_reason or "Evidence relevance below threshold."
 
     def _intent_terms(self, intent: SearchIntent) -> list[str]:
@@ -378,6 +455,8 @@ class SearchGrounder:
             terms.extend(["score", "live", "result", "current"])
         if intent.recency_need:
             terms.extend(["latest", "recent", "today", "current"])
+        if intent.schedule_need:
+            terms.extend(["schedule", "game", "match", "today", "time"])
         return list(dict.fromkeys(terms))[:20]
 
     def _has_score_signal(self, text: str) -> bool:
@@ -385,6 +464,35 @@ class SearchGrounder:
             any(sig in text for sig in ["score", "final", "live", "result", "full-time", "halftime", "goals"])
             or re.search(r"\b\d{1,2}\s*[-:]\s*\d{1,2}\b", text)
         )
+
+    def _has_specific_answer_signal(self, text: str, intent: SearchIntent) -> bool:
+        hay = str(text or "").lower()
+        if intent.live_score_need:
+            return self._has_score_signal(hay)
+        if "odds" in (intent.resolved_request or "").lower():
+            return bool(re.search(r"[+-]\d{3,4}\b|\b\d+\.\d{2}\b|\bodds\b.*(?:spread|moneyline|total)", hay))
+        if intent.schedule_need or intent.current_day_need:
+            has_time = bool(re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm|et|pt|ct|mt|utc|edt|pdt)\b", hay))
+            has_date = bool(
+                re.search(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+20\d{2}\b", hay)
+                or re.search(r"\b20\d{2}-\d{2}-\d{2}\b", hay)
+            )
+            has_matchup = bool(re.search(r"\b(?:vs\.?|versus| at )\b", hay))
+            has_event_words = any(word in hay for word in ["play", "plays", "playing", "game", "match", "kickoff", "tipoff", "starts"])
+            has_named_result = bool(re.search(r"\b[a-z][a-z .'-]{2,}\s+(?:vs\.?|versus|at)\s+[a-z][a-z .'-]{2,}\b", hay))
+            return (has_event_words and (has_time or has_date or has_matchup or has_named_result)) or has_named_result
+        if any(term in hay for term in ["available", "released", "launches", "starts", "opens"]):
+            return True
+        return False
+
+    def _looks_like_date_or_nav_only(self, text: str, intent: SearchIntent) -> bool:
+        hay = str(text or "").lower()
+        has_date = bool(
+            re.search(r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s+[a-z]+\s+\d{1,2},?\s+20\d{2}\b", hay)
+            or re.search(r"\b20\d{2}-\d{2}-\d{2}\b", hay)
+        )
+        nav_words = sum(1 for word in ["schedule", "standings", "fixtures", "results", "teams", "stats", "tickets"] if word in hay)
+        return bool((has_date or nav_words >= 3) and not self._has_specific_answer_signal(hay, intent))
 
     def _clean_query(self, query: str) -> str:
         q = _normalize_text(query)

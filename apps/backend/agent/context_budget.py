@@ -21,6 +21,7 @@ class ContextBlock:
     priority: int
     header: str = ""
     min_chars: int = 0
+    protected: bool = False
 
 
 @dataclass
@@ -32,6 +33,9 @@ class ContextBudgetReport:
     used_tokens: int
     kept_blocks: List[str]
     trimmed_blocks: List[str]
+    stage: str = "none"
+    usage_ratio: float = 0.0
+    protected_blocks: List[str] | None = None
 
 
 class ContextBudgetManager:
@@ -53,7 +57,8 @@ class ContextBudgetManager:
         if not self.enabled or self.injectable_tokens <= 0:
             text = "\n\n".join(self._render_block(b) for b in material if b.text.strip()).strip()
             used = estimate_tokens(text)
-            return text, ContextBudgetReport(False, self.context_window, self.reserve_tokens, 0, used, [b.name for b in material], [])
+            ratio = self._usage_ratio(used + max(0, int(overhead_tokens or 0)))
+            return text, ContextBudgetReport(False, self.context_window, self.reserve_tokens, 0, used, [b.name for b in material], [], self._stage_for_ratio(ratio), ratio, [b.name for b in material if b.protected])
 
         budget = max(0, self.injectable_tokens - max(0, int(overhead_tokens or 0)))
         used = 0
@@ -61,7 +66,11 @@ class ContextBudgetManager:
         kept: List[str] = []
         trimmed: List[str] = []
 
-        for block in sorted(material, key=lambda b: b.priority):
+        protected = [b for b in material if b.protected]
+        normal = [b for b in material if not b.protected]
+        ordered = sorted(protected, key=lambda b: b.priority) + sorted(normal, key=lambda b: b.priority)
+
+        for block in ordered:
             raw_text = str(block.text or "").strip()
             rendered_block = self._render_block(block)
             need = estimate_tokens(rendered_block)
@@ -73,6 +82,12 @@ class ContextBudgetManager:
 
             remaining_tokens = max(0, budget - used)
             remaining_chars = remaining_tokens * 4
+            if block.protected:
+                rendered.append(rendered_block)
+                kept.append(block.name)
+                used += need
+                continue
+
             if remaining_chars >= max(80, int(block.min_chars or 0)):
                 header = str(block.header or block.name).strip()
                 body_budget = max(0, remaining_chars - len(header) - 20)
@@ -90,7 +105,7 @@ class ContextBudgetManager:
 
         # Any lower-priority blocks after the first overflow are trimmed.
         overflow_started = False
-        for block in sorted(material, key=lambda b: b.priority):
+        for block in ordered:
             if block.name in kept or block.name in trimmed:
                 if block.name in trimmed:
                     overflow_started = True
@@ -98,6 +113,7 @@ class ContextBudgetManager:
             if overflow_started or used >= budget:
                 trimmed.append(block.name)
 
+        ratio = self._usage_ratio(used + max(0, int(overhead_tokens or 0)))
         return "\n\n".join(rendered).strip(), ContextBudgetReport(
             True,
             self.context_window,
@@ -106,6 +122,9 @@ class ContextBudgetManager:
             used,
             kept,
             trimmed,
+            self._stage_for_ratio(ratio),
+            ratio,
+            [b.name for b in material if b.protected],
         )
 
     def _render_block(self, block: ContextBlock) -> str:
@@ -115,3 +134,21 @@ class ContextBudgetManager:
             return text
         return f"{header}:\n{text}"
 
+    def pressure_stage(self, blocks: Iterable[ContextBlock], *, overhead_tokens: int = 0) -> str:
+        material = [b for b in blocks if str(b.text or "").strip()]
+        used = sum(estimate_tokens(self._render_block(b)) for b in material) + max(0, int(overhead_tokens or 0))
+        return self._stage_for_ratio(self._usage_ratio(used))
+
+    def _usage_ratio(self, used_tokens: int) -> float:
+        if self.context_window <= 0:
+            return 0.0
+        return max(0.0, min(2.0, float(used_tokens) / float(self.context_window)))
+
+    def _stage_for_ratio(self, ratio: float) -> str:
+        if ratio >= 0.85:
+            return "compact"
+        if ratio >= 0.65:
+            return "summarize"
+        if ratio >= 0.50:
+            return "soft_trim"
+        return "none"
