@@ -152,24 +152,72 @@ def _file_tool_root() -> Path:
         return Path(".").resolve()
 
 
+def _file_tool_extra_roots() -> list[Path]:
+    roots: list[Path] = []
+    raw = getattr(config, "file_tool_extra_roots", []) or []
+    if isinstance(raw, str):
+        raw = raw.replace("\n", ";").replace(",", ";").split(";")
+    for item in raw:
+        try:
+            val = str(item or "").strip()
+            if not val:
+                continue
+            p = Path(val).expanduser().resolve()
+            if p not in roots:
+                roots.append(p)
+        except Exception:
+            continue
+    return roots
+
+
+def _file_tool_roots() -> list[Path]:
+    roots = [_file_tool_root()]
+    for root in _file_tool_extra_roots():
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _desktop_root() -> Path:
+    return (Path.home() / "Desktop").expanduser().resolve()
+
+
+def _candidate_file_path(path: str, root: Path) -> Path:
+    raw = str(path or "").strip().strip("\"'")
+    low = raw.replace("\\", "/").lower()
+    if low in {"desktop", "~/desktop", "%userprofile%/desktop"}:
+        return _desktop_root()
+    for prefix in ("desktop/", "~/desktop/", "%userprofile%/desktop/"):
+        if low.startswith(prefix):
+            suffix = raw.replace("\\", "/")[len(prefix):]
+            return _desktop_root() / suffix
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    return candidate
+
+
 def _safe_file_path(path: str) -> Optional[Path]:
     if not path:
         return None
     root = _file_tool_root()
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = root / candidate
+    candidate = _candidate_file_path(path, root)
     try:
         resolved = candidate.resolve()
     except Exception:
         return None
-    try:
-        common = os.path.commonpath([str(root), str(resolved)])
-    except Exception:
-        return None
-    if common != str(root):
-        return None
-    return resolved
+    for allowed_root in _file_tool_roots():
+        try:
+            common = os.path.commonpath([str(allowed_root), str(resolved)])
+        except Exception:
+            continue
+        if common == str(allowed_root):
+            return resolved
+    return None
+
+
+def _format_file_tool_roots() -> str:
+    return "; ".join(str(p) for p in _file_tool_roots())
 
 
 def _run_wmic(args: list[str]) -> list[str]:
@@ -405,12 +453,11 @@ def desktop_list_windows(filter: Optional[str] = None, limit: int = 15) -> str:
         return f"Failed to list windows: {str(e)}"
 
 
-@tool(args_schema=FileListArgs, description="List files/folders within a directory (restricted to FILE_TOOL_ROOT).")
+@tool(args_schema=FileListArgs, description="List files/folders within an allowed workspace directory.")
 def file_list(path: Optional[str] = ".", limit: int = 50) -> str:
-    root = _file_tool_root()
     target = _safe_file_path(path or ".")
     if target is None:
-        return f"Path not allowed. Allowed root: {root}"
+        return f"Path not allowed. Allowed roots: {_format_file_tool_roots()}"
     if not target.exists():
         return "Path not found."
     if not target.is_dir():
@@ -426,7 +473,7 @@ def file_list(path: Optional[str] = ".", limit: int = 50) -> str:
         return f"Failed to list files: {str(e)}"
 
 
-@tool(args_schema=FileReadArgs, description="Read a text file (restricted to FILE_TOOL_ROOT).")
+@tool(args_schema=FileReadArgs, description="Read a text file from an allowed workspace directory.")
 def file_read(path: str, max_chars: int = 4000) -> str:
     target = _safe_file_path(path)
     if target is None:
@@ -465,7 +512,7 @@ def file_write(path: str, content: str, append: bool = False) -> str:
         return f"Failed to write file: {str(e)}"
 
 
-@tool(args_schema=FileMoveArgs, description="Move/rename a file or folder (restricted to FILE_TOOL_ROOT; opt-in system action).")
+@tool(args_schema=FileMoveArgs, description="Move/rename a file or folder inside allowed workspace directories (opt-in system action).")
 def file_move(src: str, dst: str, overwrite: bool = False) -> str:
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_file_write", False):
         return "File operations are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
@@ -490,7 +537,7 @@ def file_move(src: str, dst: str, overwrite: bool = False) -> str:
         return f"Failed to move: {str(e)}"
 
 
-@tool(args_schema=FileCopyArgs, description="Copy a file or folder (restricted to FILE_TOOL_ROOT; opt-in system action).")
+@tool(args_schema=FileCopyArgs, description="Copy a file or folder inside allowed workspace directories (opt-in system action).")
 def file_copy(src: str, dst: str, overwrite: bool = False) -> str:
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_file_write", False):
         return "File operations are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
@@ -518,7 +565,7 @@ def file_copy(src: str, dst: str, overwrite: bool = False) -> str:
         return f"Failed to copy: {str(e)}"
 
 
-@tool(args_schema=FileDeleteArgs, description="Delete a file or folder (restricted to FILE_TOOL_ROOT; opt-in system action).")
+@tool(args_schema=FileDeleteArgs, description="Delete a file or folder inside allowed workspace directories (opt-in system action).")
 def file_delete(path: str, recursive: bool = False) -> str:
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_file_write", False):
         return "File operations are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
@@ -539,7 +586,7 @@ def file_delete(path: str, recursive: bool = False) -> str:
         return f"Failed to delete: {str(e)}"
 
 
-@tool(args_schema=FileMkdirArgs, description="Create a folder (restricted to FILE_TOOL_ROOT; opt-in system action).")
+@tool(args_schema=FileMkdirArgs, description="Create a folder inside an allowed workspace directory (opt-in system action).")
 def file_mkdir(path: str, parents: bool = True, exist_ok: bool = True) -> str:
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_file_write", False):
         return "File operations are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
@@ -572,25 +619,69 @@ def _terminal_first_token(command: str) -> str:
     return token
 
 
-@tool(args_schema=TerminalRunArgs, description="Run a PowerShell command (Windows; allowlisted; opt-in system action).")
+def _is_command_safe(command: str) -> bool:
+    """Check if a command is free of shell chaining, statement separators, or redirection
+    operators outside of quotes. Prevents command injection and denylist bypass.
+    """
+    in_single_quote = False
+    in_double_quote = False
+    escape = False
+
+    for i, char in enumerate(command):
+        if escape:
+            escape = False
+            continue
+        if char == '\\':
+            escape = True
+            continue
+        if char == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+            continue
+        if char == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            continue
+
+        if not in_single_quote and not in_double_quote:
+            # Block statement separators, command chaining, pipelines, redirection,
+            # newlines, subexpressions, and environment variables outside quotes.
+            if char in (';', '&', '|', '<', '>', '\n', '\r', '`', '$'):
+                return False
+
+    return True
+
+
+def _terminal_command_denied(command: str) -> Optional[str]:
+    token = _terminal_first_token(command)
+    deny = [
+        str(x).strip().lower()
+        for x in (getattr(config, "terminal_command_denylist", None) or [])
+        if str(x).strip()
+    ]
+    if not token:
+        return "Command rejected: command is empty."
+    if token in set(deny):
+        return f"Command blocked by terminal denylist: {token}"
+    return None
+
+
+@tool(args_schema=TerminalRunArgs, description="Run a PowerShell command (Windows; denylisted dangerous commands; opt-in system action).")
 def terminal_run(command: str, cwd: Optional[str] = ".", timeout: Optional[int] = None) -> str:
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_terminal_commands", False):
         return "Terminal commands are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_TERMINAL_COMMANDS=true, then restart the API."
 
-    root = _file_tool_root()
+    # Prevent command injection / denylist bypass via command chaining.
+    if not _is_command_safe(command):
+        return "Command rejected: Contains statement separators or chaining operators outside of quotes."
+
     cwd_p = _safe_file_path(cwd or ".")
     if cwd_p is None:
-        return f"CWD not allowed. Allowed root: {root}"
+        return f"CWD not allowed. Allowed roots: {_format_file_tool_roots()}"
     if not cwd_p.exists() or not cwd_p.is_dir():
         return "CWD not found or is not a directory."
 
-    allow = [str(x).strip().lower() for x in (getattr(config, "terminal_command_allowlist", None) or []) if str(x).strip()]
-    if not allow:
-        return "No terminal commands are allowlisted. Set TERMINAL_COMMAND_ALLOWLIST and restart the API."
-    token = _terminal_first_token(command)
-    allow_set = set(allow)
-    if "*" not in allow_set and "powershell" not in allow_set and "ps" not in allow_set and token not in allow_set:
-        return f"Command not allowlisted: {token or '(unknown)'}"
+    denied = _terminal_command_denied(command)
+    if denied:
+        return denied
 
     try:
         default_timeout = int(getattr(config, "terminal_command_timeout", 20) or 20)
@@ -603,6 +694,20 @@ def terminal_run(command: str, cwd: Optional[str] = ".", timeout: Optional[int] 
     if timeout_s <= 0:
         timeout_s = default_timeout
     timeout_s = max(1, min(120, timeout_s))
+
+    if getattr(config, "terminal_execution_mode", "host") == "docker":
+        try:
+            from agent.sandbox import DockerSandbox
+            out = DockerSandbox.run_command(command, cwd=str(cwd_p), timeout=timeout_s)
+            try:
+                max_chars = int(getattr(config, "terminal_max_output_chars", 8000) or 8000)
+            except Exception:
+                max_chars = 8000
+            if max_chars > 0 and len(out) > max_chars:
+                out = out[:max_chars].rstrip() + "…"
+            return out
+        except Exception as e:
+            return f"Failed to run command in Docker sandbox: {str(e)}"
 
     cmd: list[str]
     if os.name == "nt":
@@ -1517,6 +1622,41 @@ def web_search(query: str) -> str:
                 logger.warning(msg)
                 return [], msg
 
+        def _search_duckduckgo(q: str) -> tuple[list[dict], str]:
+            """Free web search using DuckDuckGo - no API key required."""
+            try:
+                try:
+                    from ddgs import DDGS  # New package name (2025+)
+                except ImportError:
+                    from duckduckgo_search import DDGS  # Legacy fallback
+                max_results = int(getattr(config, "tavily_max_results", 8) or 8)
+                
+                with DDGS() as ddgs:
+                    results = list(ddgs.text(q, max_results=max_results))
+                
+                items = []
+                for result in results:
+                    title = str(result.get("title") or "No title").strip()
+                    link = str(result.get("href") or result.get("url") or "").strip()
+                    snippet = str(result.get("body") or "").strip()
+                    items.append(
+                        {
+                            "title": title,
+                            "url": link,
+                            "snippet": snippet,
+                            "extract": snippet,
+                            "date": "",
+                            "_query": q,
+                        }
+                    )
+                return items, ""
+            except ImportError:
+                return [], "DuckDuckGo search not available. Install duckduckgo-search package."
+            except Exception as e:
+                msg = f"DuckDuckGo search failed: {e}"
+                logger.warning(msg)
+                return [], msg
+
         queries = _split_queries(query)
         if not queries:
             return "No search results found."
@@ -1613,10 +1753,27 @@ def web_search(query: str) -> str:
         merged = []
         seen_urls = set()
         tavily_errors = []
+        ddg_errors = []
+        use_ddg_fallback = not str(getattr(config, "tavily_api_key", "") or "").strip()
+        
         for q in queries:
-            items, err = _search_tavily(q)
-            if err and err not in tavily_errors:
-                tavily_errors.append(err)
+            # Try Tavily first if API key is available
+            if not use_ddg_fallback:
+                items, err = _search_tavily(q)
+                if err and err not in tavily_errors:
+                    tavily_errors.append(err)
+                # If Tavily fails, try DuckDuckGo fallback
+                if not items and err:
+                    logger.info(f"Tavily failed for '{q}', trying DuckDuckGo fallback")
+                    items, ddg_err = _search_duckduckgo(q)
+                    if ddg_err and ddg_err not in ddg_errors:
+                        ddg_errors.append(ddg_err)
+            else:
+                # Use DuckDuckGo directly if no Tavily API key
+                items, err = _search_duckduckgo(q)
+                if err and err not in ddg_errors:
+                    ddg_errors.append(err)
+            
             for it in items:
                 url = (it.get("url") or "").strip()
                 if not url:
@@ -1635,6 +1792,8 @@ def web_search(query: str) -> str:
         if not merged:
             if tavily_errors:
                 return tavily_errors[0]
+            if ddg_errors:
+                return ddg_errors[0]
             return "No search results found."
 
         base_q = " ".join(queries)
@@ -3774,6 +3933,7 @@ TOOL_METADATA: Dict[str, Dict[str, Any]] = {
     "file_list": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
     "file_read": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
     "system_info": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "project_status": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
     "analyze_screen": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
      "vision_qa": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
      "take_screenshot": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
@@ -4163,6 +4323,148 @@ def self_list(path: str = "") -> str:
         return f"Failed to list directory: {str(e)}"
 
 
+# ============================================================================
+# PROJECT STATUS / SHOWCASE TOOL (v8.0.0)
+# ============================================================================
+
+class ProjectStatusArgs(BaseModel):
+    workspace_path: str = Field(
+        default="",
+        description="Optional path to the workspace/project root to check. Defaults to the configured file_tool_root.",
+    )
+
+
+@tool(args_schema=ProjectStatusArgs, description="Check the current project status: git changes, test results, todos, and build health. Use this to self-verify work, showcase finished projects, or diagnose issues.")
+def project_status(workspace_path: str = "") -> str:
+    """
+    Comprehensive project health check and showcase report.
+    Checks git status, runs tests, reads todos, and produces a structured report.
+    """
+    try:
+        # Resolve workspace path
+        ws_root = Path(workspace_path).resolve() if workspace_path else Path(getattr(config, "file_tool_root", ".") or ".").resolve()
+
+        if not ws_root.exists():
+            return f"Workspace path not found: {ws_root}"
+
+        sections = []
+        sections.append(f"# Project Status Report\n**Workspace:** `{ws_root}`\n**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+        # ── 1. Git Status ──
+        try:
+            git_result = subprocess.run(
+                ["git", "status", "--porcelain", "-b"],
+                cwd=str(ws_root), capture_output=True, text=True, timeout=10
+            )
+            if git_result.returncode == 0:
+                git_lines = git_result.stdout.strip().split("\n")
+                branch_line = git_lines[0] if git_lines else "unknown"
+                changes = [l for l in git_lines[1:] if l.strip()]
+                modified = [l for l in changes if l.startswith(" M") or l.startswith("M ")]
+                added = [l for l in changes if l.startswith("A ") or l.startswith("??")]
+                deleted = [l for l in changes if l.startswith("D ") or l.startswith(" D")]
+
+                git_section = f"## Git Status\n**Branch:** `{branch_line.replace('## ', '')}`\n"
+                git_section += f"- Modified: {len(modified)} files\n"
+                git_section += f"- New/Untracked: {len(added)} files\n"
+                git_section += f"- Deleted: {len(deleted)} files\n"
+                if changes:
+                    git_section += f"\n**Changed files:**\n"
+                    for c in changes[:20]:
+                        git_section += f"  `{c.strip()}`\n"
+                    if len(changes) > 20:
+                        git_section += f"  ... and {len(changes) - 20} more\n"
+                else:
+                    git_section += "\nWorking tree clean.\n"
+                sections.append(git_section)
+            else:
+                sections.append("## Git Status\nNot a git repository or git not available.\n")
+        except FileNotFoundError:
+            sections.append("## Git Status\nGit is not installed.\n")
+        except Exception as e:
+            sections.append(f"## Git Status\nError: {e}\n")
+
+        # ── 2. Test Results ──
+        test_dirs = ["tests", "test", "apps/backend/tests"]
+        test_found = False
+        for td in test_dirs:
+            test_path = ws_root / td
+            if test_path.exists():
+                test_found = True
+                try:
+                    test_result = subprocess.run(
+                        [sys.executable, "-m", "pytest", str(test_path), "--tb=short", "-q", "--no-header"],
+                        cwd=str(ws_root), capture_output=True, text=True, timeout=120
+                    )
+                    output = test_result.stdout.strip()
+                    # Extract summary line
+                    summary_lines = [l for l in output.split("\n") if "passed" in l or "failed" in l or "error" in l]
+                    summary = summary_lines[-1] if summary_lines else "No summary"
+                    status_emoji = "✅" if test_result.returncode == 0 else "❌"
+                    sections.append(f"## Tests {status_emoji}\n**Directory:** `{td}`\n**Result:** {summary}\n")
+                    if test_result.returncode != 0:
+                        # Show failed test details (limited)
+                        fail_lines = [l for l in output.split("\n") if "FAILED" in l][:10]
+                        if fail_lines:
+                            sections.append("**Failed:**\n" + "\n".join(f"  - `{l.strip()}`" for l in fail_lines) + "\n")
+                except subprocess.TimeoutExpired:
+                    sections.append(f"## Tests ⏱️\n**Directory:** `{td}`\nTests timed out (>120s).\n")
+                except Exception as e:
+                    sections.append(f"## Tests ⚠️\n**Directory:** `{td}`\nError running tests: {e}\n")
+                break
+        if not test_found:
+            sections.append("## Tests\nNo test directory found.\n")
+
+        # ── 3. Todo Status ──
+        todo_paths = [ws_root / "data" / "todos.json", ws_root / "apps" / "backend" / "data" / "todos.json"]
+        for tp in todo_paths:
+            if tp.exists():
+                try:
+                    todos = json.loads(tp.read_text(encoding="utf-8"))
+                    if isinstance(todos, list):
+                        total = len(todos)
+                        done = sum(1 for t in todos if t.get("done") or t.get("completed"))
+                        pending = total - done
+                        sections.append(f"## Todos\n- Total: {total}\n- Done: {done} ✅\n- Pending: {pending} 📋\n")
+                        if pending > 0:
+                            pending_items = [t for t in todos if not (t.get("done") or t.get("completed"))][:5]
+                            sections.append("**Top pending:**\n" + "\n".join(f"  - {t.get('text', t.get('title', 'Untitled'))}" for t in pending_items) + "\n")
+                except Exception:
+                    pass
+                break
+
+        # ── 4. Build Health Check ──
+        # Check for common build indicators
+        pkg_json = ws_root / "package.json"
+        if pkg_json.exists():
+            try:
+                pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
+                scripts = pkg.get("scripts", {})
+                sections.append(f"## Build System\n**package.json** found.\nAvailable scripts: {', '.join(f'`{s}`' for s in sorted(scripts.keys())[:10])}\n")
+            except Exception:
+                pass
+
+        # Check for Python setup
+        req_txt = ws_root / "requirements.txt"
+        setup_py = ws_root / "setup.py"
+        pyproject = ws_root / "pyproject.toml"
+        if req_txt.exists() or setup_py.exists() or pyproject.exists():
+            sections.append("## Python Project\nPython project files detected.\n")
+
+        # ── 5. File Summary ──
+        try:
+            py_count = len(list(ws_root.rglob("*.py")))
+            ts_count = len(list(ws_root.rglob("*.ts"))) + len(list(ws_root.rglob("*.tsx")))
+            md_count = len(list(ws_root.rglob("*.md")))
+            sections.append(f"## File Summary\n- Python files: {py_count}\n- TypeScript files: {ts_count}\n- Markdown docs: {md_count}\n")
+        except Exception:
+            pass
+
+        return "\n---\n\n".join(sections)
+    except Exception as exc:
+        return f"Failed to generate project status: {exc}"
+
+
 def get_available_tools() -> list:
     """
     Get list of available tools based on dependencies.
@@ -4200,6 +4502,7 @@ def get_available_tools() -> list:
         notepad_write,
         terminal_run,
         system_info,
+        project_status,
         # Self-modification tools
         self_edit,
         self_rollback,

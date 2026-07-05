@@ -268,6 +268,12 @@ reflect_on_plan() → post-plan: "ACCOMPLISHED" / "PARTIAL" / "FAILED"
 - Skip results longer than 200 characters (substantial = probably fine)
 - Reflection LLM calls use low temperature (0.1) for deterministic evaluation
 
+**Agentic search hardening (v7.1.2):**
+- `WebTaskReflector` now has a specialized live-score gate. For sports score/result/live queries, date-only or schedule-only results are treated as insufficient even when they are non-empty.
+- Retry queries stay anchored to the user's actual intent: current score, live score, result, and today's date when needed.
+- Failed search quality checks emit a thinking event before retry, so the chat shows why Echo is trying again.
+- Repeated tool-quality lessons are stored in `data/agent_lessons.json` and injected into future system prompts as short operational lessons. This is separate from user memory and avoids saving every conversation as long-term memory.
+
 **NDJSON task event types:**
 
 | Event | Payload | When |

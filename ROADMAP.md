@@ -1,5 +1,35 @@
 # EchoSpeak Roadmap
 
+## v7.2.0 - Agent Reliability, Coding Lifecycle, and Memory Doctor
+
+**Status:** Proposed  
+**Baseline:** See [docs/AGENTIC_BASELINE_2026.md](docs/AGENTIC_BASELINE_2026.md)
+
+### Priorities
+
+- **Provider readiness**
+  - Detect LM Studio/Ollama/API-provider outages before starting heavy agent paths.
+  - Convert provider failures into clear user-facing recovery messages.
+  - Surface provider status in the UI near model selection and chat execution.
+- **Coding agent lifecycle**
+  - Standardize coding requests around inspect -> plan -> implement -> verify -> summarize.
+  - Create generated projects inside named folders instead of dropping files at repo root.
+  - Classify terminal results as passed, failed, timed out, denied, or provider unavailable.
+- **Memory doctor**
+  - Add a memory audit action that reports duplicate, stale, pinned, profile, and vector memories.
+  - Keep raw conversation history searchable but not automatically injected.
+  - Add an editable operational lessons view for `data/agent_lessons.json`.
+- **MCP trust center**
+  - Track MCP server trust metadata: command, transport, scopes, version, last approval, and risk.
+  - Separate MCP tools, resources, and prompts in the capabilities UI.
+  - Add warnings for local MCP servers that can execute code or access broad filesystem/network scopes.
+- **Evaluation harness**
+  - Add repeatable agent scenarios for coding, live-score research, Discord recap, memory recall, and provider-offline recovery.
+
+### Why This Is Next
+
+EchoSpeak has enough raw capability. The next jump is reliability: making the agent choose tools consistently, recover from bad results, explain blockers clearly, and learn durable lessons without hoarding every conversation.
+
 ---
 
 ## v7.1.0 — Inline Code Diff, Accept/Decline Flow, and Efficient Editing
