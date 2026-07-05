@@ -78,7 +78,7 @@ EchoSpeak also runs an Action Parser pass before heuristic tool routing. The Act
 
 - env hard gates (`ENABLE_SYSTEM_ACTIONS`, tool-specific `ALLOW_*` flags)
 - workspace tool allowlist (ceiling)
-- file root and terminal allowlist enforcement (tool-level safety)
+- file root enforcement and terminal denylist enforcement (tool-level safety)
 
 If valid and confirmation-gated, Echo proposes the action and waits for you to reply `confirm` or `cancel`.
 
@@ -127,7 +127,7 @@ Current action tools include:
   - `file_copy`
   - `file_delete`
   - `file_mkdir`
-- `terminal_run` (PowerShell; allowlisted)
+- `terminal_run` (PowerShell; denylisted dangerous commands, confirmation-gated)
 - Discord web automation:
   - `discord_contacts_add` (confirmation-gated; writes to `DISCORD_CONTACTS_PATH`)
   - `discord_web_send` (confirmation-gated; Playwright; uses a persistent profile)
@@ -455,10 +455,18 @@ The current architecture makes adding such systems later straightforward (behind
 - `ALLOW_DESKTOP_AUTOMATION`
 - `ALLOW_FILE_WRITE`
 - `ALLOW_TERMINAL_COMMANDS`
-- `TERMINAL_COMMAND_ALLOWLIST`
+- `TERMINAL_COMMAND_DENYLIST`
 - `TERMINAL_COMMAND_TIMEOUT`
 - `TERMINAL_MAX_OUTPUT_CHARS`
 - `FILE_TOOL_ROOT`
+
+### Provider readiness + memory doctor
+
+v7.2.0 adds a preflight gate before full agent execution:
+
+- `GET /provider` reports `ready`, `readiness_message`, and `readiness_detail`.
+- `POST /query` and `POST /query/stream` return a clear `provider_unavailable` response when the selected provider is not reachable or is missing required configuration.
+- `GET /memory/doctor?thread_id=...&max_scan=300` audits memory shape without deleting anything: duplicate groups, typed memory coverage, pinned/profile counts, and raw conversation auto-store status.
 
 ### Discord (Playwright)
 

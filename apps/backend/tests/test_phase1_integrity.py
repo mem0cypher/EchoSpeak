@@ -34,6 +34,61 @@ def test_get_llm_config_honors_default_cloud_provider(monkeypatch):
     assert get_llm_config() is config.gemini
 
 
+def test_provider_readiness_reports_lmstudio_unreachable(monkeypatch):
+    monkeypatch.setattr(config.local, "base_url", "http://localhost:1234", raising=False)
+
+    def fake_urlopen(req, timeout=0):
+        raise server_mod.URLError("connection refused")
+
+    monkeypatch.setattr(server_mod, "urlopen", fake_urlopen, raising=True)
+
+    readiness = server_mod._check_provider_readiness(ModelProvider.LM_STUDIO)
+
+    assert readiness["ok"] is False
+    assert readiness["provider"] == "lmstudio"
+    assert "LM Studio" in readiness["message"]
+    assert "localhost:1234" in readiness["detail"]
+
+
+def test_provider_readiness_accepts_openai_when_key_exists(monkeypatch):
+    monkeypatch.setattr(config.openai, "api_key", "sk-test", raising=False)
+
+    readiness = server_mod._check_provider_readiness(ModelProvider.OPENAI)
+
+    assert readiness == {"ok": True, "provider": "openai", "message": "", "detail": ""}
+
+
+def test_memory_doctor_flags_duplicates_and_conversation_dominance(monkeypatch):
+    duplicate_text = "Ty prefers clean transparent reasoning traces."
+
+    class FakeMemory:
+        use_faiss = True
+        memory_count = 4
+        _profile = {"user_name": "Ty"}
+
+        def list_items(self, offset=0, limit=300, thread_id=None):
+            return [
+                {"id": "1", "text": duplicate_text, "timestamp": "1", "metadata": {"type": "conversation"}},
+                {"id": "2", "text": duplicate_text, "timestamp": "2", "metadata": {"type": "conversation"}},
+                {"id": "3", "text": "Project note", "timestamp": "3", "metadata": {"type": "project", "pinned": True}},
+                {"id": "4", "text": "Untyped note", "timestamp": "4", "metadata": {}},
+            ]
+
+    class FakeAgent:
+        memory = FakeMemory()
+
+    monkeypatch.setattr(config, "memory_auto_store_conversations", True, raising=False)
+
+    report = server_mod._build_memory_doctor_report(FakeAgent(), thread_id=None, max_scan=10)
+
+    assert report.ok is False
+    assert report.type_counts["conversation"] == 2
+    assert report.pinned_count == 1
+    assert report.missing_type_count == 1
+    assert report.duplicate_groups[0]["count"] == 2
+    assert any("auto-store" in warning for warning in report.warnings)
+
+
 def test_broadcast_discord_event_uses_gateway_loop(monkeypatch):
     captured = {}
 
