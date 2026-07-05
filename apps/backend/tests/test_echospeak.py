@@ -434,6 +434,37 @@ class TestDiscordHardening:
         assert seen["query"] == "No because of kernel level anti cheat"
         assert seen["thread_id"] == "discord_1_2"
 
+    def test_referential_followup_uses_current_subject(self, tmp_path):
+        from agent.core import EchoSpeakAgent
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        agent._current_subject_text = "Canada vs Morocco World Cup score"
+
+        resolved, is_followup, subject = agent._resolve_referential_followup("do a deeper search")
+
+        assert is_followup is True
+        assert subject == "Canada vs Morocco World Cup score"
+        assert "Canada vs Morocco World Cup score" in resolved
+        assert "do a deeper search" in resolved
+
+    def test_printed_tool_directive_becomes_pending_terminal_action(self, tmp_path, monkeypatch):
+        from agent.core import EchoSpeakAgent
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+
+        response = agent._handle_printed_tool_directive(
+            '|TOOL| terminal_run {"command":"echo hello","cwd":"."}',
+            "run echo hello",
+        )
+
+        assert response is not None
+        assert "|TOOL|" not in response
+        assert "Reply 'confirm'" in response
+        assert agent._pending_action is not None
+        assert agent._pending_action["tool"] == "terminal_run"
+        assert agent._pending_action["kwargs"]["command"] == "echo hello"
+
     def test_direct_fallback_uses_full_discord_prompt_and_wrapped_followup(self, tmp_path):
         from agent.core import EchoSpeakAgent, ContextBundle
         from config import DiscordUserRole

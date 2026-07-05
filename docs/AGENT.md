@@ -5,6 +5,8 @@ This file is for developers extending EchoSpeak’s agent.
 ---
 
 ## Recent Updates
+- **Continuity + verifier-first reflection (v7.3.0)**: `ContextBundle` now carries explicit current-subject state for referential follow-ups, execution metadata records the Stage 4 tool-calling branch, and `ReflectionEngine` uses deterministic checks for terminal/file/JSON results before asking the LLM to self-grade.
+- **Coding loop + trust surfaces (v7.3.0)**: Added `GET /coding/readiness`, surfaced Memory Doctor in the Web UI, and extended the Tools panel with coding readiness plus tool-origin/trust metadata. The coding workspace prompt now guides Echo through inspect -> plan -> implement -> verify -> summarize.
 - **Provider readiness + memory doctor (v7.2.0)**: `/query` and `/query/stream` now preflight the configured model provider before starting the agent loop, returning a clear `provider_unavailable` response when LM Studio/Ollama/LocalAI/vLLM/API keys are not ready. `GET /provider` includes readiness metadata, and `GET /memory/doctor` reports duplicate memory groups, type coverage, pinned/profile counts, and raw conversation auto-store status.
 - **Agentic baseline (v7.1.3 docs)**: Added `docs/AGENTIC_BASELINE_2026.md`, comparing EchoSpeak against current Claude Code, Letta, LangGraph, OpenAI Agents SDK, OpenHands, CrewAI, and MCP patterns. The next roadmap target is reliability: provider readiness, coding lifecycle, memory doctor, MCP trust center, and evaluation scenarios.
 - **Agentic tool loop hardening (v7.1.2)**: Terminal execution now uses a denylist, coding/project prompts auto-promote into the coding workspace, `Desktop/...` resolves through configured extra file roots, and operational lessons can be injected into the system prompt without saving every conversation as memory.
@@ -43,6 +45,7 @@ This file is for developers extending EchoSpeak’s agent.
 - `apps/backend/agent/core.py`
   - `LLMWrapper`: provider abstraction (OpenAI, Google Gemini, Ollama, **LM Studio (GGUF direct)**, LocalAI, llama.cpp, vLLM)
   - `EchoSpeakAgent`: routing + tool usage + memory + safety gating
+  - `ContextBundle`: explicit turn context including `current_subject` and resolved follow-up input for chat continuity
 - `apps/backend/io_module/personaplex_client.py`
   - `PersonaPlexClient`: Async WebSocket client (Opus/sphn)
   - `PersonaPlexOrchestrator`: High-level lifecycle + tool routing (mic pause/resume)
@@ -61,6 +64,8 @@ This file is for developers extending EchoSpeak’s agent.
   - Git commit watcher, changelog parsing, diff summary, tweet prompts
 - `apps/backend/agent/memory.py`
   - FAISS-based memory (local embeddings fallback if OpenAI key absent)
+- `apps/backend/agent/reflection.py`
+  - Verifier-first step reflection for concrete tool outcomes, with LLM reflection reserved for ambiguous results
 - `apps/backend/twitter_bot.py`
   - Twitter/X bot: autonomous tweets, changelog tweets, mention replies
 - `apps/backend/twitch_bot.py`

@@ -3,6 +3,8 @@ Vision I/O module for Echo Speak.
 Handles screen capture and OCR operations.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 from typing import Optional, Tuple

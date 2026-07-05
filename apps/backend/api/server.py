@@ -26,7 +26,7 @@ from urllib.error import URLError, HTTPError
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-from fastapi import FastAPI, HTTPException, Query, Response, Request, UploadFile, File, WebSocket, WebSocketDisconnect, Header, Depends
+from fastapi import FastAPI, HTTPException, Query, Response, Request, UploadFile, File, WebSocket, WebSocketDisconnect, Header, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -394,6 +394,14 @@ def _validate_settings_effective(effective: dict) -> list[dict]:
         if not root:
             issues.append({"key": "file_tool_root", "message": "Set FILE_TOOL_ROOT to restrict file writes.", "severity": "warning"})
 
+    api_host = str(((s.get("api") or {}).get("host") or "")).strip().lower()
+    api_auth_enabled = bool(s.get("api_auth_enabled"))
+    api_auth_key = str(s.get("api_auth_key") or "").strip()
+    if api_auth_enabled and not api_auth_key:
+        issues.append({"key": "api_auth_key", "message": "API auth is enabled but API_AUTH_KEY is empty.", "severity": "error"})
+    if api_host in {"0.0.0.0", "::", "[::]"} and not api_auth_enabled:
+        issues.append({"key": "api_auth_enabled", "message": "API_HOST is network-facing. Enable API_AUTH_ENABLED before remote or multi-device use.", "severity": "warning"})
+
     if bool(s.get("webhook_enabled")):
         secret = str(s.get("webhook_secret") or "").strip()
         secret_path = str(s.get("webhook_secret_path") or "").strip()
@@ -442,6 +450,23 @@ def _validate_settings_effective(effective: dict) -> list[dict]:
             issues.append({"key": "telegram_bot_token", "message": "Telegram bot is enabled but TELEGRAM_BOT_TOKEN is empty.", "severity": "error"})
         if not isinstance(allowed_users, list) or not any(str(x).strip() for x in allowed_users):
             issues.append({"key": "telegram_allowed_users", "message": "Telegram bot allowed users list is empty. Consider restricting access explicitly.", "severity": "warning"})
+
+    if bool(s.get("allow_twitch")):
+        if not str(s.get("twitch_client_id") or "").strip() or not str(s.get("twitch_client_secret") or "").strip():
+            issues.append({"key": "twitch_client_secret", "message": "Twitch is enabled but TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET is incomplete.", "severity": "error"})
+        if bool(s.get("twitch_chat_reply_enabled")) and not str(s.get("twitch_bot_access_token") or "").strip():
+            issues.append({"key": "twitch_bot_access_token", "message": "Twitch chat replies are enabled but TWITCH_BOT_ACCESS_TOKEN is empty.", "severity": "error"})
+        if str(s.get("twitch_eventsub_callback_url") or "").strip() and not str(s.get("twitch_eventsub_secret") or "").strip():
+            issues.append({"key": "twitch_eventsub_secret", "message": "Twitch EventSub callback is configured but TWITCH_EVENTSUB_SECRET is empty.", "severity": "warning"})
+
+    if bool(s.get("allow_twitter")):
+        bearer = str(s.get("twitter_bearer_token") or "").strip()
+        access = str(s.get("twitter_access_token") or "").strip()
+        access_secret = str(s.get("twitter_access_token_secret") or "").strip()
+        if not bearer and not access:
+            issues.append({"key": "twitter_bearer_token", "message": "Twitter/X is enabled but no bearer or access token is configured.", "severity": "error"})
+        if access and not access_secret:
+            issues.append({"key": "twitter_access_token_secret", "message": "Twitter/X access token is set but TWITTER_ACCESS_TOKEN_SECRET is empty.", "severity": "error"})
 
     tavily_key = str(s.get("tavily_api_key") or "").strip()
     if not tavily_key:
@@ -1303,6 +1328,104 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_PUBLIC_AUTH_PATHS = {
+    "/",
+    "/health",
+    "/metrics",
+    "/favicon.ico",
+    "/.well-known/agent.json",
+}
+
+
+def _is_local_client(host: str) -> bool:
+    h = str(host or "").strip().lower()
+    return h in {"127.0.0.1", "::1", "localhost"} or h.startswith("127.")
+
+
+def _configured_api_auth_key() -> str:
+    return str(getattr(config, "api_auth_key", "") or os.getenv("API_AUTH_KEY", "") or "").strip()
+
+
+def _extract_api_auth_key_from_headers(headers: Any) -> str:
+    for key in ("x-echospeak-key", "x-api-key", "x-admin-key"):
+        val = str(headers.get(key) or "").strip()
+        if val:
+            return val
+    auth = str(headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
+def _api_auth_required_for_host(host: str) -> bool:
+    if not bool(getattr(config, "api_auth_enabled", False)):
+        return False
+    if bool(getattr(config, "api_auth_localhost_bypass", True)) and _is_local_client(host):
+        return False
+    return True
+
+
+def _api_auth_ok(headers: Any, host: str) -> bool:
+    if not _api_auth_required_for_host(host):
+        return True
+    expected = _configured_api_auth_key()
+    if not expected:
+        return False
+    provided = _extract_api_auth_key_from_headers(headers)
+    return bool(provided and hmac.compare_digest(provided, expected))
+
+
+def _mcp_trust_summary(
+    mcp_servers: Any,
+    mcp_client_present: bool,
+    mcp_tool_count: int,
+) -> Dict[str, Any]:
+    """Summarize MCP availability without overstating configured-only capability."""
+    configured_count = len(mcp_servers) if isinstance(mcp_servers, dict) else 0
+    loaded_tools = int(mcp_tool_count or 0)
+    mcp_available = bool(configured_count and mcp_client_present and loaded_tools > 0)
+    if mcp_available:
+        status = "available"
+        warning = ""
+    elif configured_count and mcp_client_present and loaded_tools <= 0:
+        status = "configured_no_tools"
+        warning = "MCP servers are configured and the MCP bridge is present, but no MCP tools are loaded yet."
+    elif configured_count and not mcp_client_present:
+        status = "client_missing"
+        warning = "MCP servers are configured, but agent.mcp_client.py is missing, so MCP tools cannot load."
+    elif mcp_client_present:
+        status = "not_configured"
+        warning = ""
+    else:
+        status = "not_configured"
+        warning = ""
+
+    warnings = [warning] if warning else []
+    return {
+        "mcp_configured_count": configured_count,
+        "mcp_tool_count": loaded_tools,
+        "mcp_available_tool_count": loaded_tools if mcp_available else 0,
+        "mcp_client_present": bool(mcp_client_present),
+        "mcp_available": mcp_available,
+        "mcp_status": status,
+        "warnings": warnings,
+    }
+
+
+@app.middleware("http")
+async def api_auth_middleware(request: Request, call_next):
+    """Optional shared-key auth for network/remote EchoSpeak access."""
+    if request.method.upper() == "OPTIONS" or request.url.path in _PUBLIC_AUTH_PATHS:
+        return await call_next(request)
+    client_ip = _get_client_ip(request)
+    if not _api_auth_ok(request.headers, client_ip):
+        return Response(
+            content='{"detail":"EchoSpeak API auth required."}',
+            status_code=401,
+            media_type="application/json",
+        )
+    return await call_next(request)
+
 # Graceful restart support
 _restart_requested = False
 _restart_lock = threading.Lock()
@@ -1941,6 +2064,7 @@ class MemoryDoctorResponse(BaseModel):
     scanned: int
     use_faiss: bool
     auto_store_conversations: bool
+    session_memory: Dict[str, Any] = Field(default_factory=dict)
     type_counts: Dict[str, int]
     pinned_count: int
     profile_fact_count: int
@@ -2004,6 +2128,20 @@ class CapabilitiesResponse(BaseModel):
     tools: Dict[str, Any]
     features: Dict[str, Any]
     skills: List[Dict[str, Any]] = []
+    trust: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CodingReadinessResponse(BaseModel):
+    ok: bool
+    provider: Dict[str, Any]
+    workspace: Dict[str, Any]
+    file_roots: Dict[str, Any]
+    tools: List[Dict[str, Any]]
+    blocked_tools: List[str]
+    missing_tools: List[str]
+    recommended_loop: List[str]
+    warnings: List[str]
+    recommendations: List[str]
 
 
 class PendingActionResponse(BaseModel):
@@ -2103,7 +2241,12 @@ async def query(request: QueryRequest):
 
 
 @app.post("/memory/compact")
-async def compact_memory(request: MemoryCompactRequest):
+async def compact_memory(
+    request: Optional[MemoryCompactRequest] = Body(default=None),
+    thread_id: Optional[str] = Query(default=None),
+    similarity: float = Query(default=0.94, ge=0.5, le=1.0),
+    max_scan: int = Query(default=250, ge=10, le=1000),
+):
     """Merge near-duplicate memory items within a thread by deleting redundant items.
 
     This is a lightweight compaction pass to reduce spam/duplicates.
@@ -2111,8 +2254,13 @@ async def compact_memory(request: MemoryCompactRequest):
     try:
         import difflib
 
-        agent = get_agent(request.thread_id)
-        items = agent.memory.list_items(offset=0, limit=int(request.max_scan or 250))
+        req = request or MemoryCompactRequest(
+            thread_id=thread_id,
+            similarity=similarity,
+            max_scan=max_scan,
+        )
+        agent = get_agent(req.thread_id)
+        items = agent.memory.list_items(offset=0, limit=int(req.max_scan or 250))
         if not items:
             return {"success": True, "deleted": 0, "kept": 0, "memory_count": agent.memory.memory_count}
 
@@ -2149,7 +2297,7 @@ async def compact_memory(request: MemoryCompactRequest):
                     if not cid or not ctxt:
                         continue
                     ratio = difflib.SequenceMatcher(a=txt.lower(), b=ctxt.lower()).ratio()
-                    if ratio >= float(request.similarity or 0.94):
+                    if ratio >= float(req.similarity or 0.94):
                         deleted_ids.append(iid)
                         kept_ids.add(cid)
                         if is_pinned:
@@ -2175,26 +2323,6 @@ async def compact_memory(request: MemoryCompactRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-class CapabilitiesResponse(BaseModel):
-    ok: bool
-    provider: str
-    workspace: Dict[str, Any]
-    tools: Dict[str, Any]
-    features: Dict[str, Any]
-    skills: List[Dict[str, Any]] = []
-
-
-class PendingActionResponse(BaseModel):
-    has_pending: bool
-    action: Optional[Dict[str, Any]] = None
-    approval_id: Optional[str] = None
-    risk_level: Optional[str] = None
-    risk_color: Optional[str] = None
-    policy_flags: List[str] = []
-    session_permissions: Dict[str, bool] = {}
-    dry_run_available: bool = False
-
-
 @app.get("/capabilities", response_model=CapabilitiesResponse)
 async def capabilities(thread_id: Optional[str] = Query(default=None)):
     try:
@@ -2206,8 +2334,14 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
 
         # Import tool metadata
         from agent.tools import TOOL_METADATA
+        from agent.tool_registry import ToolRegistry
 
         items = []
+        risk_counts: Dict[str, int] = {}
+        origin_counts: Dict[str, int] = {}
+        mcp_tool_count = 0
+        mcp_servers = getattr(config, "mcp_servers", None) or {}
+        mcp_client_present = bool((BASE_DIR / "agent" / "mcp_client.py").exists())
         # NOTE: `lc_tools` intentionally excludes many action/system tools.
         # For the Capabilities & Permissions UI, we want to show the full registered tool set.
         for t in (getattr(agent, "tools", []) or []):
@@ -2242,6 +2376,32 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
             risk_level = meta.get("risk_level", "safe")
             requires_confirmation = meta.get("requires_confirmation", False)
             policy_flags = meta.get("policy_flags", [])
+            entry = ToolRegistry.get(name)
+            category = str(getattr(entry, "category", "") or "")
+            origin = "mcp" if category == "mcp" or name.startswith("mcp__") else "local"
+            mcp_server = ""
+            if origin == "mcp":
+                mcp_tool_count += 1
+                parts = name.split("__", 2)
+                if len(parts) >= 3:
+                    mcp_server = parts[1]
+            if origin == "mcp":
+                server_cfg = mcp_servers.get(mcp_server) if isinstance(mcp_servers, dict) else None
+                if isinstance(server_cfg, dict):
+                    trust_state = str(server_cfg.get("trust") or server_cfg.get("trust_state") or "configured").strip() or "configured"
+                    transport = str(server_cfg.get("transport") or "stdio")
+                else:
+                    trust_state = "unconfigured"
+                    transport = ""
+                if not mcp_client_present:
+                    allowed_by_policy = False
+                    trust_state = "client_missing"
+                    blocked_reason = blocked_reason or "MCP client is missing; configured MCP servers are not available."
+            else:
+                trust_state = "built_in"
+                transport = ""
+            risk_counts[str(risk_level)] = risk_counts.get(str(risk_level), 0) + 1
+            origin_counts[origin] = origin_counts.get(origin, 0) + 1
 
             # Get usage statistics
             try:
@@ -2263,6 +2423,11 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
                     "risk_level": risk_level,
                     "requires_confirmation": requires_confirmation,
                     "policy_flags": policy_flags,
+                    "origin": origin,
+                    "category": category or ("mcp" if origin == "mcp" else "local"),
+                    "trust_state": trust_state,
+                    "mcp_server": mcp_server or None,
+                    "transport": transport or None,
                     "usage_count": usage["usage_count"],
                     "error_count": usage["error_count"],
                     "last_used_at": usage["last_used_at"],
@@ -2290,6 +2455,8 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
                 "has_plugin": (skill_path / "plugin.py").exists() if skill_path.exists() else False,
             })
 
+        mcp_summary = _mcp_trust_summary(mcp_servers, mcp_client_present, mcp_tool_count)
+
         return CapabilitiesResponse(
             ok=bool(report.get("ok", True)),
             provider=str(getattr(agent, "llm_provider", "") or ""),
@@ -2297,9 +2464,113 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
             tools={"count": len(items), "items": items, "allowlist": tools.get("allowlist")},
             features=features,
             skills=skills_list,
+            trust={
+                "risk_counts": risk_counts,
+                "origin_counts": origin_counts,
+                **mcp_summary,
+                "recommendations": [
+                    "Treat local/MCP tools as executable capability. Keep exact commands, risk, and confirmation visible before use.",
+                    "Prefer built-in read-only tools for inspection; require explicit approval for writes, terminal commands, desktop actions, and MCP actions.",
+                ],
+            },
         )
     except Exception as e:
         logger.error(f"Capabilities error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/coding/readiness", response_model=CodingReadinessResponse)
+async def coding_readiness(thread_id: Optional[str] = Query(default=None)):
+    """Report whether Echo is ready to execute the coding-agent lifecycle."""
+    try:
+        agent = get_agent(thread_id)
+        _apply_thread_scope(agent, thread_id)
+        readiness = _check_provider_readiness()
+        required = ["project_status", "file_list", "file_read", "file_write", "file_mkdir", "artifact_write", "terminal_run"]
+        loaded = {str(getattr(t, "name", "") or "") for t in (getattr(agent, "tools", []) or [])}
+        allowlist = getattr(agent, "_tool_allowlist_override", None)
+        allowset = set(allowlist) if isinstance(allowlist, (set, frozenset)) else None
+        from agent.tools import TOOL_METADATA
+
+        tool_rows: list[dict[str, Any]] = []
+        blocked: list[str] = []
+        missing: list[str] = []
+        for name in required:
+            exists = name in loaded
+            allowed_by_workspace = True if allowset is None else name in allowset
+            try:
+                allowed_by_policy = bool(agent._action_allowed(name)) if agent._is_action_tool(name) else True  # type: ignore[attr-defined]
+            except Exception:
+                allowed_by_policy = False
+            allowed = bool(exists and allowed_by_workspace and allowed_by_policy)
+            reason = ""
+            if not exists:
+                reason = "Tool is not loaded."
+                missing.append(name)
+            elif not allowed_by_workspace:
+                reason = "Blocked by the active workspace tool list."
+                blocked.append(name)
+            elif not allowed_by_policy:
+                reason = "Blocked by runtime system-action settings."
+                blocked.append(name)
+            meta = TOOL_METADATA.get(name, {})
+            tool_rows.append(
+                {
+                    "name": name,
+                    "loaded": exists,
+                    "allowed": allowed,
+                    "allowed_by_workspace": allowed_by_workspace,
+                    "allowed_by_policy": allowed_by_policy,
+                    "risk_level": meta.get("risk_level", "safe"),
+                    "requires_confirmation": bool(meta.get("requires_confirmation", False)),
+                    "policy_flags": list(meta.get("policy_flags", [])),
+                    "reason": reason,
+                }
+            )
+
+        warnings: list[str] = []
+        recommendations: list[str] = []
+        provider_ready = bool(readiness.get("ok"))
+        if not provider_ready:
+            warnings.append(str(readiness.get("message") or "Model provider is not ready."))
+            recommendations.append("Start or configure the selected model provider before testing coding requests.")
+        if blocked or missing:
+            warnings.append("One or more coding tools are missing or blocked.")
+            recommendations.append("Enable system actions, file write, terminal access, and the coding workspace only as needed for local coding.")
+        if not bool(getattr(config, "allow_terminal_commands", False)):
+            recommendations.append("Terminal verification is disabled; Echo can still edit files but cannot run build/test checks.")
+        if not str(getattr(config, "file_tool_root", "") or "").strip():
+            warnings.append("FILE_TOOL_ROOT is empty.")
+            recommendations.append("Set FILE_TOOL_ROOT to the folder where Echo should create and inspect project files.")
+        if not warnings:
+            recommendations.append("Coding lifecycle is ready: inspect, plan, implement, verify, summarize.")
+
+        report = agent.get_doctor_report() or {}
+        workspace = report.get("workspace") if isinstance(report.get("workspace"), dict) else {}
+        return CodingReadinessResponse(
+            ok=provider_ready and not missing and not blocked,
+            provider={
+                "name": str(readiness.get("provider") or getattr(agent, "llm_provider", "") or ""),
+                "ready": provider_ready,
+                "message": str(readiness.get("message") or ""),
+                "detail": str(readiness.get("detail") or ""),
+            },
+            workspace=workspace,
+            file_roots={
+                "root": str(getattr(config, "file_tool_root", "") or ""),
+                "extra_roots": list(getattr(config, "file_tool_extra_roots", []) or []),
+                "terminal_execution_mode": str(getattr(config, "terminal_execution_mode", "") or "host"),
+                "terminal_denylist": list(getattr(config, "terminal_command_denylist", []) or []),
+            },
+            tools=tool_rows,
+            blocked_tools=blocked,
+            missing_tools=missing,
+            recommended_loop=["inspect", "plan", "implement", "verify", "summarize"],
+            warnings=warnings,
+            recommendations=recommendations,
+        )
+    except Exception as e:
+        logger.error(f"Coding readiness error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2709,10 +2980,16 @@ async def webhook_trigger(path: str, request: Request):
     routine = manager.get_routine_by_webhook(f"/{path}")
     if not routine:
         raise HTTPException(status_code=404, detail="Webhook not found")
+    raw_body = await request.body()
+    secret = _load_webhook_secret()
+    if secret:
+        sig = request.headers.get("x-echospeak-signature") or request.headers.get("x-signature") or ""
+        if not _verify_webhook_signature(secret, raw_body, sig):
+            raise HTTPException(status_code=401, detail="Invalid signature")
     
     # Get request body if any — validate type and size
     try:
-        body = await request.json()
+        body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
         if not isinstance(body, dict) or len(json.dumps(body)) > 10_000:
             raise HTTPException(status_code=400, detail="Invalid webhook body (must be JSON object under 10KB)")
     except HTTPException:
@@ -3623,6 +3900,10 @@ async def _spotify_playback_monitor():
 
 @app.websocket("/gateway/ws")
 async def gateway_ws(websocket: WebSocket):
+    client_host = websocket.client.host if websocket.client else "unknown"
+    if not _api_auth_ok(websocket.headers, client_host):
+        await websocket.close(code=1008, reason="EchoSpeak API auth required")
+        return
     await websocket.accept()
     _gateway_connections.add(websocket)
     session_id = str(uuid.uuid4())
@@ -4153,6 +4434,7 @@ def _build_memory_doctor_report(agent, thread_id: Optional[str], max_scan: int =
             scanned=0,
             use_faiss=False,
             auto_store_conversations=bool(getattr(config, "memory_auto_store_conversations", False)),
+            session_memory={},
             type_counts={},
             pinned_count=0,
             profile_fact_count=0,
@@ -4239,12 +4521,25 @@ def _build_memory_doctor_report(agent, thread_id: Optional[str], max_scan: int =
     if not warnings:
         recommendations.append("Memory looks healthy in the scanned sample.")
 
+    session_memory: Dict[str, Any] = {}
+    try:
+        distiller = getattr(agent, "_session_memory", None)
+        if distiller is not None and bool(getattr(config, "session_memory_enabled", True)):
+            session_memory = distiller.doctor(thread_id or getattr(agent, "_current_thread_id", None) or "default")
+            if session_memory.get("enabled") and not session_memory.get("exists"):
+                recommendations.append("Session memory is enabled and will be created after the next completed turn.")
+        else:
+            session_memory = {"enabled": False}
+    except Exception as exc:
+        session_memory = {"enabled": bool(getattr(config, "session_memory_enabled", True)), "error": str(exc)[:200]}
+
     return MemoryDoctorResponse(
         ok=not bool(warnings),
         memory_count=memory_count,
         scanned=len(items),
         use_faiss=bool(getattr(memory, "use_faiss", False)),
         auto_store_conversations=auto_store,
+        session_memory=session_memory,
         type_counts=type_counts,
         pinned_count=pinned_count,
         profile_fact_count=profile_fact_count,

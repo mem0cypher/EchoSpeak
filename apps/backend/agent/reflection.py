@@ -16,7 +16,9 @@ web_search result quality checks (date staleness, market queries, etc.).
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
@@ -123,15 +125,6 @@ class ReflectionEngine:
         if state and state.cycles_used >= self.max_cycles:
             return False
 
-        # Substantial results are usually fine
-        result_len = len(str(result or ""))
-        if result_len > SUBSTANTIAL_RESULT_LENGTH:
-            return False
-
-        # Empty or very short results should be reflected on
-        if result_len < 50:
-            return True
-
         # Failed results need reflection
         result_lower = str(result or "").lower()
         failure_signals = [
@@ -141,7 +134,171 @@ class ReflectionEngine:
         if any(sig in result_lower for sig in failure_signals):
             return True
 
+        # Substantial non-error results are usually fine
+        result_len = len(str(result or ""))
+        if result_len > SUBSTANTIAL_RESULT_LENGTH:
+            return False
+
+        # Empty or very short results should be reflected on
+        if result_len < 50:
+            return True
+
         return False
+
+    def _record_verification_failure(
+        self,
+        kind: str,
+        tool_name: str,
+        reason: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        telemetry = getattr(self.agent, "_verification_telemetry", None)
+        if telemetry is None:
+            return
+        try:
+            telemetry.record(kind, tool=tool_name, reason=reason, metadata=metadata or {})
+        except Exception:
+            pass
+
+    def _deterministic_reflection(
+        self,
+        task: Dict[str, Any],
+        result: str,
+    ) -> Optional[ReflectionResult]:
+        """Accept or reject concrete tool results without asking the model."""
+        tool_name = str(task.get("tool", "")).strip()
+        text = str(result or "").strip()
+        lower = text.lower()
+        failure_signals = (
+            "command not allowed",
+            "command rejected",
+            "not allowlisted",
+            "permission denied",
+            "access is denied",
+            "not found",
+            "no such file",
+            "timed out",
+            "timeout",
+            "traceback",
+            "exception",
+            "failed",
+            "error",
+        )
+        file_failure_exact = {
+            "file not found.",
+            "path not found.",
+            "path not allowed.",
+            "path is not a directory.",
+            "path is a directory.",
+            "binary file detected; text read skipped.",
+            "source path not found.",
+            "destination already exists. set overwrite=true to replace.",
+            "path is a directory. set recursive=true to delete folders.",
+        }
+        file_failure_prefixes = (
+            "failed to ",
+            "file write is disabled.",
+            "file operations are disabled.",
+        )
+
+        def has_file_failure() -> bool:
+            return lower in file_failure_exact or any(
+                lower.startswith(prefix) for prefix in file_failure_prefixes
+            )
+
+        def fail(reason: str, suggestion: str = "", kind: str = "") -> ReflectionResult:
+            if kind:
+                self._record_verification_failure(
+                    kind,
+                    tool_name,
+                    reason,
+                    metadata={"task_index": task.get("index"), "description": task.get("description", "")},
+                )
+            return ReflectionResult(
+                accepted=False,
+                reason=reason,
+                suggestion=suggestion,
+            )
+
+        def accept(reason: str) -> ReflectionResult:
+            return ReflectionResult(accepted=True, reason=reason)
+
+        if tool_name == "terminal_run":
+            exit_match = re.search(r"\bExitCode\s*[:=]\s*(-?\d+)\b", text, re.IGNORECASE)
+            if exit_match:
+                code = int(exit_match.group(1))
+                if code == 0:
+                    return accept("Deterministic terminal check passed (ExitCode=0).")
+                return fail(
+                    f"Terminal command exited non-zero (ExitCode={code}).",
+                    "Inspect stderr/stdout, adjust the command or code, and retry only if the next step is verifiable.",
+                    "terminal_nonzero",
+                )
+            if any(signal in lower for signal in failure_signals):
+                return fail(
+                    "Terminal output contains a deterministic failure signal.",
+                    "Use the reported terminal error to choose the next concrete action.",
+                    "terminal_nonzero",
+                )
+            return None
+
+        file_write_success = (
+            text.startswith("Wrote ")
+            or text.startswith("Appended ")
+            or text.startswith("Created folder:")
+            or text.startswith("Moved ")
+            or text.startswith("Copied ")
+            or text.startswith("Deleted ")
+            or text.startswith("Wrote artifact")
+            or " chars to " in text
+        )
+        file_tools = {
+            "file_write",
+            "file_mkdir",
+            "file_move",
+            "file_copy",
+            "file_delete",
+            "artifact_write",
+        }
+        if tool_name in file_tools:
+            if has_file_failure():
+                return fail(
+                    f"{tool_name} reported a deterministic failure.",
+                    "Fix the path, permission, or payload and verify again.",
+                    "file_operation_failed",
+                )
+            if file_write_success:
+                return accept(f"{tool_name} reported a concrete filesystem change.")
+            return None
+
+        if tool_name in {"file_read", "file_list"}:
+            if has_file_failure():
+                return fail(
+                    f"{tool_name} reported a deterministic failure.",
+                    "Correct the path or working directory before continuing.",
+                    "file_operation_failed",
+                )
+            if text:
+                return accept(f"{tool_name} returned concrete output.")
+            return fail(
+                f"{tool_name} returned empty output.",
+                "Confirm the path or broaden the listing/read target.",
+                "file_operation_failed",
+            )
+
+        if text and text[0] in "{[":
+            try:
+                json.loads(text)
+                return accept("Tool returned well-formed JSON.")
+            except Exception:
+                if tool_name.endswith("_json") or "json" in tool_name:
+                    return fail(
+                        "Tool was expected to return JSON, but output is malformed.",
+                        "Repair the JSON-producing step before relying on this output.",
+                        "action_args_invalid",
+                    )
+
+        return None
 
     def reflect_on_step(
         self,
@@ -172,12 +329,29 @@ class ReflectionEngine:
         # Check cycle budget
         if state.cycles_used >= self.max_cycles:
             r = ReflectionResult(
-                accepted=True,
-                reason="Max reflection cycles reached, accepting result",
+                accepted=False,
+                reason="Max reflection cycles reached without deterministic success",
+                suggestion="Stop retrying this exact step and surface the blocker or choose a new verifiable approach.",
                 cycle=state.cycles_used,
+            )
+            self._record_verification_failure(
+                "max_retries_exhausted",
+                tool_name,
+                r.reason,
+                metadata={"task_index": task_index, "description": description},
             )
             state.reflections.append(r)
             return r
+
+        deterministic = self._deterministic_reflection(task, result)
+        if deterministic is not None:
+            deterministic.cycle = state.cycles_used
+            state.reflections.append(deterministic)
+            logger.info(
+                "ReflectionEngine: deterministic step %d (%s) accepted=%s reason=%s",
+                task_index, tool_name, deterministic.accepted, deterministic.reason[:80],
+            )
+            return deterministic
 
         state.cycles_used += 1
 
@@ -226,6 +400,34 @@ class ReflectionEngine:
         """
         if not completed_tasks:
             return ReflectionResult(accepted=True, reason="No tasks to reflect on")
+
+        failed_statuses = {"failed", "blocked", "cancelled", "canceled", "error"}
+        deterministic_seen = 0
+        for t in completed_tasks:
+            status = str(t.get("status", "unknown") or "unknown").strip().lower()
+            desc = str(t.get("description", t.get("tool", "Unknown")))
+            if status in failed_statuses:
+                return ReflectionResult(
+                    accepted=False,
+                    reason=f"FAILED: deterministic plan status shows '{desc}' is {status}.",
+                    suggestion="Surface the exact blocker instead of asking the model to self-grade the plan.",
+                )
+            det = self._deterministic_reflection(t, str(t.get("result", "") or ""))
+            if det is None:
+                continue
+            deterministic_seen += 1
+            if not det.accepted:
+                return ReflectionResult(
+                    accepted=False,
+                    reason=f"FAILED: deterministic check for '{desc}' failed. {det.reason}",
+                    suggestion=det.suggestion or "Fix the failed concrete step and verify again.",
+                )
+
+        if deterministic_seen == len(completed_tasks):
+            return ReflectionResult(
+                accepted=True,
+                reason="ACCOMPLISHED: every completed task passed deterministic verification.",
+            )
 
         # Build summary of completed tasks
         task_summaries = []

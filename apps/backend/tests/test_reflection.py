@@ -69,6 +69,12 @@ class TestReflectionEngineHeuristics:
         assert engine.should_reflect(task, "Error: page not found", plan_size=2) is True
         assert engine.should_reflect(task, "Request timed out", plan_size=2) is True
 
+    def test_long_failure_signal_still_reflects(self):
+        engine = self._make_engine()
+        task = {"tool": "terminal_run", "index": 0}
+        long_error = "x" * 260 + " Error: command failed"
+        assert engine.should_reflect(task, long_error, plan_size=3) is True
+
     def test_max_cycles_prevents_infinite_loop(self):
         engine = self._make_engine()
         engine.max_cycles = 2
@@ -138,6 +144,33 @@ class TestReflectionEngineStepReflection:
 
         assert result.accepted is True
 
+    def test_terminal_exit_code_rejects_without_llm(self):
+        engine = self._make_engine()
+        task = {"tool": "terminal_run", "index": 0}
+        result = engine.reflect_on_step(task, "ExitCode=1\nstderr: failed", "run tests", 2)
+
+        assert result.accepted is False
+        assert "exitcode=1" in result.reason.lower()
+        engine.agent.llm_wrapper.invoke.assert_not_called()
+
+    def test_file_write_accepts_without_llm(self):
+        engine = self._make_engine()
+        task = {"tool": "file_write", "index": 0}
+        result = engine.reflect_on_step(task, "Wrote 128 chars to index.html", "create file", 2)
+
+        assert result.accepted is True
+        assert "filesystem" in result.reason.lower()
+        engine.agent.llm_wrapper.invoke.assert_not_called()
+
+    def test_file_read_content_with_error_word_is_not_deterministic_failure(self):
+        engine = self._make_engine()
+        engine.agent.llm_wrapper.invoke.return_value = "ACCEPT: content read"
+        task = {"tool": "file_read", "index": 0}
+        result = engine.reflect_on_step(task, "This document says error handling matters.", "read file", 2)
+
+        assert result.accepted is True
+        engine.agent.llm_wrapper.invoke.assert_not_called()
+
     def test_cycle_budget_enforced(self):
         engine = self._make_engine()
         engine.max_cycles = 1
@@ -151,7 +184,7 @@ class TestReflectionEngineStepReflection:
 
         # Second call exceeds budget — auto-accept
         r2 = engine.reflect_on_step(task, "bad", "goal", 2)
-        assert r2.accepted is True
+        assert r2.accepted is False
         assert "max" in r2.reason.lower()
 
 
@@ -189,6 +222,29 @@ class TestReflectionEnginePlanReflection:
         engine = self._make_engine()
         result = engine.reflect_on_plan("goal", [])
         assert result.accepted is True
+
+    def test_failed_status_rejects_without_llm(self):
+        engine = self._make_engine()
+
+        result = engine.reflect_on_plan("run tests", [
+            {"description": "Run tests", "tool": "terminal_run", "status": "failed", "result": "ExitCode=1"},
+        ])
+
+        assert result.accepted is False
+        assert "failed" in result.reason.lower()
+        engine.agent.llm_wrapper.invoke.assert_not_called()
+
+    def test_all_deterministic_tasks_accept_without_llm(self):
+        engine = self._make_engine()
+
+        result = engine.reflect_on_plan("create file and verify", [
+            {"description": "Write file", "tool": "file_write", "status": "completed", "result": "Wrote 12 chars to index.html"},
+            {"description": "Run tests", "tool": "terminal_run", "status": "completed", "result": "ExitCode=0"},
+        ])
+
+        assert result.accepted is True
+        assert "deterministic" in result.reason.lower()
+        engine.agent.llm_wrapper.invoke.assert_not_called()
 
 
 class TestReflectionEngineRetryParams:
