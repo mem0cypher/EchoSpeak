@@ -121,6 +121,9 @@ type ProviderInfo = {
   available_providers: ProviderListItem[];
   context_window?: number;
   max_output_tokens?: number;
+  ready?: boolean;
+  readiness_message?: string;
+  readiness_detail?: string;
 };
 
 type ProviderModelsResponse = {
@@ -141,6 +144,34 @@ type MemoryListResponse = {
   items: MemoryItem[];
   count: number;
   use_faiss: boolean;
+};
+
+type MemoryDoctorReport = {
+  ok: boolean;
+  memory_count: number;
+  scanned: number;
+  use_faiss: boolean;
+  auto_store_conversations: boolean;
+  type_counts: Record<string, number>;
+  pinned_count: number;
+  profile_fact_count: number;
+  missing_type_count: number;
+  duplicate_groups: { count: number; preview?: string; items?: any[] }[];
+  warnings: string[];
+  recommendations: string[];
+};
+
+type CodingReadiness = {
+  ok: boolean;
+  provider: { name: string; ready: boolean; message: string; detail?: string };
+  workspace: Record<string, any>;
+  file_roots: { root?: string; extra_roots?: string[]; terminal_execution_mode?: string; terminal_denylist?: string[] };
+  tools: { name: string; loaded: boolean; allowed: boolean; risk_level?: string; requires_confirmation?: boolean; policy_flags?: string[]; reason?: string }[];
+  blocked_tools: string[];
+  missing_tools: string[];
+  recommended_loop: string[];
+  warnings: string[];
+  recommendations: string[];
 };
 
 type DocumentItem = {
@@ -2224,6 +2255,8 @@ export const Dashboard: React.FC = () => {
   const [memoryItems, setMemoryItems] = useState<MemoryItem[]>([]);
   const [memoryCount, setMemoryCount] = useState<number>(0);
   const [memoryLoading, setMemoryLoading] = useState<boolean>(false);
+  const [memoryDoctor, setMemoryDoctor] = useState<MemoryDoctorReport | null>(null);
+  const [memoryDoctorLoading, setMemoryDoctorLoading] = useState<boolean>(false);
   const [docItems, setDocItems] = useState<DocumentItem[]>([]);
   const [servicesHeartbeatStatus, setServicesHeartbeatStatus] = useState<any>(null);
   const [servicesHeartbeatHistory, setServicesHeartbeatHistory] = useState<any[]>([]);
@@ -2244,6 +2277,8 @@ export const Dashboard: React.FC = () => {
   const toolInfoRef = useRef<Record<string, { name: string; input: string }>>({});
   const latestCodeFilenameRef = useRef<string | null>(null);
   const [capabilitiesData, setCapabilitiesData] = useState<any>(null);
+  const [codingReadiness, setCodingReadiness] = useState<CodingReadiness | null>(null);
+  const [codingReadinessLoading, setCodingReadinessLoading] = useState<boolean>(false);
   const [memoryFilterType, setMemoryFilterType] = useState<string>("");
   const [selectedMemoryIds, setSelectedMemoryIds] = useState<string[]>([]);
   const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null);
@@ -2350,7 +2385,7 @@ export const Dashboard: React.FC = () => {
 
   useEffect(() => {
     if (leftTab === "capabilities") {
-      fetch(`${apiBase}/capabilities?thread_id=${activeThreadId}`)
+      fetch(`${apiBase}/capabilities?thread_id=${encodeURIComponent(activeThreadId)}`)
         .then(res => res.json())
         .then(data => setCapabilitiesData(data))
         .catch(e => console.error("Failed to fetch capabilities:", e));
@@ -2917,6 +2952,38 @@ export const Dashboard: React.FC = () => {
       addMessage({ id: crypto.randomUUID(), role: "assistant", text: `Error: ${String(e)}`, at: Date.now() });
     } finally {
       setMemoryLoading(false);
+    }
+  };
+
+  const refreshMemoryDoctor = async () => {
+    setMemoryDoctorLoading(true);
+    try {
+      const tid = encodeURIComponent(String(activeThreadId || "").trim());
+      const qs = tid ? `?thread_id=${tid}&max_scan=300` : "?max_scan=300";
+      const resp = await fetchWithTimeout(`${apiBase}/memory/doctor${qs}`, undefined, 7000);
+      if (!resp.ok) throw new Error(`Memory doctor failed (${resp.status})`);
+      const data = (await resp.json()) as MemoryDoctorReport;
+      setMemoryDoctor(data);
+    } catch (e) {
+      console.error("Memory doctor error:", e);
+    } finally {
+      setMemoryDoctorLoading(false);
+    }
+  };
+
+  const refreshCodingReadiness = async () => {
+    setCodingReadinessLoading(true);
+    try {
+      const tid = encodeURIComponent(String(activeThreadId || "").trim());
+      const qs = tid ? `?thread_id=${tid}` : "";
+      const resp = await fetchWithTimeout(`${apiBase}/coding/readiness${qs}`, undefined, 7000);
+      if (!resp.ok) throw new Error(`Coding readiness failed (${resp.status})`);
+      const data = (await resp.json()) as CodingReadiness;
+      setCodingReadiness(data);
+    } catch (e) {
+      console.error("Coding readiness error:", e);
+    } finally {
+      setCodingReadinessLoading(false);
     }
   };
 
@@ -3743,11 +3810,17 @@ export const Dashboard: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    if (leftTab === "memory") refreshMemory();
+    if (leftTab === "memory") {
+      refreshMemory();
+      refreshMemoryDoctor();
+    }
     if (leftTab === "docs") refreshDocuments();
     if (leftTab === "soul") refreshSoul();
     if (leftTab === "services") refreshServices();
     if (leftTab === "projects") refreshProjects();
+    if (leftTab === "capabilities") {
+      refreshCodingReadiness();
+    }
     if (leftTab === "approvals") {
       refreshPendingApproval();
       refreshApprovals();
@@ -4107,7 +4180,40 @@ export const Dashboard: React.FC = () => {
                           </div>
                           {/* Content area */}
                           {(activeCodeTab === -1 || codeSessions.length === 0) ? (
-                            <div style={{ flex: 1, overflow: "hidden" }}>
+                            <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", gap: 10, padding: "0 12px 12px" }}>
+                              <div style={{ flex: "0 0 auto", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, background: "rgba(255,255,255,0.03)", padding: 12 }}>
+                                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 8 }}>
+                                  <div>
+                                    <div style={{ fontSize: 12, fontWeight: 800, color: "#e2e8f0" }}>Coding readiness</div>
+                                    <div style={{ fontSize: 11, color: "rgba(255,255,255,0.45)" }}>
+                                      Inspect, plan, implement, verify, summarize.
+                                    </div>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    className="icon-button"
+                                    onClick={refreshCodingReadiness}
+                                    style={{ height: 28, padding: "0 10px", fontSize: 11 }}
+                                  >
+                                    {codingReadinessLoading ? "..." : "Check"}
+                                  </button>
+                                </div>
+                                {codingReadiness ? (
+                                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+                                    <div style={{ fontSize: 11, color: codingReadiness.provider?.ready ? "#22c55e" : "#f59e0b" }}>
+                                      Provider: {codingReadiness.provider?.message || codingReadiness.provider?.name || "unknown"}
+                                    </div>
+                                    <div style={{ fontSize: 11, color: codingReadiness.blocked_tools.length || codingReadiness.missing_tools.length ? "#f59e0b" : "#22c55e" }}>
+                                      Tools: {codingReadiness.tools.filter(t => t.allowed).length}/{codingReadiness.tools.length} ready
+                                    </div>
+                                    <div style={{ fontSize: 11, color: "rgba(255,255,255,0.5)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                      Root: {codingReadiness.file_roots?.root || "unset"}
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>Run the check before testing a coding request.</div>
+                                )}
+                              </div>
                               <WorkspaceExplorer apiBase={apiBase} />
                             </div>
                           ) : (
@@ -4729,7 +4835,10 @@ export const Dashboard: React.FC = () => {
                     <button
                       className="icon-button"
                       style={{ height: 32, padding: "0 12px", fontSize: 14, flex: 1 }}
-                      onClick={refreshMemory}
+                      onClick={async () => {
+                        await refreshMemory();
+                        await refreshMemoryDoctor();
+                      }}
                       type="button"
                     >
                       Refresh
@@ -4739,9 +4848,10 @@ export const Dashboard: React.FC = () => {
                       style={{ height: 32, padding: "0 12px", fontSize: 14, flex: 1 }}
                       onClick={async () => {
                         try {
-                          const res = await fetch(`${apiBase}/memory/compact?thread_id=${activeThreadId}`, { method: "POST" });
+                          const res = await fetch(`${apiBase}/memory/compact?thread_id=${encodeURIComponent(activeThreadId)}`, { method: "POST" });
                           if (res.ok) {
-                            refreshMemory();
+                            await refreshMemory();
+                            await refreshMemoryDoctor();
                           }
                         } catch (e) {
                           console.error("Compact memory error:", e);
@@ -4774,6 +4884,54 @@ export const Dashboard: React.FC = () => {
                       <option value="contacts">Contacts</option>
                       <option value="note">Note</option>
                     </select>
+                  </div>
+                  <div className="research-card" style={{ marginTop: 20, marginBottom: 12 }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 10 }}>
+                      <div>
+                        <div className="research-title">Memory Doctor</div>
+                        <div className="research-snippet">Read-only health check for duplicate, untyped, pinned, and profile memory.</div>
+                      </div>
+                      <button
+                        className="icon-button"
+                        style={{ height: 30, padding: "0 12px", fontSize: 12 }}
+                        onClick={refreshMemoryDoctor}
+                        type="button"
+                      >
+                        {memoryDoctorLoading ? "Checking..." : "Check"}
+                      </button>
+                    </div>
+                    {memoryDoctor ? (
+                      <>
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8, marginBottom: 10 }}>
+                          {[
+                            ["Status", memoryDoctor.ok ? "Healthy" : "Needs review"],
+                            ["Scanned", String(memoryDoctor.scanned)],
+                            ["Pinned", String(memoryDoctor.pinned_count)],
+                            ["Profile facts", String(memoryDoctor.profile_fact_count)],
+                            ["Untyped", String(memoryDoctor.missing_type_count)],
+                            ["Duplicates", String(memoryDoctor.duplicate_groups?.length || 0)],
+                          ].map(([label, value]) => (
+                            <div key={label} style={{ padding: 10, borderRadius: 8, background: "rgba(255,255,255,0.04)", border: `1px solid ${colors.line}` }}>
+                              <div style={{ fontSize: 10, color: colors.textDim, marginBottom: 3 }}>{label}</div>
+                              <div style={{ fontSize: 13, fontWeight: 700, color: label === "Status" ? (memoryDoctor.ok ? "#22c55e" : "#f59e0b") : colors.text }}>{value}</div>
+                            </div>
+                          ))}
+                        </div>
+                        {Object.keys(memoryDoctor.type_counts || {}).length ? (
+                          <div className="research-snippet" style={{ marginBottom: 8 }}>
+                            Types: {Object.entries(memoryDoctor.type_counts).map(([k, v]) => `${k}:${v}`).join(", ")}
+                          </div>
+                        ) : null}
+                        {(memoryDoctor.warnings || []).slice(0, 3).map((w, i) => (
+                          <div key={`mw-${i}`} className="research-snippet" style={{ color: "#f59e0b" }}>{w}</div>
+                        ))}
+                        {(memoryDoctor.recommendations || []).slice(0, 3).map((r, i) => (
+                          <div key={`mr-${i}`} className="research-snippet">{r}</div>
+                        ))}
+                      </>
+                    ) : (
+                      <div className="research-snippet">Run the doctor to see memory health for this session.</div>
+                    )}
                   </div>
                   {selectedMemoryIds.length > 0 && (
                     <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8, padding: "8px 12px", background: colors.panel2, borderRadius: 8 }}>
@@ -6727,15 +6885,16 @@ export const Dashboard: React.FC = () => {
                         type="button"
                         onClick={async () => {
                           try {
-                            const res = await fetch(`${apiBase}/capabilities?thread_id=${activeThreadId}`);
+                            const res = await fetch(`${apiBase}/capabilities?thread_id=${encodeURIComponent(activeThreadId)}`);
                             const data = await res.json();
                             setCapabilitiesData(data);
+                            await refreshCodingReadiness();
                           } catch (e) {
                             console.error("Failed to fetch capabilities:", e);
                           }
                         }}
                       >
-                        Refresh Capabilities
+                        Refresh Tools
                       </button>
 
                       {/* Provider & Workspace Info */}
@@ -6752,6 +6911,36 @@ export const Dashboard: React.FC = () => {
                             </div>
                           </div>
 
+                          {/* Coding Readiness */}
+                          <div style={{ background: "linear-gradient(135deg, rgba(34,197,94,0.08), rgba(255,255,255,0.01))", padding: 12, borderRadius: 12, border: "1px solid rgba(34,197,94,0.18)", marginBottom: 16 }}>
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 8 }}>
+                              <div style={{ fontSize: 12, fontWeight: 700 }}>Coding Agent Loop</div>
+                              <span style={{ fontSize: 11, fontWeight: 700, color: codingReadiness?.ok ? "#22c55e" : "#f59e0b" }}>
+                                {codingReadinessLoading ? "checking" : codingReadiness?.ok ? "ready" : "needs review"}
+                              </span>
+                            </div>
+                            {codingReadiness ? (
+                              <>
+                                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 8, marginBottom: 8 }}>
+                                  <div className="research-snippet">Provider: {codingReadiness.provider?.message || codingReadiness.provider?.name || "unknown"}</div>
+                                  <div className="research-snippet">Tools: {codingReadiness.tools.filter(t => t.allowed).length}/{codingReadiness.tools.length} ready</div>
+                                  <div className="research-snippet">Loop: {(codingReadiness.recommended_loop || []).join(" -> ")}</div>
+                                </div>
+                                {(codingReadiness.blocked_tools || []).length ? (
+                                  <div className="research-snippet" style={{ color: "#f59e0b" }}>Blocked: {codingReadiness.blocked_tools.join(", ")}</div>
+                                ) : null}
+                                {(codingReadiness.missing_tools || []).length ? (
+                                  <div className="research-snippet" style={{ color: colors.danger }}>Missing: {codingReadiness.missing_tools.join(", ")}</div>
+                                ) : null}
+                                {(codingReadiness.recommendations || []).slice(0, 2).map((r, i) => (
+                                  <div key={`cr-${i}`} className="research-snippet">{r}</div>
+                                ))}
+                              </>
+                            ) : (
+                              <div className="research-snippet">Refresh tools to check whether coding can inspect, write, and verify projects.</div>
+                            )}
+                          </div>
+
                           {/* Features */}
                           <div style={{ background: "linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01))", padding: 12, borderRadius: 12, border: "1px solid rgba(255,255,255,0.1)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", boxShadow: "0 4px 16px -4px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.05)", marginBottom: 16 }}>
                             <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>Feature Flags</div>
@@ -6763,6 +6952,23 @@ export const Dashboard: React.FC = () => {
                                 </div>
                               ))}
                             </div>
+                          </div>
+
+                          {/* Tool Trust */}
+                          <div style={{ background: "linear-gradient(135deg, rgba(245,158,11,0.08), rgba(255,255,255,0.01))", padding: 12, borderRadius: 12, border: "1px solid rgba(245,158,11,0.18)", marginBottom: 16 }}>
+                            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>Tool Trust Center</div>
+                            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8, marginBottom: 8 }}>
+                              <div className="research-snippet">Local: {capabilitiesData.trust?.origin_counts?.local || 0}</div>
+                              <div className="research-snippet">MCP tools: {capabilitiesData.trust?.mcp_tool_count || 0}</div>
+                              <div className="research-snippet">MCP configs: {capabilitiesData.trust?.mcp_configured_count || 0}</div>
+                              <div className="research-snippet">MCP client: {capabilitiesData.trust?.mcp_client_present ? "present" : "missing"}</div>
+                            </div>
+                            {(capabilitiesData.trust?.warnings || []).map((w: string, i: number) => (
+                              <div key={`tw-${i}`} className="research-snippet" style={{ color: "#f59e0b" }}>{w}</div>
+                            ))}
+                            {(capabilitiesData.trust?.recommendations || []).slice(0, 2).map((r: string, i: number) => (
+                              <div key={`tr-${i}`} className="research-snippet">{r}</div>
+                            ))}
                           </div>
 
                           {/* Skills & Plugins */}
@@ -6832,6 +7038,19 @@ export const Dashboard: React.FC = () => {
                                         CONFIRM
                                       </span>
                                     )}
+                                    <span
+                                      style={{
+                                        fontSize: 10,
+                                        padding: "2px 6px",
+                                        borderRadius: 4,
+                                        background: tool.origin === "mcp" ? "rgba(245,158,11,0.14)" : "rgba(34,197,94,0.12)",
+                                        color: tool.origin === "mcp" ? "#f59e0b" : "#22c55e",
+                                        fontWeight: 600,
+                                        textTransform: "uppercase",
+                                      }}
+                                    >
+                                      {tool.origin || "local"}
+                                    </span>
                                     {/* Allowed/Blocked Status */}
                                     <span
                                       style={{
@@ -6856,6 +7075,9 @@ export const Dashboard: React.FC = () => {
                                     Requires: {tool.policy_flags.join(", ")}
                                   </div>
                                 )}
+                                <div style={{ fontSize: 10, color: colors.textDim }}>
+                                  Trust: {tool.trust_state || "built_in"}{tool.mcp_server ? ` · MCP server: ${tool.mcp_server}` : ""}
+                                </div>
                               </div>
                             ))}
                           </div>

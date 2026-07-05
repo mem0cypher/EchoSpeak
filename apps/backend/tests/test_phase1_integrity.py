@@ -58,6 +58,38 @@ def test_provider_readiness_accepts_openai_when_key_exists(monkeypatch):
     assert readiness == {"ok": True, "provider": "openai", "message": "", "detail": ""}
 
 
+def test_mcp_trust_summary_does_not_claim_missing_client_available():
+    summary = server_mod._mcp_trust_summary(
+        {"filesystem": {"transport": "stdio", "trust": "trusted"}},
+        mcp_client_present=False,
+        mcp_tool_count=2,
+    )
+
+    assert summary["mcp_configured_count"] == 1
+    assert summary["mcp_client_present"] is False
+    assert summary["mcp_available"] is False
+    assert summary["mcp_available_tool_count"] == 0
+    assert summary["mcp_status"] == "client_missing"
+    assert summary["warnings"]
+
+
+def test_api_auth_requires_key_when_enabled_for_nonlocal_host(monkeypatch):
+    monkeypatch.setattr(config, "api_auth_enabled", True, raising=False)
+    monkeypatch.setattr(config, "api_auth_key", "secret-key", raising=False)
+    monkeypatch.setattr(config, "api_auth_localhost_bypass", False, raising=False)
+
+    assert server_mod._api_auth_ok({}, "192.168.1.20") is False
+    assert server_mod._api_auth_ok({"x-echospeak-key": "secret-key"}, "192.168.1.20") is True
+
+
+def test_api_auth_localhost_bypass(monkeypatch):
+    monkeypatch.setattr(config, "api_auth_enabled", True, raising=False)
+    monkeypatch.setattr(config, "api_auth_key", "secret-key", raising=False)
+    monkeypatch.setattr(config, "api_auth_localhost_bypass", True, raising=False)
+
+    assert server_mod._api_auth_ok({}, "127.0.0.1") is True
+
+
 def test_memory_doctor_flags_duplicates_and_conversation_dominance(monkeypatch):
     duplicate_text = "Ty prefers clean transparent reasoning traces."
 

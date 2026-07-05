@@ -7,7 +7,7 @@ Supports multiple LLM providers: OpenAI, Ollama, LM Studio, LocalAI, llama.cpp, 
 import importlib.util
 import hashlib
 import ast
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import json
 import os
 import re
@@ -249,7 +249,10 @@ class _TraceHandler:
             pass
 
 from config import config, ModelProvider, get_llm_config, DATA_DIR
+from agent.context_budget import ContextBlock, ContextBudgetManager, estimate_tokens
 from agent.memory import AgentMemory
+from agent.research import SearchGrounder
+from agent.session_memory import SessionMemoryDistiller
 from agent.skills_registry import (
     build_skills_prompt,
     list_skills,
@@ -266,6 +269,7 @@ from agent.tool_registry import ToolRegistry, PluginRegistry
 from agent.router import IntentRouter, RoutingDecision
 from agent.state import get_state_store
 from agent.update_context import ensure_update_context_plugin_registered, get_update_context_service
+from agent.verification import VerificationTelemetry
 
 ensure_update_context_plugin_registered()
 
@@ -291,6 +295,9 @@ class ContextBundle:
     chat_history: list = field(default_factory=list)   # LangChain messages
     graph_thread_id: Optional[str] = None
     extracted_input: str = ""               # user request stripped of wrapper context
+    resolved_input: str = ""                # referential follow-ups expanded with current subject
+    current_subject: str = ""               # explicit chat-level subject continuity
+    referential_followup: bool = False
     allowed_tool_names: Optional[frozenset] = None
     time_context: str = ""
     update_context: str = ""
@@ -571,6 +578,57 @@ class WebTaskReflector:
             return original_result
         
         q = str(task.get("params", {}).get("q") or task.get("params", {}).get("query") or "")
+
+        if bool(getattr(config, "search_grounding_enabled", True)):
+            target_tool = next((t for t in tools if t.name == tool_name), None)
+            if target_tool is not None and q:
+                used_original = False
+
+                def execute_candidate(candidate_q: str) -> str:
+                    nonlocal used_original
+                    if not used_original and candidate_q.strip().lower() == q.strip().lower():
+                        used_original = True
+                        return str(original_result or "")
+                    run_id = str(uuid.uuid4())
+                    try:
+                        if callbacks and hasattr(self.agent, "_emit_tool_start"):
+                            self.agent._emit_tool_start(callbacks, tool_name, candidate_q, run_id)
+                        result = str(target_tool.invoke(q=candidate_q) or "")
+                        if callbacks and hasattr(self.agent, "_emit_tool_end"):
+                            self.agent._emit_tool_end(callbacks, result, run_id)
+                        return result
+                    except Exception as exc:
+                        if callbacks and hasattr(self.agent, "_emit_tool_error"):
+                            self.agent._emit_tool_error(callbacks, exc, run_id)
+                        return ""
+
+                grounded = SearchGrounder(max_candidates=int(getattr(config, "search_grounding_max_candidates", 3) or 3)).ground(
+                    original_request=q,
+                    resolved_request=q,
+                    current_subject=str(getattr(self.agent, "_current_subject_text", "") or ""),
+                    execute=execute_candidate,
+                )
+                try:
+                    self.agent._last_grounded_search_result = grounded.as_dict()
+                    telemetry = getattr(self.agent, "_verification_telemetry", None)
+                    if telemetry is not None:
+                        for rejected in grounded.rejected_candidates:
+                            telemetry.record(
+                                "search_query_rejected",
+                                tool=tool_name,
+                                reason=str(rejected.get("reason") or "Search candidate rejected."),
+                                metadata={"query": rejected.get("query"), "score": rejected.get("score")},
+                            )
+                        if not grounded.accepted:
+                            telemetry.record(
+                                "search_evidence_irrelevant",
+                                tool=tool_name,
+                                reason="WebTaskReflector compatibility grounding did not find strong evidence.",
+                                metadata={"chosen_query": grounded.chosen_query},
+                            )
+                except Exception:
+                    pass
+                return str(grounded.condensed_evidence or grounded.raw_output or original_result or "")
         
         # If result is already good, return it
         if self._is_result_acceptable(q, original_result):
@@ -1629,6 +1687,18 @@ class EchoSpeakAgent:
         self._last_memory_mode: Optional[str] = None
         self._last_memory_thread_id: Optional[str] = None
         self._last_web_query_context: str = ""
+        self._current_subject_text: str = ""
+        self._last_grounded_search_result: Optional[Dict[str, Any]] = None
+        self._last_context_budget_report: Optional[Dict[str, Any]] = None
+        telemetry_enabled = bool(getattr(config, "verification_telemetry_enabled", True))
+        telemetry_path = DATA_DIR / "verification_events.jsonl" if telemetry_enabled else None
+        self._verification_telemetry = VerificationTelemetry(path=telemetry_path, enabled=telemetry_enabled)
+        self._session_memory = SessionMemoryDistiller(
+            DATA_DIR,
+            update_turns=int(getattr(config, "session_memory_update_turns", 1) or 1),
+        )
+        self._last_stage4_branch: str = ""
+        self._last_tool_calling_mode: str = ""
         self._current_thread_id: str = "default"
         self._current_execution_id: Optional[str] = None
         self._current_request_id: Optional[str] = None
@@ -2284,6 +2354,34 @@ class EchoSpeakAgent:
         parts.append("Tell me the specific thing you want done, and I'll either do it directly or tell you what needs confirmation.")
         return " ".join(parts)
 
+    def _clamp_discord_casual_reply(self, user_input: str, response_text: str) -> str:
+        """Keep casual Discord replies short and human-facing."""
+        text = re.sub(r"\s+", " ", str(response_text or "")).strip()
+        if not text:
+            return text
+        banned_fragments = [
+            "since i'm an ai",
+            "as an ai",
+            "i don't have a personal life",
+            "digital ether",
+        ]
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        kept: list[str] = []
+        for part in parts:
+            low = part.lower()
+            if any(fragment in low for fragment in banned_fragments):
+                continue
+            kept.append(part.strip())
+            if len(" ".join(kept)) >= 90:
+                break
+        out = " ".join([p for p in kept if p]).strip() or text
+        if len(out) > 120:
+            out = out[:117].rsplit(" ", 1)[0].rstrip(" ,;:") + "..."
+        if out.count("?") > 1:
+            first_q = out.find("?")
+            out = out[: first_q + 1] + out[first_q + 1 :].replace("?", ".")
+        return out
+
     def _is_architecture_question_text(self, query_lower: str) -> bool:
         q = (query_lower or "").strip().lower()
         if not q:
@@ -2594,6 +2692,112 @@ class EchoSpeakAgent:
         except Exception:
             return None
 
+    def _parse_printed_tool_directive(self, response_text: str) -> Optional[Dict[str, Any]]:
+        """Recover when a non-tool-calling model prints a tool directive as text."""
+        text = str(response_text or "").strip()
+        if not text or "|tool|" not in text.lower():
+            return None
+
+        allowed = {
+            "file_write",
+            "terminal_run",
+            "file_read",
+            "file_list",
+            "file_mkdir",
+            "file_move",
+            "file_copy",
+            "file_delete",
+            "web_search",
+        }
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if "|tool|" not in line.lower():
+                continue
+            after = re.split(r"\|tool\|", line, maxsplit=1, flags=re.IGNORECASE)[-1].strip()
+            after = after.lstrip(":|- ").strip()
+            if not after:
+                continue
+
+            data = self._parse_action_json(after)
+            if data:
+                action = str(data.get("action") or data.get("tool") or data.get("name") or "").strip().lower()
+                if not action:
+                    m_action = re.match(r"^([a-zA-Z_][\w.-]*)", after)
+                    action = (m_action.group(1).strip().lower() if m_action else "")
+                if action in allowed:
+                    data["action"] = action
+                    data.setdefault("confidence", 0.95)
+                    return data
+
+            m = re.match(r"^([a-zA-Z_][\w.-]*)\s*(.*)$", after, flags=re.DOTALL)
+            if not m:
+                continue
+            action = m.group(1).strip().lower()
+            rest = m.group(2).strip()
+            if action not in allowed:
+                continue
+
+            data = {"action": action, "confidence": 0.9}
+            json_payload = self._parse_action_json(rest)
+            if json_payload:
+                json_payload["action"] = str(json_payload.get("action") or action).strip().lower()
+                json_payload.setdefault("confidence", 0.95)
+                return json_payload
+
+            # Last-resort recovery for the common weak-model shape:
+            # |TOOL| terminal_run echo hello
+            if action == "terminal_run" and rest:
+                data.update({"command": rest, "cwd": "."})
+                return data
+            if action == "web_search" and rest:
+                data["query"] = rest
+                return data
+            if action in {"file_read", "file_list", "file_mkdir", "file_delete"} and rest:
+                data["path"] = rest.strip("\"'")
+                return data
+        return None
+
+    def _pending_preview_for_candidate(self, pending: Dict[str, Any]) -> str:
+        tool_name = str(pending.get("tool") or "").strip()
+        kwargs = pending.get("kwargs") or {}
+        display = self._format_pending_action(pending)
+        if tool_name == "file_write":
+            path = kwargs.get("path")
+            content = kwargs.get("content") or ""
+            append = kwargs.get("append") is True
+            return f"Write {len(str(content))} chars to {path}" + (" (append)" if append else "")
+        if tool_name == "terminal_run":
+            cmd_val = kwargs.get("command")
+            cwd_val = kwargs.get("cwd")
+            return f"Run terminal command in {cwd_val}: {str(cmd_val).strip()}"
+        return display
+
+    def _handle_printed_tool_directive(self, response_text: str, user_input: str) -> Optional[str]:
+        data = self._parse_printed_tool_directive(response_text)
+        normalized = self._normalize_candidate_action(data) if data else None
+        pending = self._candidate_to_pending_action(normalized, user_input) if normalized else None
+        if normalized is not None and pending is None:
+            telemetry = getattr(self, "_verification_telemetry", None)
+            if telemetry is not None:
+                telemetry.record(
+                    "action_args_invalid",
+                    tool=str(normalized.get("action") or ""),
+                    reason="Printed tool directive could not be converted into an executable action.",
+                    metadata={"normalized": normalized},
+                )
+            blocked = self._blocked_action_message(str(normalized.get("action") or ""))
+            if blocked:
+                return blocked
+            return "I recognized a tool request in the model output, but that tool is not available in the current workspace."
+        if pending is None:
+            return None
+        preview = self._pending_preview_for_candidate(pending)
+        self._set_pending_action(pending, preview, user_input)
+        display = self._format_pending_action(self._pending_action or pending)
+        plan = self._build_action_plan(user_input, display)
+        plan_block = f"Plan:\n{plan}\n\n" if plan else ""
+        return f"{preview}\n\n{plan_block}I can do this: {display}. Reply 'confirm' to proceed or 'cancel' to abort."
+
     def _normalize_candidate_action(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         action = str(data.get("action") or "").strip().lower()
         if not action or action == "none":
@@ -2773,6 +2977,18 @@ class EchoSpeakAgent:
         webhook_enabled = bool(getattr(config, "webhook_enabled", False))
         webhook_secret = self._load_webhook_secret()
         webhook_ok = not webhook_enabled or bool(webhook_secret)
+        routine_webhook_count = 0
+        try:
+            from agent.routines import get_routine_manager
+
+            routine_manager = get_routine_manager()
+            routine_webhook_count = len([
+                routine for routine in routine_manager.list_routines(enabled_only=True)
+                if str(getattr(routine, "trigger_type", "") or "") == "webhook"
+                and str(getattr(routine, "webhook_path", "") or "").strip()
+            ])
+        except Exception:
+            routine_webhook_count = 0
 
         allowlist = sorted(self._tool_allowlist_override) if self._tool_allowlist_override else []
         file_root = str(getattr(config, "file_tool_root", "") or ".").strip() or "."
@@ -2781,6 +2997,87 @@ class EchoSpeakAgent:
             for x in (getattr(config, "terminal_command_denylist", None) or [])
             if str(x).strip()
         ]
+        discord_diag: Dict[str, Any] = {
+            "enabled": bool(getattr(config, "allow_discord_bot", False)),
+            "token_set": bool(getattr(config, "discord_bot_token", "")),
+            "auto_confirm": bool(getattr(config, "discord_bot_auto_confirm", False)),
+            "owner_id_set": bool(str(getattr(config, "discord_bot_owner_id", "") or "").strip()),
+            "uses_shared_process_query": True,
+            "wrapper_marker_supported": True,
+            "last_source": str(getattr(self, "_current_source", "") or ""),
+            "last_thread_id": str(getattr(self, "_current_thread_id", "") or ""),
+            "last_user_role": str(getattr(self, "_current_user_role", "") or ""),
+            "bot_running": False,
+            "has_loop": False,
+            "guild_count": 0,
+        }
+        try:
+            from discord_bot import get_bot
+
+            bot = get_bot()
+            if bot is not None:
+                try:
+                    discord_diag["bot_running"] = bool(bot.is_running())
+                except Exception:
+                    discord_diag["bot_running"] = False
+                discord_diag["has_loop"] = bool(getattr(bot, "_loop", None))
+                client = getattr(bot, "client", None)
+                guilds = list(getattr(client, "guilds", []) or []) if client is not None else []
+                discord_diag["guild_count"] = len(guilds)
+        except Exception as exc:
+            discord_diag["error"] = str(exc)[:200]
+        integrations_diag: Dict[str, Any] = {"discord": discord_diag}
+
+        telegram_diag: Dict[str, Any] = {
+            "enabled": bool(getattr(config, "allow_telegram_bot", False)),
+            "token_set": bool(getattr(config, "telegram_bot_token", "")),
+            "allowed_users_count": len(list(getattr(config, "telegram_allowed_users", []) or [])),
+            "auto_confirm": bool(getattr(config, "telegram_auto_confirm", False)),
+            "running": False,
+        }
+        try:
+            from telegram_bot import get_telegram_bot
+
+            tg = get_telegram_bot()
+            telegram_diag["running"] = bool(tg and tg.is_running())
+        except Exception as exc:
+            telegram_diag["error"] = str(exc)[:200]
+        integrations_diag["telegram"] = telegram_diag
+
+        twitch_diag: Dict[str, Any] = {
+            "enabled": bool(getattr(config, "allow_twitch", False)),
+            "client_id_set": bool(getattr(config, "twitch_client_id", "")),
+            "client_secret_set": bool(getattr(config, "twitch_client_secret", "")),
+            "bot_token_set": bool(getattr(config, "twitch_bot_access_token", "")),
+            "eventsub_secret_set": bool(getattr(config, "twitch_eventsub_secret", "")),
+            "running": False,
+        }
+        try:
+            import twitch_bot as _twitch_mod
+
+            twi = getattr(_twitch_mod, "_twitch_bot", None)
+            if twi is not None:
+                twitch_diag["running"] = bool(twi.is_running())
+        except Exception as exc:
+            twitch_diag["error"] = str(exc)[:200]
+        integrations_diag["twitch"] = twitch_diag
+
+        twitter_diag: Dict[str, Any] = {
+            "enabled": bool(getattr(config, "allow_twitter", False)),
+            "bearer_token_set": bool(getattr(config, "twitter_bearer_token", "")),
+            "access_token_set": bool(getattr(config, "twitter_access_token", "")),
+            "access_token_secret_set": bool(getattr(config, "twitter_access_token_secret", "")),
+            "running": False,
+        }
+        try:
+            import twitter_bot as _twitter_mod
+
+            tw = getattr(_twitter_mod, "_twitter_bot", None)
+            if tw is not None:
+                twitter_diag["running"] = bool(tw.is_running())
+        except Exception as exc:
+            twitter_diag["error"] = str(exc)[:200]
+        integrations_diag["twitter"] = twitter_diag
         issues: list[str] = []
         if not provider_ok:
             issues.append("provider")
@@ -2792,6 +3089,37 @@ class EchoSpeakAgent:
             issues.append("croniter")
         if not webhook_ok:
             issues.append("webhook_secret")
+        if routine_webhook_count > 0 and not webhook_secret:
+            issues.append("routine_webhooks_unsigned")
+        if discord_diag["enabled"] and discord_diag["token_set"] and not discord_diag["bot_running"]:
+            issues.append("discord_bot")
+        if telegram_diag["enabled"] and telegram_diag["token_set"] and not telegram_diag["running"]:
+            issues.append("telegram_bot")
+        if twitch_diag["enabled"] and not (twitch_diag["client_id_set"] and twitch_diag["client_secret_set"]):
+            issues.append("twitch_config")
+        if twitter_diag["enabled"] and not (twitter_diag["bearer_token_set"] or twitter_diag["access_token_set"]):
+            issues.append("twitter_config")
+
+        session_memory_diag: Dict[str, Any] = {"enabled": bool(getattr(config, "session_memory_enabled", True))}
+        try:
+            if session_memory_diag["enabled"]:
+                session_memory_diag = self._session_memory.doctor(self._current_thread_id or "default")
+        except Exception as exc:
+            session_memory_diag["error"] = str(exc)[:200]
+
+        reliability_diag: Dict[str, Any] = {
+            "search_grounding": {
+                "enabled": bool(getattr(config, "search_grounding_enabled", True)),
+                "max_candidates": int(getattr(config, "search_grounding_max_candidates", 3) or 3),
+                "last": getattr(self, "_last_grounded_search_result", None),
+            },
+            "context_budget": {
+                "enabled": bool(getattr(config, "context_budget_enabled", True)),
+                "last": getattr(self, "_last_context_budget_report", None),
+            },
+            "session_memory": session_memory_diag,
+            "verification": self._verification_telemetry.report() if getattr(self, "_verification_telemetry", None) is not None else {},
+        }
 
         return {
             "ok": len(issues) == 0,
@@ -2821,6 +3149,10 @@ class EchoSpeakAgent:
                 "count": len(self.lc_tools or []),
                 "allowlist": allowlist,
             },
+            "tool_calling": self._tool_calling_diagnostics(),
+            "discord": discord_diag,
+            "integrations": integrations_diag,
+            "reliability": reliability_diag,
             "features": {
                 "action_parser_enabled": bool(getattr(config, "action_parser_enabled", True)),
                 "system_actions": bool(getattr(config, "enable_system_actions", False)),
@@ -2832,6 +3164,8 @@ class EchoSpeakAgent:
                 "croniter_available": cron_available,
                 "webhook_enabled": webhook_enabled,
                 "webhook_secret_set": bool(webhook_secret),
+                "routine_webhook_count": routine_webhook_count,
+                "routine_webhooks_signed": bool(webhook_secret),
             },
         }
 
@@ -2862,6 +3196,48 @@ class EchoSpeakAgent:
         tools = report.get("tools") or {}
         lines.append(f"Tools: {tools.get('count', 0)} available")
 
+        tool_calling = report.get("tool_calling") or {}
+        if tool_calling:
+            lines.append(
+                "Tool calling: "
+                + f"native={tool_calling.get('native_tool_calling_enabled')} "
+                + f"mode={tool_calling.get('last_tool_calling_mode') or 'unknown'} "
+                + f"stage4={tool_calling.get('last_stage4_branch') or 'none'}"
+            )
+
+        discord = report.get("discord") or {}
+        if discord:
+            lines.append(
+                "Discord bot: "
+                + f"enabled={discord.get('enabled')} "
+                + f"running={discord.get('bot_running')} "
+                + f"shared_core={discord.get('uses_shared_process_query')}"
+            )
+
+        integrations = report.get("integrations") or {}
+        if isinstance(integrations, dict) and integrations:
+            parts: list[str] = []
+            for name in ("telegram", "twitch", "twitter"):
+                item = integrations.get(name) or {}
+                if isinstance(item, dict):
+                    parts.append(f"{name}=enabled:{item.get('enabled')} running:{item.get('running')}")
+            if parts:
+                lines.append("Integrations: " + " | ".join(parts))
+
+        reliability = report.get("reliability") or {}
+        if isinstance(reliability, dict) and reliability:
+            sg = reliability.get("search_grounding") or {}
+            cb = reliability.get("context_budget") or {}
+            sm = reliability.get("session_memory") or {}
+            vt = reliability.get("verification") or {}
+            lines.append(
+                "Reliability: "
+                + f"search_grounding={sg.get('enabled')} "
+                + f"context_budget={cb.get('enabled')} "
+                + f"session_memory={sm.get('enabled')} "
+                + f"verification_events={vt.get('count', 0)}"
+            )
+
         features = report.get("features") or {}
         lines.append(
             f"Action Parser: {'enabled' if features.get('action_parser_enabled') else 'disabled'}"
@@ -2885,6 +3261,11 @@ class EchoSpeakAgent:
         webhook_line = "enabled" if features.get("webhook_enabled") else "disabled"
         webhook_check = "set" if features.get("webhook_secret_set") else "missing"
         lines.append(f"Webhook: {webhook_line} (secret={webhook_check})")
+        if int(features.get("routine_webhook_count") or 0) > 0:
+            lines.append(
+                f"Routine webhooks: {features.get('routine_webhook_count')} "
+                + f"(signed={features.get('routine_webhooks_signed')})"
+            )
 
         if report.get("issues"):
             lines.append("Issues: " + ", ".join(report["issues"]))
@@ -3298,6 +3679,93 @@ class EchoSpeakAgent:
         ]
         return any(term in q for term in explicit_terms)
 
+    def _is_referential_followup_text(self, query_text: str) -> bool:
+        q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+        if not q:
+            return False
+        exact = {
+            "do a deeper search",
+            "deeper search",
+            "search deeper",
+            "research deeper",
+            "go deeper",
+            "go further",
+            "dig deeper",
+            "tell me more",
+            "more on that",
+            "more about that",
+            "continue",
+            "keep going",
+            "explain more",
+            "expand on that",
+            "look into it more",
+            "check more",
+        }
+        if q in exact:
+            return True
+        prefixes = (
+            "do a deeper search",
+            "deeper search",
+            "search deeper",
+            "research deeper",
+            "go deeper",
+            "go further",
+            "dig deeper",
+            "tell me more",
+            "more on",
+            "more about",
+            "expand on",
+            "look into it more",
+            "check more",
+        )
+        if any(q.startswith(prefix) for prefix in prefixes):
+            # If the user already supplied a concrete object, don't rewrite it.
+            return q.endswith(("that", "it", "this")) or len(q.split()) <= 5
+        return False
+
+    def _resolve_referential_followup(self, query_text: str) -> tuple[str, bool, str]:
+        q = (query_text or "").strip()
+        subject = str(getattr(self, "_current_subject_text", "") or getattr(self, "_last_web_query_context", "") or "").strip()
+        if not q or not subject or not self._is_referential_followup_text(q):
+            return q, False, subject
+        low = q.lower()
+        if "search" in low or "research" in low or "look into" in low or "check" in low:
+            resolved = f"{q} about {subject}"
+        elif "more" in low or "expand" in low or "deeper" in low or "further" in low:
+            resolved = f"{q} about {subject}"
+        else:
+            resolved = f"{q} about {subject}"
+        return resolved.strip(), True, subject
+
+    def _subject_candidate_from_turn(self, user_input: str, response_text: str) -> str:
+        user = self._extract_user_request_text(user_input).strip()
+        if not user:
+            return ""
+        low = user.lower()
+        if self._is_small_talk_query(low) or self._is_referential_followup_text(user):
+            return ""
+        candidate = user
+        if self._is_explicit_web_query(low):
+            try:
+                candidate = self._extract_search_query(user) or user
+            except Exception:
+                candidate = user
+        candidate = re.sub(r"^(?:can you|could you|please|pls|hey|okay|ok)\s+", "", candidate, flags=re.IGNORECASE).strip()
+        candidate = re.sub(r"\s+", " ", candidate).strip(" .?!")
+        if len(candidate) < 4:
+            return ""
+        if len(candidate) > 220:
+            candidate = candidate[:220].rsplit(" ", 1)[0].strip()
+        return candidate
+
+    def _update_current_subject(self, user_input: str, response_text: str) -> None:
+        try:
+            candidate = self._subject_candidate_from_turn(user_input, response_text)
+            if candidate:
+                self._current_subject_text = candidate
+        except Exception:
+            pass
+
     def _needs_time_context(self, query_lower: str) -> bool:
         q = re.sub(r"\s+", " ", str(query_lower or "").strip().lower())
         if not q:
@@ -3456,11 +3924,16 @@ class EchoSpeakAgent:
         q = (query_text or "").strip()
         if not q:
             return q
-        prev = str(getattr(self, "_last_web_query_context", "") or "").strip()
+        prev = str(getattr(self, "_last_web_query_context", "") or getattr(self, "_current_subject_text", "") or "").strip()
         if not prev:
             return q
 
         low = q.lower().strip()
+        if self._is_referential_followup_text(q):
+            if "search" in low or "research" in low:
+                return f"{q} about {prev}".strip()
+            return f"{q} about {prev}".strip()
+
         if low.startswith("and in "):
             trimmed = q[7:].strip(" ?")
         else:
@@ -3493,6 +3966,66 @@ class EchoSpeakAgent:
 
         ensured_time_context = self._ensure_time_context_for_query(query_text, callbacks, time_context)
         final_query = self._build_time_aware_web_query(query_text, ensured_time_context)
+
+        if (
+            bool(getattr(config, "search_grounding_enabled", True))
+            and getattr(tool, "name", "") == "web_search"
+        ):
+            grounder = SearchGrounder(max_candidates=int(getattr(config, "search_grounding_max_candidates", 3) or 3))
+            current_subject = str(getattr(self, "_current_subject_text", "") or getattr(self, "_last_web_query_context", "") or "")
+
+            def execute_candidate(candidate_query: str) -> str:
+                candidate_run_id = str(uuid.uuid4())
+                self._emit_tool_start(callbacks, tool.name, candidate_query, candidate_run_id)
+                try:
+                    candidate_output = str(tool.invoke(q=candidate_query) or "")
+                    self._emit_tool_end(callbacks, candidate_output, candidate_run_id)
+                    return candidate_output
+                except Exception as exc:
+                    self._emit_tool_error(callbacks, exc, candidate_run_id)
+                    telemetry = getattr(self, "_verification_telemetry", None)
+                    if telemetry is not None:
+                        telemetry.record(
+                            "search_evidence_irrelevant",
+                            tool=tool.name,
+                            reason=f"Search tool failed: {exc}",
+                            metadata={"query": candidate_query},
+                        )
+                    return ""
+
+            grounded = grounder.ground(
+                original_request=query_text,
+                resolved_request=final_query,
+                current_subject=current_subject,
+                execute=execute_candidate,
+            )
+            self._last_grounded_search_result = grounded.as_dict()
+            telemetry = getattr(self, "_verification_telemetry", None)
+            if telemetry is not None:
+                for rejected in grounded.rejected_candidates:
+                    telemetry.record(
+                        "search_query_rejected",
+                        tool=tool.name,
+                        reason=str(rejected.get("reason") or "Search candidate rejected."),
+                        metadata={
+                            "query": rejected.get("query"),
+                            "score": rejected.get("score"),
+                            "original_request": query_text,
+                        },
+                    )
+                if not grounded.accepted:
+                    telemetry.record(
+                        "search_evidence_irrelevant",
+                        tool=tool.name,
+                        reason="No grounded search candidate reached the relevance threshold.",
+                        metadata={"chosen_query": grounded.chosen_query, "original_request": query_text},
+                    )
+            try:
+                self._emit_thinking_step("search", f"Search grounding chose: {grounded.chosen_query}", "done")
+            except Exception:
+                pass
+            return str(grounded.condensed_evidence or grounded.raw_output or ""), grounded.chosen_query, ensured_time_context
+
         run_id = str(uuid.uuid4())
         self._emit_tool_start(callbacks, tool.name, final_query, run_id)
         try:
@@ -4255,6 +4788,35 @@ class EchoSpeakAgent:
             return bool(getattr(config, "lmstudio_tool_calling", False) or getattr(config, "use_tool_calling_llm", False))
         return bool(getattr(config, "use_tool_calling_llm", False))
 
+    def _tool_calling_diagnostics(self) -> Dict[str, Any]:
+        native_enabled = bool(self._allow_llm_tool_calling())
+        return {
+            "provider": self.llm_provider.value,
+            "model": str(getattr(config.local, "model_name", "") if self.llm_provider not in {ModelProvider.OPENAI, ModelProvider.GEMINI} else ""),
+            "native_tool_calling_enabled": native_enabled,
+            "action_parser_enabled": bool(getattr(config, "action_parser_enabled", True)),
+            "langgraph_available": self.graph_agent is not None,
+            "agent_executor_available": self.agent_executor is not None,
+            "fallback_executor_available": self.fallback_executor is not None,
+            "lmstudio_tool_calling": bool(getattr(config, "lmstudio_tool_calling", False)),
+            "use_tool_calling_llm": bool(getattr(config, "use_tool_calling_llm", False)),
+            "last_tool_calling_mode": str(getattr(self, "_last_tool_calling_mode", "") or ""),
+            "last_stage4_branch": str(getattr(self, "_last_stage4_branch", "") or ""),
+            "current_subject": str(getattr(self, "_current_subject_text", "") or ""),
+        }
+
+    def _tool_calling_mode_label(self) -> str:
+        diag = self._tool_calling_diagnostics()
+        if diag.get("native_tool_calling_enabled") and diag.get("langgraph_available"):
+            return "native_tool_calling_langgraph"
+        if diag.get("native_tool_calling_enabled") and diag.get("agent_executor_available"):
+            return "native_tool_calling_agent_executor"
+        if diag.get("native_tool_calling_enabled"):
+            return "native_tool_calling_no_executor"
+        if diag.get("action_parser_enabled"):
+            return "json_action_parser_plus_direct_llm"
+        return "direct_llm_no_tool_calling"
+
     def _resolve_trim_max_tokens(self) -> int:
         try:
             max_tokens = int(getattr(config, "llm_trim_max_tokens", 0) or 0)
@@ -4347,10 +4909,21 @@ class EchoSpeakAgent:
             return f"{base}\n\nContext (memory + docs, may be empty):\n{context}"
         return base
 
-    def _build_context_block(self, memory_context: str, doc_context: str, profile_context: str = "") -> str:
+    def _build_context_block(
+        self,
+        memory_context: str,
+        doc_context: str,
+        profile_context: str = "",
+        pinned_context: str = "",
+        session_context: str = "",
+    ) -> str:
         parts: list[str] = []
         if profile_context:
             parts.append(f"User profile:\n{profile_context}")
+        if pinned_context:
+            parts.append(f"Pinned memory:\n{pinned_context}")
+        if session_context:
+            parts.append(f"Session memory:\n{session_context}")
         if self._summary:
             parts.append(f"Conversation summary:\n{self._summary}")
         if memory_context:
@@ -4555,6 +5128,18 @@ class EchoSpeakAgent:
                 kwargs={"mode": _mode, "thread_id": _tid},
                 daemon=True,
             ).start()
+        self._update_current_subject(clean_user_input, response_text)
+        if not _is_public and bool(getattr(config, "session_memory_enabled", True)):
+            try:
+                session_thread = thread_val or self._current_thread_id or "default"
+                self._session_memory.update_turn(
+                    thread_id=session_thread,
+                    user_input=clean_user_input,
+                    response_text=response_text,
+                    current_subject=str(getattr(self, "_current_subject_text", "") or ""),
+                )
+            except Exception as exc:
+                logger.debug(f"Session memory update skipped: {exc}")
         # Update cross-source activity tracking (Fix 3)
         try:
             src = _src
@@ -5103,6 +5688,16 @@ class EchoSpeakAgent:
         if not execution_id:
             return
         existing = self._state_store.get_execution(execution_id)
+        metadata = dict(getattr(existing, "metadata", {}) or {}) if existing is not None else {}
+        tool_calling_mode = str(getattr(self, "_last_tool_calling_mode", "") or "")
+        stage4_branch = str(getattr(self, "_last_stage4_branch", "") or "")
+        current_subject = str(getattr(self, "_current_subject_text", "") or "")
+        if tool_calling_mode:
+            metadata["tool_calling_mode"] = tool_calling_mode
+        if stage4_branch:
+            metadata["stage4_branch"] = stage4_branch
+        if current_subject:
+            metadata["current_subject"] = current_subject
         tools_used = []
         tool_latencies = []
         trace_id = None
@@ -5125,6 +5720,12 @@ class EchoSpeakAgent:
                 trace["success"] = bool(success)
                 trace["error"] = error
                 trace["response_preview"] = (response_text or "")[:500]
+                if tool_calling_mode:
+                    trace["tool_calling_mode"] = tool_calling_mode
+                if stage4_branch:
+                    trace["stage4_branch"] = stage4_branch
+                if current_subject:
+                    trace["current_subject"] = current_subject
                 self._state_store.write_trace(trace_id, trace)
                 self._last_trace_id = trace_id
             except Exception:
@@ -5143,6 +5744,7 @@ class EchoSpeakAgent:
             tools_used=tools_used,
             tool_latencies_ms=tool_latencies,
             trace_id=trace_id,
+            metadata=metadata,
             clear_pending_approval="" if status != "pending_approval" else getattr(self._pending_action, "get", lambda *_: "")("approval_id") if isinstance(self._pending_action, dict) else "",
         )
 
@@ -7302,6 +7904,14 @@ class EchoSpeakAgent:
                 except Exception:
                     pass
             if normalized is not None and pending is None:
+                telemetry = getattr(self, "_verification_telemetry", None)
+                if telemetry is not None:
+                    telemetry.record(
+                        "action_args_invalid",
+                        tool=str(normalized.get("action") or ""),
+                        reason="Action parser output could not be converted into an executable action.",
+                        metadata={"normalized": normalized},
+                    )
                 blocked_action_message = self._blocked_action_message(str(normalized.get("action") or ""))
                 if blocked_action_message:
                     self._last_tts_text = self._clamp_tts_text(blocked_action_message)
@@ -7350,7 +7960,8 @@ class EchoSpeakAgent:
         chat history, and determine allowed tools."""
         self._add_pipeline_reasoning("⚙️ Stage 2: Build Context", "Retrieving memories, documents, time context, and chat history.")
         extracted_input = self._extract_user_request_text(user_input)
-        context_query = extracted_input or user_input
+        resolved_input, referential_followup, current_subject = self._resolve_referential_followup(extracted_input)
+        context_query = resolved_input or extracted_input or user_input
         memory_context = self.memory.get_conversation_context(
             context_query,
             thread_id=thread_id,
@@ -7361,11 +7972,14 @@ class EchoSpeakAgent:
                 pinned_context = self.memory.pinned_context(thread_id=thread_id, max_chars=800)
             except Exception:
                 pinned_context = ""
-        if pinned_context:
-            if memory_context:
-                memory_context = f"Pinned memory:\n{pinned_context}\n\n{memory_context}"
-            else:
-                memory_context = f"Pinned memory:\n{pinned_context}"
+        session_context = ""
+        if include_memory and bool(getattr(config, "session_memory_enabled", True)):
+            try:
+                session_thread = thread_id or self._current_thread_id or "default"
+                session_context = self._session_memory.context_for(session_thread, max_chars=1200)
+            except Exception as exc:
+                logger.debug(f"Session memory context unavailable: {exc}")
+                session_context = ""
         doc_context, doc_sources = self._get_document_context(context_query) if include_memory else ("", [])
         self._last_doc_sources = doc_sources or []
         profile_context = ""
@@ -7386,10 +8000,14 @@ class EchoSpeakAgent:
                     profile_context = self._build_profile_context()
                 except Exception:
                     profile_context = ""
-        context = self._build_context_block(memory_context, doc_context, profile_context) if include_memory else ""
+        continuity_lines: list[str] = []
+        if current_subject:
+            continuity_lines.append(f"Current subject: {current_subject}")
+        if referential_followup and resolved_input and resolved_input != extracted_input:
+            continuity_lines.append(f"Resolved follow-up request: {resolved_input}")
         chat_history = self._history_as_messages() if include_memory else []
         graph_thread_id = thread_id if include_memory else None
-        allowed_tool_names = self._allowed_lc_tool_names(extracted_input)
+        allowed_tool_names = self._allowed_lc_tool_names(resolved_input or extracted_input)
         logger.debug(f"DEBUG: allowed_tool_names for query: {allowed_tool_names}")
         logger.debug(f"DEBUG: lc_tools names: {[getattr(t, 'name', '') for t in (self.lc_tools or [])]}")
         time_context = ""
@@ -7408,16 +8026,47 @@ class EchoSpeakAgent:
         if time_context:
             if hasattr(self, "_task_planner"):
                 self._task_planner._cached_time_context = time_context
-            if context:
-                context = f"Current system time: {time_context}\n\n{context}"
-            else:
-                context = f"Current system time: {time_context}"
+
+        context = ""
+        self._last_context_budget_report = None
+        if include_memory:
+            blocks = [
+                ContextBlock("time", time_context, 1, "Current system time"),
+                ContextBlock("continuity", "\n".join(continuity_lines), 2, "Conversation continuity", min_chars=80),
+                ContextBlock("profile", profile_context, 3, "User profile", min_chars=120),
+                ContextBlock("pinned", pinned_context, 4, "Pinned memory", min_chars=120),
+                ContextBlock("session", session_context, 5, "Session memory", min_chars=220),
+                ContextBlock("summary", self._summary, 6, "Conversation summary", min_chars=220),
+                ContextBlock("docs", doc_context, 7, "Document context", min_chars=300),
+                ContextBlock("memory", memory_context, 8, "Relevant memory", min_chars=260),
+            ]
+            local_cfg = getattr(config, "local", None)
+            configured_window = int(getattr(config, "llm_trim_max_tokens", 0) or 0)
+            if configured_window <= 0:
+                configured_window = int(getattr(local_cfg, "context_length", 0) or 0)
+            if configured_window <= 0:
+                configured_window = 8192
+            reserve_tokens = int(getattr(config, "llm_trim_reserve_tokens", 1200) or 1200)
+            overhead_tokens = estimate_tokens(self._compose_system_prompt()) + estimate_tokens(context_query) + 256
+            manager = ContextBudgetManager(
+                context_window=configured_window,
+                reserve_tokens=reserve_tokens,
+                enabled=bool(getattr(config, "context_budget_enabled", True)),
+            )
+            context, budget_report = manager.fit_blocks(blocks, overhead_tokens=overhead_tokens)
+            try:
+                self._last_context_budget_report = asdict(budget_report)
+            except Exception:
+                self._last_context_budget_report = None
 
         return ContextBundle(
             context=context,
             chat_history=chat_history,
             graph_thread_id=graph_thread_id,
             extracted_input=extracted_input,
+            resolved_input=resolved_input,
+            current_subject=current_subject,
+            referential_followup=referential_followup,
             allowed_tool_names=allowed_tool_names,
             time_context=time_context,
         )
@@ -7443,11 +8092,11 @@ class EchoSpeakAgent:
             self._add_pipeline_reasoning("⚙️ Stage 3: Shortcut Queries", "Tool-calling model detected — deferring to ReAct agent in Stage 4.")
             return None
 
-        extracted_input = ctx.extracted_input
+        extracted_input = ctx.resolved_input or ctx.extracted_input
         time_context = ctx.time_context
 
         # Detect query type with keyword heuristics (zero LLM cost)
-        schedule_extracted = self._extract_user_request_text(self._strip_live_desktop_context(user_input))
+        schedule_extracted = self._extract_user_request_text(self._strip_live_desktop_context(extracted_input or user_input))
         schedule_low = schedule_extracted.lower().strip()
         is_schedule = self._is_schedule_time_query(schedule_low) or self._is_next_upcoming_schedule_query(schedule_low)
 
@@ -7461,7 +8110,7 @@ class EchoSpeakAgent:
             return None  # Continue to Stage 4
 
         # Build search query from the best source
-        search_input = schedule_extracted if is_schedule else (expanded if is_followup else user_input)
+        search_input = schedule_extracted if is_schedule else (expanded if is_followup else extracted_input)
         qtext = self._extract_search_query(search_input)
         tool_output, used_query, time_context = self._invoke_web_research_query(
             qtext, callbacks, time_context=time_context, apply_reflection=True,
@@ -7535,19 +8184,30 @@ class EchoSpeakAgent:
         Returns response_text (may be empty if all fail)."""
         self._add_pipeline_reasoning("⚙️ Stage 4: Invoke LLM Agents", "Running agent cascade: LangGraph → AgentExecutor → Fallback.")
         response_text = ""
+        self._last_stage4_branch = "not_started"
+        self._last_tool_calling_mode = self._tool_calling_mode_label()
         self._partial_tool_results = []  # Reset partial tracker for this run
         self._partial_tool_names = {}
         _fallback_tool_context = ""  # Filled if LangGraph fails after tools ran
-        extracted_input = ctx.extracted_input
+        extracted_input = ctx.resolved_input or ctx.extracted_input
         allowed_tool_names = ctx.allowed_tool_names
         context = ctx.context
         chat_history = ctx.chat_history
         graph_thread_id = ctx.graph_thread_id
+        logger.info(
+            "Stage4 diagnostics: mode=%s allowed_tools=%s langgraph=%s agent_executor=%s fallback_executor=%s",
+            self._last_tool_calling_mode,
+            sorted([str(name) for name in (allowed_tool_names or [])]),
+            self.graph_agent is not None,
+            self.agent_executor is not None,
+            self.fallback_executor is not None,
+        )
 
         # Reasoning already emitted in stage 1 - no need to repeat here
 
         if allowed_tool_names and self.graph_agent is not None:
             try:
+                self._last_stage4_branch = "langgraph_attempt"
                 system_prompt = self._system_prompt_with_context(context)
                 self._graph_system_prompt = system_prompt
                 graph = self._get_langgraph_agent_for_toolset(allowed_tool_names) if allowed_tool_names else None
@@ -7587,12 +8247,16 @@ class EchoSpeakAgent:
                             header = "### 💭 Model Thoughts"
                         self._emit_reasoning(reasoning, header=header)
                 response_text = self._extract_graph_response(result)
+                if response_text:
+                    self._last_stage4_branch = "langgraph"
             except Exception as exc:
                 msg = str(exc)
                 if "ResourceExhausted" in msg or "quota" in msg.lower() or "429" in msg:
+                    self._last_stage4_branch = "langgraph_rate_limited"
                     logger.warning(f"LangGraph agent failed due to rate limit/quota: {exc}")
                     response_text = "I'm temporarily rate-limited by the model provider right now. Please wait a minute and try again."
                 else:
+                    self._last_stage4_branch = "langgraph_failed"
                     logger.warning(f"LangGraph agent failed; falling back to AgentExecutor: {exc}")
                     # Preserve any tool results that were captured before the crash
                     if self._partial_tool_results:
@@ -7604,6 +8268,7 @@ class EchoSpeakAgent:
 
         if not response_text and allowed_tool_names and self.agent_executor is not None:
             try:
+                self._last_stage4_branch = "agent_executor_attempt"
                 executor = self._get_tool_calling_executor_for_toolset(allowed_tool_names) if allowed_tool_names else None
                 if executor is None:
                     executor = self.agent_executor
@@ -7623,28 +8288,44 @@ class EchoSpeakAgent:
                 }
                 result = self._invoke_executor(executor, inputs, callbacks)
                 response_text = (result or {}).get("output") or ""
+                if response_text:
+                    self._last_stage4_branch = "agent_executor"
             except Exception as exc:
                 msg = str(exc)
                 if "ResourceExhausted" in msg or "quota" in msg.lower() or "429" in msg:
+                    self._last_stage4_branch = "agent_executor_rate_limited"
                     logger.warning(f"Agent executor failed due to rate limit/quota: {exc}")
                     response_text = "I'm temporarily rate-limited by the model provider right now. Please wait a minute and try again."
                 else:
+                    self._last_stage4_branch = "agent_executor_failed"
                     logger.warning(f"Agent executor failed; falling back to direct LLM: {exc}")
 
         if not response_text and allowed_tool_names and self.fallback_executor is not None:
             try:
+                self._last_stage4_branch = "fallback_executor_attempt"
                 prefix = f"Context (memory + docs, may be empty):\n{context}\n\n" if context else ""
                 merged_input = f"{prefix}{extracted_input}" if prefix else extracted_input
                 result = self._invoke_executor(self.fallback_executor, {"input": merged_input}, callbacks)
                 response_text = (result or {}).get("output") or (result or {}).get("text") or ""
+                if response_text:
+                    self._last_stage4_branch = "fallback_executor"
             except Exception as exc:
                 msg = str(exc)
                 if "ResourceExhausted" in msg or "quota" in msg.lower() or "429" in msg:
+                    self._last_stage4_branch = "fallback_executor_rate_limited"
                     logger.warning(f"Fallback agent executor failed due to rate limit/quota: {exc}")
                     response_text = "I'm temporarily rate-limited by the model provider right now. Please wait a minute and try again."
                 else:
+                    self._last_stage4_branch = "fallback_executor_failed"
                     logger.warning(f"Fallback agent executor failed; falling back to direct LLM: {exc}")
 
+        if not response_text and self._last_stage4_branch in {
+            "not_started",
+            "langgraph_failed",
+            "agent_executor_failed",
+            "fallback_executor_failed",
+        }:
+            self._last_stage4_branch = "stage5_direct_llm_pending"
         return response_text
 
     def _pq_finalize_response(
@@ -7657,7 +8338,7 @@ class EchoSpeakAgent:
         """Pipeline stage 5: Direct LLM fallback, schedule correction,
         TTS, memory recording, and return."""
         self._add_pipeline_reasoning("⚙️ Stage 5: Finalize Response", "Applying post-processing, TTS, and memory recording.")
-        extracted_input = ctx.extracted_input
+        extracted_input = ctx.resolved_input or ctx.extracted_input
         context = ctx.context
         time_context = ctx.time_context
 
@@ -7680,6 +8361,10 @@ class EchoSpeakAgent:
             current_turn = raw_input if has_wrapped_followup else f"Human: {extracted_input}"
             prompt_parts.append(f"Current conversation:\n{current_turn}\nAI:")
             response_text = self._invoke_visible_llm("\n\n".join([p for p in prompt_parts if p.strip()]))
+
+        printed_tool_response = self._handle_printed_tool_directive(response_text, extracted_input)
+        if printed_tool_response is not None:
+            response_text = printed_tool_response
 
         response_text = self._sanitize_response_text(response_text)
         response_text = self._maybe_correct_past_schedule_answer(user_input, response_text, time_context, callbacks)
@@ -7725,6 +8410,8 @@ class EchoSpeakAgent:
         _request_id = str(uuid.uuid4())
         self._current_request_id = _request_id
         self._current_thread_id = self._thread_key(thread_id)
+        self._last_stage4_branch = ""
+        self._last_tool_calling_mode = self._tool_calling_mode_label()
         self._sync_thread_state(thread_id)
         self._hydrate_pending_action_from_state()
         self._ensure_workspace_for_intent(user_input)

@@ -1,7 +1,9 @@
 import json
 import re
+import time
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 _RECENT_TERMS = {
@@ -19,6 +21,72 @@ _RECENT_TERMS = {
     "this week",
     "tonight",
 }
+
+_LIVE_SCORE_TERMS = {
+    "score",
+    "scores",
+    "result",
+    "results",
+    "who won",
+    "winning",
+    "live",
+    "current score",
+}
+
+_SCHEDULE_TERMS = {"schedule", "next game", "next match", "upcoming", "kickoff", "start time", "fixture"}
+
+
+@dataclass
+class SearchIntent:
+    original_request: str
+    resolved_request: str
+    current_subject: str = ""
+    mode: str = "general"
+    recency_need: bool = False
+    live_score_need: bool = False
+    schedule_need: bool = False
+    ambiguous: bool = False
+
+
+@dataclass
+class SearchCandidate:
+    query: str
+    reason: str
+    confidence: float = 0.5
+    tags: list[str] = field(default_factory=list)
+
+
+@dataclass
+class GroundedEvidence:
+    title: str
+    url: str
+    summary: str
+    relevance_score: float
+    recency_bucket: str = "unknown"
+    matched_terms: list[str] = field(default_factory=list)
+    rejection_reason: str = ""
+
+
+@dataclass
+class GroundedSearchResult:
+    chosen_query: str
+    candidates: list[SearchCandidate]
+    evidence: list[GroundedEvidence]
+    rejected_candidates: list[dict[str, Any]]
+    condensed_evidence: str
+    raw_output: str = ""
+    accepted: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "chosen_query": self.chosen_query,
+            "candidates": [asdict(c) for c in self.candidates],
+            "evidence": [asdict(e) for e in self.evidence],
+            "rejected_candidates": self.rejected_candidates,
+            "condensed_evidence": self.condensed_evidence,
+            "raw_output": self.raw_output,
+            "accepted": self.accepted,
+        }
 
 
 def _normalize_text(value: Any) -> str:
@@ -116,6 +184,212 @@ def _infer_mode(query: str) -> str:
     if any(term in low for term in _RECENT_TERMS):
         return "recent"
     return "general"
+
+
+def build_search_intent(original_request: str, resolved_request: str = "", current_subject: str = "") -> SearchIntent:
+    resolved = _normalize_text(resolved_request or original_request)
+    original = _normalize_text(original_request)
+    low = resolved.lower()
+    recency = any(term in low for term in _RECENT_TERMS) or any(t in low for t in ["right now", "currently", "current"])
+    live_score = any(term in low for term in _LIVE_SCORE_TERMS) and any(
+        sport in low
+        for sport in ["game", "match", "fifa", "world cup", "soccer", "football", "nhl", "nba", "nfl", "mlb", "canada", "morocco"]
+    )
+    schedule = any(term in low for term in _SCHEDULE_TERMS)
+    ambiguous = bool(current_subject and re.search(r"\b(deeper|more|again|that|this|it|continue|go further)\b", original.lower()))
+    mode = "recent" if recency else "general"
+    if live_score:
+        mode = "live_score"
+    elif schedule:
+        mode = "schedule"
+    return SearchIntent(
+        original_request=original,
+        resolved_request=resolved,
+        current_subject=_normalize_text(current_subject),
+        mode=mode,
+        recency_need=recency,
+        live_score_need=live_score,
+        schedule_need=schedule,
+        ambiguous=ambiguous,
+    )
+
+
+class SearchGrounder:
+    """Deterministic query construction, retry, and evidence condensation before LLM synthesis."""
+
+    def __init__(self, max_candidates: int = 3, relevance_threshold: float = 0.36):
+        self.max_candidates = max(1, int(max_candidates or 3))
+        self.relevance_threshold = float(relevance_threshold)
+
+    def build_candidates(self, intent: SearchIntent) -> list[SearchCandidate]:
+        base = _normalize_text(intent.resolved_request or intent.original_request)
+        if intent.ambiguous and intent.current_subject and intent.current_subject.lower() not in base.lower():
+            base = f"{base} about {intent.current_subject}"
+        base = self._clean_query(base)
+        candidates: list[SearchCandidate] = [SearchCandidate(base, "cleaned user intent", 0.72, ["base"])]
+
+        if intent.live_score_need:
+            cleaned = re.sub(r"\b(date|schedule|start time|kickoff|kick-off)\b", "", base, flags=re.IGNORECASE)
+            cleaned = self._clean_query(cleaned)
+            candidates = [
+                SearchCandidate(f"{cleaned} live score result today", "live score intent", 0.96, ["live_score", "current"]),
+                SearchCandidate(f"{cleaned} current score live updates", "live score fallback", 0.9, ["live_score", "fallback"]),
+                *candidates,
+            ]
+        elif intent.recency_need:
+            year = datetime.now().strftime("%Y")
+            candidates.append(SearchCandidate(f"{base} latest current {year}", "recency intent", 0.84, ["recent"]))
+        elif intent.schedule_need:
+            today = datetime.now().strftime("%Y-%m-%d")
+            candidates.append(SearchCandidate(f"{base} schedule today or later {today}", "schedule intent", 0.82, ["schedule"]))
+
+        deduped: list[SearchCandidate] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            q = self._clean_query(candidate.query)
+            key = q.lower()
+            if q and key not in seen:
+                candidate.query = q
+                deduped.append(candidate)
+                seen.add(key)
+        return deduped[: self.max_candidates]
+
+    def ground(
+        self,
+        *,
+        original_request: str,
+        resolved_request: str = "",
+        current_subject: str = "",
+        execute: Callable[[str], str],
+    ) -> GroundedSearchResult:
+        intent = build_search_intent(original_request, resolved_request, current_subject)
+        candidates = self.build_candidates(intent)
+        rejected: list[dict[str, Any]] = []
+        best_query = candidates[0].query if candidates else _normalize_text(resolved_request or original_request)
+        best_output = ""
+        best_evidence: list[GroundedEvidence] = []
+        best_score = -1.0
+
+        for candidate in candidates:
+            output = str(execute(candidate.query) or "")
+            evidence = self.score_evidence(output, candidate.query, intent)
+            top_score = max([e.relevance_score for e in evidence], default=0.0)
+            if top_score > best_score:
+                best_score = top_score
+                best_query = candidate.query
+                best_output = output
+                best_evidence = evidence
+            accepted = self._accept_evidence(evidence, intent)
+            if accepted:
+                return GroundedSearchResult(
+                    chosen_query=candidate.query,
+                    candidates=candidates,
+                    evidence=evidence,
+                    rejected_candidates=rejected,
+                    condensed_evidence=self.condense_evidence(evidence, output),
+                    raw_output=output,
+                    accepted=True,
+                )
+            rejected.append({"query": candidate.query, "reason": self._rejection_reason(evidence, intent), "score": top_score})
+
+        return GroundedSearchResult(
+            chosen_query=best_query,
+            candidates=candidates,
+            evidence=best_evidence,
+            rejected_candidates=rejected,
+            condensed_evidence=self.condense_evidence(best_evidence, best_output),
+            raw_output=best_output,
+            accepted=False,
+        )
+
+    def score_evidence(self, output: str, query: str, intent: SearchIntent) -> list[GroundedEvidence]:
+        items = [_normalize_evidence(item, tool_name="web_search", fallback_query=query, position=i) for i, item in enumerate(_parse_numbered_blocks(output), start=1)]
+        if not items and output.strip():
+            fallback_summary = _normalize_text(output[:600])
+            items = [{
+                "title": "Search output",
+                "url": "",
+                "snippet": fallback_summary,
+                "extract": fallback_summary,
+                "recency_bucket": "unknown",
+                "content": _normalize_text(output[:1200]),
+            }]
+        evidence: list[GroundedEvidence] = []
+        terms = self._intent_terms(intent)
+        for item in items:
+            hay = " ".join(str(item.get(k) or "") for k in ("title", "summary", "content", "page_title")).lower()
+            matched = [t for t in terms if t in hay]
+            score = min(1.0, 0.12 * len(matched))
+            if intent.live_score_need:
+                score += 0.55 if self._has_score_signal(hay) else -0.25
+                if any(t in hay for t in ["schedule", "date", "kickoff", "start time"]) and not self._has_score_signal(hay):
+                    score -= 0.25
+            if intent.recency_need and str(item.get("recency_bucket") or "") in {"breaking", "recent"}:
+                score += 0.18
+            if item.get("url"):
+                score += 0.05
+            rejection = "" if score >= self.relevance_threshold else "Evidence did not strongly match the requested intent."
+            evidence.append(GroundedEvidence(
+                title=str(item.get("title") or "Untitled source"),
+                url=str(item.get("url") or ""),
+                summary=str(item.get("summary") or item.get("content") or "")[:700],
+                relevance_score=max(0.0, min(1.0, score)),
+                recency_bucket=str(item.get("recency_bucket") or "unknown"),
+                matched_terms=matched[:12],
+                rejection_reason=rejection,
+            ))
+        evidence.sort(key=lambda e: e.relevance_score, reverse=True)
+        return evidence[:8]
+
+    def condense_evidence(self, evidence: list[GroundedEvidence], raw_output: str) -> str:
+        usable = [e for e in evidence if e.relevance_score >= 0.12]
+        if not usable:
+            return str(raw_output or "").strip()
+        lines = []
+        for idx, item in enumerate(usable[:5], start=1):
+            source = f" ({item.url})" if item.url else ""
+            lines.append(
+                f"{idx}. {item.title}{source}\n"
+                f"   Relevance: {item.relevance_score:.2f}; Recency: {item.recency_bucket}; Matches: {', '.join(item.matched_terms) or 'none'}\n"
+                f"   Evidence: {item.summary}"
+            )
+        return "\n\n".join(lines).strip()
+
+    def _accept_evidence(self, evidence: list[GroundedEvidence], intent: SearchIntent) -> bool:
+        if not evidence:
+            return False
+        top = evidence[0]
+        if intent.live_score_need:
+            return top.relevance_score >= self.relevance_threshold and self._has_score_signal(top.summary.lower() + " " + top.title.lower())
+        return top.relevance_score >= self.relevance_threshold or (len(evidence) >= 2 and top.relevance_score >= 0.25)
+
+    def _rejection_reason(self, evidence: list[GroundedEvidence], intent: SearchIntent) -> str:
+        if not evidence:
+            return "No usable evidence returned."
+        if intent.live_score_need:
+            return "Evidence did not look like a live/current score result."
+        return evidence[0].rejection_reason or "Evidence relevance below threshold."
+
+    def _intent_terms(self, intent: SearchIntent) -> list[str]:
+        words = re.findall(r"[a-z0-9]{3,}", (intent.resolved_request + " " + intent.current_subject).lower())
+        stop = {"what", "when", "where", "which", "with", "about", "please", "search", "deeper", "right", "currently", "today"}
+        terms = [w for w in words if w not in stop]
+        if intent.live_score_need:
+            terms.extend(["score", "live", "result", "current"])
+        if intent.recency_need:
+            terms.extend(["latest", "recent", "today", "current"])
+        return list(dict.fromkeys(terms))[:20]
+
+    def _has_score_signal(self, text: str) -> bool:
+        return bool(
+            any(sig in text for sig in ["score", "final", "live", "result", "full-time", "halftime", "goals"])
+            or re.search(r"\b\d{1,2}\s*[-:]\s*\d{1,2}\b", text)
+        )
+
+    def _clean_query(self, query: str) -> str:
+        q = _normalize_text(query)
+        q = re.sub(r"\b(can you|please|tell me|what is|what's|search the internet|look up)\b", "", q, flags=re.IGNORECASE)
+        return _normalize_text(q)
 
 
 def _parse_numbered_blocks(output: str) -> list[dict[str, Any]]:

@@ -1,5 +1,62 @@
 # Changes
 
+## v7.3.1 - Reliability Architecture Pass
+
+### Backend
+- Added a general `SearchGrounder` in `apps/backend/agent/research.py` with explicit intent/candidate/evidence/result types. Web search now builds up to three grounded candidates, anchors referential follow-ups to the current subject, rejects weak/date-only score evidence, and feeds condensed evidence to the LLM instead of trusting the first raw search result.
+- Added `apps/backend/agent/context_budget.py` and wired it into Stage 2 context building. Echo now reserves model headroom before invocation and trims lower-priority blocks before profile, pinned memory, current subject, and session summary.
+- Added `apps/backend/agent/session_memory.py` and update hooks after completed turns. Each thread can now maintain a durable session summary with current subject, open tasks, facts, preferences, unresolved questions, and decisions separate from raw chat/vector memory.
+- Added `apps/backend/agent/verification.py` and connected telemetry to search grounding, printed/action-parser tool failures, deterministic terminal/file failures, and exhausted reflection cycles.
+- Extended `/doctor` with reliability diagnostics for search grounding, context budget, session memory, and verification clusters.
+- Extended `/memory/doctor` with session-memory status, path, last update, current subject, turn count, and summary size.
+- Added `agent.adapters` and a minimal `agent.mcp_client` bridge so referenced integration modules exist and Trust Center can distinguish configured MCP servers from actually loaded MCP tools.
+- Corrected MCP trust summary semantics: MCP is only reported as available when configured, client-present, and loaded tools exist.
+
+### Verification
+- Python compile passed for touched backend modules.
+- Focused pytest pass: 12 targeted tests passed for reliability architecture, research parsing, referential follow-up continuity, printed `|TOOL|` recovery, deterministic terminal failure, and reflection stop conditions.
+- Full backend pytest is improved but still not clean: 191 passed / 12 failed. Remaining failures are pre-existing or adjacent contract drift around LangChain `StructuredTool` callability, workspace allowlist state, project-update tool exposure, LangGraph history expectations, and task-planner auto-confirm behavior.
+
+## v7.3.0 - Pre-Testing Technical Audit
+
+- Added `docs/PRE_TESTING_TECHNICAL_AUDIT_2026.md`, a pre-testing architecture/security/reliability audit covering the current agent loop, memory system, coding readiness, integration endpoints, MCP trust gap, UI surfaces, docs drift, tests, and production-readiness checklist.
+- Marked the main pre-test blockers: terminal denylist documentation drift, missing MCP client implementation, local-first API auth posture, FAISS trusted-state boundary, and missing endpoint contract tests for the new v7.3 routes.
+- Added `INFRASTRUCTURE.md`, a full backend infrastructure guide covering FastAPI routes, the agent pipeline, model/tool modes, memory tiers, search grounding, reflection, safety gates, integrations, diagnostics, and the recommended next architecture upgrades.
+
+## v7.3.0 - Coding Loop, Memory Doctor UI, Tool Trust
+
+### Backend
+- Added `GET /coding/readiness` to report provider readiness, coding workspace state, file roots, terminal denylist, and required coding tool availability.
+- Extended `GET /capabilities` with tool origin/trust metadata and an MCP summary so configured-but-missing MCP capability is reported as unavailable, not as real loaded tooling.
+- Added optional shared-key API auth (`API_AUTH_ENABLED`, `API_AUTH_KEY`, `API_AUTH_LOCALHOST_BYPASS`) across HTTP endpoints and the WebSocket gateway for non-local/remote exposure.
+- Fixed the `/capabilities` response model so the new `trust` payload is not filtered out by a duplicate schema definition.
+- Fixed `/coding/readiness` provider readiness so it uses the shared preflight `ok` field instead of a non-existent `ready` field.
+- Made `POST /memory/compact` accept both JSON body and query parameters, matching the Memory UI compact button.
+- Hardened routine webhooks: `/webhooks/{path}` now verifies the global webhook HMAC signature when a webhook secret is configured.
+- Extended settings validation and `/doctor` integration diagnostics for Telegram, Twitch, Twitter/X, Discord, and routine webhook signing.
+
+### Agent
+- Added explicit conversation continuity state (`current_subject` / resolved follow-up input) so prompts like "do a deeper search" carry forward the topic Echo just answered instead of falling into a generic clarification loop.
+- Added Stage 4 diagnostics for the agent cascade. Each execution can now report the active tool-calling mode plus whether Echo used LangGraph, AgentExecutor, fallback executor, or direct-LLM fallback.
+- Extended `/doctor` with Discord shared-core diagnostics so the bot path can be checked for enabled/running state, source/thread role state, and whether it is using the same `process_query` route.
+- Hardened `ReflectionEngine` with verifier-first checks for terminal exit codes, file operations, file reads/lists, and structured JSON before asking the model to grade its own work.
+- Changed exhausted reflection cycles from implicit success to a blocker signal unless a deterministic check has already proved the step worked.
+- Added recovery for weak-model printed tool directives such as `|TOOL| terminal_run {...}` so they become normal pending actions instead of leaking inert raw tool text into chat.
+- Strengthened the coding workspace prompt around the lifecycle: inspect, plan, implement, verify, summarize.
+- Added explicit guidance for Desktop-targeted coding requests so Echo uses configured file roots instead of getting stuck saying it cannot see the desktop.
+- Fixed optional vision import behavior so missing OpenCV does not crash backend import through evaluated `np.ndarray` annotations.
+
+### Web UI
+- Added a Coding readiness card to the Code visualizer.
+- Added a Memory Doctor card to the Memory studio tab.
+- Added Coding Agent Loop and Tool Trust Center sections to the Tools studio tab.
+- Encoded thread IDs in Tool Trust and memory compact calls, and refreshed Memory Doctor after compaction.
+
+### Verification
+- Python compile passed for the touched backend modules.
+- Focused pytest pass: 11 targeted tests passed for deterministic reflection, plan stop conditions, MCP unavailable reporting, API auth checks, current-subject continuity, and printed `|TOOL|` recovery.
+- A broad test-file run still needs the project dependency set and writable temp setup; the first whole-file attempt exposed unrelated optional dependency/temp-folder issues, so verification was narrowed to the patched behaviors.
+
 ## v7.2.0 - Provider Readiness Preflight
 
 ### Backend

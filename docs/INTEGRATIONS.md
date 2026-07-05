@@ -5,6 +5,10 @@ This document explains the **advanced tooling stack** that was implemented in Ec
 ---
 
 ## Recent Updates
+- **Endpoint contract audit (v7.3.0)**: Fixed `/capabilities.trust`, `/coding/readiness` provider readiness, `/memory/compact` query/body compatibility, and routine webhook HMAC enforcement when a global webhook secret is configured.
+- **Integration doctor coverage (v7.3.0)**: `/doctor` now includes platform integration readiness for Discord, Telegram, Twitch, Twitter/X, and routine webhook signing state.
+- **Agent diagnostics + deterministic checks (v7.3.0)**: Execution records now include Stage 4 branch/tool-calling mode metadata, and `ReflectionEngine` verifies concrete terminal/file/JSON outcomes before using LLM reflection.
+- **Conversation continuity (v7.3.0)**: The context layer tracks the current subject and resolves referential follow-ups like "do a deeper search" before routing tools.
 - **Inline code diff (v7.1.0)**: Unified one-pane diff view in the Code panel with green additions, red deletions, and Accept/Decline buttons for pending `file_write` actions. Per-file session model replaces snapshot array.
 - **Efficient SEARCH/REPLACE editing (v7.1.0)**: File-edit pipeline uses targeted SEARCH/REPLACE blocks instead of full-file rewrites, saving 80–95% of LLM output tokens. Automatic fallback to full-file if parsing fails.
 - **Context Ring (v7.1.0)**: Token-usage gauge in chat input with color-coded thresholds and hover tooltip.
@@ -467,6 +471,34 @@ v7.2.0 adds a preflight gate before full agent execution:
 - `GET /provider` reports `ready`, `readiness_message`, and `readiness_detail`.
 - `POST /query` and `POST /query/stream` return a clear `provider_unavailable` response when the selected provider is not reachable or is missing required configuration.
 - `GET /memory/doctor?thread_id=...&max_scan=300` audits memory shape without deleting anything: duplicate groups, typed memory coverage, pinned/profile counts, and raw conversation auto-store status.
+
+### Coding readiness + tool trust
+
+v7.3.0 adds agent-operation visibility for the next reliability layer:
+
+- `GET /coding/readiness?thread_id=...` reports whether Echo can inspect, write, and verify code for the active session.
+- The Web UI Code visualizer shows coding readiness next to the file explorer.
+- The Memory tab surfaces the read-only Memory Doctor report.
+- The Tools tab shows coding readiness and a Tool Trust Center with local/MCP counts, risk metadata, and MCP-client availability.
+- MCP servers listed in `MCP_SERVERS` are reported as `client_missing` until `apps/backend/agent/mcp_client.py` exists; configured metadata is not treated as loaded capability.
+
+### API auth for remote access
+
+EchoSpeak remains local-first. Before exposing `API_HOST` beyond localhost, enable shared-key auth:
+
+- `API_AUTH_ENABLED=true`
+- `API_AUTH_KEY=<long random key>`
+- `API_AUTH_LOCALHOST_BYPASS=true` keeps local desktop use smooth while requiring the key from non-local clients.
+- REST clients can send `X-EchoSpeak-Key`, `X-API-Key`, `X-Admin-Key`, or `Authorization: Bearer <key>`.
+- `/gateway/ws` uses the same header-based check and closes unauthorized network clients with policy violation code `1008`.
+
+### Automation webhooks
+
+EchoSpeak exposes two webhook paths:
+
+- `POST /trigger/webhook` requires `WEBHOOK_ENABLED=true` and a valid HMAC signature.
+- `POST /webhooks/{path}` triggers saved routines by path. If `WEBHOOK_SECRET` or `WEBHOOK_SECRET_PATH` is configured, this route also requires the same HMAC signature.
+- `/doctor` reports enabled routine webhook count and whether routine webhooks are signed.
 
 ### Discord (Playwright)
 

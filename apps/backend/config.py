@@ -46,6 +46,7 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 SETTINGS_SECRETS_PATH = DATA_DIR / "settings.secrets.json"
 
 SECRET_TOP_LEVEL_SETTINGS = {
+    "api_auth_key",
     "tavily_api_key",
     "discord_webhook_url",
     "discord_bot_token",
@@ -444,6 +445,7 @@ class Config:
         self.gemini_use_langgraph = os.getenv("GEMINI_USE_LANGGRAPH", "false").lower() == "true"
         self.llm_trim_max_tokens = int(os.getenv("LLM_TRIM_MAX_TOKENS", "0") or 0)
         self.llm_trim_reserve_tokens = int(os.getenv("LLM_TRIM_RESERVE_TOKENS", "512") or 512)
+        self.context_budget_enabled = os.getenv("CONTEXT_BUDGET_ENABLED", "true").lower() == "true"
 
         self.document_rag_enabled = os.getenv("DOCUMENT_RAG_ENABLED", "true").lower() == "true"
         self.doc_upload_max_mb = int(os.getenv("DOC_UPLOAD_MAX_MB", "25"))
@@ -484,6 +486,8 @@ class Config:
         self.multi_task_planner_enabled = os.getenv("MULTI_TASK_PLANNER_ENABLED", "true").lower() == "true"
         self.web_task_reflection_enabled = os.getenv("WEB_TASK_REFLECTION_ENABLED", "true").lower() == "true"
         self.web_task_max_retries = int(os.getenv("WEB_TASK_MAX_RETRIES", "2") or 2)
+        self.search_grounding_enabled = os.getenv("SEARCH_GROUNDING_ENABLED", "true").lower() == "true"
+        self.search_grounding_max_candidates = int(os.getenv("SEARCH_GROUNDING_MAX_CANDIDATES", "3") or 3)
 
         self.memory_default_mode = os.getenv("MEMORY_DEFAULT_MODE", "general").strip() or "general"
 
@@ -496,6 +500,8 @@ class Config:
         self.file_memory_max_chars = int(os.getenv("FILE_MEMORY_MAX_CHARS", "2000") or 2000)
         self.memory_importance_enabled = os.getenv("MEMORY_IMPORTANCE_ENABLED", "true").lower() == "true"
         self.memory_flush_enabled = os.getenv("MEMORY_FLUSH_ENABLED", "false").lower() == "true"
+        self.session_memory_enabled = os.getenv("SESSION_MEMORY_ENABLED", "true").lower() == "true"
+        self.session_memory_update_turns = int(os.getenv("SESSION_MEMORY_UPDATE_TURNS", "1") or 1)
         self.memory_flush_system_prompt = os.getenv(
             "MEMORY_FLUSH_SYSTEM_PROMPT",
             "You are a memory assistant. Extract durable facts, preferences, and decisions. "
@@ -508,6 +514,7 @@ class Config:
 
         self.trace_enabled = os.getenv("TRACE_ENABLED", "false").lower() == "true"
         self.trace_path = os.getenv("TRACE_PATH", "").strip() or str(LOGS_DIR / "agent_traces.jsonl")
+        self.verification_telemetry_enabled = os.getenv("VERIFICATION_TELEMETRY_ENABLED", "true").lower() == "true"
 
         self.enable_system_actions = os.getenv("ENABLE_SYSTEM_ACTIONS", "false").lower() == "true"
         self.allow_open_chrome = os.getenv("ALLOW_OPEN_CHROME", "false").lower() == "true"
@@ -569,6 +576,10 @@ class Config:
             if p.strip()
         ]
         self.artifacts_dir = os.getenv("ARTIFACTS_DIR", str(ARTIFACTS_DIR)).strip() or str(ARTIFACTS_DIR)
+
+        self.api_auth_enabled = os.getenv("API_AUTH_ENABLED", "false").lower() == "true"
+        self.api_auth_key = os.getenv("API_AUTH_KEY", "").strip()
+        self.api_auth_localhost_bypass = os.getenv("API_AUTH_LOCALHOST_BYPASS", "true").lower() == "true"
 
         self.skills_dir = os.getenv("SKILLS_DIR", str(SKILLS_DIR)).strip() or str(SKILLS_DIR)
         self.workspaces_dir = os.getenv("WORKSPACES_DIR", str(WORKSPACES_DIR)).strip() or str(WORKSPACES_DIR)
@@ -884,6 +895,7 @@ class Config:
             "gemini_use_langgraph",
             "llm_trim_max_tokens",
             "llm_trim_reserve_tokens",
+            "context_budget_enabled",
             "document_rag_enabled",
             "doc_upload_max_mb",
             "doc_context_max_chars",
@@ -911,6 +923,8 @@ class Config:
             "multi_task_planner_enabled",
             "web_task_reflection_enabled",
             "web_task_max_retries",
+            "search_grounding_enabled",
+            "search_grounding_max_candidates",
             "memory_default_mode",
             "memory_partition_enabled",
             "memory_auto_store_conversations",
@@ -920,10 +934,13 @@ class Config:
             "file_memory_max_chars",
             "memory_importance_enabled",
             "memory_flush_enabled",
+            "session_memory_enabled",
+            "session_memory_update_turns",
             "memory_flush_system_prompt",
             "memory_flush_prompt",
             "trace_enabled",
             "trace_path",
+            "verification_telemetry_enabled",
             "web_search_timeout",
             "tavily_api_key",
             "tavily_search_depth",
@@ -957,6 +974,9 @@ class Config:
             "file_tool_root",
             "file_tool_extra_roots",
             "artifacts_dir",
+            "api_auth_enabled",
+            "api_auth_key",
+            "api_auth_localhost_bypass",
             "skills_dir",
             "workspaces_dir",
             "default_workspace",
