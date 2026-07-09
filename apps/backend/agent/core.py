@@ -12658,8 +12658,19 @@ class EchoSpeakAgent:
         response_text = ""
         self._last_stage4_branch = "not_started"
         self._last_tool_calling_mode = self._tool_calling_mode_label()
-        self._partial_tool_results = []  # Reset partial tracker for this run
+        # Reset this-turn tool tracker, but KEEP durable seeds from Stage 2
+        # (active_work_restore). Full wipe forced Stage 4 to re-list Desktop /
+        # re-ask project type even when the fingerprint already existed.
+        _prior = list(getattr(self, "_partial_tool_results", None) or [])
+        self._partial_tool_results = [
+            tr for tr in _prior if str(tr.get("tool") or "") == "active_work_restore"
+        ]
         self._partial_tool_names = {}
+        # Always re-hydrate pin + samples so Stage 4 has project substance
+        try:
+            self._hydrate_from_active_work()
+        except Exception:
+            pass
         _fallback_tool_context = ""  # Filled if LangGraph fails after tools ran
         extracted_input = ctx.resolved_input or ctx.extracted_input
         allowed_tool_names = ctx.allowed_tool_names
@@ -12667,12 +12678,13 @@ class EchoSpeakAgent:
         chat_history = ctx.chat_history
         graph_thread_id = ctx.graph_thread_id
         logger.info(
-            "Stage4 diagnostics: mode=%s allowed_tools=%s langgraph=%s agent_executor=%s fallback_executor=%s",
+            "Stage4 diagnostics: mode=%s allowed_tools=%s langgraph=%s agent_executor=%s fallback_executor=%s seeded_partials=%s",
             self._last_tool_calling_mode,
             sorted([str(name) for name in (allowed_tool_names or [])]),
             self.graph_agent is not None,
             self.agent_executor is not None,
             self.fallback_executor is not None,
+            len(self._partial_tool_results or []),
         )
 
         # Reasoning already emitted in stage 1 - no need to repeat here
