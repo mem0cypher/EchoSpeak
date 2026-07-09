@@ -179,6 +179,38 @@ def test_weather_place_structural_not_city_list():
     assert "weather" in bare.lower()
 
 
+def test_fifa_matchup_single_query_not_junk_split():
+    """Live: France/maracoo + 'pelsae check' must be ONE sports query, not 3 junk ones."""
+    from agent.research import (
+        resolve_web_search_queries,
+        looks_like_multi_intent,
+        _extract_vs_sides,
+        _normalize_sports_query,
+        _prep_search_work_text,
+    )
+
+    q = "what time does the fifa game with france and maracoo start today? pelsae check"
+    prep = _prep_search_work_text(q)
+    assert "pelsae" not in prep.lower()
+    assert "please check" not in prep.lower()
+    assert looks_like_multi_intent(q) is False
+    sides = _extract_vs_sides(q)
+    assert "france" in sides.lower()
+    assert "maracoo" in sides.lower() or "morocco" in sides.lower()
+    sports = _normalize_sports_query(q)
+    assert "france" in sports.lower()
+    assert "fifa" in sports.lower() or "world cup" in sports.lower()
+    assert "kickoff" in sports.lower() or "time" in sports.lower()
+    resolved = resolve_web_search_queries(q, q, use_decomposition=True)
+    assert len(resolved) == 1, resolved
+    r0 = resolved[0].lower()
+    assert "france" in r0
+    assert "maracoo" in r0 or "morocco" in r0
+    assert "pelsae" not in r0
+    assert r0 != "maracoo start today"
+    assert "pelsae check" not in r0
+
+
 def test_local_scan_reloops_into_project_not_stall():
     """After listing Desktop, must enter 2d-shooter-game and not ask 'what first?'."""
     from pathlib import Path

@@ -60,8 +60,8 @@ _SCHEDULE_TERMS = {
     "for tomorrow",
 }
 
-# Speech/typo fixes that are *structural* (day words, compound forms) — not entity lists.
-# Never put team/city/country names here; that routes by test vocabulary.
+# Speech/typo fixes that are *structural* (day words, politeness, compound forms).
+# Not entity/team routing maps — only words that break *parsing* when mangled.
 _SPELLING_FIXES = {
     "wordlcup": "world cup",
     "worldcup": "world cup",
@@ -71,6 +71,11 @@ _SPELLING_FIXES = {
     "tomorow": "tomorrow",
     "tomorro": "tomorrow",
     "todya": "today",
+    # Politeness STT (must not become its own search: "pelsae check")
+    "pelsae": "please",
+    "plese": "please",
+    "plase": "please",
+    "pealse": "please",
 }
 
 _WEATHER_TERMS = {
@@ -393,56 +398,72 @@ def _is_schedule_or_sports_clause(text: str) -> bool:
     return False
 
 
-def _extract_vs_sides(text: str) -> str:
-    """
-    Structural matchup parse: 'France vs Morocco', 'A versus B', 'X against Y'.
-    No country/team whitelist — any free-form sides (unicode letters OK).
-    """
-    # \w with UNICODE includes accented letters (Curaçao, São Paulo, …)
-    m = re.search(
-        r"(?iu)\b([\w][\w .'-]{0,40}?)\s+(?:vs\.?|versus|against)\s+([\w][\w .'-]{0,40}?)\b",
-        text or "",
-    )
-    if not m:
-        return ""
-    def _side(s: str) -> str:
-        s = _normalize_text(s)
-        # Drop leading articles / chatty interrogatives ("who wins Senegal" → "Senegal")
-        for _ in range(4):
-            nxt = re.sub(
-                r"(?i)^(the|a|an|who|what|which|when|wins?|win|plays?|playing)\s+",
-                "",
-                s,
-            )
-            if nxt == s:
-                break
-            s = nxt
-        # Drop competition/league words so sides aren't "world cup Senegal"
-        s = re.sub(
-            r"(?i)\b(fifa|world\s*cup|nhl|nba|nfl|mlb|uefa|premier\s*league|champions\s*league|"
-            r"soccer|football|hockey|basketball|baseball)\b",
-            " ",
-            s,
-        )
-        s = re.sub(
-            r"(?i)\s+\b(kickoff|time|schedule|fixtures?|matches?|games?|today|tomorrow|tonight|"
-            r"et|pt|mt|ct|utc|gmt|mnt|mst|est|pst)\b.*$",
+def _clean_match_side(s: str) -> str:
+    """Normalize one free-form match side (any nation/club — no whitelist)."""
+    s = _normalize_text(s)
+    for _ in range(4):
+        nxt = re.sub(
+            r"(?i)^(the|a|an|who|what|which|when|wins?|win|plays?|playing|with|between)\s+",
             "",
             s,
         )
-        s = _normalize_text(s)
-        # Prefer last 1–3 tokens if still chatty
-        toks = s.split()
-        if len(toks) > 3:
-            s = " ".join(toks[-3:])
-        return _normalize_text(s)
+        if nxt == s:
+            break
+        s = nxt
+    s = re.sub(
+        r"(?i)\b(fifa|world\s*cup|nhl|nba|nfl|mlb|uefa|premier\s*league|champions\s*league|"
+        r"soccer|football|hockey|basketball|baseball)\b",
+        " ",
+        s,
+    )
+    s = re.sub(
+        r"(?i)\s+\b(kickoff|time|schedule|fixtures?|matches?|games?|today|tomorrow|tonight|"
+        r"start|starts|starting|et|pt|mt|ct|utc|gmt|mnt|mst|est|pst)\b.*$",
+        "",
+        s,
+    )
+    s = _normalize_text(s)
+    toks = s.split()
+    if len(toks) > 3:
+        s = " ".join(toks[-3:])
+    return _normalize_text(s)
 
-    a, b = _side(m.group(1)), _side(m.group(2))
-    if not a or not b or len(a) < 2 or len(b) < 2:
-        return ""
-    if a.lower() in _SPORTS_STOP or b.lower() in _SPORTS_STOP:
-        return ""
-    return f"{a} {b}"
+
+def _extract_vs_sides(text: str) -> str:
+    """
+    Structural matchup parse — free-form sides, no country whitelist.
+
+    Accepts:
+      France vs Morocco | A versus B | X against Y
+      with France and Morocco | between A and B
+      game with France and maracoo  (STT OK — keep free-form spelling)
+    """
+    raw = text or ""
+    patterns = (
+        # Classic vs
+        r"(?iu)\b([\w][\w .'-]{0,40}?)\s+(?:vs\.?|versus|against)\s+([\w][\w .'-]{0,40}?)\b",
+        # with/between X and Y (live: "fifa game with france and maracoo")
+        r"(?iu)\b(?:with|between)\s+([\w][\w'-]{1,30})\s+and\s+([\w][\w'-]{1,30})\b",
+        # game/match ... X and Y
+        r"(?iu)\b(?:game|match|fixture|matchup)\s+(?:with\s+|between\s+)?"
+        r"([\w][\w'-]{1,30})\s+and\s+([\w][\w'-]{1,30})\b",
+    )
+    for pat in patterns:
+        m = re.search(pat, raw)
+        if not m:
+            continue
+        a, b = _clean_match_side(m.group(1)), _clean_match_side(m.group(2))
+        if not a or not b or len(a) < 2 or len(b) < 2:
+            continue
+        if a.lower() in _SPORTS_STOP or b.lower() in _SPORTS_STOP:
+            continue
+        # Reject obvious non-sides ("time and the")
+        if a.lower() in {"time", "what", "when", "start", "does", "the"} or b.lower() in {
+            "time", "what", "when", "start", "does", "the", "today", "tomorrow",
+        }:
+            continue
+        return f"{a} {b}"
+    return ""
 
 
 def _extract_teamish_phrase(text: str) -> str:
@@ -925,6 +946,17 @@ def _prep_search_work_text(text: str) -> str:
         " ",
         work,
     )
+    # Trailing politeness must never become its own search ("pelsae check" / "please check")
+    work = re.sub(
+        r"(?i)[?!.]?\s*\b(?:please|pls|plz)\s*(?:check|look(?:\s+up)?|search|confirm|verify)?\s*[?!.]*\s*$",
+        " ",
+        work,
+    )
+    work = re.sub(
+        r"(?i)\b(?:can you|could you|would you)\s+(?:please\s+)?(?:check|look up|search|confirm)\s*[?!.]*\s*$",
+        " ",
+        work,
+    )
     return _normalize_text(work)
 
 
@@ -963,6 +995,12 @@ def _is_smalltalk_clause(text: str) -> bool:
     if not low:
         return True
     if _is_hollow_secondary_clause(low):
+        return True
+    # Pure politeness / confirmation tails (never search these alone)
+    if re.search(
+        r"(?i)^\s*(?:please|pls|plz)?\s*(?:check|look|confirm|verify|thanks|thank you)?\s*[?!.]*\s*$",
+        low,
+    ) or re.fullmatch(r"(?:please|pelsae|pls|plz)(?:\s+check)?", low):
         return True
     if _is_weather_clause(low) or _is_schedule_or_sports_clause(low):
         return False
@@ -1023,7 +1061,12 @@ def looks_like_multi_intent(text: str) -> bool:
     if len(words) < 10:
         return False
     low = t.lower()
-    # Two+ explicit question marks
+    # Single sports/schedule ask is never multi (even with "france and morocco" or trailing please)
+    if domains == {"sports"} or (
+        "sports" in domains and len(domains) == 1
+    ):
+        return False
+    # Two+ explicit question marks (after stripping politeness tails)
     if t.count("?") >= 2:
         return True
     # Clear multi-join markers with substance on both sides
@@ -1040,21 +1083,38 @@ def looks_like_multi_intent(text: str) -> bool:
         if len(parts) >= 2:
             # Two fact-bearing sides → multi even if domains only resolved on full text
             return True
-    # Two interrogative heads in one message
+    # Two interrogative heads — ignore trailing "check" politeness after please-strip
     inters = re.findall(
-        r"(?i)\b(what|when|where|who|which|how|why|find out|look up|check|tell me)\b",
+        r"(?i)\b(what|when|where|who|which|how|why|find out|look up|tell me)\b",
         low,
     )
+    # Bare "check" only counts mid-sentence as its own ask, not "please check"
+    if re.search(r"(?i)\bcheck\b", low) and not re.search(
+        r"(?i)\b(?:please|pls|plz)?\s*check\s*$", low
+    ):
+        if re.search(r"(?i)\bcheck\b.+\b(weather|score|price|news|status)\b", low):
+            inters.append("check")
     if len(inters) >= 2 and len(words) >= 12:
         return True
-    # "A, and B" with two clause-like segments — ignore pure small-talk / hollow tails
+    # "A, and B" clause split — do NOT split matchup "X and Y" pairs into fake multi
+    # Protect "with France and Morocco" style before splitting on and
+    protected = re.sub(
+        r"(?iu)\b((?:with|between)\s+[\w][\w'-]{1,30}\s+)and(\s+[\w][\w'-]{1,30})\b",
+        r"\1&AND&\2",
+        t,
+    )
+    protected = re.sub(
+        r"(?iu)\b((?:game|match|fixture)\s+(?:with\s+|between\s+)?[\w][\w'-]{1,30}\s+)and(\s+[\w][\w'-]{1,30})\b",
+        r"\1&AND&\2",
+        protected,
+    )
     clauses = [
-        c.strip(" ,;:")
-        for c in re.split(r"[?!.]+|\band\b", t, flags=re.IGNORECASE)
+        c.strip(" ,;:").replace("&AND&", "and")
+        for c in re.split(r"[?!.]+|\band\b", protected, flags=re.IGNORECASE)
         if c
         and len(c.split()) >= 3
-        and not _is_smalltalk_clause(c)
-        and not _is_hollow_secondary_clause(c)
+        and not _is_smalltalk_clause(c.replace("&AND&", "and"))
+        and not _is_hollow_secondary_clause(c.replace("&AND&", "and"))
     ]
     if len(clauses) >= 2:
         # Distinct domains across clauses
@@ -1396,14 +1456,29 @@ def _heuristic_decompose(text: str) -> list[str]:
     work = _prep_search_work_text(text)
     if not work:
         return []
+    # Single-domain sports/schedule: one compact query (never explode matchup "and")
+    if intent_domains(work) <= {"sports"} and _is_schedule_or_sports_clause(work):
+        one = _normalize_clause_for_search(work, full_context=work)
+        return [one] if one else []
+    # Protect matchup "X and Y" from clause splits
+    protected = re.sub(
+        r"(?iu)\b((?:with|between)\s+[\w][\w'-]{1,30}\s+)and(\s+[\w][\w'-]{1,30})\b",
+        r"\1&AND&\2",
+        work,
+    )
+    protected = re.sub(
+        r"(?iu)\b((?:game|match|fixture)\s+(?:with\s+|between\s+)?[\w][\w'-]{1,30}\s+)and(\s+[\w][\w'-]{1,30})\b",
+        r"\1&AND&\2",
+        protected,
+    )
     parts = [
-        c.strip(" ,;:")
+        c.strip(" ,;:").replace("&AND&", "and")
         for c in re.split(
             r"[?!.]+|\band also\b|\bas well as\b|\band then\b|\balso\b|\bplus\b|\band\b",
-            work,
+            protected,
             flags=re.IGNORECASE,
         )
-        if c and len(c.split()) >= 2 and not _is_smalltalk_clause(c)
+        if c and len(c.replace("&AND&", "and").split()) >= 2 and not _is_smalltalk_clause(c.replace("&AND&", "and"))
     ]
     # Merge orphaned "who is playing" onto prior sports clause
     merged_parts: list[str] = []
@@ -1693,11 +1768,11 @@ def split_web_search_queries(text: str) -> list[str]:
 
 def normalize_web_search_query_single(query: str) -> str:
     """Compact a single-intent string (no multi-intent fan-out)."""
-    q = _normalize_text(query)
+    # Prep first: spelling + strip "pelsae check" so we never search politeness
+    q = _prep_search_work_text(query) or _normalize_text(query)
     if not q:
         return ""
     q = q.replace("\u2019", "'").replace("\u2018", "'")
-    q = apply_spelling_fixes(q)
 
     # Drop "do a deeper search about …" wrappers so we never Tavily the meta-phrase.
     q = re.sub(
@@ -1718,12 +1793,33 @@ def normalize_web_search_query_single(query: str) -> str:
     q = re.sub(r"(?i)\b(?:look\s+into\s+it\s+more|check\s+more|expand\s+on\s+that)\b", " ", q)
     q = _normalize_text(q)
 
+    # Sports/schedule first on FULL string — before "and" clause splits destroy matchups
+    # (live: "france and maracoo" must not become "maracoo start today" alone).
+    if _is_schedule_or_sports_clause(q) or re.search(r"(?i)\b(fifa|world cup)\b", q):
+        sports = _normalize_sports_query(q)
+        if sports and (
+            _extract_vs_sides(q)
+            or re.search(r"(?i)\b(fifa|world cup|nhl|nba|nfl|mlb|schedule|kickoff)\b", sports)
+        ):
+            return sports
+
     # Drop leading social openers / greeting clauses.
     q = _SOCIAL_OPEN_RE.sub(" ", q)
     # Split multi-intent: prefer the clause that looks like the factual ask.
+    # Protect matchup "X and Y" from being torn apart.
+    protected = re.sub(
+        r"(?iu)\b((?:with|between)\s+[\w][\w'-]{1,30}\s+)and(\s+[\w][\w'-]{1,30})\b",
+        r"\1&AND&\2",
+        q,
+    )
+    protected = re.sub(
+        r"(?iu)\b((?:game|match|fixture)\s+(?:with\s+|between\s+)?[\w][\w'-]{1,30}\s+)and(\s+[\w][\w'-]{1,30})\b",
+        r"\1&AND&\2",
+        protected,
+    )
     clauses = [
-        c.strip(" ,;:")
-        for c in re.split(r"[?!.]+|\band\b|\balso\b", q, flags=re.IGNORECASE)
+        c.strip(" ,;:").replace("&AND&", "and")
+        for c in re.split(r"[?!.]+|\band\b|\balso\b", protected, flags=re.IGNORECASE)
         if c and c.strip(" ,;:")
     ]
 
@@ -1732,12 +1828,12 @@ def normalize_web_search_query_single(query: str) -> str:
         score = 0
         if _RELEASE_DATE_RE.search(c):
             score += 5
-        if any(t in low for t in ("weather", "forecast", "score", "trailer", "news", "price", "stock", "release")):
+        if any(t in low for t in ("weather", "forecast", "score", "trailer", "news", "price", "stock", "release", "fifa", "kickoff")):
             score += 3
         if re.search(r"\b(when|what|who|where|which|how much|how many)\b", low):
             score += 2
-        if re.search(r"\b(hey|hi|hello|feeling|doing)\b", low):
-            score -= 3
+        if re.search(r"\b(hey|hi|hello|feeling|doing|please|check)\b", low) and len(c.split()) <= 3:
+            score -= 8
         score += min(len(c.split()), 8)  # slight preference for substance
         return score
 
