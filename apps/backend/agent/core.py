@@ -5769,6 +5769,19 @@ class EchoSpeakAgent:
         if q:
             self._last_web_query_context = q
 
+    @staticmethod
+    def _search_query_fingerprint(query: str) -> str:
+        """Collapse near-duplicate queries (word-order noise on mnt/et/convert)."""
+        toks = re.findall(r"[a-z0-9]+", str(query or "").lower())
+        # Drop pure ordering noise / stopwords that churn retries
+        drop = {
+            "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "at",
+            "each", "full", "list", "with", "please", "make", "sure", "its",
+        }
+        # Keep tz tokens but sort so "mnt et convert" == "et mnt convert"
+        kept = [t for t in toks if t not in drop and len(t) > 1]
+        return " ".join(sorted(set(kept)))
+
     def _raw_web_search_execute(self, query: str) -> str:
         """Execute the underlying Tavily/web_search tool without grounding.
 
@@ -5782,9 +5795,14 @@ class EchoSpeakAgent:
         if not q:
             return ""
         cache = getattr(self, "_request_search_cache", None)
+        # Exact + fingerprint keys (prevents mnt/et word-order re-fetches)
         cache_key = re.sub(r"\s+", " ", q).strip().lower()
-        if isinstance(cache, dict) and cache_key in cache:
-            return str(cache[cache_key] or "")
+        fp = self._search_query_fingerprint(q)
+        if isinstance(cache, dict):
+            if cache_key in cache:
+                return str(cache[cache_key] or "")
+            if fp and f"fp:{fp}" in cache:
+                return str(cache[f"fp:{fp}"] or "")
         try:
             result = str(raw_web_search.invoke({"query": q}) or "")
         except TypeError:
@@ -5798,6 +5816,8 @@ class EchoSpeakAgent:
             result = ""
         if isinstance(cache, dict) and cache_key:
             cache[cache_key] = result
+            if fp:
+                cache[f"fp:{fp}"] = result
         return result
 
     def _apply_search_grounding_to_lc_tools(self, tools: Optional[list]) -> list:
@@ -5928,6 +5948,32 @@ class EchoSpeakAgent:
                     f"Listing:\n{listing[:3000]}\n"
                     f"Samples:\n{samples[:4000]}"
                 ).strip()
+
+        # --- Anti-loop: same turn must not re-run near-identical FIFA/TZ searches ---
+        # Live bug: 9× "FIFA … ET and mnt convert" tool rows from grounder + reflector +
+        # keep-trying + model tool calls. Fingerprint once → reuse packet, no new UI row.
+        if not hasattr(self, "_request_grounded_results") or self._request_grounded_results is None:
+            self._request_grounded_results = {}
+        if not hasattr(self, "_request_grounded_count"):
+            self._request_grounded_count = 0
+        fp = self._search_query_fingerprint(f"{original_request or ''} {raw_q}")
+        if fp and fp in self._request_grounded_results:
+            logger.info("Search loop suppressed (fingerprint hit): {!r}", raw_q[:90])
+            return str(self._request_grounded_results[fp] or "")
+        # Hard cap: never more than 3 grounded search *orchestrations* per user turn
+        if int(self._request_grounded_count or 0) >= 3:
+            # Return best prior packet for this turn if any
+            if self._request_grounded_results:
+                logger.info("Search loop hard-cap (3) — reusing prior grounded packet")
+                return str(next(reversed(list(self._request_grounded_results.values()))) or "")
+            logger.info("Search loop hard-cap (3) with empty cache — skipping")
+            return (
+                "[GROUNDED_SEARCH]\n"
+                "accepted=false\n"
+                "reason=search_budget_exhausted\n"
+                "Do not invent facts. Use any prior search evidence already in context.\n"
+            )
+        self._request_grounded_count = int(self._request_grounded_count or 0) + 1
 
         # --- Live sports structured path (default for scores/odds; not crawl search) ---
         # Category mismatch: Tavily/etc. return crawled pages; live scores need APIs.
@@ -6094,9 +6140,19 @@ class EchoSpeakAgent:
             return "\n\n".join(chunks)
 
         # Default 2 candidates — enough retry without 3× waste per intent.
-        # Schedule gets a slightly higher budget inside SearchGrounder when needed.
+        # Already-rich schedule/TZ queries get a single candidate (no variant storm).
         max_cands = int(getattr(config, "search_grounding_max_candidates", 2) or 2)
-        grounder = SearchGrounder(max_candidates=max(1, min(max_cands, 4)))
+        rich_schedule = any(
+            re.search(
+                r"(?i)\b(kickoff|convert|timezone|mnt|mountain|fixtures?|match list)\b",
+                q,
+            )
+            and re.search(r"(?i)\b(today|tomorrow|thursday|friday|\d{4})\b", q)
+            for q in multi
+        )
+        if rich_schedule:
+            max_cands = 1
+        grounder = SearchGrounder(max_candidates=max(1, min(max_cands, 3)))
         current_subject = str(
             getattr(self, "_current_subject_text", "")
             or getattr(self, "_last_web_query_context", "")
@@ -6117,6 +6173,17 @@ class EchoSpeakAgent:
                         metadata={"query": candidate_query},
                     )
                 return ""
+
+        # Deduplicate multi list by fingerprint (near-identical FIFA/TZ variants)
+        deduped_multi: list[str] = []
+        seen_fp: set[str] = set()
+        for q in multi:
+            qfp = self._search_query_fingerprint(q)
+            if qfp in seen_fp:
+                continue
+            seen_fp.add(qfp)
+            deduped_multi.append(q)
+        multi = deduped_multi or multi
 
         formatted_parts: list[str] = []
         last_grounded = None
@@ -6192,6 +6259,19 @@ class EchoSpeakAgent:
                 }
 
         joined = "\n\n".join(formatted_parts)
+        # Store for anti-loop re-entry (model/reflector/retry with near-identical query)
+        try:
+            if not hasattr(self, "_request_grounded_results") or self._request_grounded_results is None:
+                self._request_grounded_results = {}
+            if fp and joined:
+                self._request_grounded_results[fp] = joined
+            # Also key by each multi query fingerprint
+            for mq in multi:
+                mfp = self._search_query_fingerprint(mq)
+                if mfp and joined:
+                    self._request_grounded_results[mfp] = joined
+        except Exception:
+            pass
         # Anchor teams/times from evidence even if the model later answers vaguely
         try:
             evidence_blob = joined
@@ -11398,9 +11478,14 @@ class EchoSpeakAgent:
         low = f"{display_question} {used_query} {answer}".lower()
         today = datetime.now().strftime("%Y-%m-%d")
         if re.search(r"\b(timezone|time zone|mnt|mst|mdt|mountain|my time|local time)\b", low):
+            # Prefer sharpening the *used* compact query — not a new full-slate storm
+            base = q if re.search(r"(?i)\b(fifa|world cup|kickoff|match|schedule)\b", q) else seed
+            if re.search(r"(?i)\b(convert|timezone|mnt|mountain)\b", base):
+                # Already a TZ query — tiny nudge only (anti-loop)
+                return f"{base} kickoff times".strip()
             if attempt == 1:
-                return f"{seed} each event kickoff time list convert local timezone {today}".strip()
-            return f"{q} kickoff times convert timezone detailed schedule {today}"
+                return f"{base} kickoff times convert Mountain Time MNT from ET {today}".strip()
+            return f"{base} kickoff times convert timezone detailed schedule {today}"
         # Price/cost BEFORE schedule: product titles with "game" must not become kickoff lists
         if re.search(r"\b(price|cost|msrp|pre-?order|stock|bitcoin|btc|crypto)\b", low):
             # Prefer the compact product price query already used — not full multi-intent seed
@@ -11475,6 +11560,10 @@ class EchoSpeakAgent:
         This is the system-wide keep-trying loop for web research (Stage 3 and any caller).
         Plan reflection only covered multi-step TaskPlanner; weather had a one-off repair.
         """
+        # Schedule + TZ asks already search rich once — cap retries hard (anti-loop)
+        ql = f"{display_question} {used_query}".lower()
+        if re.search(r"\b(mnt|timezone|mountain|kickoff|fifa|world cup)\b", ql):
+            max_answer_retries = min(int(max_answer_retries or 1), 1)
         response = self._summarize_web_results(
             user_input,
             display_question,
@@ -12214,6 +12303,8 @@ class EchoSpeakAgent:
         self._last_tool_calling_mode = self._tool_calling_mode_label()
         # Per-request web_search cache (dedupe multi-candidate / multi-intent rehits)
         self._request_search_cache: Dict[str, str] = {}
+        self._request_grounded_results: Dict[str, str] = {}
+        self._request_grounded_count: int = 0
         self._sync_thread_state(thread_id)
         self._hydrate_pending_action_from_state()
         self._ensure_workspace_for_intent(user_input)

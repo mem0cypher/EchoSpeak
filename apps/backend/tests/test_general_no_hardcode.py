@@ -179,6 +179,30 @@ def test_weather_place_structural_not_city_list():
     assert "weather" in bare.lower()
 
 
+def test_search_fingerprint_dedupes_tz_word_order():
+    from agent.core import EchoSpeakAgent
+    import tempfile
+
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    a = "FIFA World Cup today full match list kickoff ET and mnt convert timezone"
+    b = "FIFA World Cup today full match list kickoff ET and et mnt convert timezone"
+    c = "FIFA World Cup today full match list kickoff ET and mnt et convert timezone"
+    fa, fb, fc = (
+        agent._search_query_fingerprint(a),
+        agent._search_query_fingerprint(b),
+        agent._search_query_fingerprint(c),
+    )
+    assert fa == fb == fc
+    # Grounded re-entry reuses packet without counting as new storms
+    agent._request_grounded_results = {}
+    agent._request_grounded_count = 0
+    agent._request_search_cache = {}
+    agent._request_grounded_results[fa] = "[GROUNDED_SEARCH]\naccepted=true\nFrance vs Morocco 4pm"
+    out = agent._grounded_web_search(b, original_request=b, emit_tool_events=False)
+    assert "France" in out or "4pm" in out
+    assert agent._request_grounded_count == 0  # suppressed, did not increment
+
+
 def test_search_query_quality_gate_rejects_fragments():
     """Utterance fragments must not become searches; multi keeps entity-rich queries only."""
     from agent.research import (

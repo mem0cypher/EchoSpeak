@@ -444,6 +444,8 @@ def _extract_vs_sides(text: str) -> str:
         r"(?iu)\b([\w][\w .'-]{0,40}?)\s+(?:vs\.?|versus|against)\s+([\w][\w .'-]{0,40}?)\b",
         # with/between X and Y (live: "fifa game with france and maracoo")
         r"(?iu)\b(?:with|between)\s+([\w][\w'-]{1,30})\s+and\s+([\w][\w'-]{1,30})\b",
+        # "with france game" / "france game today" (opponent unknown — keep named side)
+        r"(?iu)\b(?:with|for)\s+([\w][\w'-]{2,30})\s+(?:game|match|fixture)\b",
         # game/match ... X and Y
         r"(?iu)\b(?:game|match|fixture|matchup)\s+(?:with\s+|between\s+)?"
         r"([\w][\w'-]{1,30})\s+and\s+([\w][\w'-]{1,30})\b",
@@ -451,6 +453,13 @@ def _extract_vs_sides(text: str) -> str:
     for pat in patterns:
         m = re.search(pat, raw)
         if not m:
+            continue
+        # One named side only (e.g. "with france game") — still useful
+        if m.lastindex == 1:
+            a = _clean_match_side(m.group(1))
+            if a and len(a) >= 2 and a.lower() not in _SPORTS_STOP:
+                if a.lower() not in {"time", "what", "when", "start", "does", "the", "game", "match"}:
+                    return a
             continue
         a, b = _clean_match_side(m.group(1)), _clean_match_side(m.group(2))
         if not a or not b or len(a) < 2 or len(b) < 2:
@@ -2409,29 +2418,39 @@ class SearchGrounder:
                 day_word = "today"
                 cal = datetime.now().strftime("%A %B %d %Y")
             day_iso = tomorrow if day_word == "tomorrow" else today
-            # Prefer authority schedule pages over vague "this year" recaps.
-            # Pin calendar label so "tomorrow" isn't a whole tournament month.
-            candidates = [
-                SearchCandidate(f"{base}", "schedule base", 0.94, ["schedule"]),
-                SearchCandidate(
-                    f"{base} {day_word} {cal} kickoff",
-                    f"schedule {day_word} calendar",
-                    0.95,
-                    ["schedule", day_word, "date"],
-                ),
-                SearchCandidate(
-                    f"{base} {day_iso}",
-                    "schedule iso date",
-                    0.93,
-                    ["schedule", "date"],
-                ),
-                SearchCandidate(
-                    f"{base} fixtures {day_word} site:espn.com OR site:cbssports.com",
-                    "schedule authority",
-                    0.9,
-                    ["schedule", "source"],
-                ),
-            ]
+            # Already-rich query (calendar + kickoff + TZ) → single candidate, no variant storm
+            rich = bool(
+                re.search(r"(?i)\b(kickoff|convert|timezone|mnt|mountain|match list)\b", base)
+                and re.search(r"(?i)\b(today|tomorrow|thursday|friday|july|\d{4})\b", base)
+            )
+            if rich:
+                candidates = [
+                    SearchCandidate(base, "schedule rich single", 0.96, ["schedule", "rich"]),
+                ]
+            else:
+                # Prefer authority schedule pages over vague "this year" recaps.
+                # Pin calendar label so "tomorrow" isn't a whole tournament month.
+                candidates = [
+                    SearchCandidate(f"{base}", "schedule base", 0.94, ["schedule"]),
+                    SearchCandidate(
+                        f"{base} {day_word} {cal} kickoff",
+                        f"schedule {day_word} calendar",
+                        0.95,
+                        ["schedule", day_word, "date"],
+                    ),
+                    SearchCandidate(
+                        f"{base} {day_iso}",
+                        "schedule iso date",
+                        0.93,
+                        ["schedule", "date"],
+                    ),
+                    SearchCandidate(
+                        f"{base} fixtures {day_word} site:espn.com OR site:cbssports.com",
+                        "schedule authority",
+                        0.9,
+                        ["schedule", "source"],
+                    ),
+                ]
         elif intent.recency_need:
             year = datetime.now().strftime("%Y")
             candidates.append(SearchCandidate(f"{base} latest current {year}", "recency intent", 0.84, ["recent"]))
@@ -2529,7 +2548,14 @@ class SearchGrounder:
             return hit
 
         # Board-wide deeper pass for schedule/sports when first pass failed.
-        if intent.schedule_need:
+        # Skip when the base query was already TZ/kickoff-rich (deeper only churns variants).
+        base_rich = bool(
+            re.search(
+                r"(?i)\b(kickoff|convert|timezone|mnt|mountain|match list)\b",
+                best_query or resolved_request or "",
+            )
+        )
+        if intent.schedule_need and not base_rich:
             deeper = self._deeper_schedule_candidates(best_query or resolved_request, intent)
             # Avoid re-running identical queries
             seen_q = {str(r.get("query") or "").lower() for r in rejected}
