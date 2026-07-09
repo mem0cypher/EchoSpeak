@@ -1277,6 +1277,11 @@ class AgentMemory:
         return results
 
     def get_conversation_context(self, query: str, k: int = 5, mode: Optional[str] = None, thread_id: Optional[str] = None) -> str:
+        # When raw auto-store is off, do not inject type=conversation dumps into the
+        # prompt (session + ephemeral chat history own multi-turn continuity). This
+        # keeps session summary and FAISS from fighting each other with stale turns.
+        inject_raw_conversations = bool(getattr(config, "memory_auto_store_conversations", False))
+
         if not self.use_faiss:
             if not self.simple_memory:
                 return ""
@@ -1286,6 +1291,17 @@ class AgentMemory:
                 if self._mode_matches(m.get("mode"), mode)
                 and self._thread_matches(m.get("thread_id"), thread_id)
             ]
+            if not inject_raw_conversations:
+                filtered = []
+                for m in matched:
+                    mt = ""
+                    if isinstance(m, dict):
+                        meta = m.get("metadata") if isinstance(m.get("metadata"), dict) else {}
+                        mt = str((meta or {}).get("type") or m.get("type") or "").strip().lower()
+                    if mt == "conversation":
+                        continue
+                    filtered.append(m)
+                matched = filtered
             if not matched:
                 return ""
             return "\n\n".join([m["text"] for m in matched[-k:]])
@@ -1294,15 +1310,30 @@ class AgentMemory:
         if not docs:
             return ""
 
-        context_parts = []
+        typed_parts: List[str] = []
+        conversation_parts: List[str] = []
         for doc in docs:
-            if doc.page_content.strip():
-                mode_val = (getattr(doc, "metadata", {}) or {}).get("mode")
-                if not self._mode_matches(mode_val, mode):
-                    continue
-                if not self._thread_matches((getattr(doc, "metadata", {}) or {}).get("thread_id"), thread_id):
-                    continue
-                context_parts.append(doc.page_content)
+            if not doc.page_content.strip():
+                continue
+            meta = getattr(doc, "metadata", {}) or {}
+            mode_val = meta.get("mode") if isinstance(meta, dict) else None
+            if not self._mode_matches(mode_val, mode):
+                continue
+            if not self._thread_matches(meta.get("thread_id") if isinstance(meta, dict) else None, thread_id):
+                continue
+            mt = str(meta.get("type") or "").strip().lower() if isinstance(meta, dict) else ""
+            if mt == "conversation":
+                conversation_parts.append(doc.page_content)
+            else:
+                typed_parts.append(doc.page_content)
+
+        # Prefer durable typed memories; only fill with raw conversations when auto-store is on.
+        context_parts = list(typed_parts)
+        if inject_raw_conversations:
+            for part in conversation_parts:
+                if len(context_parts) >= k:
+                    break
+                context_parts.append(part)
 
         if not context_parts:
             return ""

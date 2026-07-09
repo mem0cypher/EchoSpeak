@@ -42,11 +42,46 @@ _SCHEDULE_TERMS = {
     "start time",
     "fixture",
     "who plays",
+    "who is playing",
+    "who's playing",
+    "who playing",
     "playing today",
+    "playing tomorrow",
+    "playing tonight",
     "games today",
+    "games tomorrow",
+    "games tonight",
     "matches today",
+    "matches tomorrow",
+    "matches tonight",
     "what games",
     "what matches",
+    "on tomorrow",
+    "for tomorrow",
+}
+
+# Common STT / typo variants → canonical (sports & countries). Applied before search.
+_SPELLING_FIXES = {
+    "maracco": "morocco",
+    "morroco": "morocco",
+    "moroco": "morocco",
+    "marocco": "morocco",
+    "cananda": "canada",
+    "canadah": "canada",
+    "edmontom": "edmonton",
+    "edminton": "edmonton",
+    "oilors": "oilers",
+    "oilres": "oilers",
+    "flams": "flames",
+    "canuks": "canucks",
+    "portugul": "portugal",
+    "portugual": "portugal",
+    "spane": "spain",
+    "brazile": "brazil",
+    "argintina": "argentina",
+    "argentia": "argentina",
+    "wordlcup": "world cup",
+    "worldcup": "world cup",
 }
 
 _WEATHER_TERMS = {
@@ -137,14 +172,754 @@ def extract_research_query(input_text: str) -> str:
         if isinstance(parsed, dict):
             query = parsed.get("query")
             if query is not None:
-                return _normalize_text(query)
+                return normalize_web_search_query(_normalize_text(query))
     except Exception:
         pass
 
     match = re.search(r"query\s*[:=]\s*['\"]([^'\"]+)['\"]", raw, flags=re.IGNORECASE)
     if match:
-        return _normalize_text(match.group(1))
-    return _normalize_text(raw)
+        return normalize_web_search_query(_normalize_text(match.group(1)))
+    return normalize_web_search_query(_normalize_text(raw))
+
+
+# Social / chat filler that must never ship to Tavily as the search string.
+_SOCIAL_OPEN_RE = re.compile(
+    r"(?i)\b(?:"
+    r"how(?:'re| are) you(?:\s+feeling)?|"
+    r"how(?:'s| is) it going|"
+    r"how you doing|"
+    r"how(?:'re| are) things|"
+    r"how(?:'s| is) everything|"
+    r"what(?:'s| is) up|"
+    r"wyd|"
+    r"how(?:'s| is) your day|"
+    r"good (?:morning|afternoon|evening|night)"
+    r")\b[^.?!]*[.?!]?"
+)
+_CHAT_FILLER_RE = re.compile(
+    r"(?i)\b(?:"
+    r"can you|could you|would you|please|pls|"
+    r"i wonder(?:ing)?|i was wondering|just wondering|"
+    r"tell me|do you know|any idea|any news|"
+    r"hey|hi|hello|yo|sup|"
+    r"for me|thanks|thank you|thx|"
+    r"real quick|quickly|btw|by the way"
+    r")\b"
+)
+_RELEASE_DATE_RE = re.compile(
+    r"(?i)(?:"
+    r"release\s*date|"
+    r"when\s+(?:does|is|will|do|did)\b.+\b(?:come\s+out|coming\s+out|release|released|drop(?:ping)?|launch(?:ing|es)?)\b|"
+    r"\bcomes?\s+out\b|"
+    r"\bcoming\s+out\b"
+    r")"
+)
+
+# Team → home city for bare "what's the weather" alongside a sports ask.
+_TEAM_CITY = {
+    "oilers": "Edmonton",
+    "oiler": "Edmonton",
+    "flames": "Calgary",
+    "canucks": "Vancouver",
+    "leafs": "Toronto",
+    "maple leafs": "Toronto",
+    "canadiens": "Montreal",
+    "habs": "Montreal",
+    "jets": "Winnipeg",
+    "senators": "Ottawa",
+    "sens": "Ottawa",
+    "rangers": "New York",
+    "bruins": "Boston",
+    "blackhawks": "Chicago",
+    "kings": "Los Angeles",
+    "ducks": "Anaheim",
+    "sharks": "San Jose",
+    "knights": "Las Vegas",
+    "avalanche": "Denver",
+    "avs": "Denver",
+    "stars": "Dallas",
+    "wild": "Minnesota",
+    "predators": "Nashville",
+    "blues": "St. Louis",
+    "red wings": "Detroit",
+    "penguins": "Pittsburgh",
+    "capitals": "Washington",
+    "caps": "Washington",
+    "raptors": "Toronto",
+    "blue jays": "Toronto",
+    "jays": "Toronto",
+    "elks": "Edmonton",
+    "stampeders": "Calgary",
+    "roughriders": "Regina",
+    "bombers": "Winnipeg",
+}
+
+
+def apply_spelling_fixes(text: str) -> str:
+    """Fix common speech-to-text / typo variants in search queries (maracco→morocco)."""
+    s = str(text or "")
+    if not s:
+        return s
+    # Multi-word first
+    low = s.lower()
+    for bad, good in (("wordl cup", "world cup"), ("worldcup", "world cup"), ("wordlcup", "world cup")):
+        if bad in low:
+            s = re.sub(re.escape(bad), good, s, flags=re.IGNORECASE)
+            low = s.lower()
+
+    def _fix_token(m: re.Match) -> str:
+        word = m.group(0)
+        key = re.sub(r"[^a-z0-9]", "", word.lower())
+        fixed = _SPELLING_FIXES.get(key)
+        if not fixed:
+            return word
+        # Preserve simple capitalization
+        if word.isupper():
+            return fixed.upper()
+        if word[:1].isupper():
+            return fixed[:1].upper() + fixed[1:]
+        return fixed
+
+    return re.sub(r"[A-Za-z][A-Za-z']*", _fix_token, s)
+
+
+def _infer_city_from_text(text: str) -> str:
+    low = (text or "").lower()
+    # Explicit city first
+    m = re.search(
+        r"\b(?:in|for|near|around)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
+        text or "",
+    )
+    if m:
+        place = m.group(1).strip()
+        if place.lower() not in {"the", "a", "an", "my", "our", "today", "tonight"}:
+            return place
+    for team, city in sorted(_TEAM_CITY.items(), key=lambda kv: -len(kv[0])):
+        if re.search(rf"\b{re.escape(team)}\b", low):
+            return city
+    # Common bare city names
+    for city in (
+        "Edmonton", "Calgary", "Vancouver", "Toronto", "Montreal", "Winnipeg",
+        "Ottawa", "Seattle", "Denver", "Boston", "Chicago", "Dallas",
+    ):
+        if re.search(rf"\b{re.escape(city)}\b", text or "", flags=re.IGNORECASE):
+            return city
+    return ""
+
+
+def _is_weather_clause(text: str) -> bool:
+    low = (text or "").lower()
+    return any(t in low for t in _WEATHER_TERMS)
+
+
+def _is_schedule_or_sports_clause(text: str) -> bool:
+    low = (text or "").lower()
+    if any(t in low for t in _SCHEDULE_TERMS):
+        return True
+    if re.search(r"\b(next|upcoming)\s+(game|match|fixture)\b", low):
+        return True
+    if re.search(r"\b(game|match|schedule|fixture)\b", low) and (
+        any(team in low for team in _TEAM_CITY)
+        or re.search(r"\b(nhl|nba|nfl|mlb|oilers?|flames|canucks|leafs)\b", low)
+    ):
+        return True
+    return False
+
+
+def _normalize_sports_query(text: str) -> str:
+    q = _normalize_text(text)
+    low = q.lower()
+    # Edmonton Oilers / Oilers
+    if re.search(r"\boilers?\b", low):
+        if re.search(r"\b(next|upcoming|when)\b", low) or "schedule" in low or "game" in low:
+            return "Edmonton Oilers next game schedule NHL"
+        return "Edmonton Oilers " + q
+    if re.search(r"\bflames\b", low) and re.search(r"\b(next|game|schedule)\b", low):
+        return "Calgary Flames next game schedule NHL"
+    if re.search(r"\bcanucks\b", low) and re.search(r"\b(next|game|schedule)\b", low):
+        return "Vancouver Canucks next game schedule NHL"
+    if re.search(r"\b(next|upcoming)\s+(game|match)\b", low):
+        team = re.sub(
+            r"(?i)\b(when|is|the|next|upcoming|game|match|schedule|for|of|what|time)\b",
+            " ",
+            q,
+        )
+        team = _normalize_text(team)
+        if team:
+            return f"{team} next game schedule"
+    return q
+
+
+def _strip_weather_chat_filler(text: str) -> str:
+    """Leaf cleaner for weather strings — must NEVER call normalize_web_search_query*."""
+    q = _normalize_text(text)
+    if not q:
+        return ""
+    q = q.replace("\u2019", "'").replace("\u2018", "'")
+    q = _SOCIAL_OPEN_RE.sub(" ", q)
+    # Drop compliments / small-talk that often co-occur with weather asks
+    q = re.sub(
+        r"(?i)\b(you look(?:ing)? great|looking good|look good|hope you(?:'re| are) well|"
+        r"not much|just chilling|just chiiling|what'?s up|whats up|echo)\b[^.?!]*",
+        " ",
+        q,
+    )
+    q = _CHAT_FILLER_RE.sub(" ", q)
+    q = re.sub(
+        r"(?i)\b(can you|could you|would you|please|pls|check|look up|get me|for me|"
+        r"tho|though|right now|real quick|quickly|hope|well|just|much)\b",
+        " ",
+        q,
+    )
+    q = re.sub(r"(?i)^(what(?:'s| is)|how(?:'s| is)|and|also|the|a|an)\s+", "", q)
+    q = re.sub(r"[?!.]+", " ", q)
+    q = _normalize_text(q)
+    return q
+
+
+def _normalize_weather_query(text: str, *, city_hint: str = "") -> str:
+    """Build a compact weather search string. Must not call normalize_web_search_query*."""
+    city = (city_hint or "").strip() or _infer_city_from_text(text)
+    day = "tomorrow" if re.search(r"(?i)\btomorrow\b", text or "") else "today"
+    if city:
+        return f"{city} weather {day} high low temperature forecast"
+    # No city: strip chat filler only (never re-enter normalize_web_search_query_single —
+    # that path used to recurse: weather → single → weather → …).
+    cleaned = _strip_weather_chat_filler(text)
+    cleaned = re.sub(r"(?i)\b(weather|forecast|temperature|temp)\b", " ", cleaned)
+    cleaned = re.sub(r"(?i)\b(the|a|an|for|me|my|you|your)\b", " ", cleaned)
+    cleaned = _normalize_text(cleaned)
+    # Only keep cleaned if it looks like a place name (short, no leftover chatter)
+    if cleaned and 2 <= len(cleaned) <= 40 and len(cleaned.split()) <= 4:
+        return f"{cleaned} weather {day} high low temperature forecast"
+    return f"weather {day} high low temperature forecast"
+
+
+def _has_gta_context(text: str) -> bool:
+    return bool(re.search(r"(?i)\b(?:gta|grand theft auto)\b", text or ""))
+
+
+def _has_trailer_intent(text: str) -> bool:
+    return bool(re.search(r"(?i)\btrailer\s*(?:#?\s*)?(\d+|three|two|one)\b", text or ""))
+
+
+def _has_character_cast_intent(text: str) -> bool:
+    low = (text or "").lower()
+    return bool(
+        re.search(r"\b(characters?|cast|protagonists?|playable)\b", low)
+        or re.search(r"\bnames of the (?:characters?|cast)\b", low)
+        or re.search(r"\bwho (?:is|are) (?:in|the)\b", low)
+    )
+
+
+def _normalize_gta_trailer_query(text: str, full_context: str = "") -> str:
+    blob = f"{text or ''} {full_context or ''}"
+    m = re.search(r"(?i)\btrailer\s*(?:#?\s*)?(\d+|three|two|one)\b", blob)
+    num = ""
+    if m:
+        raw_n = m.group(1).lower()
+        num = {"one": "1", "two": "2", "three": "3"}.get(raw_n, raw_n)
+    if num:
+        return f"GTA 6 Trailer {num} release date announcement Rockstar"
+    return "GTA 6 Trailer 3 release date announcement Rockstar"
+
+
+def _normalize_gta_characters_query(text: str = "") -> str:
+    return "GTA 6 characters cast Lucia Jason Duval known details plot"
+
+
+def _prep_search_work_text(text: str) -> str:
+    """Strip social fluff before intent detection / split."""
+    raw = _normalize_text(text)
+    if not raw:
+        return ""
+    raw = raw.replace("\u2019", "'").replace("\u2018", "'")
+    work = _SOCIAL_OPEN_RE.sub(" ", raw)
+    work = re.sub(
+        r"(?i)\b(you look(?:ing)? great|looking good|love (?:the|your) (?:look|design|avatar)|really liking how you look)[^.?!]*[.?!]?",
+        " ",
+        work,
+    )
+    return _normalize_text(work)
+
+
+def _is_smalltalk_clause(text: str) -> bool:
+    """True for pure social/filler clauses that must not become search queries."""
+    low = _normalize_text(text).lower()
+    if not low:
+        return True
+    if _is_weather_clause(low) or _is_schedule_or_sports_clause(low):
+        return False
+    if any(
+        t in low
+        for t in (
+            "score", "odds", "price", "stock", "news", "headline", "trailer",
+            "release", "gta", "forecast", "temperature", "schedule", "fixture",
+        )
+    ):
+        return False
+    if re.search(
+        r"(?i)\b(not much|just chilling|chilling|hope you(?:'re| are) well|"
+        r"look(?:ing)? good|you look|sounds good|lol|haha|thanks|thank you|"
+        r"how(?:'re| are) you|what's up|whats up|cool|nice|awesome|hey|hi|hello)\b",
+        low,
+    ):
+        # Pure vibes / greeting with no fact noun
+        if not re.search(r"(?i)\b(what|when|where|who|which|how much|how many|find|check|search|look up)\b", low):
+            return True
+        # "look good" style — not "look up"
+        if re.search(r"(?i)\blook(?:ing)?\s+good\b", low) and "look up" not in low:
+            return True
+    return False
+
+
+def looks_like_multi_intent(text: str) -> bool:
+    """
+    Cheap classifier: is this message more than one distinct ask?
+
+    Must stay false for simple single-fact questions so they never pay
+    decomposition latency (no extra LLM call, no extra Tavily fan-out).
+    """
+    t = _prep_search_work_text(text)
+    if not t:
+        return False
+    words = t.split()
+    # Single-fact short asks never multi
+    if len(words) < 10:
+        return False
+    low = t.lower()
+    # Two+ explicit question marks
+    if t.count("?") >= 2:
+        return True
+    # Clear multi-join markers with substance on both sides
+    if re.search(
+        r"(?i)\b(?:and also|also|plus|as well as|and then)\b",
+        low,
+    ):
+        parts = re.split(r"(?i)\b(?:and also|also|plus|as well as)\b", t)
+        parts = [p.strip() for p in parts if len(p.split()) >= 3]
+        if len(parts) >= 2:
+            return True
+    # Two interrogative heads in one message
+    inters = re.findall(
+        r"(?i)\b(what|when|where|who|which|how|why|find out|look up|check|tell me)\b",
+        low,
+    )
+    if len(inters) >= 2 and len(words) >= 12:
+        return True
+    # "A, and B" with two clause-like segments — ignore pure small-talk clauses
+    clauses = [
+        c.strip(" ,;:")
+        for c in re.split(r"[?!.]+|\band\b", t, flags=re.IGNORECASE)
+        if c and len(c.split()) >= 3 and not _is_smalltalk_clause(c)
+    ]
+    if len(clauses) >= 2:
+        qish = sum(
+            1
+            for c in clauses
+            if re.search(r"(?i)\b(what|when|where|who|which|how|find|check|tell|names?)\b", c)
+        )
+        if qish >= 2:
+            return True
+        # One interrogative + another substantive fact clause (e.g. "tallest building in Dubai
+        # and who is the CEO of Tesla") — still multi even if only one clause has who/what.
+        if qish >= 1 and len(clauses) >= 2 and all(len(c.split()) >= 3 for c in clauses[:2]):
+            return True
+        # Two noun-heavy clauses with little overlap (independent facts joined by "and")
+        if len(words) >= 10 and all(len(c.split()) >= 3 for c in clauses[:2]):
+            a = set(re.findall(r"[a-z0-9]{4,}", clauses[0].lower()))
+            b = set(re.findall(r"[a-z0-9]{4,}", clauses[1].lower()))
+            stop = {"what", "when", "where", "which", "that", "this", "with", "from", "about", "current", "right"}
+            a, b = a - stop, b - stop
+            if a and b and len(a & b) / max(1, len(a | b)) < 0.35:
+                return True
+    return False
+
+
+def recipe_multi_search_queries(text: str) -> list[str]:
+    """
+    Fast path: hand-written multi-intent recipes only.
+
+    Returns 2+ queries when a recipe matches, else [].
+    Single-intent weather/sports alone is *not* multi — handled by single normalize.
+    """
+    work = _prep_search_work_text(text)
+    if not work:
+        return []
+
+    city_hint = _infer_city_from_text(work)
+    has_weather = _is_weather_clause(work)
+    has_sports = _is_schedule_or_sports_clause(work)
+    has_gta = _has_gta_context(work)
+    has_trailer = _has_trailer_intent(work)
+    has_chars = _has_character_cast_intent(work)
+
+    out: list[str] = []
+    if has_sports and has_weather:
+        clauses = [
+            c.strip(" ,;:")
+            for c in re.split(r"[?!.]+|\band\b|\balso\b", work, flags=re.IGNORECASE)
+            if c and c.strip(" ,;:")
+        ]
+        sports_clause = next((c for c in clauses if _is_schedule_or_sports_clause(c)), work)
+        weather_clause = next((c for c in clauses if _is_weather_clause(c)), "weather")
+        out.append(_normalize_sports_query(sports_clause))
+        w_city = _infer_city_from_text(weather_clause) or city_hint
+        out.append(_normalize_weather_query(weather_clause, city_hint=w_city))
+    elif (has_trailer or has_chars) and (has_gta or has_trailer):
+        if has_trailer:
+            out.append(_normalize_gta_trailer_query(work, full_context=work))
+        if has_chars or (has_gta and re.search(r"(?i)\b(who|names?|know|cast)\b", work)):
+            out.append(_normalize_gta_characters_query(work))
+
+    return _dedupe_queries(out)[:4]
+
+
+def _dedupe_queries(queries: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for q in queries:
+        key = _normalize_text(q).lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(_normalize_text(q))
+    return deduped
+
+
+def _heuristic_decompose(text: str) -> list[str]:
+    """No-LLM fallback: split on and/also/? into compact sub-queries."""
+    work = _prep_search_work_text(text)
+    if not work:
+        return []
+    parts = [
+        c.strip(" ,;:")
+        for c in re.split(r"[?!.]+|\band also\b|\balso\b|\band\b", work, flags=re.IGNORECASE)
+        if c and len(c.split()) >= 3 and not _is_smalltalk_clause(c)
+    ]
+    out: list[str] = []
+    for p in parts:
+        # Prefer specialized single normalize per clause
+        n = normalize_web_search_query_single(p) or p
+        n = _normalize_text(n)
+        if n and len(n) >= 4 and not _is_smalltalk_clause(n):
+            out.append(n)
+    return _dedupe_queries(out)[:5]
+
+
+def decompose_search_intents(text: str, llm_invoke=None) -> list[str]:
+    """
+    General multi-intent decomposition (fallback when no recipe matches).
+
+    llm_invoke: optional callable(str) -> str for a focused decompose prompt.
+    If missing or parse fails, uses heuristic clause split.
+    """
+    work = _prep_search_work_text(text)
+    if not work:
+        return []
+
+    if callable(llm_invoke):
+        prompt = (
+            "Break the user message into the minimum independent web-search sub-questions "
+            "needed to answer it fully (2-5 max). Preserve key nouns, places, names, dates.\n"
+            "Return ONLY a JSON array of short search strings, e.g. "
+            '["tallest building in Dubai", "CEO of Tesla 2026"].\n'
+            "If there is only ONE ask, return a one-element array.\n"
+            "Do not answer the questions. Do not add commentary.\n\n"
+            f"User: {work[:500]}\n"
+        )
+        try:
+            raw = str(llm_invoke(prompt) or "").strip()
+            # Prefer JSON array
+            m = re.search(r"\[[\s\S]*\]", raw)
+            if m:
+                import json as _json
+
+                data = _json.loads(m.group(0))
+                if isinstance(data, list):
+                    items = [_normalize_text(str(x)) for x in data if str(x or "").strip()]
+                    items = [x for x in items if len(x) >= 3]
+                    if items:
+                        return _dedupe_queries(items)[:5]
+            # Numbered / bulleted lines
+            lines = []
+            for line in raw.splitlines():
+                line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip().strip("\"'")
+                if len(line.split()) >= 2:
+                    lines.append(line)
+            if lines:
+                return _dedupe_queries(lines)[:5]
+        except Exception:
+            pass
+
+    return _heuristic_decompose(work)
+
+
+def resolve_web_search_queries(
+    user_text: str,
+    model_query: str = "",
+    *,
+    llm_invoke=None,
+    use_decomposition: bool = True,
+) -> list[str]:
+    """
+    Full query resolution for grounded search.
+
+    Order:
+      1) Recipe multi-split (free, instant) when it returns 2+ queries
+      2) If multi-intent suspected and no recipe: general decomposition
+      3) Single compact query from user text
+      4) Never silently replace a real multi-split with the model's single tool arg
+    """
+    user = _normalize_text(user_text)
+    model_q = _normalize_text(model_query)
+
+    # 1) Fast recipes
+    recipes = recipe_multi_search_queries(user)
+    if len(recipes) >= 2:
+        multi = list(recipes)
+    else:
+        multi = []
+        # 2) General decomposition fallback (only when multi-intent looks real)
+        if use_decomposition and looks_like_multi_intent(user):
+            decomp = decompose_search_intents(user, llm_invoke=llm_invoke)
+            if len(decomp) >= 2:
+                multi = decomp
+        # 3) Single-intent compact
+        if not multi:
+            one = normalize_web_search_query_single(user) or normalize_web_search_query_single(model_q)
+            if not one:
+                one = model_q or user
+            multi = [one] if one else []
+
+    # Optionally append distinct model tool arg if useful and not already covered
+    if model_q:
+        keys = {m.lower() for m in multi}
+        model_c = normalize_web_search_query_single(model_q) or model_q
+        if (
+            model_c
+            and len(model_c) >= 8
+            and len(model_c.split()) >= 2
+            and model_c.lower() not in keys
+            and len(model_c.split()) <= 14
+            and not re.match(r"(?i)^(i |can you|please|find out|what |when )", model_c)
+            # Only add as extra on multi; never replace multi with model alone
+            and len(multi) >= 2
+        ):
+            multi.append(model_c)
+
+    return _dedupe_queries(multi)[:5]
+
+
+def split_web_search_queries(text: str) -> list[str]:
+    """
+    Split multi-intent chat into separate compact search queries.
+
+    Fast path: recipes. Fallback: general decomposition when multi-intent is detected.
+    For single-intent weather/sports alone, returns one normalized query (no LLM).
+    """
+    work = _prep_search_work_text(text)
+    if not work:
+        return []
+
+    # Recipes that produce 2+ queries
+    recipes = recipe_multi_search_queries(work)
+    if len(recipes) >= 2:
+        return recipes
+
+    # General multi-intent (no LLM here — callers that have an LLM should use
+    # resolve_web_search_queries(..., llm_invoke=...). Heuristic only for pure split.)
+    if looks_like_multi_intent(work):
+        decomp = _heuristic_decompose(work)
+        if len(decomp) >= 2:
+            return decomp
+
+    # Single-intent specialties (weather alone, sports alone, etc.)
+    city_hint = _infer_city_from_text(work)
+    if _is_weather_clause(work) and not _is_schedule_or_sports_clause(work):
+        return [_normalize_weather_query(work, city_hint=city_hint)]
+    if _is_schedule_or_sports_clause(work) and not _is_weather_clause(work):
+        return [_normalize_sports_query(work)]
+    if (_has_trailer_intent(work) or _has_character_cast_intent(work)) and (
+        _has_gta_context(work) or _has_trailer_intent(work)
+    ):
+        # Single side of GTA (only trailer or only cast) — one query
+        if _has_trailer_intent(work) and not _has_character_cast_intent(work):
+            return [_normalize_gta_trailer_query(work, full_context=work)]
+        if _has_character_cast_intent(work) and not _has_trailer_intent(work):
+            return [_normalize_gta_characters_query(work)]
+
+    single = normalize_web_search_query_single(work)
+    return [single] if single else []
+
+
+def normalize_web_search_query_single(query: str) -> str:
+    """Compact a single-intent string (no multi-intent fan-out)."""
+    q = _normalize_text(query)
+    if not q:
+        return ""
+    q = q.replace("\u2019", "'").replace("\u2018", "'")
+    q = apply_spelling_fixes(q)
+
+    # Drop "do a deeper search about …" wrappers so we never Tavily the meta-phrase.
+    q = re.sub(
+        r"(?i)\b(?:please\s+)?(?:can you\s+)?(?:do\s+a\s+)?(?:deep(?:er)?|more)\s+(?:web\s+)?search(?:\s+(?:about|on|for|into))?\b",
+        " ",
+        q,
+    )
+    q = re.sub(
+        r"(?i)\b(?:dig|go)\s+deeper(?:\s+(?:on|into|about|for))?\b",
+        " ",
+        q,
+    )
+    q = re.sub(
+        r"(?i)\b(?:search|research)\s+deeper(?:\s+(?:about|on|into|for))?\b",
+        " ",
+        q,
+    )
+    q = re.sub(r"(?i)\b(?:look\s+into\s+it\s+more|check\s+more|expand\s+on\s+that)\b", " ", q)
+    q = _normalize_text(q)
+
+    # Drop leading social openers / greeting clauses.
+    q = _SOCIAL_OPEN_RE.sub(" ", q)
+    # Split multi-intent: prefer the clause that looks like the factual ask.
+    clauses = [
+        c.strip(" ,;:")
+        for c in re.split(r"[?!.]+|\band\b|\balso\b", q, flags=re.IGNORECASE)
+        if c and c.strip(" ,;:")
+    ]
+
+    def _clause_score(c: str) -> int:
+        low = c.lower()
+        score = 0
+        if _RELEASE_DATE_RE.search(c):
+            score += 5
+        if any(t in low for t in ("weather", "forecast", "score", "trailer", "gta", "news", "price", "stock")):
+            score += 3
+        if re.search(r"\b(when|what|who|where|which|how much|how many)\b", low):
+            score += 2
+        if re.search(r"\b(hey|hi|hello|feeling|doing)\b", low):
+            score -= 3
+        score += min(len(c.split()), 8)  # slight preference for substance
+        return score
+
+    if clauses:
+        # Always rebuild from clauses so leftover "and …" glue is dropped.
+        q = max(clauses, key=_clause_score)
+
+    q = _CHAT_FILLER_RE.sub(" ", q)
+    q = re.sub(r"(?i)\b(i wonder(?:ing)?|just wondering)\b", " ", q)
+    # Drop glue left after social/clause splits
+    q = re.sub(r"(?i)^(and|also|plus|so|but|well)\s+", "", q)
+    q = re.sub(r"(?i)^(what(?:'s| is)|how(?:'s| is)|when(?:'s| is))\s+", "", q)
+    q = _normalize_text(q)
+
+    # Known entity rewrite: GTA / Grand Theft Auto trailer N (and bare "trailer 3")
+    if _has_trailer_intent(q) and (_has_gta_context(q) or _has_trailer_intent(q)):
+        # Prefer GTA Trailer N when trailer number present (default franchise context)
+        return _normalize_gta_trailer_query(q, full_context=q)
+    if _has_gta_context(q) and _has_character_cast_intent(q):
+        return _normalize_gta_characters_query(q)
+    gta = re.search(
+        r"(?i)\b(?:gta|grand theft auto)\s*(?:6|vi|six)?\b.*?\btrailer\s*(\d+)\b"
+        r"|\btrailer\s*(\d+)\b.*?\b(?:gta|grand theft auto)\s*(?:6|vi|six)?\b",
+        q,
+    )
+    if not gta:
+        # "trailer 3 for gta 6" / "new trailer ... gta 6"
+        gta = re.search(
+            r"(?i)\btrailer\s*(\d+)\b.{0,40}\b(?:gta|grand theft auto)\s*(6|vi|six)\b"
+            r"|\b(?:gta|grand theft auto)\s*(6|vi|six)\b.{0,40}\btrailer\s*(\d+)\b"
+            r"|\b(?:gta|grand theft auto)\s*(6|vi|six)\b.{0,40}\btrailer\b",
+            q,
+        )
+    if gta:
+        nums = [g for g in gta.groups() if g]
+        trailer_n = next((n for n in nums if n.isdigit()), None)
+        if trailer_n:
+            return f"GTA 6 Trailer {trailer_n} release date announcement Rockstar"
+        return "GTA 6 trailer release date announcement Rockstar"
+
+    # Sports / next-game compact form
+    if _is_schedule_or_sports_clause(q):
+        sports = _normalize_sports_query(q)
+        if sports:
+            return sports
+
+    # Weather compact form (with inferred city when possible)
+    if _is_weather_clause(q):
+        return _normalize_weather_query(q, city_hint=_infer_city_from_text(q))
+
+    # Generic: "when does X come out / release" → "X release date"
+    m = re.search(
+        r"(?i)(?:when\s+(?:does|is|will|do|did)\s+)?(.+?)\s+"
+        r"(?:come\s+out|coming\s+out|release(?:s|d)?|drop(?:s|ping)?|launch(?:es|ing)?)\b",
+        q,
+    )
+    if m:
+        subject = _normalize_text(m.group(1))
+        subject = re.sub(
+            r"(?i)^(when|that|the|a|an|new|latest|next)\s+",
+            "",
+            subject,
+        )
+        subject = re.sub(r"(?i)\b(that|the|a|an|new|latest)\b", " ", subject)
+        subject = _normalize_text(subject)
+        if 2 <= len(subject) <= 80:
+            return f"{subject} release date"
+
+    # Strip leftover conversational glue / trailing greetings
+    q = re.sub(
+        r"(?i)\b(when|what|who|where|which|how|does|is|are|will|do|did|the|a|an|that|this|for|of|to|me|you|please)\b",
+        " ",
+        q,
+    ) if len(q.split()) > 12 else q
+    # Lighter strip for shorter queries — only leading wrappers
+    q = re.sub(
+        r"(?i)^(search(?:\s+for)?|look\s+up|find(?:\s+out)?|research(?:\s+deeply)?|check|get)\s+",
+        "",
+        q,
+    )
+    q = re.sub(r"(?i)\b(hey|hi|hello|yo|sup)\b[?.!]*$", "", q)
+    q = _normalize_text(q.strip(" ?!.,;:"))
+    return q or _normalize_text(query)
+
+
+def normalize_web_search_query(query: str) -> str:
+    """Turn a chatty multi-intent user line into a compact web search string.
+
+    For multi-intent (sports + weather), returns the *primary* query only.
+    Callers that need every intent must use ``split_web_search_queries``.
+
+    Examples:
+      "how're you feeling? and i wonder when that new trailer comes out for trailer 3 for gta 6 hey?"
+        → "GTA 6 Trailer 3 release date"
+      "search for canada vs morocco score"
+        → "canada vs morocco score"
+    """
+    parts = split_web_search_queries(query)
+    if parts:
+        # Prefer fact-bearing queries over leftover small-talk if split misfired.
+        def _part_score(p: str) -> int:
+            low = (p or "").lower()
+            score = 0
+            if any(
+                t in low
+                for t in (
+                    "weather", "forecast", "score", "schedule", "trailer", "odds",
+                    "price", "nhl", "world cup", "gta", "temperature",
+                )
+            ):
+                score += 6
+            if re.search(r"\b(vs|versus|tomorrow|today|tonight|release)\b", low):
+                score += 3
+            if _is_smalltalk_clause(p):
+                score -= 10
+            score += min(len(p.split()), 6)
+            return score
+
+        return max(parts, key=_part_score)
+    return normalize_web_search_query_single(query)
 
 
 def _parse_date_value(value: str) -> Optional[datetime]:
@@ -222,44 +997,112 @@ def _infer_mode(query: str) -> str:
 
 
 def build_search_intent(original_request: str, resolved_request: str = "", current_subject: str = "") -> SearchIntent:
-    resolved = _normalize_text(resolved_request or original_request)
-    original = _normalize_text(original_request)
+    # Classify primarily from the *resolved* compact query so a multi-intent
+    # original ("oilers game and weather") does not force weather mode onto a
+    # sports-only resolved string (that produced "oilers game weather forecast").
+    original = apply_spelling_fixes(_normalize_text(original_request))
+    raw_resolved = apply_spelling_fixes(_normalize_text(resolved_request or original_request))
+    # Already-compact caller query (from multi-split): refine single-intent only.
+    # Full chat originals go through multi-aware normalize.
+    if resolved_request and _normalize_text(resolved_request) != _normalize_text(original_request):
+        resolved = normalize_web_search_query_single(raw_resolved) or raw_resolved
+    else:
+        resolved = normalize_web_search_query(raw_resolved) or raw_resolved
+    resolved = apply_spelling_fixes(resolved)
+
     low = resolved.lower()
-    recency = any(term in low for term in _RECENT_TERMS) or any(t in low for t in ["right now", "currently", "current"])
+    low_orig = original.lower()
+    combined = f"{low} {low_orig}"
+    release_date_need = bool(
+        _RELEASE_DATE_RE.search(original)
+        or _RELEASE_DATE_RE.search(resolved)
+        or "release date" in low
+    )
+    # Mode flags from resolved only (critical — do not OR-in original weather).
+    weather = any(term in low for term in _WEATHER_TERMS)
+    near_future = bool(
+        re.search(r"\b(today|tonight|tomorrow|this weekend|this week|next week)\b", combined)
+    )
+    who_playing = bool(
+        re.search(r"\bwho(?:'s| is|s)?\s+playing\b", combined)
+        or re.search(r"\bwho\s+plays\b", combined)
+        or re.search(r"\bwhat\s+(?:games?|matches?)\b", combined)
+    )
+    sports_event = bool(
+        re.search(
+            r"\b(world cup|fifa|nhl|nba|nfl|mlb|soccer|football|hockey|match(?:es)?|fixture|tournament)\b",
+            combined,
+        )
+    )
+    schedule = (
+        any(term in low for term in _SCHEDULE_TERMS)
+        or any(term in low_orig for term in _SCHEDULE_TERMS)
+        or bool(re.search(r"\b(next game|schedule|fixture)\b", low))
+        or bool(re.search(r"\b(oilers|flames|canucks|nhl)\b", low) and re.search(r"\b(game|match)\b", low))
+        or (who_playing and (near_future or sports_event))
+        or (near_future and sports_event and re.search(r"\b(play|playing|game|match|vs|versus)\b", combined))
+    )
     live_score = any(term in low for term in _LIVE_SCORE_TERMS) and any(
         sport in low
-        for sport in ["game", "match", "fifa", "world cup", "soccer", "football", "nhl", "nba", "nfl", "mlb", "canada", "morocco"]
+        for sport in [
+            "game", "match", "fifa", "world cup", "soccer", "football",
+            "nhl", "nba", "nfl", "mlb", "canada", "morocco", "oilers",
+        ]
     )
-    schedule = any(term in low for term in _SCHEDULE_TERMS)
-    weather = any(term in low for term in _WEATHER_TERMS)
-    current_day = any(term in low for term in ["today", "tonight", "right now", "currently", "current", "tomorrow"])
+    recency = (
+        any(term in low for term in _RECENT_TERMS)
+        or any(t in low for t in ["right now", "currently", "current", "tomorrow"])
+        or release_date_need
+        or schedule
+        or weather
+    )
+    current_day = any(
+        term in combined
+        for term in ["today", "tonight", "right now", "currently", "current", "tomorrow", "this weekend"]
+    )
     specific_answer = bool(
         live_score
         or schedule
-        or weather  # always need concrete temps / conditions, not homepage nav text
+        or weather
+        or release_date_need
         or (
             current_day
-            and any(term in low for term in ["who plays", "what games", "what matches", "events", "available", "odds", "release", "released"])
+            and any(
+                term in combined
+                for term in [
+                    "who plays", "who is playing", "who's playing", "what games",
+                    "what matches", "events", "available", "odds", "release", "released", "playing",
+                ]
+            )
         )
-        or any(term in low for term in ["odds", "availability", "released", "release date", "score", "scores"])
+        or any(term in low for term in ["odds", "availability", "released", "release date", "score", "scores", "next game"])
     )
-    ambiguous = bool(current_subject and re.search(r"\b(deeper|more|again|that|this|it|continue|go further)\b", original.lower()))
+    ambiguous = bool(current_subject and re.search(r"\b(deeper|more|again|that|this|it|continue|go further)\b", low_orig))
     mode = "recent" if recency else "general"
-    if weather:
+    # Never force weather mode onto a pure sports/schedule query.
+    sportsy = bool(
+        re.search(
+            r"\b(oilers|flames|canucks|nhl|nba|nfl|mlb|next game|schedule|fixture|world cup|fifa)\b",
+            low,
+        )
+    ) or schedule
+    if weather and not sportsy:
         mode = "weather"
-    elif live_score:
+    elif live_score and not schedule:
         mode = "live_score"
-    elif schedule:
+    elif schedule or sportsy:
         mode = "schedule"
+    elif weather:
+        mode = "weather"
     return SearchIntent(
         original_request=original,
         resolved_request=resolved,
         current_subject=_normalize_text(current_subject),
         mode=mode,
         recency_need=recency or weather,
-        live_score_need=live_score,
-        schedule_need=schedule,
-        weather_need=weather,
+        live_score_need=live_score and mode == "live_score",
+        schedule_need=schedule or (mode == "schedule"),
+        weather_need=(mode == "weather"),
         specific_answer_need=specific_answer,
         current_day_need=current_day,
         ambiguous=ambiguous,
@@ -274,11 +1117,23 @@ class SearchGrounder:
         self.relevance_threshold = float(relevance_threshold)
 
     def build_candidates(self, intent: SearchIntent) -> list[SearchCandidate]:
-        base = _normalize_text(intent.resolved_request or intent.original_request)
+        # Always normalize — never ship raw multi-intent chat as the Tavily string.
+        base = normalize_web_search_query(intent.resolved_request or intent.original_request)
+        if not base:
+            base = _normalize_text(intent.resolved_request or intent.original_request)
         if intent.ambiguous and intent.current_subject and intent.current_subject.lower() not in base.lower():
             base = f"{base} about {intent.current_subject}"
         base = self._clean_query(base)
         candidates: list[SearchCandidate] = [SearchCandidate(base, "cleaned user intent", 0.72, ["base"])]
+
+        # Release-date / trailer style asks need tight factual candidates.
+        if "release date" in base.lower() or _RELEASE_DATE_RE.search(intent.original_request or ""):
+            year = datetime.now().strftime("%Y")
+            candidates = [
+                SearchCandidate(f"{base} official", "release date official", 0.95, ["release", "official"]),
+                SearchCandidate(f"{base} {year}", "release date year-bound", 0.9, ["release", "recent"]),
+                SearchCandidate(base, "release date base", 0.86, ["release"]),
+            ]
 
         if intent.weather_need:
             # Prefer forecast-page queries that return °C/°F numbers, not homepage chrome.
@@ -324,23 +1179,67 @@ class SearchGrounder:
                 SearchCandidate(f"{cleaned} current score live updates", "live score fallback", 0.9, ["live_score", "fallback"]),
                 *candidates,
             ]
+        elif intent.schedule_need:
+            today = datetime.now().strftime("%Y-%m-%d")
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            year = datetime.now().strftime("%Y")
+            day_word = "tomorrow" if re.search(r"(?i)\btomorrow\b", intent.resolved_request or "") else (
+                "tonight" if re.search(r"(?i)\btonight\b", intent.resolved_request or "") else "today"
+            )
+            day_iso = tomorrow if day_word == "tomorrow" else today
+            # Prefer authority schedule pages over vague "this year" recaps.
+            # Cover today/tonight/tomorrow — not just "today".
+            candidates = [
+                SearchCandidate(f"{base}", "schedule base", 0.94, ["schedule"]),
+                SearchCandidate(
+                    f"{base} {day_word} schedule fixtures kickoff",
+                    f"schedule {day_word}",
+                    0.93,
+                    ["schedule", day_word],
+                ),
+                SearchCandidate(
+                    f"{base} next game date time",
+                    "schedule next game",
+                    0.91,
+                    ["schedule", "next"],
+                ),
+                SearchCandidate(
+                    f"{base} {year} ESPN OR FIFA OR NHL.com schedule",
+                    "schedule authority",
+                    0.9,
+                    ["schedule", "source"],
+                ),
+                SearchCandidate(f"{base} {day_iso}", "schedule dated", 0.86, ["schedule", "date"]),
+            ]
         elif intent.recency_need:
             year = datetime.now().strftime("%Y")
             candidates.append(SearchCandidate(f"{base} latest current {year}", "recency intent", 0.84, ["recent"]))
-        elif intent.schedule_need:
-            today = datetime.now().strftime("%Y-%m-%d")
-            candidates.append(SearchCandidate(f"{base} schedule today or later {today}", "schedule intent", 0.82, ["schedule"]))
 
         deduped: list[SearchCandidate] = []
         seen: set[str] = set()
         for candidate in candidates:
-            q = self._clean_query(candidate.query)
+            # Schedule/sports bases are already compact — do not re-run multi-intent normalize.
+            if intent.schedule_need or intent.live_score_need:
+                q = _normalize_text(candidate.query)
+            else:
+                q = self._clean_query(candidate.query)
             key = q.lower()
             if q and key not in seen:
                 candidate.query = q
                 deduped.append(candidate)
                 seen.add(key)
         return deduped[: self.max_candidates]
+
+    def _deeper_schedule_candidates(self, base: str, intent: SearchIntent) -> list[SearchCandidate]:
+        """Second-pass queries when first schedule candidates were weak."""
+        year = datetime.now().strftime("%Y")
+        team = _normalize_text(re.sub(r"(?i)\b(next game|schedule|nhl|date|time|this year)\b", " ", base))
+        team = team or base
+        return [
+            SearchCandidate(f"{team} next game {year}", "deeper next game year", 0.92, ["schedule", "deeper"]),
+            SearchCandidate(f"site:nhl.com {team} schedule", "deeper nhl.com", 0.91, ["schedule", "deeper"]),
+            SearchCandidate(f"{team} upcoming games schedule ESPN", "deeper espn", 0.88, ["schedule", "deeper"]),
+        ]
 
     def ground(
         self,
@@ -359,29 +1258,113 @@ class SearchGrounder:
         best_evidence: list[GroundedEvidence] = []
         best_score = -1.0
 
-        for candidate in candidates:
-            output = str(execute(candidate.query) or "")
-            evidence = self.score_evidence(output, candidate.query, intent)
-            if intent.specific_answer_need and fetch_url:
-                evidence, output = self._maybe_fetch_full_page(evidence, output, intent, fetch_url)
-            top_score = max([e.relevance_score for e in evidence], default=0.0)
-            if top_score > best_score:
-                best_score = top_score
-                best_query = candidate.query
-                best_output = output
-                best_evidence = evidence
-            accepted = self._accept_evidence(evidence, intent)
-            if accepted:
-                return GroundedSearchResult(
-                    chosen_query=candidate.query,
-                    candidates=candidates,
-                    evidence=evidence,
-                    rejected_candidates=rejected,
-                    condensed_evidence=self.condense_evidence(evidence, output),
-                    raw_output=output,
-                    accepted=True,
+        def _run_candidates(cands: list[SearchCandidate]) -> Optional[GroundedSearchResult]:
+            nonlocal best_query, best_output, best_evidence, best_score
+            for candidate in cands:
+                output = str(execute(candidate.query) or "")
+                evidence = self.score_evidence(output, candidate.query, intent)
+                # Fetch pages when we need a concrete answer (schedule, weather, live score, etc.)
+                if (intent.specific_answer_need or intent.schedule_need or intent.weather_need) and fetch_url:
+                    evidence, output = self._maybe_fetch_full_page(evidence, output, intent, fetch_url)
+                top_score = max([e.relevance_score for e in evidence], default=0.0)
+                if top_score > best_score:
+                    best_score = top_score
+                    best_query = candidate.query
+                    best_output = output
+                    best_evidence = evidence
+                accepted = self._accept_evidence(evidence, intent)
+                if accepted:
+                    return GroundedSearchResult(
+                        chosen_query=candidate.query,
+                        candidates=candidates,
+                        evidence=evidence,
+                        rejected_candidates=rejected,
+                        condensed_evidence=self.condense_evidence(evidence, output),
+                        raw_output=output,
+                        accepted=True,
+                    )
+                rejected.append(
+                    {"query": candidate.query, "reason": self._rejection_reason(evidence, intent), "score": top_score}
                 )
-            rejected.append({"query": candidate.query, "reason": self._rejection_reason(evidence, intent), "score": top_score})
+            return None
+
+        hit = _run_candidates(candidates)
+        if hit is not None:
+            return hit
+
+        # Board-wide deeper pass for schedule/sports when first pass failed.
+        if intent.schedule_need:
+            deeper = self._deeper_schedule_candidates(best_query or resolved_request, intent)
+            # Avoid re-running identical queries
+            seen_q = {str(r.get("query") or "").lower() for r in rejected}
+            deeper = [c for c in deeper if c.query.lower() not in seen_q]
+            if deeper:
+                hit = _run_candidates(deeper)
+                if hit is not None:
+                    return hit
+
+        # Soft-accept: if best evidence still has schedule signals, treat as usable
+        # so the model is instructed to report best-available dates instead of giving up.
+        # Covers today/tomorrow/near-future fixture asks equally.
+        if (intent.schedule_need or intent.current_day_need) and best_evidence:
+            for e in best_evidence[:5]:
+                hay = f"{e.title} {e.summary}".lower()
+                if self._has_schedule_signal(hay) and e.relevance_score >= 0.18:
+                    return GroundedSearchResult(
+                        chosen_query=best_query,
+                        candidates=candidates,
+                        evidence=best_evidence,
+                        rejected_candidates=rejected,
+                        condensed_evidence=self.condense_evidence(best_evidence, best_output),
+                        raw_output=best_output,
+                        accepted=True,
+                    )
+                # Near-future slate: "tomorrow's fixtures" pages often list matchups without "next game"
+                if intent.current_day_need and e.relevance_score >= 0.22 and (
+                    re.search(r"\b(?:vs\.?|versus|@)\b", hay)
+                    or re.search(r"\b(?:group\s+[a-h]|round of|knockout|fixture|kickoff)\b", hay)
+                ):
+                    return GroundedSearchResult(
+                        chosen_query=best_query,
+                        candidates=candidates,
+                        evidence=best_evidence,
+                        rejected_candidates=rejected,
+                        condensed_evidence=self.condense_evidence(best_evidence, best_output),
+                        raw_output=best_output,
+                        accepted=True,
+                    )
+
+        # Soft-accept entertainment / cast / trailer rumors when named entities appear
+        # (prevents "no information about characters" after sources mention Lucia/Jason).
+        low_resolved = (intent.resolved_request or "").lower()
+        if best_evidence and (
+            "character" in low_resolved
+            or "cast" in low_resolved
+            or "trailer" in low_resolved
+            or "lucia" in low_resolved
+            or "gta" in low_resolved
+        ):
+            for e in best_evidence[:5]:
+                hay = f"{e.title} {e.summary}".lower()
+                has_names = bool(
+                    re.search(r"\b(lucia|jason|duval|caminos|leonida|vice city|rockstar)\b", hay)
+                )
+                has_trailer_window = bool(
+                    re.search(
+                        r"\b(trailer\s*\d+|summer|fall|spring|202[5-9]|announc|pre-?order|rumor|rumour|expected)\b",
+                        hay,
+                    )
+                )
+                if e.relevance_score >= 0.18 and (has_names or has_trailer_window):
+                    return GroundedSearchResult(
+                        chosen_query=best_query,
+                        candidates=candidates,
+                        evidence=best_evidence,
+                        rejected_candidates=rejected,
+                        condensed_evidence=self.condense_evidence(best_evidence, best_output),
+                        raw_output=best_output,
+                        accepted=True,
+                    )
 
         return GroundedSearchResult(
             chosen_query=best_query,
@@ -462,6 +1445,12 @@ class SearchGrounder:
                 score += 0.55 if self._has_score_signal(hay) else -0.25
                 if any(t in hay for t in ["schedule", "date", "kickoff", "start time"]) and not self._has_score_signal(hay):
                     score -= 0.25
+            elif intent.schedule_need:
+                # Schedule pages are date-heavy by nature — boost matchup/date signals,
+                # never penalize as "nav only" the way live-score does.
+                score += 0.52 if self._has_schedule_signal(hay) else -0.12
+                if any(d in hay for d in ("nhl.com", "espn.com", "cbssports", "rotowire", "theathletic")):
+                    score += 0.1
             elif intent.specific_answer_need:
                 score += 0.38 if self._has_specific_answer_signal(hay, intent) else -0.22
                 if self._looks_like_date_or_nav_only(hay, intent):
@@ -522,6 +1511,13 @@ class SearchGrounder:
             return False
         if intent.live_score_need:
             return top.relevance_score >= self.relevance_threshold and self._has_score_signal(top.summary.lower() + " " + top.title.lower())
+        if intent.schedule_need:
+            # Accept if any of top results have date/matchup/next-game signals.
+            for e in evidence[:5]:
+                hay = f"{e.title} {e.summary}".lower()
+                if e.relevance_score >= max(0.24, self.relevance_threshold - 0.1) and self._has_schedule_signal(hay):
+                    return True
+            return False
         if intent.specific_answer_need:
             hay = top.summary.lower() + " " + top.title.lower()
             return top.relevance_score >= self.relevance_threshold and self._has_specific_answer_signal(hay, intent)
@@ -532,6 +1528,8 @@ class SearchGrounder:
             return "No usable evidence returned."
         if intent.live_score_need:
             return "Evidence did not look like a live/current score result."
+        if intent.schedule_need:
+            return "Evidence did not contain a clear next-game date/time/matchup."
         if intent.specific_answer_need:
             return "Evidence did not contain the requested specific current answer."
         return evidence[0].rejection_reason or "Evidence relevance below threshold."
@@ -570,6 +1568,60 @@ class SearchGrounder:
             return True
         return False
 
+    def _has_schedule_signal(self, text: str) -> bool:
+        """Next-game / fixture facts: date, time, opponent — not pure schedule nav chrome."""
+        hay = str(text or "").lower()
+        # Pure schedule hub chrome (date + Standings/Tickets/etc.) is NOT a next-game fact.
+        nav_hits = sum(
+            1
+            for word in ("standings", "fixtures", "results", "teams", "stats", "tickets", "scores", "news")
+            if word in hay
+        )
+        has_time = bool(
+            re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm|et|pt|ct|mt|utc|edt|pdt|est|pst|mst|cst)\b", hay)
+        )
+        has_date = bool(
+            re.search(
+                r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:,?\s+20\d{2})?\b",
+                hay,
+            )
+            or re.search(r"\b20\d{2}-\d{2}-\d{2}\b", hay)
+            or re.search(
+                r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b.{0,40}\b\d{1,2}\b",
+                hay,
+            )
+        )
+        has_matchup = bool(re.search(r"\b(?:vs\.?|versus|@)\b", hay) or re.search(r"\bat\s+[a-z]", hay))
+        has_named = bool(
+            re.search(r"\b[a-z][a-z .'-]{2,}\s+(?:vs\.?|versus|@|at)\s+[a-z][a-z .'-]{2,}\b", hay)
+        )
+        has_next = any(
+            p in hay
+            for p in (
+                "next game",
+                "upcoming game",
+                "upcoming games",
+                "next match",
+                "puck drop",
+                "faceoff",
+                "tipoff",
+                "tip-off",
+            )
+        )
+        # Nav hub: "Sunday July 5 Schedule Results Standings Teams Stats Tickets"
+        if nav_hits >= 3 and not (has_named or has_matchup or has_time or has_next):
+            return False
+        # Date+matchup, named matchup, next-game + date/time, or time + game language
+        if has_named or (has_matchup and (has_date or has_time)):
+            return True
+        if has_next and (has_date or has_time or has_matchup):
+            return True
+        if has_time and any(w in hay for w in ("game", "match", "play", "host", "visit", "face", "oilers", "flames")):
+            return True
+        if has_date and has_matchup:
+            return True
+        return False
+
     def _has_specific_answer_signal(self, text: str, intent: SearchIntent) -> bool:
         hay = str(text or "").lower()
         if intent.weather_need:
@@ -579,15 +1631,7 @@ class SearchGrounder:
         if "odds" in (intent.resolved_request or "").lower():
             return bool(re.search(r"[+-]\d{3,4}\b|\b\d+\.\d{2}\b|\bodds\b.*(?:spread|moneyline|total)", hay))
         if intent.schedule_need or intent.current_day_need:
-            has_time = bool(re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm|et|pt|ct|mt|utc|edt|pdt)\b", hay))
-            has_date = bool(
-                re.search(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+20\d{2}\b", hay)
-                or re.search(r"\b20\d{2}-\d{2}-\d{2}\b", hay)
-            )
-            has_matchup = bool(re.search(r"\b(?:vs\.?|versus| at )\b", hay))
-            has_event_words = any(word in hay for word in ["play", "plays", "playing", "game", "match", "kickoff", "tipoff", "starts"])
-            has_named_result = bool(re.search(r"\b[a-z][a-z .'-]{2,}\s+(?:vs\.?|versus|at)\s+[a-z][a-z .'-]{2,}\b", hay))
-            return (has_event_words and (has_time or has_date or has_matchup or has_named_result)) or has_named_result
+            return self._has_schedule_signal(hay)
         if any(term in hay for term in ["available", "released", "launches", "starts", "opens"]):
             return True
         return False
@@ -602,8 +1646,15 @@ class SearchGrounder:
         return bool((has_date or nav_words >= 3) and not self._has_specific_answer_signal(hay, intent))
 
     def _clean_query(self, query: str) -> str:
-        q = _normalize_text(query)
-        q = re.sub(r"\b(can you|please|tell me|what is|what's|search the internet|look up)\b", "", q, flags=re.IGNORECASE)
+        q = normalize_web_search_query(query) or _normalize_text(query)
+        q = apply_spelling_fixes(q)
+        q = re.sub(
+            r"\b(can you|could you|please|tell me|what is|what's|search the internet|look up|i wonder|hey|hi|hello|"
+            r"do a deeper search|deeper search|dig deeper|go deeper|search deeper)\b",
+            "",
+            q,
+            flags=re.IGNORECASE,
+        )
         return _normalize_text(q)
 
 
@@ -693,7 +1744,11 @@ def format_grounded_tool_output(result: GroundedSearchResult) -> str:
             "Use ONLY the evidence below. Prefer concrete facts from these sources. "
             "Do not invent scores, times, temperatures, or outcomes not present here. "
             "For weather: quote high/low/current temps and conditions when present; "
-            "never tell the user to 'check AccuWeather' if numbers are already below.\n\n"
+            "never tell the user to 'check AccuWeather' if numbers are already below. "
+            "For schedules/next games (today OR tomorrow OR near-future): if a date, time, "
+            "or opponent appears below, report it clearly — do not tell the user to check "
+            "NHL.com/FIFA when the fact is present. "
+            "Never claim you cannot search the web — search already succeeded.\n\n"
             f"{body}"
         ).strip()
 
@@ -716,10 +1771,12 @@ def format_grounded_tool_output(result: GroundedSearchResult) -> str:
         f"CHOSEN_QUERY: {chosen}\n"
         "INSTRUCTION: Do NOT invent an answer. Do NOT claim a specific score, result, schedule, "
         "odds, or release fact unless it appears in BEST_AVAILABLE_EVIDENCE below. "
-        "Tell the user the search evidence was insufficient for a confident answer, "
-        "summarize only what is weakly available if helpful, and offer a narrower retry query. "
-        "Never rephrase this as 'nothing found' when evidence exists but is weak — say the evidence "
-        "was insufficient to confirm the requested answer.\n"
+        "If BEST_AVAILABLE_EVIDENCE contains dates, opponents, times, or temps, report those as "
+        "best-available (with uncertainty) — do NOT tell the user to go check an official site "
+        "when usable fragments are already present. Only say evidence was insufficient when "
+        "BEST_AVAILABLE_EVIDENCE has no relevant fragments. "
+        "CRITICAL: web_search DID run. Never claim your tools cannot search the web, that search "
+        "is disabled, or that you lack web access — say only that this particular evidence was thin.\n"
         f"REJECTED_CANDIDATES:\n{rejected_block}\n"
         f"BEST_AVAILABLE_EVIDENCE:\n{best}"
     ).strip()

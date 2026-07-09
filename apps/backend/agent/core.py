@@ -1157,6 +1157,18 @@ Return ONLY the JSON array, no explanation:
             result = tool.invoke(**params)
             if hasattr(self.agent, "_check_context_budget_mid_task"):
                 self.agent._check_context_budget_mid_task("after_tool_output", task, str(result or ""))
+            # v7.5.2 coding loop (TaskPlanner path)
+            if hasattr(self.agent, "_coding_loop_note_tool"):
+                try:
+                    pending = bool(task.get("status") == "pending_confirmation") or str(tool_name) == "file_write"
+                    self.agent._coding_loop_note_tool(
+                        str(tool_name or ""),
+                        str(params),
+                        str(result or ""),
+                        pending_write=pending,
+                    )
+                except Exception:
+                    pass
             
             # Apply reflection and retry for web search tasks (legacy fast-path)
             if tool_name == "web_search":
@@ -1692,9 +1704,12 @@ class EchoSpeakAgent:
         self._skills_prompt: str = ""
         self._tool_allowlist_override: Optional[set[str]] = None
         self._action_parser_enabled = bool(getattr(config, "action_parser_enabled", True))
+        # v7.5.2: code-enforced coding lifecycle (inspect→…→summarize)
+        self._coding_loop = None  # Optional[CodingLoop]
         # Track tool outputs so LangGraph fallback can preserve partial results
         self._partial_tool_results: List[Dict[str, str]] = []
         self._partial_tool_names: Dict[str, str] = {}  # run_id → tool_name
+        self._partial_tool_inputs: Dict[str, str] = {}  # run_id → tool input
         # Cross-source activity tracking
         self._last_activity: Dict[str, Any] = {"source": None, "summary": "", "thread_id": None, "at": 0.0}
         # Discord user identity & role (set per-request in process_query)
@@ -1706,10 +1721,13 @@ class EchoSpeakAgent:
         # Populate the global tool registry from the legacy lists (migration bridge)
         ToolRegistry.register_from_metadata(get_available_tools(), TOOL_METADATA)
 
-        # Load MCP dynamic tools
+        # Load MCP dynamic tools via process-wide singleton (Trust Center + agent share state)
+        self._mcp_manager = None
         try:
-            from agent.mcp_client import MCPManager
-            mcp_mgr = MCPManager()
+            from agent.mcp_client import get_mcp_manager
+
+            mcp_mgr = get_mcp_manager()
+            self._mcp_manager = mcp_mgr
             if getattr(config, "mcp_servers", None):
                 mcp_mgr.initialize_servers(config.mcp_servers)
         except Exception as e:
@@ -1720,12 +1738,27 @@ class EchoSpeakAgent:
         self.lc_tools = self._apply_search_grounding_to_lc_tools(ToolRegistry.get_config_filtered_funcs(config))
         self.tools = self._create_tools()
 
-        # Merge MCP tools into self.tools
+        # Merge MCP tools into self.tools (StructuredTool or shim already registered)
         for name, entry in ToolRegistry._entries.items():
             if entry.category == "mcp" and not any(t.name == name for t in self.tools):
-                def make_wrapper(t_func=entry.func):
-                    return lambda **kwargs: t_func.invoke(kwargs)
-                self.tools.append(Tool(name, make_wrapper(entry.func), entry.description))
+                func = entry.func
+                if hasattr(func, "invoke") or hasattr(func, "name"):
+                    # Prefer the LangChain tool object directly when possible
+                    try:
+                        self.tools.append(func)
+                        continue
+                    except Exception:
+                        pass
+
+                def make_wrapper(t_func=func):
+                    def _wrapped(**kwargs):
+                        if hasattr(t_func, "invoke"):
+                            return t_func.invoke(kwargs)
+                        return t_func(**kwargs)
+
+                    return _wrapped
+
+                self.tools.append(Tool(name, make_wrapper(func), entry.description))
         self.graph_agent = self._create_langgraph_agent()
         if self.graph_agent is None:
             self.agent_executor = self._create_agent_executor()
@@ -1877,54 +1910,90 @@ class EchoSpeakAgent:
 
         Called by the RoutineManager scheduler when a cron/webhook routine fires.
         Output is routed to the routine's delivery_channels (discord, telegram, etc.).
+
+        Isolation rules:
+          - dedicated thread_id so chat subject/history is not polluted
+          - source=routine suppresses interactive stream callbacks
+          - snapshot/restore current_subject + last web context for the interactive agent
         """
         try:
             action_type = getattr(routine, "action_type", "query")
             action_config = getattr(routine, "action_config", {}) or {}
             routine_name = getattr(routine, "name", "unknown")
+            routine_id = str(getattr(routine, "id", "") or routine_name).strip() or "anon"
             delivery_channels = getattr(routine, "delivery_channels", None) or ["web"]
+            isolated_thread = f"routine_{routine_id}"
+
+            # Snapshot interactive continuity so a "daily news briefing" never
+            # overwrites the user's current subject after the lock is released.
+            snap_subject = str(getattr(self, "_current_subject_text", "") or "")
+            snap_web = str(getattr(self, "_last_web_query_context", "") or "")
+            snap_partial = list(getattr(self, "_partial_tool_results", []) or [])
 
             response = None
 
-            if action_type == "query":
-                message = action_config.get("message", "").strip()
-                if not message:
-                    logger.warning(f"Routine '{routine_name}' has no message configured")
+            try:
+                if action_type == "query":
+                    message = action_config.get("message", "").strip()
+                    if not message:
+                        logger.warning(f"Routine '{routine_name}' has no message configured")
+                        return
+                    logger.info(f"Routine '{routine_name}' firing query: {message[:80]}...")
+                    response, success = self.process_query(
+                        message,
+                        include_memory=False,
+                        source="routine",
+                        thread_id=isolated_thread,
+                        callbacks=[],
+                    )
+                    logger.info(
+                        f"Routine '{routine_name}' completed (success={success}): "
+                        f"{str(response)[:120]}..."
+                    )
+
+                elif action_type == "tool":
+                    tool_name = action_config.get("tool_name", "").strip()
+                    tool_args = action_config.get("args", {})
+                    if not tool_name:
+                        logger.warning(f"Routine '{routine_name}' has no tool_name configured")
+                        return
+                    synthetic_query = f"Run the {tool_name} tool"
+                    if tool_args:
+                        args_str = ", ".join(f"{k}={v}" for k, v in tool_args.items())
+                        synthetic_query += f" with {args_str}"
+                    logger.info(f"Routine '{routine_name}' firing tool: {tool_name}")
+                    response, _ = self.process_query(
+                        synthetic_query,
+                        include_memory=False,
+                        source="routine",
+                        thread_id=isolated_thread,
+                        callbacks=[],
+                    )
+
+                elif action_type == "skill":
+                    skill_name = action_config.get("skill_name", "").strip()
+                    message = action_config.get("message", "").strip()
+                    if message:
+                        logger.info(f"Routine '{routine_name}' firing skill '{skill_name}': {message[:80]}")
+                        response, _ = self.process_query(
+                            message,
+                            include_memory=False,
+                            source="routine",
+                            thread_id=isolated_thread,
+                            callbacks=[],
+                        )
+
+                else:
+                    logger.warning(f"Routine '{routine_name}' has unknown action_type: {action_type}")
                     return
-                logger.info(f"Routine '{routine_name}' firing query: {message[:80]}...")
-                response, success = self.process_query(
-                    message,
-                    include_memory=True,
-                    source="routine",
-                )
-                logger.info(
-                    f"Routine '{routine_name}' completed (success={success}): "
-                    f"{str(response)[:120]}..."
-                )
-
-            elif action_type == "tool":
-                tool_name = action_config.get("tool_name", "").strip()
-                tool_args = action_config.get("args", {})
-                if not tool_name:
-                    logger.warning(f"Routine '{routine_name}' has no tool_name configured")
-                    return
-                synthetic_query = f"Run the {tool_name} tool"
-                if tool_args:
-                    args_str = ", ".join(f"{k}={v}" for k, v in tool_args.items())
-                    synthetic_query += f" with {args_str}"
-                logger.info(f"Routine '{routine_name}' firing tool: {tool_name}")
-                response, _ = self.process_query(synthetic_query, include_memory=False, source="routine")
-
-            elif action_type == "skill":
-                skill_name = action_config.get("skill_name", "").strip()
-                message = action_config.get("message", "").strip()
-                if message:
-                    logger.info(f"Routine '{routine_name}' firing skill '{skill_name}': {message[:80]}")
-                    response, _ = self.process_query(message, include_memory=True, source="routine")
-
-            else:
-                logger.warning(f"Routine '{routine_name}' has unknown action_type: {action_type}")
-                return
+            finally:
+                # Always restore interactive chat continuity
+                try:
+                    self._current_subject_text = snap_subject
+                    self._last_web_query_context = snap_web
+                    self._partial_tool_results = snap_partial
+                except Exception:
+                    pass
 
             # Route the response to the routine's delivery channels
             if response and str(response).strip():
@@ -2302,6 +2371,98 @@ class EchoSpeakAgent:
             if str(self._workspace_id or "").strip().lower() != "coding":
                 self.configure_workspace("coding")
                 logger.info("[Workspace Auto-Detect] Promoted to coding workspace from project/file intent.")
+
+    def _coding_workspace_active(self) -> bool:
+        return str(getattr(self, "_workspace_id", "") or "").strip().lower() == "coding"
+
+    def _ensure_coding_loop(self, user_input: str = "") -> None:
+        """Start or resume a coding loop when in coding workspace / coding intent."""
+        if not (self._coding_workspace_active() or self._is_coding_project_intent(user_input)):
+            return
+        try:
+            from agent.coding_loop import CodingLoop, CodingPhase, project_folder_for_name
+        except Exception as exc:
+            logger.debug("coding_loop unavailable: {}", exc)
+            return
+        loop = getattr(self, "_coding_loop", None)
+        terminal = False
+        if loop is not None:
+            try:
+                terminal = loop.phase in (CodingPhase.DONE, CodingPhase.FAILED)
+            except Exception:
+                terminal = False
+        if loop is None or terminal:
+            folder = ""
+            try:
+                root = str(getattr(config, "file_tool_root", "") or ".")
+                # Prefer a stable session folder name from first words of the request
+                label = re.sub(r"\s+", " ", (user_input or "project").strip())[:40] or "project"
+                folder = project_folder_for_name(label, root)
+            except Exception:
+                folder = ""
+            self._coding_loop = CodingLoop(project_folder=folder)
+            try:
+                self._coding_loop.start(project_folder=folder, note="coding turn start")
+            except Exception as exc:
+                logger.debug("coding loop start: {}", exc)
+        elif loop.phase == CodingPhase.IDLE:
+            try:
+                loop.start(note="coding turn resume")
+            except Exception:
+                pass
+
+    def _coding_loop_note_tool(
+        self,
+        tool_name: str,
+        tool_input: str = "",
+        tool_output: str = "",
+        *,
+        pending_write: bool = False,
+    ) -> None:
+        """Advance coding loop from an observed tool call (TaskPlanner or LC tools)."""
+        if not self._coding_workspace_active() and getattr(self, "_coding_loop", None) is None:
+            return
+        self._ensure_coding_loop()
+        loop = getattr(self, "_coding_loop", None)
+        if loop is None:
+            return
+        try:
+            from agent.coding_loop import parse_terminal_status_block
+        except Exception:
+            parse_terminal_status_block = None  # type: ignore
+
+        path = ""
+        term_status = ""
+        name = str(tool_name or "").strip().lower()
+        raw_in = str(tool_input or "")
+        # Extract path from common tool input shapes
+        m = re.search(r"['\"]?path['\"]?\s*[:=]\s*['\"]([^'\"]+)['\"]", raw_in, flags=re.I)
+        if m:
+            path = m.group(1).strip()
+        elif name.startswith("file_") and raw_in and len(raw_in) < 260 and "\n" not in raw_in:
+            path = raw_in.strip().strip("'\"")
+        if name == "terminal_run" and callable(parse_terminal_status_block):
+            term_status = parse_terminal_status_block(str(tool_output or ""))
+        try:
+            loop.note_tool(
+                name,
+                path=path,
+                terminal_status=term_status,
+                pending_write=bool(pending_write) or name == "file_write",
+            )
+        except Exception as exc:
+            logger.debug("coding_loop note_tool: {}", exc)
+
+    def get_coding_loop_state(self) -> Dict[str, Any]:
+        loop = getattr(self, "_coding_loop", None)
+        if loop is None:
+            return {"active": False, "phase": "idle"}
+        try:
+            d = loop.as_dict()
+            d["active"] = True
+            return d
+        except Exception:
+            return {"active": False, "phase": "idle"}
 
     def _is_capability_question_text(self, query_lower: str) -> bool:
         q = (query_lower or "").strip().lower()
@@ -3058,6 +3219,13 @@ class EchoSpeakAgent:
                 q = str(normalized.get("query") or normalized.get("q") or "").strip()
                 if not q:
                     q = str(user_input or "").strip()
+                # Prefer extracted compact query over raw multi-intent chat.
+                try:
+                    compact = self._extract_search_query(user_input or q)
+                    if compact and len(compact) < len(q):
+                        q = compact
+                except Exception:
+                    pass
                 grounded = self._grounded_web_search(q, original_request=user_input or q, emit_tool_events=True)
                 if is_grounded_search_output(grounded) and "SEARCH_EVIDENCE_INSUFFICIENT" in grounded:
                     return (
@@ -3438,6 +3606,7 @@ class EchoSpeakAgent:
             },
             "session_memory": session_memory_diag,
             "verification": self._verification_telemetry.report() if getattr(self, "_verification_telemetry", None) is not None else {},
+            "coding_loop": self.get_coding_loop_state(),
         }
 
         return {
@@ -3472,6 +3641,7 @@ class EchoSpeakAgent:
             "discord": discord_diag,
             "integrations": integrations_diag,
             "reliability": reliability_diag,
+            "coding_loop": self.get_coding_loop_state(),
             "features": {
                 "action_parser_enabled": bool(getattr(config, "action_parser_enabled", True)),
                 "system_actions": bool(getattr(config, "enable_system_actions", False)),
@@ -3935,51 +4105,73 @@ class EchoSpeakAgent:
             "?", "what", "how", "when", "where", "who", "which",
             "is there", "show me", "tell me", "find", "search",
             "look up", "check", "get me", "give me", "research",
+            "i wonder", "wondering", "come out", "coming out", "release",
         ])
         if not has_question_signal:
             return False
 
-        triggers = [
+        # Phrase triggers (safe as substring)
+        phrase_triggers = [
             "right now",
             "currently",
-            "live",
-            "score",
-            "scores",
-            "weather",
-            "forecast",
-            "price",
-            "stock",
-            "stocks",
-            "bitcoin",
-            "btc",
-            "ethereum",
-            "eth",
+            "live score",
             "exchange rate",
             "flight status",
-            "traffic",
             "is it open",
-            "availability",
-            "released",
-            # Sports results / recency triggers
             "last night",
-            "yesterday",
             "last game",
-            "won",
-            "lost",
-            "beat",
-            "defeated",
-            "standings",
-            "playoff",
-            "playoffs",
-            "odds",
             "sports odds",
             "betting odds",
+            "come out",
+            "coming out",
+            "release date",
         ]
-        if any(t in q for t in triggers):
+        if any(t in q for t in phrase_triggers):
             return True
-        if "today" in q and self._has_live_info_subject(q):
+
+        # Word-boundary triggers — avoid "won" matching "wonder", "live" in unrelated words, etc.
+        word_triggers = (
+            r"\blive\b",
+            r"\bscore\b",
+            r"\bscores\b",
+            r"\bweather\b",
+            r"\bforecast\b",
+            r"\bprice\b",
+            r"\bstock\b",
+            r"\bstocks\b",
+            r"\bbitcoin\b",
+            r"\bbtc\b",
+            r"\bethereum\b",
+            r"\beth\b",
+            r"\btraffic\b",
+            r"\bavailability\b",
+            r"\breleased\b",
+            r"\brelease\b",
+            r"\byesterday\b",
+            r"\bwon\b",
+            r"\blost\b",
+            r"\bbeat\b",
+            r"\bdefeated\b",
+            r"\bstandings\b",
+            r"\bplayoff\b",
+            r"\bplayoffs\b",
+            r"\bodds\b",
+            r"\btrailer\b",
+        )
+        if any(re.search(p, q) for p in word_triggers):
             return True
-        if "latest" in q or "breaking" in q:
+        if re.search(r"\btoday\b", q) and self._has_live_info_subject(q):
+            return True
+        # Near-future sports slates (tomorrow used to fall through as non-live)
+        if re.search(r"\b(today|tonight|tomorrow|this weekend)\b", q) and (
+            self._has_schedule_terms(q)
+            or re.search(r"\bwho(?:'s| is)?\s+playing\b", q)
+            or re.search(r"\b(world cup|fifa|nhl|nba|nfl|mlb|match|fixture)\b", q)
+        ):
+            return True
+        if re.search(r"\blatest\b", q) or re.search(r"\bbreaking\b", q):
+            return True
+        if self._is_deeper_search_followup(q):
             return True
         return False
 
@@ -3989,9 +4181,12 @@ class EchoSpeakAgent:
             return False
         if self._is_live_web_intent(q):
             return True
+        if self._is_deeper_search_followup(q):
+            return True
         explicit_terms = [
             "search",
             "deep search",
+            "deeper search",
             "research",
             "research deeply",
             "look up",
@@ -4005,6 +4200,8 @@ class EchoSpeakAgent:
             "recent news",
             "updates on",
             "update on",
+            "dig deeper",
+            "search again",
         ]
         return any(term in q for term in explicit_terms)
 
@@ -4071,12 +4268,44 @@ class EchoSpeakAgent:
             "explain more",
             "expand on that",
             "look into it more",
+            "look into that",
             "check more",
             "same for that",
             "same there",
             "and there",
+            "what do you think",
+            "what do you think?",
+            "what do you think about it",
+            "what do you think about it?",
+            "what do you think about that",
+            "what do you think about that?",
+            "thoughts",
+            "thoughts?",
+            "your thoughts",
+            "your thoughts?",
+            "interesting",
+            "interesting.",
+            "cool",
+            "nice",
+            "yeah",
+            "yep",
+            "ok",
+            "okay",
         }
         if q in exact:
+            return True
+        # Hollow opinion / pronoun follow-ups that depend on current_subject
+        if re.fullmatch(
+            r"(?:so\s+)?(?:i'?ll|i will)?\s*look into (?:it|that)(?:\s+for you)?(?:\s+right now)?\??",
+            q,
+        ):
+            return True
+        if re.fullmatch(
+            r"what do you think(?: about (?:it|that|this))?\??",
+            q,
+        ):
+            return True
+        if re.fullmatch(r"(?:your )?thoughts(?: on (?:it|that|this))?\??", q):
             return True
         prefixes = (
             "do a deeper search",
@@ -4098,6 +4327,8 @@ class EchoSpeakAgent:
             "and how about",
             "and in ",
             "same for ",
+            "what do you think about",
+            "thoughts on ",
         )
         if any(q.startswith(prefix) for prefix in prefixes):
             # Full self-contained questions should not be rewritten away.
@@ -4153,6 +4384,41 @@ class EchoSpeakAgent:
             return subject
         return f"{subject} in {place}".strip()
 
+    def _is_deeper_search_followup(self, query_text: str) -> bool:
+        """User wants another / deeper web pass on the current subject."""
+        q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+        q = q.replace("\u2019", "'").replace("\u2018", "'")
+        if not q:
+            return False
+        exact = {
+            "do a deeper search",
+            "deeper search",
+            "search deeper",
+            "research deeper",
+            "go deeper",
+            "go further",
+            "dig deeper",
+            "look into it more",
+            "look into that",
+            "check more",
+            "search more",
+            "more search",
+            "do another search",
+            "search again",
+        }
+        if q in exact or q.rstrip("?.!") in exact:
+            return True
+        if re.search(
+            r"\b(?:do\s+a\s+)?(?:deep(?:er)?|another)\s+(?:web\s+)?search\b",
+            q,
+        ):
+            return True
+        if re.search(r"\b(?:dig|go)\s+deeper\b", q) and len(q.split()) <= 8:
+            return True
+        if re.search(r"\b(?:search|research)\s+deeper\b", q):
+            return True
+        return False
+
     def _resolve_referential_followup(self, query_text: str) -> tuple[str, bool, str]:
         q = (query_text or "").strip()
         subject = str(
@@ -4177,6 +4443,12 @@ class EchoSpeakAgent:
                     pass
                 return resolved, True, resolved
 
+        # "do a deeper search" → search the SUBJECT itself, not meta-phrase "deeper search about X"
+        # (meta-phrase caused weak Tavily queries + model claiming tools can't search).
+        if subject and self._is_deeper_search_followup(q):
+            resolved = f"{subject} latest detailed sources analysis"
+            return resolved.strip(), True, subject
+
         if not subject or not self._is_referential_followup_text(q):
             # Still try web-query expander (handles what about + prev search context)
             expanded = self._expand_follow_up_web_query(q)
@@ -4186,9 +4458,13 @@ class EchoSpeakAgent:
 
         low = q.lower()
         if "search" in low or "research" in low or "look into" in low or "check" in low:
-            resolved = f"{q} about {subject}"
+            # Prefer subject-first queries when the user is asking to search more
+            if self._is_deeper_search_followup(q) or re.search(r"\b(deeper|more|again)\b", low):
+                resolved = f"{subject} latest detailed sources analysis"
+            else:
+                resolved = f"{subject} {q}".strip()
         elif "more" in low or "expand" in low or "deeper" in low or "further" in low:
-            resolved = f"{q} about {subject}"
+            resolved = f"{subject} more detail latest sources"
         else:
             resolved = f"{q} about {subject}"
         return resolved.strip(), True, subject
@@ -4201,6 +4477,26 @@ class EchoSpeakAgent:
         # Never let hollow follow-ups overwrite a good topic (this caused Vancouver to lose weather).
         if self._is_small_talk_query(low) or self._is_referential_followup_text(user) or self._is_location_swap_followup(user):
             return ""
+        # Explicit memory writes are durable facts, not a new discussion subject.
+        try:
+            if self.memory.extract_remember_payload(user):
+                return ""
+        except Exception:
+            pass
+        # Pronoun-heavy short questions ("when does it release?") should not replace a solid subject.
+        if str(getattr(self, "_current_subject_text", "") or "").strip() and re.search(
+            r"\b(it|that|this|them|they|those)\b", low
+        ):
+            content_words = re.findall(r"[a-z0-9]{4,}", low)
+            stop = {
+                "when", "does", "what", "about", "think", "tell", "more", "have", "with",
+                "from", "your", "you", "will", "would", "could", "should", "there", "here",
+                "show", "does", "into", "look", "right", "now", "please", "just", "like",
+                "think", "about", "that", "this", "them", "they", "those", "release",
+            }
+            content = [w for w in content_words if w not in stop]
+            if len(content) <= 1:
+                return ""
         candidate = user
         if self._is_explicit_web_query(low) or "weather" in low or "forecast" in low:
             try:
@@ -4402,8 +4698,10 @@ class EchoSpeakAgent:
                 return self._swap_location_into_subject(prev, place)
 
         if self._is_referential_followup_text(q):
+            if self._is_deeper_search_followup(q):
+                return f"{prev} latest detailed sources analysis".strip()
             if "search" in low or "research" in low:
-                return f"{q} about {prev}".strip()
+                return f"{prev} latest detailed sources analysis".strip()
             return f"{q} about {prev}".strip()
 
         if low.startswith("and in "):
@@ -4438,24 +4736,32 @@ class EchoSpeakAgent:
         """Execute the underlying Tavily/web_search tool without grounding.
 
         Used only as the SearchGrounder execute callback so candidate loops never
-        re-enter _grounded_web_search.
+        re-enter _grounded_web_search. Request-scoped cache avoids re-hitting the
+        same query 3× for multi-candidate / multi-intent turns.
         """
         from agent.tools import web_search as raw_web_search
 
         q = str(query or "").strip()
         if not q:
             return ""
+        cache = getattr(self, "_request_search_cache", None)
+        cache_key = re.sub(r"\s+", " ", q).strip().lower()
+        if isinstance(cache, dict) and cache_key in cache:
+            return str(cache[cache_key] or "")
         try:
-            return str(raw_web_search.invoke({"query": q}) or "")
+            result = str(raw_web_search.invoke({"query": q}) or "")
         except TypeError:
             try:
-                return str(raw_web_search.invoke(q) or "")
+                result = str(raw_web_search.invoke(q) or "")
             except Exception as exc:
                 logger.warning(f"raw web_search failed: {exc}")
-                return ""
+                result = ""
         except Exception as exc:
             logger.warning(f"raw web_search failed: {exc}")
-            return ""
+            result = ""
+        if isinstance(cache, dict) and cache_key:
+            cache[cache_key] = result
+        return result
 
     def _apply_search_grounding_to_lc_tools(self, tools: Optional[list]) -> list:
         """Wrap web_search StructuredTools so native tool-calling hits grounding."""
@@ -4479,8 +4785,24 @@ class EchoSpeakAgent:
             description = description.rstrip(".") + " Results are evidence-grounded before return."
 
         def _run(query: str = "", **kwargs: Any) -> str:
+            from agent.research import looks_like_multi_intent, recipe_multi_search_queries
+
             q = str(query or kwargs.get("query") or kwargs.get("q") or "").strip()
-            return agent._grounded_web_search(q, original_request=q, emit_tool_events=False)
+            # Prefer the full user turn for multi-intent split (Oilers + weather).
+            orig = str(
+                getattr(agent, "_active_user_query", None)
+                or getattr(agent, "_last_user_input_for_plan", None)
+                or q
+            ).strip()
+            # Emit per-intent tool rows when recipe or cheap multi-intent detector fires
+            # (full decompose runs inside _grounded_web_search).
+            emit_extra = len(recipe_multi_search_queries(orig or q)) >= 2 or looks_like_multi_intent(orig or q)
+            return agent._grounded_web_search(
+                q,
+                original_request=orig or q,
+                callbacks=getattr(agent, "_current_callbacks", None),
+                emit_tool_events=emit_extra,
+            )
 
         try:
             from langchain_core.tools import StructuredTool
@@ -4534,38 +4856,81 @@ class EchoSpeakAgent:
         - TaskPlanner / WebTaskReflector (via tool wrappers + reflector delegate)
         - Native LangGraph/ReAct tool calls (lc_tools wrapper)
         """
-        q = str(query or "").strip()
-        if not q:
+        from agent.research import (
+            resolve_web_search_queries,
+            looks_like_multi_intent,
+            _infer_city_from_text,
+            _is_weather_clause,
+            _normalize_weather_query,
+        )
+
+        raw_q = str(query or "").strip()
+        if not raw_q:
             return ""
+        orig = str(original_request or raw_q).strip() or raw_q
+        # Recipe fast path + general multi-intent decomposition fallback.
+        # Never silent-overwrite multi with the model's single tool arg.
+        llm_invoke = None
+        try:
+            wrap = getattr(self, "llm_wrapper", None)
+            if wrap is not None and hasattr(wrap, "invoke_fast"):
+                llm_invoke = lambda p, _w=wrap: _w.invoke_fast(p, max_tokens=180)
+            elif wrap is not None and hasattr(wrap, "invoke"):
+                llm_invoke = lambda p, _w=wrap: _w.invoke(p)
+        except Exception:
+            llm_invoke = None
+        multi = resolve_web_search_queries(
+            orig,
+            raw_q,
+            llm_invoke=llm_invoke,
+            use_decomposition=True,
+        )
+        if not multi:
+            multi = resolve_web_search_queries(raw_q, raw_q, llm_invoke=None, use_decomposition=False)
+        if not multi:
+            multi = [raw_q]
+        # Bare "check the weather" with no city: prefer last subject / web context location.
+        subject = str(
+            getattr(self, "_current_subject_text", "")
+            or getattr(self, "_last_web_query_context", "")
+            or ""
+        )
+        subject_city = _infer_city_from_text(subject) if subject else ""
+        if subject_city:
+            fixed: list[str] = []
+            for q in multi:
+                if _is_weather_clause(q) and not _infer_city_from_text(q):
+                    fixed.append(_normalize_weather_query(q, city_hint=subject_city))
+                else:
+                    fixed.append(q)
+            multi = fixed
 
         if not bool(getattr(config, "search_grounding_enabled", True)):
-            run_id = str(uuid.uuid4())
-            if emit_tool_events:
-                self._emit_tool_start(callbacks, "web_search", q, run_id)
-            try:
-                raw = self._raw_web_search_execute(q)
+            chunks = []
+            for q in multi:
+                run_id = str(uuid.uuid4())
                 if emit_tool_events:
-                    self._emit_tool_end(callbacks, raw, run_id)
-                return raw
-            except Exception as exc:
-                if emit_tool_events:
-                    self._emit_tool_error(callbacks, exc, run_id)
-                return ""
+                    self._emit_tool_start(callbacks, "web_search", q, run_id)
+                try:
+                    raw = self._raw_web_search_execute(q)
+                    if emit_tool_events:
+                        self._emit_tool_end(callbacks, raw, run_id)
+                    if raw:
+                        chunks.append(f"### Search: {q}\n{raw}")
+                except Exception as exc:
+                    if emit_tool_events:
+                        self._emit_tool_error(callbacks, exc, run_id)
+            return "\n\n".join(chunks)
 
-        grounder = SearchGrounder(
-            max_candidates=int(getattr(config, "search_grounding_max_candidates", 3) or 3)
-        )
+        # Default 2 candidates — enough retry without 3× waste per intent.
+        # Schedule gets a slightly higher budget inside SearchGrounder when needed.
+        max_cands = int(getattr(config, "search_grounding_max_candidates", 2) or 2)
+        grounder = SearchGrounder(max_candidates=max(1, min(max_cands, 4)))
         current_subject = str(
             getattr(self, "_current_subject_text", "")
             or getattr(self, "_last_web_query_context", "")
             or ""
         )
-        orig = str(original_request or q).strip() or q
-
-        # One outer tool event for the whole grounder loop (avoids "Search done" x N candidates).
-        ground_run_id = str(uuid.uuid4()) if emit_tool_events else ""
-        if emit_tool_events:
-            self._emit_tool_start(callbacks, "web_search", q, ground_run_id)
 
         def execute_candidate(candidate_query: str) -> str:
             try:
@@ -4582,63 +4947,79 @@ class EchoSpeakAgent:
                     )
                 return ""
 
-        try:
-            grounded = grounder.ground(
-                original_request=orig,
-                resolved_request=q,
-                current_subject=current_subject,
-                execute=execute_candidate,
-                fetch_url=self._fetch_search_result_page_text,
-            )
-        except Exception as exc:
+        formatted_parts: list[str] = []
+        last_grounded = None
+        any_accepted = False
+        for q in multi:
+            # One tool event per intent so chat shows each search (Oilers, then weather).
+            ground_run_id = str(uuid.uuid4()) if emit_tool_events else ""
             if emit_tool_events:
-                self._emit_tool_error(callbacks, exc, ground_run_id)
-            raise
-
-        try:
-            self._last_grounded_search_result = grounded.as_dict()
-        except Exception:
-            self._last_grounded_search_result = {
-                "chosen_query": grounded.chosen_query,
-                "accepted": grounded.accepted,
-                "condensed_evidence": grounded.condensed_evidence,
-            }
-
-        telemetry = getattr(self, "_verification_telemetry", None)
-        if telemetry is not None:
-            for rejected in grounded.rejected_candidates:
-                telemetry.record(
-                    "search_query_rejected",
-                    tool="web_search",
-                    reason=str(rejected.get("reason") or "Search candidate rejected."),
-                    metadata={
-                        "query": rejected.get("query"),
-                        "score": rejected.get("score"),
-                        "original_request": orig,
-                    },
+                self._emit_tool_start(callbacks, "web_search", q, ground_run_id)
+            try:
+                grounded = grounder.ground(
+                    original_request=orig,
+                    resolved_request=q,
+                    current_subject=current_subject,
+                    execute=execute_candidate,
+                    fetch_url=self._fetch_search_result_page_text,
                 )
-            if not grounded.accepted:
-                telemetry.record(
-                    "search_evidence_insufficient",
-                    tool="web_search",
-                    reason="No grounded search candidate reached the relevance threshold.",
-                    metadata={"chosen_query": grounded.chosen_query, "original_request": orig},
+            except Exception as exc:
+                if emit_tool_events:
+                    self._emit_tool_error(callbacks, exc, ground_run_id)
+                raise
+            last_grounded = grounded
+            any_accepted = any_accepted or bool(grounded.accepted)
+            part = format_grounded_tool_output(grounded)
+            if len(multi) > 1:
+                part = f"### Search: {q}\n{part}"
+            formatted_parts.append(part)
+            if emit_tool_events:
+                self._emit_tool_end(callbacks, part, ground_run_id)
+            try:
+                status = "accepted" if grounded.accepted else "insufficient"
+                logger.info(
+                    "Search grounding %s query=%r evidence=%d",
+                    status,
+                    grounded.chosen_query,
+                    len(grounded.evidence or []),
                 )
-        try:
-            status = "accepted" if grounded.accepted else "insufficient"
-            logger.info(
-                "Search grounding %s query=%r evidence=%d",
-                status,
-                grounded.chosen_query,
-                len(grounded.evidence or []),
-            )
-        except Exception:
-            pass
+            except Exception:
+                pass
+            telemetry = getattr(self, "_verification_telemetry", None)
+            if telemetry is not None:
+                for rejected in grounded.rejected_candidates:
+                    telemetry.record(
+                        "search_query_rejected",
+                        tool="web_search",
+                        reason=str(rejected.get("reason") or "Search candidate rejected."),
+                        metadata={
+                            "query": rejected.get("query"),
+                            "score": rejected.get("score"),
+                            "original_request": orig,
+                        },
+                    )
+                if not grounded.accepted:
+                    telemetry.record(
+                        "search_evidence_insufficient",
+                        tool="web_search",
+                        reason="No grounded search candidate reached the relevance threshold.",
+                        metadata={"chosen_query": grounded.chosen_query, "original_request": orig},
+                    )
 
-        formatted = format_grounded_tool_output(grounded)
-        if emit_tool_events:
-            self._emit_tool_end(callbacks, formatted, ground_run_id)
-        return formatted
+        if last_grounded is not None:
+            try:
+                self._last_grounded_search_result = last_grounded.as_dict()
+                self._last_grounded_search_result["multi_queries"] = list(multi)
+                self._last_grounded_search_result["any_accepted"] = any_accepted
+            except Exception:
+                self._last_grounded_search_result = {
+                    "chosen_query": last_grounded.chosen_query,
+                    "accepted": last_grounded.accepted,
+                    "condensed_evidence": last_grounded.condensed_evidence,
+                    "multi_queries": list(multi),
+                }
+
+        return "\n\n".join(formatted_parts)
 
     def _invoke_web_research_query(self, query_text: str, callbacks: Optional[list], time_context: str = "", apply_reflection: bool = True) -> tuple[str, str, str]:
         tool = self._preferred_web_research_tool()
@@ -5033,10 +5414,16 @@ class EchoSpeakAgent:
             "kickoff",
             "tipoff",
         ]
-        if not any(t in q for t in time_ask):
-            return False
-
-        return self._has_schedule_terms(q)
+        if any(t in q for t in time_ask) and self._has_schedule_terms(q):
+            return True
+        # Near-future fixture slate: "who's playing tomorrow", "what games today"
+        if re.search(r"\b(today|tonight|tomorrow|this weekend)\b", q) and (
+            re.search(r"\bwho(?:'s| is)?\s+playing\b", q)
+            or re.search(r"\bwhat\s+(?:games?|matches?)\b", q)
+            or (self._has_schedule_terms(q) and re.search(r"\b(world cup|fifa|nhl|nba|nfl|mlb)\b", q))
+        ):
+            return True
+        return False
 
     def _is_hardware_capability_query(self, query_lower: str) -> bool:
         q = (query_lower or "").strip()
@@ -5877,7 +6264,13 @@ class EchoSpeakAgent:
             explicit_remember_payload = ""
 
         if not _is_public:
-            self.memory.add_conversation(clean_user_input, response_text, mode=mode_val, thread_id=thread_val)
+            # Raw turn → FAISS only when explicitly enabled. Default off so ordinary
+            # chatter does not inflate memory_count / "Memory saved" every turn.
+            # Durable path below (profile / curated / typed) is separate and gated.
+            if bool(getattr(config, "memory_auto_store_conversations", False)):
+                self.memory.add_conversation(
+                    clean_user_input, response_text, mode=mode_val, thread_id=thread_val
+                )
             # Deterministic regex-based profile extraction — captures facts like
             # "im memo not max" → user_name="memo", friend="max" immediately,
             # without needing an extra LLM call.
@@ -6500,6 +6893,17 @@ class EchoSpeakAgent:
         pending_payload["approval_id"] = approval.id
         pending_payload["preview"] = preview
         self._pending_action = pending_payload
+        # v7.5.2: pending write actions enter confirm phase of coding loop
+        try:
+            path = str((pending_payload.get("kwargs") or {}).get("path") or "")
+            self._coding_loop_note_tool(
+                tool_name,
+                path or str(pending_payload.get("kwargs") or ""),
+                "",
+                pending_write=True,
+            )
+        except Exception:
+            pass
         self._state_store.update_thread_state(
             self._thread_key(),
             pending_approval_id=approval.id,
@@ -7626,6 +8030,9 @@ class EchoSpeakAgent:
         self._tool_start_times[run_id] = time.time()
         # Map run_id → tool name for _emit_tool_end to look up
         self._partial_tool_names[run_id] = name
+        if not hasattr(self, "_partial_tool_inputs"):
+            self._partial_tool_inputs = {}
+        self._partial_tool_inputs[run_id] = str(input_str or "")
 
         # Stream event (fire-and-forget)
         if hasattr(self, '_stream_buffer') and self._stream_buffer:
@@ -7648,9 +8055,17 @@ class EchoSpeakAgent:
     def _emit_tool_end(self, callbacks: Optional[list], output: str, run_id: str) -> None:
         # Record observability metrics
         tool_name = self._partial_tool_names.pop(run_id, "unknown")
+        tool_input = ""
+        if hasattr(self, "_partial_tool_inputs"):
+            tool_input = self._partial_tool_inputs.pop(run_id, "")
         latency_ms = 0.0
         if hasattr(self, '_tool_start_times') and run_id in self._tool_start_times:
             latency_ms = (time.time() - self._tool_start_times.pop(run_id)) * 1000
+        # v7.5.2: drive coding loop from real tool completions
+        try:
+            self._coding_loop_note_tool(str(tool_name or ""), tool_input, str(output or ""))
+        except Exception:
+            pass
         # Capture result for LangGraph fallback preservation
         self._partial_tool_results.append({"tool": tool_name, "output": str(output)[:4000]})
         try:
@@ -7849,6 +8264,15 @@ class EchoSpeakAgent:
             return True
         if self._has_live_info_subject(low) or self._is_live_web_intent(low):
             return True
+        if self._is_explicit_web_query(low) or self._is_deeper_search_followup(low):
+            return True
+        # Near-future sports slate ("who's playing tomorrow")
+        if re.search(r"\b(today|tonight|tomorrow|this weekend)\b", low) and (
+            self._has_schedule_terms(low)
+            or re.search(r"\bwho(?:'s| is)?\s+playing\b", low)
+            or re.search(r"\b(world cup|fifa|nhl|nba|nfl)\b", low)
+        ):
+            return True
         # "what about in Vancouver?" while current subject is weather/live facts
         subject = str(
             getattr(self, "_current_subject_text", "")
@@ -7862,7 +8286,103 @@ class EchoSpeakAgent:
             or self._topic_template_from_subject(subject) in {"weather", "sports", "news"}
         ):
             return True
+        # Deeper search on an existing live subject
+        if self._is_deeper_search_followup(q) and subject and (
+            self._has_live_info_subject(subject)
+            or self._topic_template_from_subject(subject) in {"weather", "sports", "news"}
+            or any(w in subject for w in ("score", "game", "match", "weather", "odds", "world cup", "gta"))
+        ):
+            return True
         return False
+
+    def _response_claims_search_unavailable(self, text: str) -> bool:
+        """Detect false 'I can't search' claims after tools were actually available."""
+        low = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        if not low:
+            return False
+        patterns = (
+            "don't let me search",
+            "do not let me search",
+            "doesn't let me search",
+            "can't search the web",
+            "cannot search the web",
+            "can't search online",
+            "cannot search online",
+            "don't have access to the web",
+            "do not have access to the web",
+            "don't have web search",
+            "no access to search",
+            "tools don't let me",
+            "tools do not let me",
+            "search is not available",
+            "search isn't available",
+            "unable to search the web",
+            "i can't look that up",
+            "i cannot look that up",
+            "my tools don't",
+            "my tools do not",
+            "i don't have a search",
+            "i do not have a search",
+            "web search is disabled",
+            "can't use web search",
+            "cannot use web search",
+        )
+        return any(p in low for p in patterns)
+
+    def _ensure_search_capability_honesty(
+        self,
+        user_input: str,
+        response_text: str,
+        callbacks: Optional[list] = None,
+    ) -> str:
+        """If the model falsely claims it cannot search, force a real search + rewrite."""
+        if not self._response_claims_search_unavailable(response_text):
+            return response_text
+        if not self._tool_available_in_current_context("web_search"):
+            return response_text
+        # Prefer expanded follow-up / deeper-search subject
+        display = self._extract_user_request_text(user_input)
+        resolved, is_fu, _subj = self._resolve_referential_followup(display)
+        search_q = resolved if is_fu and resolved else display
+        logger.warning(
+            "Search-capability honesty: model claimed search unavailable; forcing web_search for %r",
+            search_q[:80],
+        )
+        try:
+            tool_output = self._grounded_web_search(
+                search_q,
+                original_request=display,
+                callbacks=callbacks,
+                emit_tool_events=True,
+            )
+        except Exception as exc:
+            logger.warning("Search-capability honesty search failed: %s", exc)
+            return (
+                "I do have web search — something went wrong re-running it just now. "
+                "Please try again in a moment."
+            )
+        if not str(tool_output or "").strip():
+            return (
+                "I do have web search available. The last pass didn't return usable snippets — "
+                "try rephrasing the topic and I'll search again."
+            )
+        try:
+            return self._summarize_web_results(
+                user_input,
+                display,
+                str(tool_output),
+                search_q,
+                "",
+                is_schedule=bool(self._has_schedule_terms(search_q.lower())),
+                callbacks=callbacks,
+            )
+        except Exception as exc:
+            logger.warning("Search-capability honesty summarize failed: %s", exc)
+            # Never leave the false claim in place
+            return (
+                "I can search the web (and just did). Here's the best available evidence:\n\n"
+                + str(tool_output)[:2500]
+            )
 
     def _ensure_live_web_search(
         self,
@@ -7937,12 +8457,16 @@ class EchoSpeakAgent:
     def _user_has_social_open(self, user_input: str) -> bool:
         """True if the user greets or asks how Echo is (social first beat)."""
         low = re.sub(r"\s+", " ", str(user_input or "").strip().lower())
+        # Normalize curly apostrophes so how're / how's still match.
+        low = low.replace("\u2019", "'").replace("\u2018", "'")
         if not low:
             return False
         social = [
-            r"\bhow(?:'re| are) you\b",
+            r"\bhow(?:'re| are) you(?:\s+feeling)?\b",
             r"\bhow(?:'s| is) it going\b",
             r"\bhow you doing\b",
+            r"\bhow(?:'re| are) things\b",
+            r"\bhow(?:'s| is) everything\b",
             r"\bwhat(?:'s| is) up\b",
             r"\bwyd\b",
             r"\bhow(?:'s| is) your day\b",
@@ -7950,6 +8474,19 @@ class EchoSpeakAgent:
             r"\bgood (morning|afternoon|evening|night)\b",
         ]
         return any(re.search(p, low) for p in social)
+
+    def _social_task_preamble_fallback(self, task_hint: str = "that") -> str:
+        """Deterministic social-first line when the LLM preamble fails."""
+        import random
+        task = re.sub(r"\s+", " ", str(task_hint or "that")).strip() or "that"
+        options = [
+            f"Doing good — checking {task} now.",
+            f"I'm good — looking into {task}.",
+            f"Feeling solid — pulling {task} up.",
+            f"All good here — one sec on {task}.",
+            f"Pretty good — let me check {task}.",
+        ]
+        return random.choice(options)
 
     def _looks_like_social_reopen(self, text: str) -> bool:
         """Final answers that re-greet after a preamble already handled the vibe."""
@@ -8135,13 +8672,24 @@ class EchoSpeakAgent:
             if len(words) > 24:
                 text = " ".join(words[:24]).rstrip(",.;:") + "."
             if len(text) < 3:
-                return ""
+                # Never drop the social half on multi-intent turns.
+                if social:
+                    text = self._social_task_preamble_fallback(task_hint)
+                else:
+                    return ""
+            if social and not self._preamble_covers_social(text):
+                # Model returned task-only; force social-first shape.
+                text = self._social_task_preamble_fallback(task_hint)
             if len(text) > 180:
                 text = text[:177].rstrip() + "…"
             self.record_turn_partial_beat(text)
             return text
         except Exception as e:
             logger.warning("generate_tool_preamble_beat failed: %s", e)
+            if social:
+                text = self._social_task_preamble_fallback(task_hint)
+                self.record_turn_partial_beat(text)
+                return text
             return ""
 
     def _extract_calc_expression(self, user_input: str) -> str:
@@ -8268,6 +8816,8 @@ class EchoSpeakAgent:
         return ""
 
     def _extract_search_query(self, user_input: str) -> str:
+        from agent.research import normalize_web_search_query
+
         text = self._extract_user_request_text((user_input or "").strip())
         lower = text.lower()
         
@@ -8280,19 +8830,22 @@ class EchoSpeakAgent:
         for pattern in patterns:
             m = re.search(pattern, lower)
             if m:
-                return m.group(1).strip(" .,")
+                return normalize_web_search_query(m.group(1).strip(" .,")) or m.group(1).strip(" .,")
         
         # Handle "next game/match" patterns
         m = re.search(r"(?:next|upcoming)\s+(?:game|match|event|show)\s+(?:for\s+)?(.+?)(?:\s+also|\s+please|\s+and|$)", lower)
         if m:
-            return f"next game {m.group(1).strip(' .,')}"
+            return normalize_web_search_query(f"next game {m.group(1).strip(' .,')}") or f"next game {m.group(1).strip(' .,')}"
         
         # Standard prefix stripping
         for prefix in ("research deeply", "deep search", "research", "search", "look up", "find"):
             if lower.startswith(prefix):
                 text = text[len(prefix):].strip(" :,-")
                 break
-        return text
+        # Always compact chatty multi-intent prompts into a real search string
+        # (never "how're you feeling? and i wonder when…").
+        cleaned = normalize_web_search_query(text)
+        return cleaned or text
 
     # _split_multi_intent_web_queries was removed: it was dead code after
     # Stage 3 simplification (only fired on weather+schedule combos).
@@ -9285,32 +9838,57 @@ class EchoSpeakAgent:
         """
         self._add_pipeline_reasoning("⚙️ Stage 3: Shortcut Queries", "Checking for web search fast-path triggers.")
 
-        # When the model supports native tool calling (e.g. Gemma 4),
-        # skip heuristic shortcuts and let Stage 4's ReAct agent decide
-        # when to call tools — more reliable and uses the model's reasoning.
-        if self._allow_llm_tool_calling() and self.graph_agent is not None:
-            self._add_pipeline_reasoning("⚙️ Stage 3: Shortcut Queries", "Tool-calling model detected — deferring to ReAct agent in Stage 4.")
-            return None
-
         extracted_input = ctx.resolved_input or ctx.extracted_input
         time_context = ctx.time_context
+        raw_extracted = self._extract_user_request_text(user_input)
 
         # Detect query type with keyword heuristics (zero LLM cost)
         schedule_extracted = self._extract_user_request_text(self._strip_live_desktop_context(extracted_input or user_input))
         schedule_low = schedule_extracted.lower().strip()
-        is_schedule = self._is_schedule_time_query(schedule_low) or self._is_next_upcoming_schedule_query(schedule_low)
+        is_schedule = (
+            self._is_schedule_time_query(schedule_low)
+            or self._is_next_upcoming_schedule_query(schedule_low)
+            or bool(
+                re.search(r"\b(today|tonight|tomorrow|this weekend)\b", schedule_low)
+                and (
+                    self._has_schedule_terms(schedule_low)
+                    or re.search(r"\bwho(?:'s| is)?\s+playing\b", schedule_low)
+                    or re.search(r"\b(world cup|fifa|nhl|nba|nfl|mlb)\b", schedule_low)
+                )
+            )
+        )
 
         expanded = self._expand_follow_up_web_query(extracted_input)
         is_followup = expanded != extracted_input
+        is_deeper = self._is_deeper_search_followup(raw_extracted) and bool(
+            getattr(self, "_current_subject_text", "") or getattr(self, "_last_web_query_context", "")
+        )
 
-        low = extracted_input.lower().strip()
-        is_explicit = self._is_explicit_web_query(low)
+        low = (extracted_input or "").lower().strip()
+        is_explicit = self._is_explicit_web_query(low) or is_deeper
 
-        if not (is_schedule or is_explicit or is_followup):
+        # When the model supports native tool calling (e.g. Gemma 4),
+        # normally defer to Stage 4 ReAct — EXCEPT deeper-search / schedule
+        # follow-ups where small models have lied about search being off.
+        if self._allow_llm_tool_calling() and self.graph_agent is not None:
+            if not (is_deeper or is_schedule or (is_followup and is_explicit)):
+                self._add_pipeline_reasoning(
+                    "⚙️ Stage 3: Shortcut Queries",
+                    "Tool-calling model detected — deferring to ReAct agent in Stage 4.",
+                )
+                return None
+            self._add_pipeline_reasoning(
+                "⚙️ Stage 3: Shortcut Queries",
+                "Forcing grounded search path (deeper/schedule/follow-up) — do not trust model to self-report tools.",
+            )
+
+        if not (is_schedule or is_explicit or is_followup or is_deeper):
             return None  # Continue to Stage 4
 
         # Build search query from the best source
         search_input = schedule_extracted if is_schedule else (expanded if is_followup else extracted_input)
+        if is_deeper and not is_schedule:
+            search_input = extracted_input or expanded
         qtext = self._extract_search_query(search_input)
         tool_output, used_query, time_context = self._invoke_web_research_query(
             qtext, callbacks, time_context=time_context, apply_reflection=True,
@@ -9837,12 +10415,21 @@ class EchoSpeakAgent:
         self._current_thread_id = self._thread_key(thread_id)
         self._last_stage4_branch = ""
         self._last_tool_calling_mode = self._tool_calling_mode_label()
+        # Per-request web_search cache (dedupe multi-candidate / multi-intent rehits)
+        self._request_search_cache: Dict[str, str] = {}
         self._sync_thread_state(thread_id)
         self._hydrate_pending_action_from_state()
         self._ensure_workspace_for_intent(user_input)
+        # v7.5.2: open coding loop when coding workspace / coding intent
+        try:
+            self._ensure_coding_loop(user_input)
+        except Exception:
+            pass
 
+        # Background sources must never stream tool rows into an interactive chat.
+        bg_source = str(source or "").strip().lower() in {"routine", "heartbeat", "proactive", "cron"}
         trace: Optional[Dict[str, Any]] = None
-        callbacks_local = list(callbacks or [])
+        callbacks_local = [] if bg_source else list(callbacks or [])
         if self._trace_enabled:
             trace = {
                 "trace_id": str(uuid.uuid4()),
@@ -9875,10 +10462,14 @@ class EchoSpeakAgent:
         self._current_execution_id = execution.id
 
         # Attach a stream buffer for this request (stored in singleton dict for /stream/{id} lookup)
+        # Background jobs get a private buffer that no UI is watching — never reuse interactive buffer.
         try:
             from agent.stream_events import get_stream_buffer
-            self._stream_buffer = get_stream_buffer(_request_id)
-            self._stream_buffer.push_status("processing")
+            if bg_source:
+                self._stream_buffer = None
+            else:
+                self._stream_buffer = get_stream_buffer(_request_id)
+                self._stream_buffer.push_status("processing")
         except Exception:
             self._stream_buffer = None
 
@@ -9970,6 +10561,10 @@ class EchoSpeakAgent:
             # ("check AccuWeather"). Re-synthesize from grounded tool output.
             response_text = self._ensure_weather_answer_uses_evidence(
                 user_input, response_text or "",
+            )
+            # Worst bug class: model claims "tools don't let me search" after web_search works.
+            response_text = self._ensure_search_capability_honesty(
+                user_input, response_text or "", callbacks_local,
             )
             # Multi-beat: never re-greet in the post-tool answer if we already spoke a first beat.
             response_text = self._ensure_no_regreet_after_partials(

@@ -71,6 +71,11 @@ type Message = {
   usage?: MessageUsage;
   /** True when the reply was already shown live via stream tokens — skip typewriter re-reveal */
   skipTypewriter?: boolean;
+  /**
+   * Multi-beat: "partial" = first spoken mid-turn line (tools must render below it).
+   * "final" = post-tool answer. Used for timeline ordering only.
+   */
+  streamBeat?: "partial" | "final";
 };
 
 /** Rough client-side token estimate (chars / 3.5) — matches context meter */
@@ -3506,18 +3511,36 @@ export const Dashboard: React.FC = () => {
         })
       ),
     ];
-    // Chronological, but within the same turn: task plan sits above search/tool activity.
+    // Chronological with multi-beat contract:
+    //   user → first spoken assistant beat (partial) → tool/search rows → final answer
+    // Only *partial* assistant messages (skipTypewriter) force above tools — not finals.
     const kindRank = (k: TimelineItem["kind"]) =>
       k === "message" ? 0 : k === "task_plan" ? 1 : k === "activity" ? 2 : 3;
+    const isPartialBeat = (t: TimelineItem) => {
+      if (t.kind !== "message") return false;
+      const m = (t as Extract<TimelineItem, { kind: "message" }>).msg;
+      return m.role === "assistant" && m.streamBeat === "partial";
+    };
+    const isToolActivity = (t: TimelineItem) =>
+      t.kind === "activity" &&
+      ((t as Extract<TimelineItem, { kind: "activity" }>).item.kind === "thinking" ||
+        (t as Extract<TimelineItem, { kind: "activity" }>).item.kind === "tool");
+
     merged.sort((a, b) => {
       const dt = a.at - b.at;
-      // Same second / close events: tasks above search/tools.
-      if (Math.abs(dt) < 120_000 && a.kind !== "message" && b.kind !== "message") {
-        const ra = kindRank(a.kind);
-        const rb = kindRank(b.kind);
-        if (ra !== rb) return ra - rb;
+      // Close in time: partial spoken beat always above tool/search activity.
+      if (Math.abs(dt) < 180_000) {
+        if (isPartialBeat(a) && isToolActivity(b)) return -1;
+        if (isToolActivity(a) && isPartialBeat(b)) return 1;
+        if (a.kind !== "message" && b.kind !== "message") {
+          const ra = kindRank(a.kind);
+          const rb = kindRank(b.kind);
+          if (ra !== rb) return ra - rb;
+        }
       }
       if (dt !== 0) return dt;
+      if (isPartialBeat(a) && isToolActivity(b)) return -1;
+      if (isToolActivity(a) && isPartialBeat(b)) return 1;
       return kindRank(a.kind) - kindRank(b.kind);
     });
     return merged;
@@ -3628,6 +3651,10 @@ export const Dashboard: React.FC = () => {
     let finalHandled = false;
     /** Mid-turn spoken beats already committed (so final doesn't re-add them). */
     const partialReplies: string[] = [];
+    /** True once the first spoken mid-turn beat is sealed — tools must sort after it. */
+    let sawPartialBeat = false;
+    /** Floor timestamp for tool/search activity after the first partial. */
+    let toolsAfterPartialAt = 0;
     setActivities((prev) => [
       ...prev,
       {
@@ -3718,7 +3745,10 @@ export const Dashboard: React.FC = () => {
                 matched = true;
               }
             }
-            return matched ? { ...p, steps } : p;
+            if (!matched) return p;
+            // Keep card under first partial beat if any.
+            const nextAt = sawPartialBeat ? Math.max(p.at, toolsAfterPartialAt) : p.at;
+            return { ...p, at: nextAt, steps };
           })
         );
       };
@@ -3751,6 +3781,8 @@ export const Dashboard: React.FC = () => {
             let prevSteps = (existing.steps || []).filter((s) =>
               step.id === bootstrapStepId ? true : s.id !== bootstrapStepId
             );
+            // Also drop post-partial placeholder once real tool/search steps land.
+            prevSteps = prevSteps.filter((s) => s.id !== `${reqId}:post-partial-working`);
             // Upsert by id so tool_end can complete the same row.
             const byId = prevSteps.findIndex((s) => s.id === step.id);
             let nextSteps: ThinkingStep[];
@@ -3766,9 +3798,14 @@ export const Dashboard: React.FC = () => {
             } else {
               nextSteps = [...prevSteps, step];
             }
+            // NEVER pull the card earlier (Math.min was pinning Search done above the first beat).
+            // After a partial beat, stay strictly after that spoken message.
+            const stepAt = step.at || Date.now();
+            const floor = sawPartialBeat ? Math.max(toolsAfterPartialAt, existing.at) : existing.at;
+            const nextAt = Math.max(floor, stepAt, sawPartialBeat ? toolsAfterPartialAt : 0);
             updated[existingIdx] = {
               ...existing,
-              at: Math.min(existing.at, step.at || Date.now()),
+              at: nextAt || stepAt,
               steps: nextSteps,
             };
             return updated;
@@ -3846,7 +3883,22 @@ export const Dashboard: React.FC = () => {
             evt.name === "file_write" ? "Writing" :
             evt.name === "terminal_run" ? "Running" :
             "Using";
-          const inputPreview = String(evt.input || "").replace(/\s+/g, " ").trim();
+          // Prefer the bare query string for web_search so chat shows what Tavily got.
+          let inputPreview = String(evt.input || "").replace(/\s+/g, " ").trim();
+          if (evt.name === "web_search" && inputPreview) {
+            // LangChain / Python may pass "{'query': '...'}" or JSON or "query=..."
+            const m =
+              inputPreview.match(/['"]query['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+              inputPreview.match(/['"]query['"]\s*:\s*['"]([^'"]+)['"]/) ||
+              inputPreview.match(/\{['"]query['"]:\s*['"]([^'"]+)['"]\}/i) ||
+              inputPreview.match(/\bquery\s*[:=]\s*['"]([^'"]+)['"]/i) ||
+              inputPreview.match(/\bquery\s*[:=]\s*([^{\[\]'"][^}\]]*)/i);
+            if (m && m[1]) inputPreview = m[1].trim().replace(/['"]$/g, "");
+            // Drop social multi-intent noise if it slipped through
+            if (inputPreview.length > 120 && /how(?:'re| are) you|look great|liking how you look/i.test(inputPreview)) {
+              inputPreview = inputPreview.slice(0, 100) + "…";
+            }
+          }
           // Hide silent/internal tools from the chat step list (time inject, calc, …).
           const silentTools = new Set([
             "get_system_time",
@@ -3860,12 +3912,20 @@ export const Dashboard: React.FC = () => {
             "query_memory",
           ]);
           if (!silentTools.has(String(evt.name || "").toLowerCase())) {
+            const reqId = eventRequestId(evt);
+            const stepAt = sawPartialBeat
+              ? Math.max(Date.now(), toolsAfterPartialAt)
+              : normalizeTimestampMs(evt.at || Date.now());
             appendThinkingStep(evt, {
               id: evt.id,
               type: evt.name === "web_search" ? "search" : evt.name === "file_read" ? "read" : "tool",
-              content: inputPreview ? `${toolVerb} ${evt.name}: ${inputPreview}` : `${toolVerb} ${evt.name}`,
+              content: inputPreview
+                ? evt.name === "web_search"
+                  ? `Searching: ${inputPreview}`
+                  : `${toolVerb} ${evt.name}: ${inputPreview}`
+                : `${toolVerb} ${evt.name}`,
               status: "running",
-              at: normalizeTimestampMs(evt.at || Date.now()),
+              at: stepAt,
             });
           }
           return;
@@ -3900,11 +3960,21 @@ export const Dashboard: React.FC = () => {
               outLow.includes("search_evidence_insufficient") ||
               outLow.includes("accepted=false") ||
               (count === 0 && outLow.includes("insufficient"));
+            const qPreview = String(info?.input || "")
+              .replace(/\s+/g, " ")
+              .trim()
+              .slice(0, 80);
             const summary = insufficient
-              ? "Search finished — evidence insufficient"
+              ? qPreview
+                ? `Search done (weak evidence): ${qPreview}`
+                : "Search finished — evidence insufficient"
               : count
-                ? `Search done (${count} sources)`
-                : "Search done";
+                ? qPreview
+                  ? `Search done (${count} sources): ${qPreview}`
+                  : `Search done (${count} sources)`
+                : qPreview
+                  ? `Search done: ${qPreview}`
+                  : "Search done";
             markThinkingStep(
               evt,
               evt.id,
@@ -4070,12 +4140,17 @@ export const Dashboard: React.FC = () => {
             if (partialReplies.some((p) => p.trim() === text)) continue;
             partialReplies.push(text);
             const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
+            const beatAt = Date.now();
+            sawPartialBeat = true;
+            // Tools must render strictly below this spoken beat (across all multi-beat turns).
+            toolsAfterPartialAt = beatAt + 10;
             addMessage({
               id: crypto.randomUUID(),
               role: "assistant",
               text,
-              at: Date.now(),
+              at: beatAt,
               skipTypewriter: true,
+              streamBeat: "partial",
               usage: buildMessageUsage(text, useAppStore.getState().messages, ctxWindow, {
                 provider: providerInfo?.provider,
                 model: providerInfo?.model,
@@ -4087,6 +4162,41 @@ export const Dashboard: React.FC = () => {
             if (evt.speak !== false) {
               void speakText(text);
             }
+            // Move the thinking/tool card under this beat. Keep any tool rows already
+            // recorded (they may have finished before this event was painted).
+            const reqId = eventRequestId(evt);
+            setActivities((prev) =>
+              prev.map((p) => {
+                if (p.kind !== "thinking" || p.request_id !== reqId) return p;
+                const kept = (p.steps || []).filter(
+                  (s) =>
+                    s.id !== bootstrapStepId &&
+                    s.id !== `${reqId}:post-partial-working` &&
+                    (s.status === "done" || s.status === "failed" || s.status === "running") &&
+                    !/^(thinking|thinking…)$/i.test(String(s.content || "").trim())
+                );
+                const hasToolWork = kept.some(
+                  (s) => s.type === "search" || s.type === "tool" || s.type === "read"
+                );
+                return {
+                  ...p,
+                  at: toolsAfterPartialAt,
+                  content: "working",
+                  steps: hasToolWork
+                    ? kept
+                    : [
+                        ...kept,
+                        {
+                          id: `${reqId}:post-partial-working`,
+                          type: "tool" as const,
+                          content: "checking…",
+                          status: "running" as const,
+                          at: toolsAfterPartialAt,
+                        },
+                      ],
+                };
+              })
+            );
             dispatchActivity({ type: "thinking", content: "working" });
           } else if (evt.type === "thinking") {
             const content = (evt.content || "").trim();
@@ -4192,8 +4302,10 @@ export const Dashboard: React.FC = () => {
                 id: crypto.randomUUID(),
                 role: "assistant",
                 text: reply,
-                at: Date.now(),
+                // Always after tools: toolsAfterPartialAt is 0 when no partial.
+                at: Math.max(Date.now(), toolsAfterPartialAt + 1),
                 skipTypewriter: alreadyStreamed || partialReplies.length > 0,
+                streamBeat: "final",
                 usage: buildMessageUsage(reply, useAppStore.getState().messages, ctxWindow, {
                   provider: providerInfo?.provider,
                   model: providerInfo?.model,

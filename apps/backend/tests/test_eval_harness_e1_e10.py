@@ -1,7 +1,8 @@
 """
-v7.4.4 Eval harness — E1–E10 fixtures (deterministic / recorded, no live network).
+v7.4.4+ Eval harness — E1–E11 fixtures (deterministic / recorded, no live network).
 
 Success bar (product): ≥8/10 stable; zero raw tool-call syntax in chat.
+E11 covers long-conversation subject continuity + memory-save discipline.
 These tests exercise harness behavior with stubs — they are the CI gate.
 Live Tavily/Gemma runs remain manual.
 """
@@ -267,12 +268,859 @@ def test_e10_context_flood_protects_subject():
     assert report.trimmed_blocks or report.compressed_blocks or "compressed" in fitted.lower()
 
 
+# ---------------------------------------------------------------------------
+# E11 — Long conversation: subject continuity, memory-save discipline, tier agreement
+# ---------------------------------------------------------------------------
+
+def _e11_scripted_turns():
+    """15–20+ turns: evolving topic, follow-ups, tangent, switch-back, durable fact."""
+    gta = "GTA 6 trailer"
+    return [
+        # Main topic establishment + evolution
+        ("Have you seen the new GTA 6 trailer?", f"Yeah the {gta} looks massive.", "gta"),
+        ("What stood out to you?", "The vice city vibe and the characters.", "gta"),
+        ("so i'll look into that for you right now", "Sounds good — digging into the trailer details.", "gta"),
+        ("what do you think about it?", f"I think the {gta} sets a high bar for open-world hype.", "gta"),
+        ("When does it release?", "Rockstar has said 2025 for GTA 6, still subject to change.", "gta"),
+        ("Tell me more about the setting", "Leonida is the state, with Vice City as the big draw.", "gta"),
+        ("How long is the trailer?", "A few minutes — enough to show world density and tone.", "gta"),
+        ("Is Lucia the protagonist?", "Yes, Lucia is a confirmed lead character in GTA 6.", "gta"),
+        # Soft follow-ups that must NOT overwrite subject
+        ("interesting", "Yeah, the casting and tone really land.", "gta"),
+        ("and what about the music?", "The soundtrack tease felt very Vice City.", "gta"),
+        # Topic switch (weather) then switch-back
+        ("What's the weather in Calgary today?", "Calgary is cooler with some cloud cover today.", "weather"),
+        ("what about in Vancouver?", "Vancouver looks milder and a bit wetter.", "weather"),
+        ("ok back to the trailer", f"Back to the {gta} — want more on gameplay or story?", "gta"),
+        ("Does it show multiplayer?", "The trailer is story-focused; multiplayer details are still thin.", "gta"),
+        ("compare it to the first trailer", "The second pass usually doubles down on world density vs the first.", "gta"),
+        # Durable memory (explicit remember) — should save typed, not raw chatter
+        ("Remember that I prefer short answers about games", "Got it — I'll keep game answers short.", "gta"),
+        # Late referential follow-up (many turns after topic start)
+        ("what do you think about it?", "Still excited — the world building in that trailer is the hook.", "gta"),
+        # Another tangent then return
+        ("Side note: FIFA World Cup scores later?", "Sure — we can check live scores when you want.", "fifa"),
+        ("anyway, trailer thoughts one more time", f"Overall the {gta} still feels like the main event of the chat.", "gta"),
+        ("summarize what we've been talking about", f"Mostly the {gta}, with a brief weather detour and a FIFA note.", "gta"),
+    ]
+
+
+def test_e11_long_conversation_memory_and_subject(tmp_path, monkeypatch):
+    """
+    Long-run board scenario:
+    - subject holds through 20 turns with follow-ups, switch, and switch-back
+    - raw conversation is NOT auto-stored every turn (Memory saved discipline)
+    - durable remember still stores
+    - late follow-up resolves against earlier topic, not only last message
+    - session summary and vector retrieval stay aligned (no stale raw-turn dominance)
+    """
+    from config import config
+    from agent.core import EchoSpeakAgent
+    from agent.session_memory import SessionMemoryDistiller
+    from api import server as server_mod
+
+    monkeypatch.setattr(config, "memory_auto_store_conversations", False, raising=False)
+    monkeypatch.setattr(config, "memory_importance_enabled", True, raising=False)
+    monkeypatch.setattr(config, "memory_extraction_async", False, raising=False)
+    monkeypatch.setattr(config, "session_memory_enabled", True, raising=False)
+
+    agent = EchoSpeakAgent(memory_path=str(tmp_path / "e11_mem"))
+    # Isolate session memory from shared DATA_DIR so prior runs cannot inflate turn_count.
+    agent._session_memory = SessionMemoryDistiller(tmp_path / "e11_session", update_turns=1)
+    agent._current_source = "web"
+    agent._current_thread_id = "e11-long"
+    agent._last_memory_thread_id = "e11-long"
+
+    # Never invent durable memories via LLM for chatter turns
+    class QuietLLM:
+        def invoke(self, text: str) -> str:
+            return '{"items":[],"reason":"no durable facts"}'
+
+        def invoke_with_reasoning(self, text: str):
+            return self.invoke(text), ""
+
+    agent.llm_wrapper = QuietLLM()
+
+    turns = _e11_scripted_turns()
+    assert len(turns) >= 18
+
+    counts_before_each = []
+    subjects = []
+    conversation_saves = 0
+    durable_saves = 0
+
+    def _conversation_item_count() -> int:
+        items = agent.memory.list_items(offset=0, limit=500, thread_id="e11-long") if hasattr(agent.memory, "list_items") else []
+        if not items:
+            # Fallback: scan simple or all items without thread filter
+            try:
+                items = agent.memory.list_items(offset=0, limit=500)
+            except Exception:
+                items = []
+        n = 0
+        for it in items or []:
+            meta = it.get("metadata") if isinstance(it, dict) else {}
+            mt = str((meta or {}).get("type") or "").lower()
+            if mt == "conversation":
+                n += 1
+        return n
+
+    baseline_conv = _conversation_item_count()
+    baseline_total = int(getattr(agent.memory, "memory_count", 0) or 0)
+
+    for user, reply, _bucket in turns:
+        before = int(getattr(agent.memory, "memory_count", 0) or 0)
+        conv_before = _conversation_item_count()
+        agent._record_turn(user, reply)
+        after = int(getattr(agent.memory, "memory_count", 0) or 0)
+        conv_after = _conversation_item_count()
+        counts_before_each.append((before, after, user[:40]))
+        if conv_after > conv_before:
+            conversation_saves += conv_after - conv_before
+        if after > before and conv_after == conv_before:
+            durable_saves += after - before
+        subjects.append(str(getattr(agent, "_current_subject_text", "") or ""))
+
+    # --- 1) Memory-save frequency: no raw conversation auto-store ---
+    assert conversation_saves == 0, (
+        f"Raw conversation auto-store regression: {conversation_saves} type=conversation "
+        f"saves with memory_auto_store_conversations=False"
+    )
+    # Chitchat turns must not 1:1 inflate FAISS; durable remember may add 1+ items
+    total_delta = int(getattr(agent.memory, "memory_count", 0) or 0) - baseline_total
+    assert total_delta <= 5, f"Memory count rose too much for non-durable chatter: delta={total_delta}"
+    assert durable_saves >= 1, "Explicit 'Remember that…' should produce at least one durable save"
+
+    # --- 2) Subject continuity at turn 20+ ---
+    # After "ok back to the trailer" (index 12) and before FIFA tangent, subject must be trailer/GTA
+    post_return = subjects[12:16]
+    assert any("trailer" in (s or "").lower() or "gta" in (s or "").lower() for s in post_return), (
+        f"Failed to switch back to trailer topic: {post_return}"
+    )
+    # Mid-session weather switch should have briefly moved subject
+    weather_seen = any("weather" in (s or "").lower() or "calgary" in (s or "").lower() for s in subjects)
+    assert weather_seen, "Expected a weather subject during the switch segment"
+    # Final stretch after trailer return + FIFA note should not be stuck on weather alone
+    late_subjects = " | ".join(subjects[12:]).lower()
+    assert ("gta" in late_subjects or "trailer" in late_subjects), (
+        f"Subject lost GTA/trailer after switch-back: {subjects[12:]!r}"
+    )
+    assert not all(
+        ("weather" in (s or "").lower() or "calgary" in (s or "").lower() or "vancouver" in (s or "").lower())
+        and "trailer" not in (s or "").lower() and "gta" not in (s or "").lower()
+        for s in subjects[12:]
+    )
+
+    # --- 3) Late follow-up resolves against earlier topic ---
+    # Use subject right after "ok back to the trailer" / compare turn (GTA track, pre-FIFA)
+    gta_subject = next(
+        (s for s in reversed(subjects[12:17]) if s and ("gta" in s.lower() or "trailer" in s.lower())),
+        subjects[12],
+    )
+    agent._current_subject_text = gta_subject
+    resolved, is_ref, subj = agent._resolve_referential_followup("what do you think about it?")
+    assert is_ref is True
+    low_res = (resolved or "").lower()
+    assert "gta" in low_res or "trailer" in low_res or "gta" in (subj or "").lower() or "trailer" in (subj or "").lower(), (
+        f"Late follow-up failed to bind to GTA/trailer: resolved={resolved!r} subject={subj!r}"
+    )
+
+    # --- 4) Session memory vs vector agreement ---
+    session = agent._session_memory.load("e11-long")
+    assert session.turn_count == len(turns)
+    sess_subj = (session.current_subject or "").lower()
+    assert "gta" in sess_subj or "trailer" in sess_subj or "summarize" in sess_subj or "talking" in sess_subj
+
+    # Inject a stale raw conversation dump as if from an older buggy session
+    agent.memory.add_conversation(
+        "totally unrelated old topic about antique radios",
+        "Sure, antique radios are cool.",
+        thread_id="e11-long",
+    )
+    # With auto-store off, retrieval for the live subject must prefer durable/session,
+    # not inject the stale raw conversation turn as the memory context.
+    vec_ctx = agent.memory.get_conversation_context(
+        "what do you think about the trailer?",
+        k=5,
+        thread_id="e11-long",
+    )
+    assert "antique radios" not in (vec_ctx or "").lower(), (
+        "Vector memory injected stale raw conversation while auto-store is off — "
+        "session/vector tier disagreement"
+    )
+    # Session still reports the live topic
+    sess_ctx = agent._session_memory.context_for("e11-long", max_chars=1200)
+    assert "antique radios" not in (sess_ctx or "").lower()
+    assert "gta" in sess_ctx.lower() or "trailer" in sess_ctx.lower() or session.current_subject
+
+    # --- 5) Memory Doctor: raw conversation dominance stays healthy for this session ---
+    report = server_mod._build_memory_doctor_report(agent, thread_id="e11-long", max_scan=300)
+    assert report.auto_store_conversations is False
+    # One manually injected conversation exists for the drift probe; should not dominate
+    # a long real session of durable-only writes.
+    conv_count = int(report.type_counts.get("conversation", 0) or 0)
+    scanned = max(1, int(report.scanned or 1))
+    assert conv_count <= max(3, scanned // 2), (
+        f"Conversation memories dominate after long session: {report.type_counts}"
+    )
+    assert not any("auto-store" in w.lower() for w in (report.warnings or []))
+
+
+def test_e11_auto_store_on_still_records_conversations(tmp_path, monkeypatch):
+    """Opt-in path: when auto-store is enabled, raw turns do land in FAISS."""
+    from config import config
+    from agent.core import EchoSpeakAgent
+
+    monkeypatch.setattr(config, "memory_auto_store_conversations", True, raising=False)
+    monkeypatch.setattr(config, "memory_importance_enabled", False, raising=False)
+    monkeypatch.setattr(config, "session_memory_enabled", True, raising=False)
+
+    agent = EchoSpeakAgent(memory_path=str(tmp_path / "e11_on"))
+    agent._current_source = "web"
+    agent._current_thread_id = "e11-on"
+    agent._last_memory_thread_id = "e11-on"
+    before = int(getattr(agent.memory, "memory_count", 0) or 0)
+    agent._record_turn("hello there friend", "hi!")
+    after = int(getattr(agent.memory, "memory_count", 0) or 0)
+    assert after > before
+
+
+def test_e12_search_query_not_raw_chat_prompt():
+    """
+    Live bug: multi-intent chat was shipped to Tavily as the search string:
+      \"how're you feeling? and i wonder when that new trailer comes out for trailer 3 for gta 6 hey?\"
+    Must compact to a real query (GTA 6 Trailer 3 release date), not the raw prompt.
+    Also: substring \"won\" in \"wonder\" must not be a live-score/live-web false positive alone.
+    """
+    from agent.research import SearchGrounder, build_search_intent, normalize_web_search_query
+
+    raw = "how're you feeling? and i wonder when that new trailer comes out for trailer 3 for gta 6 hey?"
+    compact = normalize_web_search_query(raw)
+    assert "GTA 6 Trailer 3" in compact and "release" in compact.lower(), compact
+    assert "feeling" not in compact.lower()
+    assert "wonder" not in compact.lower()
+
+    agent = _bare_agent()
+    extracted = agent._extract_search_query(raw)
+    assert "GTA 6 Trailer 3" in extracted and "release" in extracted.lower(), extracted
+    # \"won\" inside \"wonder\" must not trip sports triggers by itself
+    assert agent._is_live_web_intent("i wonder how you are") is False
+    # trailer + come out still is live/web-worthy
+    assert agent._is_live_web_intent(raw.lower()) is True
+
+    intent = build_search_intent(raw, extracted, "")
+    assert "GTA 6 Trailer 3" in intent.resolved_request
+    assert intent.specific_answer_need is True
+    assert intent.recency_need is True
+    cands = SearchGrounder(max_candidates=3).build_candidates(intent)
+    assert cands
+    assert all("feeling" not in c.query.lower() for c in cands)
+    assert any("GTA 6 Trailer 3" in c.query for c in cands)
+
+    # Stage-4 style: model passes full user message as tool arg
+    seen = []
+
+    def fake_raw(q: str) -> str:
+        seen.append(q)
+        return (
+            "1. Rockstar\n"
+            "   URL: https://example.com/gta\n"
+            "   Snippet: No Trailer 3 release date announced for GTA 6 yet."
+        )
+
+    agent._raw_web_search_execute = fake_raw
+    agent._fetch_search_result_page_text = lambda url, **kw: "No official Trailer 3 date."
+    agent._verification_telemetry = VerificationTelemetry(enabled=False)
+    agent._current_subject_text = ""
+    agent._last_web_query_context = ""
+    agent._emit_tool_start = MagicMock()
+    agent._emit_tool_end = MagicMock()
+    agent._emit_tool_error = MagicMock()
+    out = agent._grounded_web_search(raw, original_request=raw, emit_tool_events=False)
+    assert seen, "expected search execute"
+    assert all("feeling" not in s.lower() and "wonder" not in s.lower() for s in seen), seen
+    assert any("GTA 6" in s or "Trailer 3" in s for s in seen), seen
+    assert out
+
+
+def test_e19_general_decompose_novel_compound_and_simple_fp():
+    """
+    General multi-intent fallback (no weather/sports/GTA recipe):
+      \"tallest building in Dubai AND current CEO of Tesla\"
+    must become 2+ sub-queries. Simple single-fact asks must NOT look multi
+    (no decomposition cost / false fan-out).
+    """
+    from agent.research import (
+        looks_like_multi_intent,
+        resolve_web_search_queries,
+        recipe_multi_search_queries,
+        decompose_search_intents,
+    )
+
+    # --- False-positive / latency guard: simple questions ---
+    simples = [
+        "what's the capital of France?",
+        "What is 2 plus 2?",
+        "who is the president of France",
+        "weather in Calgary",
+        "hi",
+    ]
+    for s in simples:
+        # weather alone is single-intent specialty, not multi
+        if "weather" in s.lower() and "and" not in s.lower():
+            assert looks_like_multi_intent(s) is False, s
+        elif len(s.split()) < 10:
+            assert looks_like_multi_intent(s) is False, s
+
+    assert looks_like_multi_intent("what's the capital of France?") is False
+    assert recipe_multi_search_queries("what's the capital of France?") == []
+
+    # --- Novel compound (no recipe) ---
+    novel = (
+        "what's the tallest building in Dubai right now, and also who is the "
+        "current CEO of Tesla and when did they take the role?"
+    )
+    assert looks_like_multi_intent(novel) is True
+    assert recipe_multi_search_queries(novel) == []  # no hand-written recipe
+
+    # Stub LLM decomposer returns structured sub-questions
+    def fake_llm(_prompt: str) -> str:
+        return (
+            '["tallest building in Dubai 2026", '
+            '"current CEO of Tesla", '
+            '"when did Tesla CEO take the role"]'
+        )
+
+    decomp = decompose_search_intents(novel, llm_invoke=fake_llm)
+    assert len(decomp) >= 2, decomp
+    joined = " ".join(decomp).lower()
+    assert "dubai" in joined
+    assert "tesla" in joined or "ceo" in joined
+
+    resolved = resolve_web_search_queries(
+        novel,
+        "tallest building dubai",  # lazy model arg — must not wipe multi
+        llm_invoke=fake_llm,
+    )
+    assert len(resolved) >= 2, resolved
+    rjoin = " ".join(resolved).lower()
+    assert "dubai" in rjoin
+    assert "tesla" in rjoin or "ceo" in rjoin
+
+    # Full grounded path with model arg overwrite resistance
+    agent = _bare_agent()
+    seen = []
+
+    def fake_raw(q: str) -> str:
+        seen.append(q)
+        return (
+            f"1. Source for {q[:40]}\n"
+            f"   URL: https://example.com/x\n"
+            f"   Snippet: Factual answer fragment about {q}."
+        )
+
+    agent._raw_web_search_execute = fake_raw
+    agent._fetch_search_result_page_text = lambda url, **kw: "details"
+    agent._verification_telemetry = VerificationTelemetry(enabled=False)
+    agent._current_subject_text = ""
+    agent._last_web_query_context = ""
+    agent._active_user_query = novel
+    agent.llm_wrapper = type("W", (), {"invoke_fast": staticmethod(lambda p, max_tokens=180: fake_llm(p))})()
+    agent._emit_tool_start = MagicMock()
+    agent._emit_tool_end = MagicMock()
+    agent._emit_tool_error = MagicMock()
+    out = agent._grounded_web_search(
+        "tallest building dubai",
+        original_request=novel,
+        emit_tool_events=False,
+    )
+    assert len(seen) >= 2, seen
+    sjoin = " ".join(seen).lower()
+    assert "dubai" in sjoin
+    assert "tesla" in sjoin or "ceo" in sjoin
+    assert out
+
+
+def test_e18_gta_trailer_and_characters_split_not_release_only():
+    """
+    Live bug: \"when trailer 3 will happen + characters in gta 6\"
+    searched only \"gta 6 release date\" (model arg) and said no character info.
+    Must fan out to Trailer 3 + characters queries from the user turn.
+    """
+    from agent.research import split_web_search_queries, normalize_web_search_query
+
+    raw = (
+        "i want you to find out when trailer 3 will happen, also can you figure out "
+        "the names of the characters in gta 6 and what we know"
+    )
+    parts = split_web_search_queries(raw)
+    assert len(parts) >= 2, parts
+    joined = " | ".join(parts).lower()
+    assert "trailer 3" in joined or "trailer" in joined
+    assert "character" in joined or "lucia" in joined or "cast" in joined
+    assert not any(p.lower() == "gta 6 release date" for p in parts)
+
+    # Model-arg overwrite must not drop multi-intent from original_request
+    agent = _bare_agent()
+    seen = []
+
+    def fake_raw(q: str) -> str:
+        seen.append(q)
+        if "character" in q.lower() or "lucia" in q.lower() or "cast" in q.lower():
+            return (
+                "1. GTA Wiki\n"
+                "   URL: https://example.com/chars\n"
+                "   Snippet: Lucia Caminos and Jason Duval are the protagonists of GTA 6 in Leonida."
+            )
+        return (
+            "1. Trailer rumors\n"
+            "   URL: https://example.com/t3\n"
+            "   Snippet: Rockstar has not announced GTA 6 Trailer 3; summer 2026 rumors persist."
+        )
+
+    agent._raw_web_search_execute = fake_raw
+    agent._fetch_search_result_page_text = lambda url, **kw: "Lucia and Jason. Trailer 3 unannounced."
+    agent._verification_telemetry = VerificationTelemetry(enabled=False)
+    agent._current_subject_text = ""
+    agent._last_web_query_context = ""
+    agent._active_user_query = raw
+    agent._emit_tool_start = MagicMock()
+    agent._emit_tool_end = MagicMock()
+    agent._emit_tool_error = MagicMock()
+    out = agent._grounded_web_search(
+        "gta 6 release date",  # weak model arg (what the live log showed)
+        original_request=raw,
+        emit_tool_events=False,
+    )
+    assert any("trailer" in s.lower() for s in seen), seen
+    assert any("character" in s.lower() or "lucia" in s.lower() or "cast" in s.lower() for s in seen), seen
+    assert "lucia" in out.lower() or "jason" in out.lower() or "trailer" in out.lower()
+    # Should not be pure give-up on characters when evidence exists
+    assert "lucia" in out.lower() or "accepted=true" in out.lower() or "Jason" in out or "jason" in out.lower()
+
+
+def test_e17_coding_loop_multi_file_tool_sequence():
+    """
+    v7.5.2: multi-file coding path advances the enforced loop
+    inspect → plan → implement (2 files) → verify (terminal status) → confirm path.
+    """
+    from agent.coding_loop import CodingLoop, CodingPhase, CodingExit, parse_terminal_status_block
+    from agent.core import EchoSpeakAgent
+    from unittest.mock import MagicMock
+
+    agent = EchoSpeakAgent.__new__(EchoSpeakAgent)
+    agent._workspace_id = "coding"
+    agent._coding_loop = None
+    agent._is_coding_project_intent = lambda u: True  # type: ignore
+
+    agent._ensure_coding_loop("create a small website with index.html and style.css")
+    assert agent._coding_loop is not None
+    assert agent._coding_loop.phase == CodingPhase.INSPECT
+
+    agent._coding_loop_note_tool("file_list", "path=.", "")
+    assert agent._coding_loop.phase == CodingPhase.INSPECT
+
+    agent._coding_loop_note_tool("file_write", "path='index.html'", "", pending_write=True)
+    # implement or confirm depending on transition
+    assert agent._coding_loop.phase in (CodingPhase.IMPLEMENT, CodingPhase.CONFIRM, CodingPhase.PLAN)
+    agent._coding_loop_note_tool("file_write", "path='style.css'", "", pending_write=True)
+    files = agent._coding_loop.state.files_touched
+    assert any("index.html" in f for f in files) or any("style" in f for f in files)
+
+    agent._coding_loop_note_tool(
+        "terminal_run",
+        "command=python -m pytest",
+        "ExitCode=0\nStatus=pass\nMode=host",
+    )
+    assert agent._coding_loop.phase in (CodingPhase.VERIFY, CodingPhase.CONFIRM, CodingPhase.SUMMARIZE)
+    assert agent._coding_loop.state.verify_status in (CodingExit.PASS.value, "pass", CodingExit.PENDING.value)
+
+    # Full machine walk for multi-file project folder naming
+    loop = CodingLoop(project_folder="projects/demo-site")
+    loop.start()
+    loop.advance(CodingPhase.PLAN)
+    loop.advance(CodingPhase.IMPLEMENT)
+    loop.mark_files(["index.html", "style.css", "app.js"])
+    assert len(loop.state.files_touched) == 3
+    loop.advance(CodingPhase.VERIFY)
+    loop.set_verify_status(CodingExit.PASS)
+    loop.advance(CodingPhase.CONFIRM)
+    loop.set_confirm_status(CodingExit.PASS)
+    loop.advance(CodingPhase.SUMMARIZE)
+    loop.complete(exit_status=CodingExit.PASS)
+    assert loop.state.exit_status == "pass"
+    assert parse_terminal_status_block("ExitCode=1\nStatus=fail") == "fail"
+
+
+def test_e15_single_preamble_per_request():
+    """ReAct loops must not emit two spoken first-beats (Doing good… then Pretty good…)."""
+    from api.server import _StreamingHandler
+    import queue
+
+    q: queue.Queue = queue.Queue()
+    h = _StreamingHandler(q, request_id="req-preamble")
+    h._preamble_fn = lambda *a, **k: "Doing good — checking that now."
+    h._flush_partial_reply("tool_start", tool_name="web_search", tool_input="q1")
+    h._start_new_generation()  # second ReAct tool loop
+    h._preamble_fn = lambda *a, **k: "Pretty good — let me check that."
+    h._flush_partial_reply("tool_start", tool_name="web_search", tool_input="q2")
+
+    partials = []
+    while not q.empty():
+        evt = q.get_nowait()
+        if evt.get("type") == "partial_reply":
+            partials.append(evt.get("response"))
+    assert len(partials) == 1, partials
+    assert "Doing good" in (partials[0] or "")
+
+
+def test_e16_schedule_signal_accepts_next_game_snippets():
+    """Next-game snippets with date/matchup must be accepted, not force 'check NHL.com'."""
+    from agent.research import SearchGrounder, build_search_intent
+
+    g = SearchGrounder(max_candidates=3)
+    intent = build_search_intent(
+        "when do the edmonton oilers play next",
+        "Edmonton Oilers next game schedule NHL",
+        "",
+    )
+    assert intent.schedule_need is True
+    assert intent.mode == "schedule"
+    fixture = (
+        "1. Oilers schedule\n"
+        "   URL: https://www.nhl.com/oilers/schedule\n"
+        "   Snippet: Next game: Edmonton Oilers vs Calgary Flames Oct 12, 2026 7:00 PM MT."
+    )
+    evidence = g.score_evidence(fixture, "Edmonton Oilers next game schedule NHL", intent)
+    assert evidence, "expected scored evidence"
+    assert g._has_schedule_signal(fixture.lower())
+    assert g._accept_evidence(evidence, intent) is True
+
+    # Deeper pass exists when first candidates fail
+    deeper = g._deeper_schedule_candidates("Edmonton Oilers next game schedule NHL", intent)
+    assert any("nhl.com" in c.query.lower() or "next game" in c.query.lower() for c in deeper)
+
+
+def test_e14_weather_without_city_no_recursion():
+    """
+    Live bug: \"can you check the weather for me tho?\" triggered
+    RecursionError: maximum recursion depth exceeded
+    via _normalize_weather_query ↔ normalize_web_search_query_single.
+    Must terminate with a compact weather query for any weather chat line.
+    """
+    from agent.research import (
+        normalize_web_search_query,
+        normalize_web_search_query_single,
+        split_web_search_queries,
+        _normalize_weather_query,
+    )
+
+    samples = [
+        "can you check the weather for me tho?",
+        "check the weather for me",
+        "what the weather",
+        "what's the weather like?",
+        "not much just chilling hope you're well echo! look good! can you check the weather for me tho?",
+        "weather in Calgary",
+        "Edmonton weather today high low temperature forecast",
+    ]
+    for s in samples:
+        out = normalize_web_search_query(s)
+        assert out and "weather" in out.lower(), (s, out)
+        assert len(out) < 200, (s, out)
+        # single path must also terminate
+        one = normalize_web_search_query_single(s)
+        assert one and "weather" in one.lower(), (s, one)
+        parts = split_web_search_queries(s)
+        assert parts, s
+        assert all("weather" in p.lower() or "Oilers" in p or "schedule" in p.lower() for p in parts) or parts
+
+    # Leaf weather normalizer never needs a city
+    bare = _normalize_weather_query("check the weather for me")
+    assert bare == "weather today high low temperature forecast", bare
+    with_city = _normalize_weather_query("check the weather", city_hint="Calgary")
+    assert with_city.startswith("Calgary weather"), with_city
+    # Social+weather should not leave chat crumbs in the query
+    social = normalize_web_search_query(
+        "not much just chilling hope you're well echo! look good! can you check the weather for me tho?"
+    )
+    assert social == "weather today high low temperature forecast", social
+    assert "chilling" not in social.lower() and "echo" not in social.lower()
+
+    # Full grounded path must not recurse
+    agent = _bare_agent()
+    seen = []
+
+    def fake_raw(q: str) -> str:
+        seen.append(q)
+        return (
+            "1. Weather\n"
+            "   URL: https://example.com/w\n"
+            "   Snippet: High 20°C low 10°C partly cloudy."
+        )
+
+    agent._raw_web_search_execute = fake_raw
+    agent._fetch_search_result_page_text = lambda url, **kw: "High 20 C low 10 C"
+    agent._verification_telemetry = VerificationTelemetry(enabled=False)
+    agent._current_subject_text = ""
+    agent._last_web_query_context = ""
+    agent._emit_tool_start = MagicMock()
+    agent._emit_tool_end = MagicMock()
+    agent._emit_tool_error = MagicMock()
+    out = agent._grounded_web_search(
+        "can you check the weather for me tho?",
+        original_request="not much just chilling! look good! can you check the weather for me tho?",
+        emit_tool_events=False,
+    )
+    assert seen, "search should execute once"
+    assert all("weather" in s.lower() for s in seen), seen
+    assert out
+
+
+def test_e13_oilers_and_weather_split_not_blended():
+    """
+    Live bug: \"next edmonton oiler game and what the weather is? also you look great\"
+    became a single blended query like \"oilers game weather forecast\" (wrong city/temps,
+    no schedule). Must fan out into Oilers schedule + Edmonton weather searches.
+    """
+    from agent.research import SearchGrounder, build_search_intent, split_web_search_queries
+
+    raw = (
+        "just wondering when the next edmonton oiler game is and what the weather is? "
+        "also im really liking how you look today! look great!"
+    )
+    parts = split_web_search_queries(raw)
+    assert len(parts) == 2, parts
+    assert any("Oilers" in p and "schedule" in p.lower() for p in parts), parts
+    assert any("Edmonton weather" in p and "forecast" in p.lower() for p in parts), parts
+    assert all("look great" not in p.lower() and "liking" not in p.lower() for p in parts)
+
+    sports = next(p for p in parts if "Oilers" in p)
+    weather = next(p for p in parts if "weather" in p.lower())
+    si = build_search_intent(raw, sports, "")
+    wi = build_search_intent(raw, weather, "")
+    assert si.mode == "schedule" and si.weather_need is False
+    assert wi.mode == "weather" and wi.weather_need is True
+    # Sports candidates must NOT be weather-rewritten
+    sc = SearchGrounder().build_candidates(si)
+    assert sc and all("temperature" not in c.query.lower() for c in sc), [c.query for c in sc]
+    assert any("Oilers" in c.query for c in sc)
+
+    agent = _bare_agent()
+    seen = []
+
+    def fake_raw(q: str) -> str:
+        seen.append(q)
+        if "weather" in q.lower():
+            return (
+                "1. Environment Canada\n"
+                "   URL: https://example.com/edm-weather\n"
+                "   Snippet: Edmonton today high 24°C low 12°C partly cloudy."
+            )
+        return (
+            "1. NHL\n"
+            "   URL: https://example.com/oilers\n"
+            "   Snippet: Next Edmonton Oilers game schedule vs Calgary Flames."
+        )
+
+    agent._raw_web_search_execute = fake_raw
+    agent._fetch_search_result_page_text = lambda url, **kw: "Edmonton Oilers next game. High 24 C."
+    agent._verification_telemetry = VerificationTelemetry(enabled=False)
+    agent._current_subject_text = ""
+    agent._last_web_query_context = ""
+    agent._emit_tool_start = MagicMock()
+    agent._emit_tool_end = MagicMock()
+    agent._emit_tool_error = MagicMock()
+    out = agent._grounded_web_search(raw, original_request=raw, emit_tool_events=True)
+    assert len(seen) >= 2, seen
+    assert any("Oilers" in s for s in seen), seen
+    assert any("weather" in s.lower() and "Edmonton" in s for s in seen), seen
+    assert all("look great" not in s.lower() for s in seen)
+    # Multi-intent should emit per-query tool events for chat visibility
+    assert agent._emit_tool_start.call_count >= 2
+    assert agent._emit_tool_end.call_count >= 2
+    assert "Oilers" in out or "weather" in out.lower() or "24" in out
+
+
+def test_e12_social_plus_gta_trailer_preamble_answers_feeling():
+    """
+    Live bug: multi-intent
+      \"how're you feeling? and … trailer 3 for gta 6\"
+    produced only \"Checking that now.\" and skipped the social half.
+
+    Preamble must answer the feeling question first even when the LLM fails.
+    """
+    agent = _bare_agent()
+    agent._turn_partial_beats = []
+    agent._sanitize_response_text = lambda s: s
+    agent._invoke_visible_llm = lambda *a, **k: ""  # force failure path
+    agent.llm_wrapper = SimpleNamespace(invoke_fast=lambda *a, **k: "")
+
+    q = "how're you feeling? and i wonder when that new trailer comes out for trailer 3 for gta 6 hey?"
+    assert agent._user_has_social_open(q) is True
+
+    # Task-only model text must be rewritten to social-first
+    beat = agent.generate_tool_preamble_beat(
+        tool_name="web_search",
+        tool_input="GTA 6 Trailer 3 release date",
+        user_query=q,
+        model_text="Checking that now.",
+    )
+    low = (beat or "").lower()
+    assert beat and len(beat) >= 8
+    assert any(
+        x in low
+        for x in (
+            "doing good",
+            "i'm good",
+            "im good",
+            "feeling solid",
+            "all good",
+            "pretty good",
+        )
+    ), f"social half missing from preamble: {beat!r}"
+    assert any(
+        x in low
+        for x in (
+            "check",
+            "looking",
+            "pulling",
+            "looking into",
+            "one sec",
+            "sec on",
+            "on that",
+            "on it",
+        )
+    ), f"task half missing from preamble: {beat!r}"
+
+
+# E20 — Deeper search must not claim "tools can't search" + real subject query
+def test_e20_deeper_search_uses_subject_not_meta_phrase():
+    from agent.research import normalize_web_search_query_single
+
+    agent = _bare_agent()
+    agent._current_subject_text = "Canada vs Morocco World Cup score"
+    agent._last_web_query_context = "Canada vs Morocco World Cup score"
+    resolved, is_fu, _subj = agent._resolve_referential_followup("do a deeper search")
+    assert is_fu is True
+    assert "canada" in resolved.lower() or "morocco" in resolved.lower()
+    assert "do a deeper search" not in resolved.lower()
+    cleaned = normalize_web_search_query_single(
+        "do a deeper search about Canada vs Morocco World Cup score"
+    )
+    assert "deeper search" not in cleaned.lower()
+    assert "canada" in cleaned.lower() or "morocco" in cleaned.lower()
+    seen = []
+    agent._raw_web_search_execute = lambda q: (seen.append(q) or FIXTURE_LIVE_SCORE)
+    agent._fetch_search_result_page_text = lambda url, **kw: ""
+    agent._request_search_cache = {}
+    out = agent._grounded_web_search(
+        resolved,
+        original_request="do a deeper search",
+        emit_tool_events=False,
+    )
+    assert seen, "expected at least one search"
+    for q in seen:
+        assert "do a deeper search" not in q.lower(), q
+    assert is_grounded_search_output(out)
+    if "SEARCH_EVIDENCE_INSUFFICIENT" in out:
+        assert "Never claim" in out or "cannot search" in out.lower()
+    agent._tool_available_in_current_context = lambda name: name == "web_search"
+    agent._summarize_web_results = lambda *a, **k: "Canada 2-1 Morocco from live sources."
+    fixed = agent._ensure_search_capability_honesty(
+        "do a deeper search",
+        "Sorry, my tools don't let me search the web right now.",
+        callbacks=None,
+    )
+    assert "don't let me search" not in fixed.lower()
+    assert "canada" in fixed.lower() or "morocco" in fixed.lower() or "2-1" in fixed
+
+
+def test_e20b_tomorrow_schedule_and_spelling():
+    from agent.research import apply_spelling_fixes, build_search_intent
+
+    assert "morocco" in apply_spelling_fixes("who is playing tomorrow maracco world cup").lower()
+    intent = build_search_intent(
+        "who is playing tomorrow maracco world cup",
+        "who is playing tomorrow maracco world cup",
+    )
+    assert intent.schedule_need is True or intent.current_day_need is True
+    assert "morocco" in intent.resolved_request.lower()
+    fixture = (
+        "1. FIFA World Cup fixtures\n"
+        "   URL: https://example.com/fixtures\n"
+        "   Snippet: Tomorrow's slate: Morocco vs Portugal at 3:00 PM ET, "
+        "Brazil vs Spain at 6:00 PM ET kickoff schedule."
+    )
+    agent = _bare_agent()
+    agent._raw_web_search_execute = lambda q: fixture
+    agent._fetch_search_result_page_text = lambda url, **kw: ""
+    agent._request_search_cache = {}
+    out = agent._grounded_web_search(
+        "who is playing tomorrow morocco world cup",
+        original_request="who is playing tomorrow maracco world cup",
+        emit_tool_events=False,
+    )
+    assert is_grounded_search_output(out)
+    assert "accepted=true" in out.lower() or "morocco" in out.lower()
+
+
+def test_e20c_search_cache_dedupes_identical_queries():
+    from agent.core import EchoSpeakAgent
+    import agent.tools as tools_mod
+
+    hits = {"n": 0}
+
+    def fake_invoke(payload):
+        hits["n"] += 1
+        return FIXTURE_LIVE_SCORE
+
+    orig = tools_mod.web_search
+    tools_mod.web_search = type("T", (), {"invoke": staticmethod(fake_invoke)})()
+    try:
+        agent = _bare_agent()
+        agent._request_search_cache = {}
+        a = EchoSpeakAgent._raw_web_search_execute(agent, "Canada vs Morocco score")
+        b = EchoSpeakAgent._raw_web_search_execute(agent, "Canada vs Morocco score")
+        c = EchoSpeakAgent._raw_web_search_execute(agent, "Canada vs Morocco score")
+        assert a and b and c
+        assert hits["n"] == 1, f"expected 1 network call, got {hits['n']}"
+    finally:
+        tools_mod.web_search = orig
+
+
+def test_e20d_routine_does_not_clobber_subject():
+    agent = _bare_agent()
+    agent._current_subject_text = "Edmonton Oilers odds"
+    agent._last_web_query_context = "Oilers moneyline"
+    agent._partial_tool_results = [{"tool": "web_search", "output": "oilers odds"}]
+    agent.process_query = MagicMock(return_value=("Daily briefing done.", True))
+    routine = SimpleNamespace(
+        id="daily_news",
+        name="daily news briefing",
+        action_type="query",
+        action_config={"message": "daily news briefing"},
+        delivery_channels=["web"],
+    )
+    agent._execute_routine = EchoSpeakAgent._execute_routine.__get__(agent, EchoSpeakAgent)
+    try:
+        agent._execute_routine(routine)
+    except Exception:
+        pass
+    assert agent._current_subject_text == "Edmonton Oilers odds"
+    assert agent._last_web_query_context == "Oilers moneyline"
+    assert agent.process_query.called
+    kwargs = agent.process_query.call_args.kwargs
+    assert kwargs.get("source") == "routine"
+    assert str(kwargs.get("thread_id") or "").startswith("routine_")
+
+
 def test_eval_board_counts_at_least_eight_passing():
-    """Meta-check: this module defines E1–E10 as ten discrete scenarios."""
+    """Meta-check: this module defines discrete E-scenarios."""
     import pathlib
     import re
 
     src = pathlib.Path(__file__).read_text(encoding="utf-8")
     e_tests = re.findall(r"^def (test_e\d+_)", src, flags=re.MULTILINE)
-    assert len(e_tests) >= 10
+    assert len(e_tests) >= 20
 

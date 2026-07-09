@@ -695,20 +695,38 @@ def terminal_run(command: str, cwd: Optional[str] = ".", timeout: Optional[int] 
         timeout_s = default_timeout
     timeout_s = max(1, min(120, timeout_s))
 
-    if getattr(config, "terminal_execution_mode", "host") == "docker":
-        try:
-            from agent.sandbox import DockerSandbox
-            out = DockerSandbox.run_command(command, cwd=str(cwd_p), timeout=timeout_s)
-            try:
-                max_chars = int(getattr(config, "terminal_max_output_chars", 8000) or 8000)
-            except Exception:
-                max_chars = 8000
-            if max_chars > 0 and len(out) > max_chars:
-                out = out[:max_chars].rstrip() + "…"
-            return out
-        except Exception as e:
-            return f"Failed to run command in Docker sandbox: {str(e)}"
+    # v7.5.0: host (default) vs docker/sandbox — never silent-fallback from docker to host.
+    try:
+        from agent.sandbox import normalize_execution_mode, run_sandboxed_terminal
+    except Exception:
+        normalize_execution_mode = None  # type: ignore
+        run_sandboxed_terminal = None  # type: ignore
 
+    mode = "host"
+    if callable(normalize_execution_mode):
+        mode = normalize_execution_mode(getattr(config, "terminal_execution_mode", "host"))
+    else:
+        raw_mode = str(getattr(config, "terminal_execution_mode", "host") or "host").strip().lower()
+        mode = "docker" if raw_mode in {"docker", "sandbox", "container"} else "host"
+
+    if mode == "docker":
+        if not callable(run_sandboxed_terminal):
+            return (
+                "ExitCode=127\n"
+                "Status=sandbox_unavailable\n"
+                "Mode=docker\n"
+                "Reason=sandbox_unavailable: agent.sandbox module failed to import. "
+                "Fix the install or set TERMINAL_EXECUTION_MODE=host (unsandboxed)."
+            )
+        result = run_sandboxed_terminal(
+            command,
+            cwd=cwd_p,
+            timeout_s=timeout_s,
+            denylist_check=_terminal_command_denied,
+        )
+        return result.format()
+
+    # ---- host path (unchanged default behavior) ----
     cmd: list[str]
     if os.name == "nt":
         cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
@@ -739,14 +757,18 @@ def terminal_run(command: str, cwd: Optional[str] = ".", timeout: Optional[int] 
             max_chars = 8000
         if max_chars > 0 and len(out) > max_chars:
             out = out[:max_chars].rstrip() + "…"
-        header = f"ExitCode={proc.returncode}"
+        status = "pass" if int(proc.returncode) == 0 else "fail"
+        header = f"ExitCode={proc.returncode}\nStatus={status}\nMode=host"
         if out:
             return header + "\n" + out
         return header
     except subprocess.TimeoutExpired:
-        return f"Command timed out after {timeout_s}s."
+        return (
+            f"ExitCode=124\nStatus=timeout\nMode=host\n"
+            f"Reason=Command timed out after {timeout_s}s."
+        )
     except Exception as e:
-        return f"Failed to run command: {str(e)}"
+        return f"ExitCode=1\nStatus=fail\nMode=host\nReason=Failed to run command: {str(e)}"
 
 
 def _artifacts_root() -> Path:

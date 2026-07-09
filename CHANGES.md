@@ -1,5 +1,142 @@
 # Changes
 
+## v7.6.0b - Search honesty, tomorrow schedules, dedupe, routine isolation
+
+### Critical — false “I can’t search”
+- **Root cause:** “do a deeper search” expanded to meta-queries (`do a deeper search about …`), Stage 3 skipped for tool-calling models, and live-web recovery didn’t treat deeper-search as needing web — so the model invented “tools don’t let me search” after successful searches.
+- **Fix:** expand deeper-search to the **current subject** (not the meta phrase); strip deeper-search wrappers in normalize; force Stage 3 grounded path for deeper/schedule follow-ups even on tool-calling models; `_ensure_search_capability_honesty` rewrites false unavailability claims; grounded packets forbid claiming web_search is disabled.
+
+### Schedule “tomorrow” + STT typos
+- Schedule intent covers who-is-playing / games **tomorrow|tonight|today** (not only “today”).
+- Soft-accept near-future fixture matchups; schedule candidates include tomorrow ISO + day word.
+- Spelling fixes for common STT errors (`maracco`→`morocco`, etc.).
+
+### Wasteful re-search
+- Per-request `_request_search_cache` on raw Tavily execute (identical queries hit network once).
+- Default grounding max candidates lowered to 2; multi-intent small-talk no longer fans out as fake sub-queries.
+
+### Background task bleed
+- Routines run with `source=routine`, isolated `thread_id`, no UI callbacks/stream buffer.
+- Snapshot/restore `current_subject` + last web context so a “daily news briefing” cannot clobber the active chat topic.
+
+### Tests
+- E20 / E20b–d: deeper-search honesty, tomorrow+spelling, search cache, routine subject isolation.
+
+## v7.6.0 - Real MCP stdio client (start / list / call)
+
+### Backend / MCP
+- Replaced stub `mcp_client.py` with a real **stdio JSON-RPC** client (Content-Length framing, MCP 2024-11-05 subset).
+- Flow: start process → `initialize` → `notifications/initialized` → `tools/list` → register → `tools/call`.
+- Tools register as `mcp__<server>__<tool>` into `ToolRegistry` (category `mcp`); LangChain `StructuredTool` when possible.
+- Process-wide singleton `get_mcp_manager()` shared by agent init and Trust Center / capabilities.
+- **Trust honesty:** configured servers ≠ available tools; start failures surface `last_error` per server; `mcp_available` only when `loaded_tool_count > 0`.
+- Untrusted servers mark tools `is_action` + moderate risk; `trust: trusted` is safe/non-action.
+- Windows-safe: background reader thread (no `select` on pipes).
+- Config: existing `MCP_SERVERS` JSON / `config.mcp_servers` (`command`, `args`, `env`, `transport`, `trust`, `enabled`, `timeout_s`).
+
+### Tests
+- `tests/fixtures/mock_mcp_server.py` — minimal echo/add MCP server.
+- `tests/test_mcp_v760.py` — list+call, bad command fails loud, configured≠available, disabled/unsupported transport.
+
+## v7.5.4 - General multi-intent decomposition fallback
+
+### Backend / Research
+- **Problem:** multi-intent only worked for hand-written recipes; other compounds fell to one junk string then the model’s lazy tool arg.
+- **Fix:** `looks_like_multi_intent` (cheap gate) → recipe fast path → `decompose_search_intents` (LLM or heuristic) → each sub-query through existing `_grounded_web_search`.
+- `resolve_web_search_queries` is the single entry; never overwrites a real multi-split with a single model query.
+- Recipes (weather+sports, GTA trailer+cast) unchanged as free fast path.
+- E19: novel Dubai/Tesla compound + simple-question false-positive guard.
+
+## v7.5.3 - GTA multi-intent (Trailer 3 + characters) no more release-only give-up
+
+### Backend / Research
+- **Why it failed:** multi-intent split only handled sports+weather; “trailer 3 + characters in gta 6” collapsed to one weak string; then `_grounded_web_search` **replaced** a single split with the model’s `gta 6 release date` arg — characters never searched; `accepted=false` told the model to give up.
+- **Fix:** fan-out Trailer N + cast/characters queries; keep user-turn multi splits (don’t overwrite with model-only arg); soft-accept when Lucia/Jason/trailer rumor snippets appear so synthesis reports best-available facts.
+- E18 locks the live failure case.
+
+## v7.5.2 - Coding loop wired into agent + multi-file eval
+
+### Backend
+- `EchoSpeakAgent` owns `_coding_loop`; starts on coding workspace / coding intent in `process_query`.
+- Tool completions (`_emit_tool_end`, TaskPlanner, pending `file_write`) call `_coding_loop_note_tool` to advance phases from real tool use (not model memory).
+- `CodingLoop.note_tool` / `fast_forward_to` auto-walk legal edges for inspect/implement/verify/confirm.
+- Doctor report + `/coding/readiness` expose live `coding_loop` snapshot (phase, files_touched, verify/exit status).
+- E17 multi-file coding-loop fixture on the eval board.
+
+## v7.5.1 - Mount escape hardening + dual denylist + coding loop machine
+
+### Backend
+- **Path boundary:** `assert_safe_project_path` / `path_is_within_root` resolve real paths so symlink roots and `..` climbs cannot map CWD outside FILE_TOOL roots; forbidden mounts (docker.sock, .ssh, …) skipped.
+- **Denylist dual-layer:** sandbox path always re-checks denylist via `default_denylist_check` (same config list as host tools) even if the caller forgets to pass a checker.
+- **Coding loop (v7.5.2 foundation):** `agent/coding_loop.py` enforces inspect→plan→implement→verify→confirm→summarize as illegal-transition-proof states; exit statuses pass/fail/timeout/denied/sandbox_unavailable/cancelled/pending; `project_folder_for_name` for named project dirs under FILE_TOOL_ROOT/projects/.
+- `/coding/readiness` recommended_loop now includes **confirm**.
+
+### Tests
+- `tests/test_sandbox_v751.py` — escape, symlink, denylist, coding loop order.
+
+## v7.5.0 - Terminal execution modes + Docker sandbox skeleton
+
+### Backend
+- Added `agent/sandbox.py`: `TERMINAL_EXECUTION_MODE=host` (default, unchanged) vs `docker`/`sandbox`.
+- Docker path: one-shot `docker run --rm --network=none`, non-root user, memory/CPU limits, mounts **only** `FILE_TOOL_ROOT` + `FILE_TOOL_EXTRA_ROOTS`, **never** docker.sock; denylist re-checked before start.
+- **No silent host fallback** when sandbox mode is selected — returns `Status=sandbox_unavailable` with an explicit reason.
+- Host path now also emits `Status=pass|fail|timeout` + `Mode=host` for consistent classification.
+- Config: `TERMINAL_DOCKER_IMAGE`, `TERMINAL_DOCKER_MEMORY`, `TERMINAL_DOCKER_CPUS`, `TERMINAL_DOCKER_USER`.
+- `GET /coding/readiness` includes `sandbox` status (mode, ready, mounts, docker probe message).
+
+### Tests
+- `tests/test_sandbox_v750.py` — mode normalize, mounts, unavailable/denied paths, no host fallback, readiness contract.
+
+## v7.4.9 - Single first-beat + schedule deeper search (no early give-up)
+
+### Backend
+- **Double first beat:** ReAct loop reset `_preamble_done_this_gen` so a second `web_search` emitted another “Doing good / Pretty good” spoken line. Now `_preamble_done_this_request` seals **one** pre-tool beat per request.
+- **Oilers/schedule “gave up”:** Schedule evidence was scored like generic “specific answer” and often rejected (or instructed as insufficient), so the model said “check NHL.com” even with sources. Dedicated `_has_schedule_signal`, schedule scoring/accept, deeper second-pass candidates (`site:nhl.com`, next game year), soft-accept when date/matchup snippets exist, and synthesis instructions to report best-available dates instead of bailing.
+
+### Tests
+- E15: single preamble per request across gen reset
+- E16: schedule next-game snippets accepted
+
+## v7.4.8 - Fix weather search RecursionError (city-less “check the weather”)
+
+### Backend / Research
+- **Root cause (confirmed, not guessed):** `_normalize_weather_query` called `normalize_web_search_query_single`, which re-entered `_normalize_weather_query` for any weather line without a city → infinite recursion → `Failed web_search: maximum recursion depth exceeded` on prompts like “can you check the weather for me tho?”.
+- Fixed: weather normalizer is a **leaf** (uses `_strip_weather_chat_filler` only); no cycle with single-query normalize.
+- Bare weather queries compact to `weather today high low temperature forecast`; city from subject/context still injected when known.
+- E14 regression locks the no-recursion path for social+weather and city-less weather.
+
+## v7.4.7 - Multi-intent search fan-out + tool rows after multi-beat
+
+### Backend / Research
+- Fixed Oilers+weather multi-intent: one blended query (`oilers game weather forecast`) dropped schedule and polluted weather. Now `split_web_search_queries()` fans out to separate grounded searches (e.g. `Edmonton Oilers next game schedule NHL` + `Edmonton weather today high low temperature forecast`), with team→city inference for bare “what’s the weather”.
+- Intent mode is classified from the **resolved** query only so sports queries never enter weather candidate rewrite.
+- Multi-intent `_grounded_web_search` emits per-query tool_start/end for chat visibility.
+
+### Web UI
+- After a `partial_reply` (social beat), thinking activity is re-timestamped and shows `checking…` then real `Searching: <query>` / `Search done (N sources): <query>` rows **below** the spoken beat (same as single-response turns).
+
+### Tests
+- E13: Oilers + weather split, no blend, dual tool emits.
+
+## v7.4.6 - Search query normalization (no raw chat as Tavily query)
+
+### Backend / Research
+- Root cause: multi-intent chat (e.g. “how’re you feeling? and i wonder when trailer 3 for gta 6…”) was passed through `_extract_search_query` / Stage-4 tool args almost unchanged; `_clean_query` only stripped a few polite words. Also `"won"` substring matched inside `"wonder"` as a live-web false positive.
+- Added `normalize_web_search_query()` — strips social openers/filler, picks the factual clause, rewrites GTA/trailer release asks to compact queries like `GTA 6 Trailer 3 release date`.
+- Applied at `_extract_search_query`, `_grounded_web_search` entry, SearchGrounder candidates, and extract_research_query.
+- Live-web triggers now use word boundaries; release-date intent sets specific+recency candidates.
+- E12 search-query fixture locks the GTA multi-intent case.
+
+## v7.4.5 - Memory save discipline + E11 long-conversation board
+
+### Backend / Memory
+- Fixed regression: `_record_turn` always called `add_conversation` (type=conversation → FAISS), so UI "Memory saved (X)" fired nearly every turn even with `MEMORY_AUTO_STORE_CONVERSATIONS=false`. Raw turns are gated again; durable path remains profile/curated/typed only.
+- Vector injection prefers typed memories; when auto-store is off, raw `type=conversation` dumps are not injected into prompt context (session + ephemeral chat own multi-turn).
+- Stronger subject continuity: hollow opinion follow-ups ("what do you think about it?"), pronoun-heavy short questions, and explicit "remember …" writes no longer overwrite `current_subject`.
+
+### Tests
+- Added E11 long-conversation eval (20 turns: follow-ups, weather switch + switch-back, late referential resolve, memory-save frequency, session vs vector agreement, Memory Doctor dominance check). Board is now E1–E11.
+
 ## v7.4.4 - Eval Harness E1–E10 (CI fixtures)
 
 ### Backend / Tests

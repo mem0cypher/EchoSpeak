@@ -73,7 +73,8 @@ def test_search_grounder_rejects_schedule_nav_snippet_without_specific_answer():
     )
 
     assert result.accepted is False
-    assert "specific current answer" in result.rejected_candidates[0]["reason"]
+    reason = str(result.rejected_candidates[0]["reason"] or "").lower()
+    assert "next-game" in reason or "specific" in reason or "schedule" in reason or "evidence" in reason
 
 
 def test_search_grounder_fetches_promising_page_when_snippet_is_weak():

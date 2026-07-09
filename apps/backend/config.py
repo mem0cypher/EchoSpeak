@@ -593,7 +593,13 @@ class Config:
                 self.mcp_servers = {}
         else:
             self.mcp_servers = {}
+        # host = legacy PowerShell/shell on the machine (default until sandbox is proven)
+        # docker|sandbox = isolated container (v7.5); never silent-fallback to host
         self.terminal_execution_mode = os.getenv("TERMINAL_EXECUTION_MODE", "host").strip().lower()
+        self.terminal_docker_image = os.getenv("TERMINAL_DOCKER_IMAGE", "python:3.12-slim").strip() or "python:3.12-slim"
+        self.terminal_docker_memory = os.getenv("TERMINAL_DOCKER_MEMORY", "512m").strip() or "512m"
+        self.terminal_docker_cpus = os.getenv("TERMINAL_DOCKER_CPUS", "1.0").strip() or "1.0"
+        self.terminal_docker_user = os.getenv("TERMINAL_DOCKER_USER", "65534:65534").strip() or "65534:65534"
         self.skill_curator_interval_minutes = int(os.getenv("SKILL_CURATOR_INTERVAL_MINUTES", "120") or 120)
         raw_notification_channels = os.getenv("NOTIFICATION_CHANNELS", "web")
         self.notification_channels = [
@@ -1078,6 +1084,10 @@ class Config:
             "twitter_autonomous_prompt",
             "mcp_servers",
             "terminal_execution_mode",
+            "terminal_docker_image",
+            "terminal_docker_memory",
+            "terminal_docker_cpus",
+            "terminal_docker_user",
             "skill_curator_interval_minutes",
         }
 

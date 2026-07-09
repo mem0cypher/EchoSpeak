@@ -1,13 +1,36 @@
 # EchoSpeak Roadmap
 
+## v7.5–v7.7 — Next sequence (dependencies-first)
+
+**Status:** Planned (post harness stability)  
+**Principle:** Safety and real integration substrate before feature surface area.
+
+| Phase | Milestone | Why first | Status |
+|-------|-----------|-----------|--------|
+| **1** | **v7.5 — Terminal/coding hardening + sandbox** | Daily coding/terminal is primary workflow — isolate before blast radius grows | **v7.5.x shipped** |
+| **2** | **v7.6 — Real MCP client** | Calendar/todo “via MCP” is empty until tools list+invoke for real | **v7.6.0 shipped** |
+| **3** | **v7.7 — Tasks / calendar / to-do on MCP** | Wiring + UX on real MCP; local todos stay offline fallback | Planned |
+
+**v7.5.0 done:** `TERMINAL_EXECUTION_MODE` host (default) vs docker/sandbox; `agent/sandbox.py` runner; no silent host fallback; `/coding/readiness.sandbox`; tests in `tests/test_sandbox_v750.py`.  
+**v7.5.1 done:** mount/symlink/`..` boundary checks; dual denylist; coding_loop state machine module + project folder helper; readiness loop includes confirm.  
+**v7.5.2 done:** coding loop started in `process_query`; advanced from tool_end / TaskPlanner / pending writes; readiness+doctor expose state; E17 multi-file fixture.  
+**v7.6.0 done:** real stdio MCP client (`initialize` → `tools/list` → `tools/call`); `mcp__server__tool` registration; singleton manager shared by agent + Trust Center; configured ≠ available; mock server tests.  
+**Still open (polish):** deeper UI binding of checklist/Code panel to `coding_loop` stream events; v7.6.1 chat E2E invoke polish; v7.6.2 approval gates UX; then v7.7 calendar/tasks.
+
+See detailed plan in section **“Next sequence plan (v7.5–v7.7)”** at the end of this file.  
+Full capability test rundown: `apps/backend/TEST_RUNDOWN.md`.
+
+---
+
 ## v7.4 — Harness Completeness (Gemma-first)
 
 **Status:** Done ✅ (spine A–F)  
 **Primary model:** Gemma 4 4B via LM Studio (native tool-calling golden path)  
 **Success bar:** ≥8/10 of E1–E10 eval fixtures stable; zero raw tool-call syntax in chat  
 **Autonomy:** confirm-default for all of v7.4 (no trusted-autonomous mode yet)  
-**CI eval board:** 10/10 deterministic fixtures pass (`tests/test_eval_harness_e1_e10.py`)  
-**Full suite:** 244 passed
+**CI eval board:** E1–E12 deterministic fixtures pass (`tests/test_eval_harness_e1_e10.py`)  
+**Full suite:** 248 passed (2026-07-08); web vitest 12 passed  
+**Manual rundown:** `apps/backend/TEST_RUNDOWN.md` (updated v7.4.6)
 
 ### Decisions locked
 
@@ -25,13 +48,17 @@
 | **v7.4.2** | **D — Context budget on Stage 5 + real summarize/compact** | **Done** |
 | **v7.4.3** | **E — Full suite green + endpoint contracts** | **Done** |
 | **v7.4.4** | **F — E1–E10 eval fixture board** | **Done** |
+| **v7.4.5** | Memory save discipline + E11 long-convo board | **Done** |
+| **v7.4.6** | Search query normalize + social preamble fallback + E12 | **Done** |
 
 ### Completed
 
 - Shared `_grounded_web_search()` for Stage 3, TaskPlanner, and native LangGraph tools; structured insufficient-evidence packets.
 - Printed-tool intercept + telemetry; partial-tool synthesis after LangGraph failure.
 - Context budget compresses under pressure; Stage 5 + mid-task reinjection covered.
-- Endpoint contracts + full suite green; E1–E10 CI board with recorded fixtures.
+- Endpoint contracts + full suite green; E1–E12 CI board with recorded fixtures.
+- Raw conversation auto-store gated; multi-intent search no longer ships chat text to Tavily.
+- Full manual capability rundown maintained in `apps/backend/TEST_RUNDOWN.md`.
 
 ---
 
@@ -1349,6 +1376,196 @@ def test_soul_with_skills():
 
 ---
 
-**Document Version:** 1.0  
-**Last Updated:** 2026-03-01  
-**Author:** Cascade AI
+**Document Version:** 1.1  
+**Last Updated:** 2026-07-09  
+**Author:** Cascade AI / product sequencing update
+
+---
+
+## Next sequence plan (v7.5–v7.7)
+
+> **Why this order:** safety before habit; real integration substrate before product surface; no promising calendar/todo “via MCP” while MCP is still a stub.
+
+### Current state (honest)
+
+| Area | What exists today | Gap |
+|------|-------------------|-----|
+| **Terminal** | `terminal_run` on **host** (`TERMINAL_EXECUTION_MODE=host`), denylist, chaining guards, timeout/output caps | No Docker/sandbox isolation; denylist is necessary but not sufficient if you lean into coding daily |
+| **Files / coding** | `FILE_TOOL_ROOT` + confirm for writes; Code panel diffs; workspace explorer; coding readiness endpoint; inspect→plan→… **prompted**, not fully enforced as a task state machine | Cycle works for demos; multi-file projects need tighter verify/confirm loops |
+| **MCP** | Trust Center + config keys + **real stdio client** (v7.6.0): list/call + `mcp__` registry | HTTP/SSE transports, calendar product, approval UX polish still open |
+| **Todos** | Local `todo_manage` + `/todos` API + TodoPanel | Echo-local list only — not Google Calendar / external task managers |
+| **Calendar skill** | Skill package under `skills/calendar/` | Not MCP-backed; don’t build more bespoke until MCP works |
+
+v7.4 harness (search, multi-beat, memory discipline, eval board) is the right foundation. **Do not layer more product chrome on a fake MCP client.**
+
+---
+
+### Phase 1 — v7.5: Terminal / coding hardening (+ sandbox)
+
+**Goal:** Safe enough to use coding + terminal every day without risking the host OS.
+
+#### 1A. Execution sandbox (Docker-first)
+
+- **Default:** keep `TERMINAL_EXECUTION_MODE=host` for opt-in power users with denylist.
+- **New mode:** `TERMINAL_EXECUTION_MODE=docker` (or `sandbox`):
+  - Run `terminal_run` inside a disposable/reusable container.
+  - Mount **only** `FILE_TOOL_ROOT` (and explicit extra roots) as volumes — not the whole user profile.
+  - Network policy: off by default for terminal; optional allowlist later.
+  - Resource limits: CPU/memory/timeout; non-root user in container.
+- **File tools** either:
+  - stay host-side but **only** under sandboxed roots, or
+  - write via the same container volume so terminal and files share one workspace.
+- **Acceptance criteria:**
+  - `rm -rf /`, destructive denylist tokens still blocked.
+  - Container cannot read `~/.ssh` or Echo’s secrets dir.
+  - Coding “run tests” works against project under `FILE_TOOL_ROOT`.
+  - Clear user-facing error if Docker is missing: “Sandbox unavailable; enable Docker or set mode=host.”
+
+#### 1B. Coding loop productization
+
+Make **inspect → plan → implement → verify → confirm → summarize** a first-class path (not only SOUL/prompt text):
+
+| Step | Behavior |
+|------|----------|
+| Inspect | `file_list` / `file_read` / tree before inventing paths |
+| Plan | Short plan in chat or task checklist (no silent multi-file writes) |
+| Implement | SEARCH/REPLACE or full write under project folder; pending **confirm** for writes |
+| Verify | `terminal_run` tests/linters; classify exit: passed / failed / timeout / denied / sandbox_unavailable |
+| Summarize | What changed, how to run, open risks |
+
+- Generated projects land in **named folders**, not repo root scatter.
+- Eval fixtures: multi-file edit + verify fail/pass + confirm cancel.
+
+#### 1C. Coding surface UX
+
+- Task checklist + Code panel + terminal output stay one story for a coding turn.
+- `/coding/readiness` already exists — extend with sandbox status (docker available? mode? roots?).
+
+**Exit criteria for Phase 1:** daily coding/terminal use is denylist + sandboxable; coding loop is measurable in evals; no requirement for MCP yet.
+
+---
+
+### Phase 2 — v7.6: Real MCP client
+
+**Goal:** MCP tools actually load and run — Trust Center stops lying by omission.
+
+#### 2A. Client implementation
+
+Replace stub `MCPManager` with:
+
+1. **Config** — keep `MCP_SERVERS` (command, args, env, transport, enabled).
+2. **Lifecycle** — start/stop stdio servers; optional SSE/HTTP later.
+3. **Discovery** — `tools/list`, `resources/list`, `prompts/list`.
+4. **Registration** — map MCP tools into Echo’s tool registry with names like `mcp__server__tool`.
+5. **Execute** — `tools/call` with timeouts; surface errors without crashing the agent loop.
+6. **Trust metadata** — command, transport, scopes, version, last approval, risk (already sketched in UI).
+
+#### 2B. Safety (MCP-specific)
+
+- Exact command visible before enable.
+- Confirm/approval for high-risk MCP tools (filesystem, shell, network).
+- Prefer running MCP servers under restricted env; align with sandbox story when MCP tools execute shell.
+- Capabilities API: `available` only if `loaded_tool_count > 0` and a health ping succeeds.
+
+#### 2C. Honest test bar (non-negotiable)
+
+| Test | Pass means |
+|------|------------|
+| Config-only | UI shows **configured, not loaded** if client fails |
+| Real server | Start a known MCP (e.g. filesystem or time server in CI) |
+| Load | `loaded_tool_count >= 1` |
+| Invoke | Agent/tool path returns real tool result |
+| Failure | Bad command → error string + unavailable, not silent empty tools |
+
+**No Phase 3 feature ships claiming “via MCP” until these pass.**
+
+**Exit criteria for Phase 2:** at least one external MCP server works end-to-end in manual + automated smoke; Trust Center matches reality.
+
+---
+
+### Phase 3 — v7.7: Tasks / calendar / to-do on MCP
+
+**Goal:** Product features as **wiring + UX**, not new one-off APIs per vendor.
+
+#### 3A. Product surfaces
+
+- **Echo local todos** (already): keep for offline/simple list.
+- **External tasks/calendar:** prefer MCP servers (Google Calendar, Todoist, Notion, etc.) once Phase 2 works.
+- UI: TodoPanel / calendar views call Echo tools that either:
+  - hit local todos, or
+  - call `mcp__…` tools with clear source labels (“Google Calendar” vs “Local todos”).
+
+#### 3B. Agent behavior
+
+- “What’s on my calendar tomorrow?” → MCP calendar tools if configured; else clear gap message.
+- “Add a task to …” → route to external MCP when enabled; confirm on write actions.
+- Do **not** reimplement OAuth + Google APIs in Echo core if an MCP server already does it.
+
+#### 3C. Deprecate / demote bespoke skills
+
+- Calendar skill and similar: either become thin wrappers around MCP or stay optional offline helpers.
+- Document which features need which MCP server.
+
+**Exit criteria for Phase 3:** one calendar MCP + one task MCP demonstrated live; local todos still work without MCP.
+
+---
+
+### Dependency graph (do not reorder)
+
+```
+v7.4 harness stability (done / stabilizing)
+        │
+        ▼
+v7.5  Terminal + coding sandbox + tight coding loop
+        │  (safe daily coding)
+        ▼
+v7.6  Real MCP client + trust + honest tests
+        │  (integration substrate)
+        ▼
+v7.7  Calendar / tasks / todo product on MCP
+        │
+        ▼
+ later: more MCP servers, multi-agent specialists, core.py split, etc.
+```
+
+**Anti-patterns to avoid:**
+
+1. Building Google Calendar OAuth inside Echo **before** MCP client works.  
+2. Shipping “MCP Trust Center” polish while `loaded_tool_count` stays 0.  
+3. Expanding host terminal power without sandbox **after** daily coding dependency.  
+4. Treating local `todo_manage` as “we’re done with tasks” when the product goal is external systems.
+
+---
+
+### Suggested PR / delivery slices
+
+| Slice | Scope | Success bar |
+|-------|--------|-------------|
+| **v7.5.0** | Terminal mode interface + docker runner skeleton | Mode switch works; host path unchanged |
+| **v7.5.1** | Volume mount policy + denylist in sandbox | Cannot escape mount; denylist still applies |
+| **v7.5.2** | Coding loop state + verify classification | Multi-file fixture green |
+| **v7.6.0** | MCP stdio client + list/call + register + trust honesty | Real server lists tools; config ≠ available ✅ |
+| **v7.6.1** | Chat E2E invoke polish + streaming tool rows | One tool call in chat works end-to-end |
+| **v7.6.2** | Approval gates UX for untrusted MCP | Confirm path obvious in Trust Center |
+| **v7.7.0** | Wire calendar MCP + UI label | Live “what’s tomorrow?” |
+| **v7.7.1** | Wire task MCP + confirm writes | Live add/list tasks |
+
+---
+
+### What you can do in parallel (without breaking the order)
+
+- Keep fixing multi-beat / search / memory (v7.4.x) — no dependency conflict.  
+- Design MCP server shortlist and UX mockups for calendar/tasks **while** v7.5 ships — implement only after v7.6.  
+- Docs: sandbox threat model, MCP trust runbook.
+
+---
+
+### Bottom line
+
+Your sequencing is correct:
+
+1. **Harden coding/terminal first** — Docker sandbox plugs in here, right as coding becomes daily.  
+2. **Build a real MCP client second** — the actual unlock for calendar/todo/tooling without N custom integrations.  
+3. **Then tasks/calendar/to-do** — mostly server choice + wiring + UX on top of working MCP.
+
+Do not invert 2 and 3: product features on a stub client will look “done” in the UI and fail live, the same class of bug as reporting MCP available with zero loaded tools.
