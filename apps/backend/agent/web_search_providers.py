@@ -353,7 +353,11 @@ class TavilyProvider:
                 )
             return SearchProviderResult(hits=_dedupe_hits(hits), provider=self.name, queries_used=[q])
         except Exception as exc:
-            return SearchProviderResult(provider=self.name, errors=[f"Tavily: {exc}"], queries_used=[q])
+            return SearchProviderResult(
+                provider=self.name,
+                errors=[_format_provider_error("Tavily", exc, self.timeout_s)],
+                queries_used=[q],
+            )
 
 
 class BraveProvider:
@@ -403,7 +407,32 @@ class BraveProvider:
                 )
             return SearchProviderResult(hits=_dedupe_hits(hits), provider=self.name, queries_used=[q])
         except Exception as exc:
-            return SearchProviderResult(provider=self.name, errors=[f"Brave: {exc}"], queries_used=[q])
+            return SearchProviderResult(
+                provider=self.name,
+                errors=[_format_provider_error("Brave", exc, self.timeout_s)],
+                queries_used=[q],
+            )
+
+
+def _format_provider_error(label: str, exc: BaseException, timeout_s: float) -> str:
+    """Stable user/test-facing provider errors (timeout must mention duration)."""
+    name = type(exc).__name__
+    msg = str(exc or "").strip()
+    is_timeout = name in {"Timeout", "ReadTimeout", "ConnectTimeout", "TimeoutError"} or (
+        "timeout" in msg.lower() and "timed out" in msg.lower()
+    )
+    # requests.exceptions.Timeout → empty or short message; always surface duration
+    try:
+        import requests
+
+        if isinstance(exc, requests.exceptions.Timeout):
+            is_timeout = True
+    except Exception:
+        pass
+    if is_timeout or name.endswith("Timeout"):
+        secs = int(timeout_s) if timeout_s else 10
+        return f"{label} timed out after {secs}s"
+    return f"{label}: {msg or name}"
 
 
 def _dedupe_hits(hits: Sequence[SearchHit]) -> List[SearchHit]:

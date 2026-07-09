@@ -462,7 +462,9 @@ class TestDiscordHardening:
         assert is_followup is True
         assert subject == "Canada vs Morocco World Cup score"
         assert "Canada vs Morocco World Cup score" in resolved
-        assert "do a deeper search" in resolved
+        # Deeper-search rewrites to subject + analysis terms (not the meta phrase itself)
+        assert "detailed" in resolved.lower() or "sources" in resolved.lower() or "analysis" in resolved.lower()
+        assert "do a deeper search" not in resolved.lower()
 
     def test_printed_tool_directive_becomes_pending_terminal_action(self, tmp_path, monkeypatch):
         from agent.core import EchoSpeakAgent

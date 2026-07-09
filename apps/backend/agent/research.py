@@ -627,10 +627,39 @@ def _prep_search_work_text(text: str) -> str:
     return _normalize_text(work)
 
 
+def _is_hollow_secondary_clause(text: str) -> bool:
+    """True for tails like 'recommend the best value pick' that need the prior topic.
+
+    These are the same research ask, not a second independent multi-intent search.
+    """
+    low = _normalize_text(text).lower()
+    if not low or len(low.split()) > 10:
+        return False
+    # Already has a concrete product/topic noun → keep as its own query
+    if re.search(
+        r"(?i)\b(gta|microphone|mic|iphone|laptop|bitcoin|fifa|weather|stock|"
+        r"python|nvidia|tesla|oilers|trailer)\b",
+        low,
+    ):
+        return False
+    if re.search(
+        r"(?i)^\s*(?:and\s+)?(?:also\s+)?(?:please\s+)?"
+        r"(?:recommend|pick|choose|which\s+(?:one|is)|the\s+best\s+value|"
+        r"best\s+value\s+pick|value\s+pick|which\s+to\s+buy)\b",
+        low,
+    ):
+        return True
+    if re.search(r"(?i)\b(best value pick|recommend the best|which is better)\b", low):
+        return True
+    return False
+
+
 def _is_smalltalk_clause(text: str) -> bool:
     """True for pure social/filler clauses that must not become search queries."""
     low = _normalize_text(apply_spelling_fixes(text or "")).lower()
     if not low:
+        return True
+    if _is_hollow_secondary_clause(low):
         return True
     if _is_weather_clause(low) or _is_schedule_or_sports_clause(low):
         return False
@@ -715,11 +744,14 @@ def looks_like_multi_intent(text: str) -> bool:
     )
     if len(inters) >= 2 and len(words) >= 12:
         return True
-    # "A, and B" with two clause-like segments — ignore pure small-talk clauses
+    # "A, and B" with two clause-like segments — ignore pure small-talk / hollow tails
     clauses = [
         c.strip(" ,;:")
         for c in re.split(r"[?!.]+|\band\b", t, flags=re.IGNORECASE)
-        if c and len(c.split()) >= 3 and not _is_smalltalk_clause(c)
+        if c
+        and len(c.split()) >= 3
+        and not _is_smalltalk_clause(c)
+        and not _is_hollow_secondary_clause(c)
     ]
     if len(clauses) >= 2:
         # Distinct domains across clauses
