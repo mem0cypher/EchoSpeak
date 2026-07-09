@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
@@ -12,12 +12,19 @@ import type { CodeDiffSession } from "./components/InlineCodeDiff";
 import { WorkspaceExplorer } from "./components/WorkspaceExplorer";
 import { TaskChecklist, createEmptyTaskPlan, taskPlanReducer } from "./components/TaskChecklist";
 import type { TaskPlanState } from "./components/TaskChecklist";
-import type { EchoReaction } from "./components/echoAnimationUtils";
+import type { EchoReaction, ToolCategory } from "./components/echoAnimationUtils";
 import { TodoPanel } from "./components/TodoPanel";
 import { AvatarEditor } from "./components/AvatarEditor";
 import { buildResearchRunFromToolEvent, normalizeResearchRun } from "./features/research/buildResearchRun";
 import { useResearchStore } from "./features/research/store";
 import type { ResearchRun } from "./features/research/types";
+import {
+  agentActivityReducer,
+  initialAgentActivity,
+  isConfirmPromptText,
+  toolCategoryFromPhase,
+  type AgentActivityState,
+} from "./agentActivity";
 
 // Types
 type Role = "user" | "assistant";
@@ -58,12 +65,31 @@ type AgentStreamEvent =
   | { type: "tool_error"; id: string; error: string; at: number; request_id?: string }
   | { type: "thinking"; content: string; at: number; request_id?: string }
   | { type: "thinking_step"; step_type: string; content: string; status: string; at: number; request_id?: string }
+  | { type: "agent_token"; data: string; at: number; request_id?: string }
   | { type: "memory_saved"; memory_count: number; at: number; request_id?: string }
   | { type: "task_plan"; data: any[]; at?: number; request_id?: string }
   | { type: "task_step"; data: { index: number; status: string; description?: string; tool?: string; result_preview?: string; total?: number }; at?: number; request_id?: string }
   | { type: "task_reflection"; data: { index: number; accepted: boolean; reason?: string; cycle?: number }; at?: number; request_id?: string }
   | { type: "final"; response: string; spoken_text?: string; success: boolean; memory_count: number; doc_sources?: DocSource[]; research?: ResearchRun[]; execution_id?: string; trace_id?: string; thread_state?: ThreadSessionState | null; request_id?: string; at: number }
   | { type: "error"; message: string; at: number; request_id?: string };
+
+/** Square spinner — Echo's shape, no emoji */
+const SquareLoader: React.FC<{ size?: number; color?: string }> = ({ size = 12, color = "rgba(140,160,255,0.95)" }) => (
+  <span
+    aria-hidden
+    style={{
+      display: "inline-block",
+      width: size,
+      height: size,
+      borderRadius: 2,
+      border: `2px solid ${color}`,
+      borderTopColor: "transparent",
+      animation: "echo-square-spin 0.75s linear infinite",
+      verticalAlign: "middle",
+      flexShrink: 0,
+    }}
+  />
+);
 
 type GatewayEvent =
   | { type: "gateway_ready"; session_id?: string; at?: number }
@@ -446,6 +472,13 @@ const globalCss = `
            height: 100%;
            overflow: hidden;
            transition: all 0.3s ease;
+         }
+         @keyframes echo-square-spin {
+           to { transform: rotate(360deg); }
+         }
+         @keyframes pulse {
+           0%, 100% { opacity: 1; }
+           50% { opacity: 0.5; }
          }
          .panel-header {
            display: flex;
@@ -1463,22 +1496,37 @@ const ContextRing: React.FC<{ messages: Message[]; contextWindow: number }> = ({
 const ChatBubble: React.FC<{
   msg: Message;
   streaming?: boolean;
+  typewriter?: boolean;
   onQuickReply?: (text: string) => void;
-}> = ({ msg, streaming, onQuickReply }) => {
+}> = ({ msg, streaming, typewriter = false, onQuickReply }) => {
   const isUser = msg.role === "user";
-  const isConfirmPrompt = !isUser
-    ? (() => {
-      const t = (msg.text || "").toLowerCase();
-      if (!t) return false;
-      if (t.includes("reply 'confirm'")) return true;
-      if (t.includes('reply "confirm"')) return true;
-      if (t.includes("confirm' to proceed") || t.includes('confirm" to proceed')) return true;
-      if (t.includes("pending action") && t.includes("confirm")) return true;
-      return false;
-    })()
-    : false;
+  const isConfirmPrompt = !isUser ? isConfirmPromptText(msg.text || "") : false;
+  const [shown, setShown] = useState(isUser || !typewriter ? msg.text : "");
+
+  useEffect(() => {
+    if (isUser || !typewriter) {
+      setShown(msg.text);
+      return;
+    }
+    const target = msg.text || "";
+    if (!target) {
+      setShown("");
+      return;
+    }
+    // Progressive reveal independent of backend generation speed.
+    let i = 0;
+    setShown("");
+    const tick = window.setInterval(() => {
+      i = Math.min(target.length, i + Math.max(2, Math.ceil(target.length / 80)));
+      setShown(target.slice(0, i));
+      if (i >= target.length) window.clearInterval(tick);
+    }, 18);
+    return () => window.clearInterval(tick);
+  }, [msg.id, msg.text, isUser, typewriter]);
 
   const canQuickReply = Boolean(isConfirmPrompt && onQuickReply && !streaming);
+  const bodyText = isUser || !typewriter ? msg.text : shown;
+  const stillTyping = !isUser && typewriter && shown.length < (msg.text || "").length;
   return (
     <motion.div
       layout
@@ -1500,7 +1548,9 @@ const ChatBubble: React.FC<{
           color: colors.text,
           border: isUser
             ? "1px solid rgba(140,180,255,0.3)"
-            : "1px solid rgba(255,255,255,0.12)",
+            : isConfirmPrompt
+              ? "1px solid rgba(250,204,21,0.45)"
+              : "1px solid rgba(255,255,255,0.12)",
           borderRadius: isUser ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
           padding: "12px 16px",
           boxShadow: isUser
@@ -1510,10 +1560,24 @@ const ChatBubble: React.FC<{
         }}
       >
         {isUser ? (
-          <div className="chat-text">{msg.text}</div>
+          <div className="chat-text">{bodyText}</div>
         ) : (
           <div className="chat-markdown">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.text}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{bodyText}</ReactMarkdown>
+            {stillTyping ? (
+              <span
+                style={{
+                  display: "inline-block",
+                  width: 7,
+                  height: 14,
+                  marginLeft: 2,
+                  borderRadius: 1,
+                  background: "rgba(140,160,255,0.9)",
+                  animation: "pulse 0.8s infinite",
+                  verticalAlign: "text-bottom",
+                }}
+              />
+            ) : null}
           </div>
         )}
 
@@ -1561,11 +1625,12 @@ const ChatBubble: React.FC<{
 
 const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; content: string; at: number; steps?: ThinkingStep[]; request_id?: string } }> = ({ item }) => {
   const [expanded, setExpanded] = useState(true);
-  const badge = { label: "Thinking", color: "rgba(140,160,255,0.9)" };
+  const badge = { label: "Live", color: "rgba(140,160,255,0.9)" };
   const content = (item.content || "").trim();
   const steps = item.steps || [];
   const hasContent = content.length > 0;
-  const title = "Reasoning live";
+  const anyRunning = steps.some((s) => s.status === "running");
+  const title = hasContent ? "Reasoning" : anyRunning ? "Working" : "Waiting";
   const containerRef = useRef<HTMLDivElement>(null);
 
   // Typewriter effect state
@@ -1688,12 +1753,32 @@ const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; con
                 transition={{ duration: 0.3, delay: idx * 0.1 }}
                 style={{ marginBottom: 5, display: "flex", alignItems: "flex-start", gap: 8 }}
               >
-                <span style={{ color: badge.color, minWidth: 20 }}>
-                  {step.type === "thought" ? "💭" : step.type === "search" ? "🔍" : step.type === "read" ? "📖" : "🔧"}
+                <span style={{ color: badge.color, minWidth: 18, marginTop: 2 }}>
+                  {step.status === "running" ? (
+                    <SquareLoader size={10} color={badge.color} />
+                  ) : (
+                    <span
+                      style={{
+                        display: "inline-block",
+                        width: 8,
+                        height: 8,
+                        borderRadius: 1,
+                        background: badge.color,
+                        opacity: 0.7,
+                      }}
+                    />
+                  )}
                 </span>
-                <span style={{ flex: 1 }}>
+                <span
+                  style={{
+                    flex: 1,
+                    fontFamily: step.type === "tool" || step.type === "search" || step.type === "read"
+                      ? "'JetBrains Mono', 'Fira Code', ui-monospace, monospace"
+                      : "inherit",
+                    fontSize: step.type === "tool" || step.type === "search" || step.type === "read" ? 11.5 : 12,
+                  }}
+                >
                   {step.content}
-                  {step.status === "running" && <span style={{ animation: "pulse 1s infinite", marginLeft: 4 }}>...</span>}
                 </span>
               </motion.div>
             ))}
@@ -1708,9 +1793,9 @@ const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; con
             )}
           </div>
         ) : steps.length === 0 ? (
-          <div style={{ marginTop: 8, fontSize: 12, color: colors.textDim, display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ width: 6, height: 6, borderRadius: 999, background: badge.color, animation: "pulse 0.8s infinite" }} />
-            Thinking...
+          <div style={{ marginTop: 8, fontSize: 12, color: colors.textDim, display: "flex", alignItems: "center", gap: 8 }}>
+            <SquareLoader size={12} color={badge.color} />
+            <span>Waiting for tokens</span>
           </div>
         ) : null}
       </div>
@@ -1718,6 +1803,9 @@ const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; con
         @keyframes pulse {
           0%, 100% { opacity: 1; }
           50% { opacity: 0.5; }
+        }
+        @keyframes echo-square-spin {
+          to { transform: rotate(360deg); }
         }
       `}</style>
     </motion.div>
@@ -2247,8 +2335,10 @@ export const Dashboard: React.FC = () => {
   const activeGroupMenuRef = useRef<HTMLDivElement | null>(null);
   const [activeGroupPos, setActiveGroupPos] = useState<{ top: number; left: number } | null>(null);
   const [showVisualizer, setShowVisualizer] = useState<boolean>(true);
-  const [agentMode, setAgentMode] = useState<"idle" | "research" | "coding" | "working">("idle");
+  const [agentMode, setAgentMode] = useState<"idle" | "research" | "coding" | "working" | "thinking">("idle");
+  const [agentActivity, dispatchActivity] = useReducer(agentActivityReducer, undefined, initialAgentActivity);
   const [visualizerPin, setVisualizerPin] = useState<null | "ring" | "research" | "coding" | "tasks">(null);
+  const [liveReplyDraft, setLiveReplyDraft] = useState("");
   const [codeSessions, setCodeSessions] = useState<CodeDiffSession[]>([]);
   const [activeCodeTab, setActiveCodeTab] = useState<number>(0);
   const [avatarConfig, setAvatarConfig] = useState<AvatarConfig>(defaultAvatarConfig);
@@ -3257,6 +3347,8 @@ export const Dashboard: React.FC = () => {
     if (userTypingTimerRef.current) clearTimeout(userTypingTimerRef.current);
     setDocSources([]);
     activeTaskPlanIdRef.current = null;
+    setLiveReplyDraft("");
+    dispatchActivity({ type: "stream_start" });
     setStreaming(true);
     try {
       const resp = await fetch(`${apiBase}/query/stream`, {
@@ -3343,6 +3435,7 @@ export const Dashboard: React.FC = () => {
       const upsertTool = (evt: AgentStreamEvent) => {
         if (evt.type === "tool_start") {
           toolInfoRef.current[evt.id] = { name: evt.name, input: evt.input };
+          dispatchActivity({ type: "tool_start", id: evt.id, name: evt.name });
           const toolVerb =
             evt.name === "web_search" ? "Searching" :
             evt.name === "file_read" ? "Reading" :
@@ -3361,6 +3454,7 @@ export const Dashboard: React.FC = () => {
         }
 
         if (evt.type === "tool_end") {
+          dispatchActivity({ type: "tool_end", id: evt.id });
           const info = toolInfoRef.current[evt.id];
           if (info?.name === "web_search") {
             const normalized = normalizeResearchRun(evt.research) || buildResearchRunFromToolEvent(evt.id, info?.name || evt.name || "", info?.input || "", evt.output || "", evt.at || Date.now());
@@ -3466,6 +3560,7 @@ export const Dashboard: React.FC = () => {
         }
 
         if (evt.type === "tool_error") {
+          dispatchActivity({ type: "tool_error", id: evt.id, message: evt.error });
           const info = toolInfoRef.current[evt.id];
           setActivities((prev) =>
             prev.map((p) => {
@@ -3504,6 +3599,9 @@ export const Dashboard: React.FC = () => {
 
           if (evt.type === "task_plan" || evt.type === "task_step" || evt.type === "task_reflection") {
             upsertTaskPlan(evt);
+            if (evt.type === "task_step" && evt.data?.status) {
+              dispatchActivity({ type: "task_step", status: String(evt.data.status) });
+            }
           } else if (evt.type === "tool_start" || evt.type === "tool_end" || evt.type === "tool_error") {
             upsertTool(evt);
           } else if (evt.type === "thinking_step") {
@@ -3514,10 +3612,17 @@ export const Dashboard: React.FC = () => {
               status: evt.status as "running" | "done",
               at: normalizeTimestampMs(evt.at || Date.now()),
             });
+          } else if (evt.type === "agent_token") {
+            const tok = String(evt.data || "");
+            if (tok) {
+              dispatchActivity({ type: "agent_token", token: tok });
+              setLiveReplyDraft((prev) => prev + tok);
+            }
           } else if (evt.type === "thinking") {
             const content = (evt.content || "").trim();
             const reqId = eventRequestId(evt);
             if (content) {
+              dispatchActivity({ type: "thinking", content });
               setActivities((prev) => {
                 const existingIdx = prev.findIndex((p) => p.kind === "thinking" && p.request_id === reqId);
                 if (existingIdx !== -1) {
@@ -3545,9 +3650,13 @@ export const Dashboard: React.FC = () => {
               refreshMemory();
             }
           } else if ((evt as any).type === "status" && (evt as any).agent_mode) {
-            setAgentMode((evt as any).agent_mode);
+            const mode = String((evt as any).agent_mode || "idle");
+            setAgentMode(mode as any);
+            dispatchActivity({ type: "status_mode", mode, tool: (evt as any).tool });
           } else if (evt.type === "error") {
             setStreaming(false);
+            dispatchActivity({ type: "error", message: evt.message });
+            setLiveReplyDraft("");
             setActivities((prev) => [
               ...prev,
               { kind: "error", id: crypto.randomUUID(), message: evt.message, at: Date.now() },
@@ -3556,6 +3665,8 @@ export const Dashboard: React.FC = () => {
           } else if (evt.type === "final") {
             const reply = evt.response || "(no response)";
             const spoken = (evt.spoken_text || "").trim();
+            dispatchActivity({ type: "final", response: reply });
+            setLiveReplyDraft("");
             if (typeof evt.memory_count === "number") {
               setMemoryCount(evt.memory_count);
             }
@@ -3579,7 +3690,7 @@ export const Dashboard: React.FC = () => {
             const speakVal = spoken && spoken === reply.trim() ? spoken : reply;
             speakText(speakVal);
             setStreaming(false);
-            setEchoReaction("success");
+            setEchoReaction(isConfirmPromptText(reply) ? null : "success");
             setAgentMode("idle");
             refreshPendingApproval(activeThreadId);
             refreshApprovals(activeThreadId);
@@ -3591,6 +3702,7 @@ export const Dashboard: React.FC = () => {
       const msg = String(err);
       const pretty = msg.includes("Failed to fetch") ? `Backend offline (${apiBase})` : msg;
       setBackendOnline(false);
+      dispatchActivity({ type: "error", message: pretty });
       addMessage({ id: crypto.randomUUID(), role: "assistant", text: `Error: ${pretty}`, at: Date.now() });
       setActivities((prev) => [
         ...prev,
@@ -3599,6 +3711,8 @@ export const Dashboard: React.FC = () => {
       setEchoReaction("error");
     } finally {
       setStreaming(false);
+      setLiveReplyDraft("");
+      dispatchActivity({ type: "stream_end" });
     }
   };
 
@@ -4245,13 +4359,35 @@ export const Dashboard: React.FC = () => {
                         </div>
                       );
                     }
-                    const hasRunningTool = activities.some(a => a.kind === "tool" && a.status === "running");
-                    const isThinking = !listening && !speaking && (streaming || hasRunningTool);
-                    // Find the latest running tool, if any
-                    const latestRunningTool = [...activities].reverse().find(a => a.kind === "tool" && a.status === "running") as any;
-                    const currentToolCategory = latestRunningTool ? getToolCategory(latestRunningTool.name) : "generic";
-                    const activeToolName = latestRunningTool?.name;
-                    const thinkingText = latestRunningTool ? getToolDisplayDetails(latestRunningTool.name, latestRunningTool.input) : "processing...";
+                    // Avatar phase is driven by the same agentActivity reducer as chat.
+                    const phase = agentActivity.phase;
+                    const isThinking =
+                      !listening &&
+                      !speaking &&
+                      (phase === "thinking" ||
+                        phase === "streaming_reply" ||
+                        phase === "task_running" ||
+                        phase.startsWith("tool_"));
+                    const currentToolCategory = (
+                      agentActivity.activeToolName
+                        ? getToolCategory(agentActivity.activeToolName)
+                        : toolCategoryFromPhase(phase)
+                    ) as ToolCategory;
+                    const activeToolName = agentActivity.activeToolName || undefined;
+                    const thinkingText =
+                      phase === "awaiting_confirm"
+                        ? "Awaiting confirmation"
+                        : phase === "error"
+                          ? agentActivity.lastError || "Error"
+                          : phase === "tool_search"
+                            ? "Searching"
+                            : phase === "streaming_reply"
+                              ? "Writing"
+                              : agentActivity.activeToolName
+                                ? getToolDisplayDetails(agentActivity.activeToolName, "")
+                                : agentActivity.label;
+                    const pendingConfirm =
+                      agentActivity.pendingConfirmation || Boolean(pendingApproval?.has_pending);
                     return (
                       <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", transform: "translateY(-24px)" }}>
                         <SquareAvatarVisual
@@ -4263,7 +4399,7 @@ export const Dashboard: React.FC = () => {
                           heartbeatEnabled={settingsDraft?.heartbeat_enabled}
                           toolCategory={currentToolCategory}
                           userIsTyping={userIsTyping}
-                          pendingConfirmation={pendingApproval?.has_pending || false}
+                          pendingConfirmation={pendingConfirm}
                           reaction={echoReaction}
                           onReactionDone={() => setEchoReaction(null)}
                           spotifyPlaying={spotifyPlaying?.is_playing ? spotifyPlaying : null}
@@ -4516,6 +4652,7 @@ export const Dashboard: React.FC = () => {
                             key={`msg-${t.id}`}
                             msg={t.msg}
                             streaming={streaming}
+                            typewriter={t.msg.role === "assistant"}
                             onQuickReply={(text) => {
                               try {
                                 stopTts();
@@ -4532,6 +4669,52 @@ export const Dashboard: React.FC = () => {
                         )
                       )}
                     </AnimatePresence>
+                    {streaming && liveReplyDraft ? (
+                      <div style={{ display: "flex", justifyContent: "flex-start", marginTop: 4, marginBottom: 8 }}>
+                        <div
+                          style={{
+                            maxWidth: "84%",
+                            padding: "10px 14px",
+                            borderRadius: "14px 14px 14px 4px",
+                            border: "1px solid rgba(140,160,255,0.28)",
+                            background: "rgba(140,160,255,0.06)",
+                            fontSize: 14,
+                            lineHeight: 1.55,
+                            color: colors.text,
+                            whiteSpace: "pre-wrap",
+                          }}
+                        >
+                          {liveReplyDraft}
+                          <span
+                            style={{
+                              display: "inline-block",
+                              width: 7,
+                              height: 14,
+                              marginLeft: 2,
+                              borderRadius: 1,
+                              background: "rgba(140,160,255,0.9)",
+                              animation: "pulse 0.8s infinite",
+                              verticalAlign: "text-bottom",
+                            }}
+                          />
+                        </div>
+                      </div>
+                    ) : null}
+                    {streaming && !liveReplyDraft && agentActivity.phase !== "idle" ? (
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "6px 4px 10px",
+                          fontSize: 12,
+                          color: colors.textDim,
+                        }}
+                      >
+                        <SquareLoader size={12} />
+                        <span>{agentActivity.label}</span>
+                      </div>
+                    ) : null}
                     <div ref={chatBottomRef} style={{ height: 1 }} />
                   </div>
                   <div className="input-bar">
@@ -4770,22 +4953,24 @@ export const Dashboard: React.FC = () => {
                   transition={{ duration: 0.18 }}
                   style={{
                     position: "fixed",
-                    top: 68,
-                    left: 16,
-                    bottom: 16,
-                    width: showVisualizer ? "calc(50vw - 28px)" : "min(640px, calc(100vw - 32px))",
-                    maxWidth: 680,
+                    top: 0,
+                    left: 0,
+                    right: showVisualizer ? "50%" : 0,
+                    bottom: 0,
+                    width: showVisualizer ? "50vw" : "100vw",
+                    maxWidth: "none",
                     zIndex: 80,
                     display: "flex",
                     flexDirection: "column",
                     gap: 12,
-                    padding: 14,
-                    background: "rgba(5,8,16,0.92)",
+                    padding: "16px 18px 18px",
+                    background: "rgba(5,8,16,0.97)",
                     backdropFilter: "blur(18px)",
                     WebkitBackdropFilter: "blur(18px)",
-                    border: `1px solid ${colors.line}`,
-                    borderRadius: 16,
-                    boxShadow: "0 22px 80px rgba(0,0,0,0.45)",
+                    border: "none",
+                    borderRight: showVisualizer ? `1px solid ${colors.line}` : "none",
+                    borderRadius: 0,
+                    boxShadow: "none",
                     overflow: "hidden",
                   }}
                 >
@@ -4793,7 +4978,7 @@ export const Dashboard: React.FC = () => {
                     <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                       <div style={{ fontSize: 13, fontWeight: 800, color: colors.text }}>Studio</div>
                       <div style={{ fontSize: 11, color: colors.textDim }}>
-                        Knowledge, configuration, and automation stay on the left while chat remains open.
+                        Full workspace for knowledge, config, and automation. Chat stays on the right.
                       </div>
                     </div>
                     <button
@@ -4804,6 +4989,38 @@ export const Dashboard: React.FC = () => {
                     >
                       Close
                     </button>
+                  </div>
+                  {/* Mini Echo dock — avatar yields the full stage while Studio is open */}
+                  <div
+                    style={{
+                      position: "absolute",
+                      right: 16,
+                      bottom: 16,
+                      width: 88,
+                      height: 88,
+                      borderRadius: 14,
+                      overflow: "hidden",
+                      border: `1px solid ${colors.line}`,
+                      background: "rgba(0,0,0,0.55)",
+                      zIndex: 2,
+                      boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+                    }}
+                    title={agentActivity.label}
+                  >
+                    <div style={{ transform: "scale(0.28)", transformOrigin: "top left", width: 320, height: 320 }}>
+                      <SquareAvatarVisual
+                        speaking={speaking}
+                        backendOnline={backendOnline}
+                        isThinking={agentActivity.streaming || agentActivity.phase !== "idle"}
+                        thinkingText={agentActivity.label}
+                        activeToolName={agentActivity.activeToolName || undefined}
+                        toolCategory={toolCategoryFromPhase(agentActivity.phase) as ToolCategory}
+                        pendingConfirmation={agentActivity.pendingConfirmation || Boolean(pendingApproval?.has_pending)}
+                        reaction={echoReaction}
+                        onReactionDone={() => setEchoReaction(null)}
+                        avatarConfig={avatarConfig}
+                      />
+                    </div>
                   </div>
                   <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 2 }}>
                     {studioTabs.map((tab) => (
