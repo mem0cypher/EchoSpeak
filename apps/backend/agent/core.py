@@ -656,10 +656,14 @@ class WebTaskReflector:
             # Concrete matchup +/or kickoff is enough even if packet is short
             if has_sides or has_clock:
                 return True
-            # Tournament fluff ("104 games", "full schedule") without names is a miss
-            if re.search(r"\b(104 games|full schedule|across canada|you can find)\b", low):
+            # Tournament fluff ("104 games", "full schedule") without names/times is a miss
+            if re.search(
+                r"\b(104 games|full schedule|across canada|you can find|"
+                r"where to watch|lamine yamal|cristiano ronaldo playing)\b",
+                low,
+            ) and not (has_sides and has_clock):
                 return False
-            if len(low) < 400:
+            if not has_sides and not has_clock and len(low) < 600:
                 return False
         if self._is_timezone_query(q):
             # Need a time or an explicit conversion mention with numbers
@@ -693,14 +697,20 @@ class WebTaskReflector:
                 return str(original_result or "")
             # Fall through to retry with refined grounded search
 
+        silent = bool(task.get("params", {}).get("silent"))
+        # Retries never spam the UI with more "Search done" rows
+        emit_events = False if silent else True
+
         if not is_grounded_search_output(original_result):
             if bool(getattr(config, "search_grounding_enabled", True)) and hasattr(self.agent, "_grounded_web_search"):
                 if q:
                     return self.agent._grounded_web_search(
                         q,
-                        original_request=q,
+                        original_request=str(
+                            task.get("params", {}).get("original_request") or q
+                        ),
                         callbacks=callbacks,
-                        emit_tool_events=True,
+                        emit_tool_events=emit_events,
                     )
                 return str(original_result or "")
 
@@ -741,7 +751,7 @@ class WebTaskReflector:
                         task.get("params", {}).get("original_request") or q or refined_q
                     ),
                     callbacks=callbacks,
-                    emit_tool_events=True,
+                    emit_tool_events=False,  # silent retry — anti-loop
                 )
                 result = str(result or "")
                 logger.info(
@@ -5949,24 +5959,51 @@ class EchoSpeakAgent:
                     f"Samples:\n{samples[:4000]}"
                 ).strip()
 
-        # --- Anti-loop: same turn must not re-run near-identical FIFA/TZ searches ---
-        # Live bug: 9× "FIFA … ET and mnt convert" tool rows from grounder + reflector +
-        # keep-trying + model tool calls. Fingerprint once → reuse packet, no new UI row.
+        # --- Anti-loop: same turn must not re-run near-identical searches ---
+        # Live: 3× identical "FIFA match list… today" rows from Stage3 + reflector + keep-trying.
         if not hasattr(self, "_request_grounded_results") or self._request_grounded_results is None:
             self._request_grounded_results = {}
         if not hasattr(self, "_request_grounded_count"):
             self._request_grounded_count = 0
-        fp = self._search_query_fingerprint(f"{original_request or ''} {raw_q}")
-        if fp and fp in self._request_grounded_results:
-            logger.info("Search loop suppressed (fingerprint hit): {!r}", raw_q[:90])
-            return str(self._request_grounded_results[fp] or "")
-        # Hard cap: never more than 3 grounded search *orchestrations* per user turn
-        if int(self._request_grounded_count or 0) >= 3:
-            # Return best prior packet for this turn if any
+        if not hasattr(self, "_request_grounded_inflight") or self._request_grounded_inflight is None:
+            self._request_grounded_inflight = set()
+        # Multiple fingerprints so refined word-order still hits
+        fps = [
+            self._search_query_fingerprint(raw_q),
+            self._search_query_fingerprint(f"{original_request or ''} {raw_q}"),
+            self._search_query_fingerprint(original_request or ""),
+        ]
+        fps = [f for f in fps if f]
+        for f in fps:
+            if f in self._request_grounded_results:
+                cached = self._request_grounded_results[f]
+                if cached is not None and str(cached).strip():
+                    logger.info("Search loop suppressed (fingerprint hit): {!r}", raw_q[:90])
+                    return str(cached)
+            if f in self._request_grounded_inflight:
+                logger.info("Search loop suppressed (in-flight): {!r}", raw_q[:90])
+                # Prefer any completed packet this turn
+                for v in self._request_grounded_results.values():
+                    if v and str(v).strip() and str(v) != "__inflight__":
+                        return str(v)
+                return (
+                    "[GROUNDED_SEARCH]\n"
+                    "accepted=false\n"
+                    "reason=search_in_flight\n"
+                    "Do not invent facts.\n"
+                )
+        # Hard cap: 1 orchestration for pure schedule/FIFA, else max 2 per turn
+        sports_cap = bool(
+            re.search(r"(?i)\b(fifa|world cup|kickoff|schedule|fixtures?|mnt|timezone)\b", raw_q)
+        )
+        cap = 1 if sports_cap else 2
+        if int(self._request_grounded_count or 0) >= cap:
             if self._request_grounded_results:
-                logger.info("Search loop hard-cap (3) — reusing prior grounded packet")
-                return str(next(reversed(list(self._request_grounded_results.values()))) or "")
-            logger.info("Search loop hard-cap (3) with empty cache — skipping")
+                for v in reversed(list(self._request_grounded_results.values())):
+                    if v and str(v).strip() and str(v) != "__inflight__":
+                        logger.info("Search loop hard-cap ({}) — reusing prior packet", cap)
+                        return str(v)
+            logger.info("Search loop hard-cap ({}) with empty cache — skipping", cap)
             return (
                 "[GROUNDED_SEARCH]\n"
                 "accepted=false\n"
@@ -5974,6 +6011,10 @@ class EchoSpeakAgent:
                 "Do not invent facts. Use any prior search evidence already in context.\n"
             )
         self._request_grounded_count = int(self._request_grounded_count or 0) + 1
+        for f in fps:
+            self._request_grounded_inflight.add(f)
+            # Placeholder so concurrent re-entry sees in-flight
+            self._request_grounded_results.setdefault(f, "__inflight__")
 
         # --- Live sports structured path (default for scores/odds; not crawl search) ---
         # Category mismatch: Tavily/etc. return crawled pages; live scores need APIs.
@@ -6263,13 +6304,17 @@ class EchoSpeakAgent:
         try:
             if not hasattr(self, "_request_grounded_results") or self._request_grounded_results is None:
                 self._request_grounded_results = {}
-            if fp and joined:
-                self._request_grounded_results[fp] = joined
-            # Also key by each multi query fingerprint
+            if not hasattr(self, "_request_grounded_inflight") or self._request_grounded_inflight is None:
+                self._request_grounded_inflight = set()
+            store_keys = list(fps)
+            store_keys.append(self._search_query_fingerprint(raw_q))
+            store_keys.append(self._search_query_fingerprint(f"{orig} {raw_q}"))
             for mq in multi:
-                mfp = self._search_query_fingerprint(mq)
-                if mfp and joined:
-                    self._request_grounded_results[mfp] = joined
+                store_keys.append(self._search_query_fingerprint(mq))
+            for k in {k for k in store_keys if k}:
+                if joined:
+                    self._request_grounded_results[k] = joined
+                self._request_grounded_inflight.discard(k)
         except Exception:
             pass
         # Anchor teams/times from evidence even if the model later answers vaguely
@@ -6307,6 +6352,7 @@ class EchoSpeakAgent:
         apply_reflection: bool = True,
         *,
         original_request: str = "",
+        emit_tool_events: bool = True,
     ) -> tuple[str, str, str]:
         tool = self._preferred_web_research_tool()
         if tool is None:
@@ -6329,9 +6375,9 @@ class EchoSpeakAgent:
                 final_query,
                 original_request=orig or query_text,
                 callbacks=callbacks,
-                emit_tool_events=True,
+                emit_tool_events=emit_tool_events,
             )
-            # Evidence-level keep-trying (was skipped for grounded packets entirely)
+            # Reflector retries are silent — never add extra Search done rows
             if apply_reflection and hasattr(self, "_task_planner"):
                 try:
                     retry_task = {
@@ -6340,6 +6386,7 @@ class EchoSpeakAgent:
                         "params": {
                             "q": final_query,
                             "original_request": orig or query_text,
+                            "silent": True,
                         },
                     }
                     tool_output = self._task_planner.web_reflector.reflect_and_retry(
@@ -11593,12 +11640,14 @@ class EchoSpeakAgent:
             refined = self._refine_query_after_weak_answer(
                 display_question, used_query, response, attempt
             )
+            # Silent re-search — do not add another Search done row to chat
             new_out, new_q, time_context = self._invoke_web_research_query(
                 refined,
                 callbacks,
                 time_context=time_context,
-                apply_reflection=True,
+                apply_reflection=False,  # already retried once; no reflector cascade
                 original_request=original_request or display_question,
+                emit_tool_events=False,
             )
             if new_out and len(str(new_out)) >= 40:
                 # Prefer richer evidence; merge if both useful
@@ -12305,6 +12354,7 @@ class EchoSpeakAgent:
         self._request_search_cache: Dict[str, str] = {}
         self._request_grounded_results: Dict[str, str] = {}
         self._request_grounded_count: int = 0
+        self._request_grounded_inflight: set = set()
         self._sync_thread_state(thread_id)
         self._hydrate_pending_action_from_state()
         self._ensure_workspace_for_intent(user_input)

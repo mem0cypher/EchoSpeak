@@ -649,13 +649,20 @@ def _normalize_sports_query(text: str) -> str:
 
     # League slate (World Cup / NHL / …) — demand concrete kickoffs, pin calendar
     if league and re.search(r"\b(fifa|world cup)\b", low):
+        pin = _pin()
+        # "next match today" → force next/upcoming kickoff language (not 104-game fluff)
+        wants_next = bool(re.search(r"\b(next|upcoming|what time|kickoff|start)\b", low))
         if side:
             base = f"{league} {side} kickoff time ET schedule fixtures"
+        elif wants_next and (day or "today" in low or "tonight" in low):
+            base = (
+                f"{league} matches today next kickoff times ET "
+                f"fixtures TV schedule ESPN"
+            )
         else:
-            base = f"{league} match list kickoff times ET each game schedule fixtures"
+            base = f"{league} matches today kickoff times ET fixtures schedule ESPN"
         if clock:
             base = f"{base} {clock}"
-        pin = _pin()
         if pin:
             return f"{base} {pin}".strip()
         return base
