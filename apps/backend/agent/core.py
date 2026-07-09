@@ -1844,6 +1844,12 @@ class EchoSpeakAgent:
             DATA_DIR,
             update_turns=int(getattr(config, "session_memory_update_turns", 1) or 1),
         )
+        try:
+            from agent.active_work import ActiveWorkStore
+
+            self._active_work_store = ActiveWorkStore()
+        except Exception:
+            self._active_work_store = None
         self._last_stage4_branch: str = ""
         self._last_tool_calling_mode: str = ""
         self._current_thread_id: str = "default"
@@ -2220,9 +2226,10 @@ class EchoSpeakAgent:
         Stack:
         1. SYSTEM_PROMPT_BASE - Minimal base identity
         2. SOUL.md - Core personality (highest priority)
-        3. Workspace - Mode-specific context
-        4. Skills - Domain-specific behavior
-        5. Capabilities - Dynamic tool discovery (auto-updates when tools change)
+        3. Active work fingerprint (durable multi-turn project state)
+        4. Workspace - Mode-specific context
+        5. Skills - Domain-specific behavior
+        6. Capabilities - Dynamic tool discovery (auto-updates when tools change)
         """
         parts = [SYSTEM_PROMPT_BASE]
         
@@ -2231,6 +2238,14 @@ class EchoSpeakAgent:
         soul_content = self._load_soul()
         if soul_content:
             parts.append(f"Identity:\n{soul_content}")
+
+        # Durable multi-turn project / goal fingerprint (code-enforced continuity)
+        try:
+            aw_block = self._active_work_context_block()
+            if aw_block:
+                parts.append(aw_block)
+        except Exception:
+            pass
         
         # Source awareness — tell the LLM where this conversation is happening
         _src = getattr(self, "_current_source", None) or ""
@@ -2559,9 +2574,9 @@ class EchoSpeakAgent:
             low,
         ):
             return True
-        # "start on <slug>" / "project <slug>" with file-ish verbs → local, not web
+        # "start 2d-shooter-game on my desktop" / "start on <slug> (desktop|folder)"
         if re.search(
-            r"\b(?:start on|open|continue on|work on|start the|scan)\s+[a-z0-9][\w.-]{1,40}\b",
+            r"\b(?:start on|start|open|continue on|work on|scan)\s+[a-z0-9][\w.-]{1,48}\b",
             low,
         ) and re.search(r"\b(desktop|files?|folder|project|code|read|look|scan)\b", low):
             return True
@@ -2588,8 +2603,8 @@ class EchoSpeakAgent:
         # Candidate slugs from phrasing + kebab/snake tokens (generic)
         candidates: list[str] = []
         for m in re.finditer(
-            r"(?:start on|open|project|folder|called|named|thats called|that's called|"
-            r"that is called|in|on)\s+([a-z0-9][\w.-]{1,48})",
+            r"(?:start on|start|open|project|folder|called|named|thats called|that's called|"
+            r"that is called|work on|continue on|in|on)\s+([a-z0-9][\w.-]{1,48})",
             low,
         ):
             candidates.append(m.group(1).strip(".,!?"))
@@ -2758,6 +2773,17 @@ class EchoSpeakAgent:
             self._last_local_project_samples = samples or ""
         except Exception:
             pass
+        # Durable multi-turn fingerprint (survives agent re-init)
+        try:
+            self._save_active_work_from_scan(
+                user_input,
+                path=pinned,
+                listing=listing or "",
+                samples=samples or "",
+                phase="ready",
+            )
+        except Exception:
+            pass
         return result
 
     def _local_scan_answer_is_hollow(self, user_input: str, answer: str) -> bool:
@@ -2765,16 +2791,21 @@ class EchoSpeakAgent:
         low = re.sub(r"\s+", " ", str(answer or "").lower())
         if not low:
             return True
-        # Classic stall: "what's first / what do you want to look at"
+        # Classic stall: re-list Desktop / ask what kind of game / what to open
         if re.search(
             r"\b("
             r"what(?:'s| is) the first thing|"
             r"what do you want|"
+            r"what kind of (?:game|project)|"
+            r"gotta see what(?:'s| is) in there|"
+            r"before i can try|"
             r"which file|"
             r"where (?:do|should) we start|"
             r"what should we (?:look at|open|start)|"
             r"ready when you are|"
-            r"let me know what"
+            r"let me know what|"
+            r"throwing a fit|"  # desktop control excuses
+            r"list what(?:'s| is) there"
             r")\b",
             low,
         ):
@@ -3046,6 +3077,356 @@ class EchoSpeakAgent:
     def _coding_workspace_active(self) -> bool:
         return str(getattr(self, "_workspace_id", "") or "").strip().lower() == "coding"
 
+    def _active_work_thread(self) -> str:
+        return str(getattr(self, "_current_thread_id", None) or "default")
+
+    def _load_active_work(self):
+        store = getattr(self, "_active_work_store", None)
+        if store is None:
+            return None
+        try:
+            return store.load(self._active_work_thread())
+        except Exception:
+            return None
+
+    def _save_active_work_from_scan(
+        self,
+        user_input: str,
+        *,
+        path: str,
+        listing: str,
+        samples: str,
+        phase: str = "ready",
+    ) -> None:
+        """Persist project fingerprint after a successful deep-scan."""
+        store = getattr(self, "_active_work_store", None)
+        if store is None or not path:
+            return
+        try:
+            from agent.active_work import ActiveWorkState, infer_goal_from_user, next_step_for_phase
+            from pathlib import Path as _P
+
+            files = [
+                ln.strip().rstrip("/")
+                for ln in str(listing or "").splitlines()
+                if ln.strip() and not ln.strip().endswith("/")
+            ][:30]
+            # Also include top-level dir entries for structure
+            dirs = [
+                ln.strip()
+                for ln in str(listing or "").splitlines()
+                if ln.strip().endswith("/")
+            ][:15]
+            goal = infer_goal_from_user(user_input)
+            # Keep prior goal if this is just "start/open" without a concrete edit ask
+            prior = store.load(self._active_work_thread())
+            if prior.goal and not re.search(
+                r"(?i)\b(add|edit|fix|implement|change|score|code it|write)\b", user_input or ""
+            ):
+                if re.search(r"(?i)\b(start|open|scan|look|desktop|folder)\b", user_input or ""):
+                    goal = prior.goal or goal
+            state = ActiveWorkState(
+                thread_id=self._active_work_thread(),
+                kind="coding_project",
+                phase=phase,
+                project_path=str(path),
+                project_name=_P(path).name,
+                goal=goal or prior.goal or f"Work on {_P(path).name}",
+                last_user_message=str(user_input or "")[:400],
+                next_step=next_step_for_phase(
+                    phase, has_samples=bool(samples), goal=goal or prior.goal or ""
+                ),
+                files_known=files or prior.files_known,
+                listing=str(listing or "")[:4000],
+                code_digest=str(samples or "")[:8000],
+                last_tools=list(
+                    {
+                        str(tr.get("tool") or "")
+                        for tr in (getattr(self, "_partial_tool_results", None) or [])
+                        if tr.get("tool")
+                    }
+                )[:12],
+                stall_count=0,
+            )
+            if dirs and not any(d in state.files_known for d in dirs):
+                state.files_known = (dirs + state.files_known)[:30]
+            store.save(state)
+            self._last_local_project_path = str(path)
+            try:
+                from agent.tools import set_active_project_root
+
+                set_active_project_root(str(path))
+            except Exception:
+                pass
+            # Align coding loop folder with real Desktop pin
+            try:
+                loop = getattr(self, "_coding_loop", None)
+                if loop is not None and hasattr(loop, "state"):
+                    loop.state.project_folder = str(path)
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.debug("save active work failed: {}", exc)
+
+    def _active_work_context_block(self) -> str:
+        store = getattr(self, "_active_work_store", None)
+        if store is None:
+            return ""
+        try:
+            return store.context_block(self._active_work_thread())
+        except Exception:
+            return ""
+
+    def _update_active_work_goal(self, user_input: str) -> None:
+        """On coding follow-ups, refresh goal/next_step without wiping project pin."""
+        store = getattr(self, "_active_work_store", None)
+        if store is None:
+            return
+        try:
+            from agent.active_work import infer_goal_from_user, next_step_for_phase
+
+            state = store.load(self._active_work_thread())
+            if not state.project_path:
+                return
+            if re.search(
+                r"(?i)\b(add|edit|fix|implement|change|score|code|write|make sure)\b",
+                user_input or "",
+            ):
+                state.goal = infer_goal_from_user(user_input) or state.goal
+                state.phase = "implement"
+                state.next_step = next_step_for_phase(
+                    "implement", has_samples=bool(state.code_digest), goal=state.goal
+                )
+            state.last_user_message = str(user_input or "")[:400]
+            store.save(state)
+            # Restore pin + in-memory samples so Stage 4 does not re-list Desktop
+            self._hydrate_from_active_work(state)
+        except Exception:
+            pass
+
+    def _hydrate_from_active_work(self, state=None) -> bool:
+        """Restore pin, listing, and code samples from durable fingerprint into this agent instance."""
+        try:
+            if state is None:
+                state = self._load_active_work()
+            if state is None or not getattr(state, "project_path", ""):
+                return False
+            path = str(state.project_path)
+            self._last_local_project_path = path
+            if getattr(state, "listing", ""):
+                self._last_local_project_listing = str(state.listing)
+            if getattr(state, "code_digest", ""):
+                self._last_local_project_samples = str(state.code_digest)
+            try:
+                from agent.tools import set_active_project_root
+
+                set_active_project_root(path)
+            except Exception:
+                pass
+            # Seed partial tool context so Stage 4 sees real file substance without re-scanning
+            digest = str(getattr(state, "code_digest", "") or "")
+            listing = str(getattr(state, "listing", "") or "")
+            if digest or listing:
+                if not hasattr(self, "_partial_tool_results") or self._partial_tool_results is None:
+                    self._partial_tool_results = []
+                # Avoid duplicating the same fingerprint every turn
+                already = any(
+                    (tr.get("tool") == "active_work_restore" and path in str(tr.get("output") or ""))
+                    for tr in (self._partial_tool_results or [])
+                )
+                if not already:
+                    blob = (
+                        f"[ACTIVE_WORK_RESTORE] path={path} phase={state.phase}\n"
+                        f"goal={state.goal}\nnext_step={state.next_step}\n"
+                        f"files={', '.join((state.files_known or [])[:20])}\n"
+                        f"listing:\n{listing[:1500]}\n"
+                        f"code_digest:\n{digest[:4000]}"
+                    )
+                    self._partial_tool_results.append(
+                        {"tool": "active_work_restore", "output": blob}
+                    )
+            try:
+                loop = getattr(self, "_coding_loop", None)
+                if loop is not None and hasattr(loop, "state"):
+                    loop.state.project_folder = path
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    def _note_active_work_after_turn(self, user_input: str, response_text: str) -> None:
+        """Update phase/stall/next_step after a turn; mark incomplete goals for replan."""
+        store = getattr(self, "_active_work_store", None)
+        if store is None:
+            return
+        try:
+            from agent.active_work import goal_looks_incomplete, next_step_for_phase
+
+            state = store.load(self._active_work_thread())
+            if not state.project_path or not state.is_active():
+                return
+            tools = [
+                str(tr.get("tool") or "")
+                for tr in (getattr(self, "_partial_tool_results", None) or [])
+                if tr.get("tool")
+            ]
+            state.last_tools = list(dict.fromkeys(tools))[:12]
+            wrote = any(t in {"file_write", "artifact_write", "self_edit"} for t in tools)
+            if wrote and state.phase == "implement":
+                # File write happened — advance next_step, keep goal until user is done
+                state.next_step = (
+                    f"Verify the last edit for: {state.goal[:160]}"
+                    if state.goal
+                    else "Verify the last edit under project_path."
+                )
+                state.stall_count = 0
+            elif goal_looks_incomplete(state, response_text, tools_ran=tools):
+                state.stall_count = int(state.stall_count or 0) + 1
+                if state.stall_count >= 1:
+                    state.phase = "blocked" if state.phase != "implement" else "implement"
+                state.next_step = next_step_for_phase(
+                    state.phase,
+                    has_samples=bool(state.code_digest),
+                    goal=state.goal or user_input,
+                )
+            state.last_user_message = str(user_input or "")[:400]
+            store.save(state)
+        except Exception as exc:
+            logger.debug("note active work after turn failed: {}", exc)
+
+    def _ensure_active_work_continuity(
+        self,
+        user_input: str,
+        response_text: str,
+        callbacks: Optional[list] = None,
+    ) -> str:
+        """Code-enforced multi-turn continuity: never re-list Desktop / re-ask project type.
+
+        When durable active work exists and the model stalls, re-lists Desktop, or
+        fails to advance an implement goal, recover from the fingerprint (brief or
+        forced next-step) instead of looping.
+        """
+        aw = self._load_active_work()
+        if aw is None or not getattr(aw, "project_path", ""):
+            # Local intent with no pin yet — leave to deep-scan ensure
+            return response_text
+
+        self._hydrate_from_active_work(aw)
+        low = re.sub(r"\s+", " ", str(response_text or "").lower())
+        hollow = self._local_scan_answer_is_hollow(user_input, response_text)
+        try:
+            from agent.active_work import looks_like_desktop_relist, goal_looks_incomplete
+
+            relist = looks_like_desktop_relist(response_text or "")
+            incomplete = goal_looks_incomplete(
+                aw,
+                response_text or "",
+                tools_ran=[
+                    str(tr.get("tool") or "")
+                    for tr in (getattr(self, "_partial_tool_results", None) or [])
+                ],
+            )
+        except Exception:
+            relist = False
+            incomplete = hollow
+
+        # If we already have a solid project brief / implement answer, keep it
+        samples = str(getattr(self, "_last_local_project_samples", "") or aw.code_digest or "")
+        has_substance = bool(
+            re.search(
+                r"\b(game\.js|index\.html|style\.css|canvas|player|enemy|collision|"
+                r"file_write|i (?:edited|changed|added|updated)|project path)\b",
+                low,
+            )
+        )
+        if not (hollow or relist or (incomplete and not has_substance)):
+            return response_text
+
+        # Recovery path
+        try:
+            if hasattr(self, "_emit_thinking_step"):
+                self._emit_thinking_step(
+                    "thought",
+                    "Resuming from durable active work — not restarting from Desktop list.",
+                    "done",
+                )
+        except Exception:
+            pass
+
+        # Ensure samples exist (use disk fingerprint first; only re-scan if empty)
+        if not samples or len(samples) < 80:
+            try:
+                self._run_local_project_deep_scan(user_input or aw.last_user_message or aw.goal)
+                samples = str(getattr(self, "_last_local_project_samples", "") or "")
+            except Exception as exc:
+                logger.warning("Active-work recovery scan failed: {}", exc)
+
+        phase = str(getattr(aw, "phase", "") or "")
+        goal = str(getattr(aw, "goal", "") or "")
+        # Implement goal: do not re-brief; force a next-step-oriented recovery answer
+        if phase == "implement" and goal and re.search(
+            r"(?i)\b(add|edit|fix|implement|change|score|code|write|make sure)\b",
+            goal + " " + (user_input or ""),
+        ):
+            brief = self._synthesize_active_work_replan(user_input, aw)
+            if brief and len(brief.strip()) > 40:
+                self._note_active_work_after_turn(user_input, brief)
+                return brief
+
+        if samples and len(samples) > 80:
+            brief = self._synthesize_local_project_brief(user_input or aw.goal or "continue project")
+            if brief and len(brief.strip()) > 40:
+                self._note_active_work_after_turn(user_input, brief)
+                return brief
+
+        # Deterministic last resort from fingerprint
+        names = ", ".join((aw.files_known or [])[:12]) or "(see project_path)"
+        fallback = (
+            f"Resuming {aw.project_name or 'the project'} at {aw.project_path}.\n"
+            f"Known files: {names}.\n"
+            f"Goal: {goal or '(open — tell me what to change)'}.\n"
+            f"Next: {aw.next_step or 'edit files under project_path'}.\n"
+            "I will not re-list the whole Desktop. Say the edit you want and I will apply it."
+        )
+        self._note_active_work_after_turn(user_input, fallback)
+        return fallback
+
+    def _synthesize_active_work_replan(self, user_input: str, aw) -> str:
+        """When a coding goal is incomplete, replan from fingerprint + code digest — not Desktop."""
+        path = str(getattr(aw, "project_path", "") or "")
+        goal = str(getattr(aw, "goal", "") or user_input or "")
+        next_step = str(getattr(aw, "next_step", "") or "")
+        samples = str(getattr(aw, "code_digest", "") or getattr(self, "_last_local_project_samples", "") or "")
+        listing = str(getattr(aw, "listing", "") or getattr(self, "_last_local_project_listing", "") or "")
+        files = ", ".join((getattr(aw, "files_known", None) or [])[:20])
+        prompt = (
+            "You are Echo Speak mid coding task. Durable ACTIVE WORK already exists.\n"
+            "RULES (mandatory):\n"
+            "- Do NOT re-list the Desktop or ask what kind of project this is.\n"
+            "- Project is already open. Use the path and file samples below.\n"
+            "- State clearly: current goal, what you already know, and the exact next file edit.\n"
+            "- If the goal is an edit, describe the concrete code change (file + behavior).\n"
+            "- Prefer acting: name the file you will edit next. Do not stall.\n"
+            "- Be concise (6–12 sentences).\n\n"
+            f"User now: {user_input}\n"
+            f"project_path: {path}\n"
+            f"goal: {goal}\n"
+            f"next_step: {next_step}\n"
+            f"files_known: {files}\n"
+            f"listing:\n{listing[:2000]}\n\n"
+            f"code_digest:\n{samples[:5000]}\n\n"
+            "Replan / continue:"
+        )
+        try:
+            return self._clamp_tts_text(self._invoke_visible_llm(prompt))
+        except Exception as exc:
+            logger.warning("Active work replan synthesis failed: {}", exc)
+            return (
+                f"Continuing on {path}. Goal: {goal}. Next: {next_step or 'edit project files'}.\n"
+                f"Known files: {files or 'see project'}. I will edit under project_path — not re-list Desktop."
+            )
+
     def _ensure_coding_loop(self, user_input: str = "") -> None:
         """Start or resume a coding loop when in coding workspace / coding intent."""
         if not (self._coding_workspace_active() or self._is_coding_project_intent(user_input)):
@@ -3064,13 +3445,31 @@ class EchoSpeakAgent:
                 terminal = False
         if loop is None or terminal:
             folder = ""
+            # Prefer durable active-work / last Desktop pin over EchoSpeak-root labels
             try:
-                root = str(getattr(config, "file_tool_root", "") or ".")
-                # Prefer a stable session folder name from first words of the request
-                label = re.sub(r"\s+", " ", (user_input or "project").strip())[:40] or "project"
-                folder = project_folder_for_name(label, root)
+                aw = self._load_active_work()
+                if aw and getattr(aw, "project_path", ""):
+                    folder = str(aw.project_path)
             except Exception:
-                folder = ""
+                pass
+            if not folder:
+                folder = str(getattr(self, "_last_local_project_path", "") or "").strip()
+            if not folder:
+                try:
+                    from agent.tools import get_active_project_root
+
+                    rootp = get_active_project_root()
+                    if rootp is not None:
+                        folder = str(rootp)
+                except Exception:
+                    pass
+            if not folder:
+                try:
+                    root = str(getattr(config, "file_tool_root", "") or ".")
+                    label = re.sub(r"\s+", " ", (user_input or "project").strip())[:40] or "project"
+                    folder = project_folder_for_name(label, root)
+                except Exception:
+                    folder = ""
             self._coding_loop = CodingLoop(project_folder=folder)
             try:
                 self._coding_loop.start(project_folder=folder, note="coding turn start")
@@ -11352,20 +11751,24 @@ class EchoSpeakAgent:
         allowed_tool_names = self._allowed_lc_tool_names(resolved_input or extracted_input)
         # Stash for post-Stage4 guards (_ensure_live_web_search must honor allowlist)
         self._current_allowed_tools = allowed_tool_names
-        # Restore Desktop project pin across turns (lost when agent re-inits mid-session)
+        # Restore Desktop project pin + samples from durable active work (survives re-init)
         try:
-            from agent.tools import get_active_project_root, set_active_project_root
+            aw = self._load_active_work()
+            if aw and getattr(aw, "project_path", ""):
+                self._hydrate_from_active_work(aw)
+            else:
+                from agent.tools import get_active_project_root, set_active_project_root
 
-            if get_active_project_root() is None:
-                pin = str(getattr(self, "_last_local_project_path", "") or "").strip()
-                if pin:
-                    set_active_project_root(pin)
-                else:
-                    pinned = self._try_pin_desktop_project_from_user(
-                        resolved_input or extracted_input or user_input
-                    )
-                    if pinned:
-                        self._last_local_project_path = pinned
+                if get_active_project_root() is None:
+                    pin = str(getattr(self, "_last_local_project_path", "") or "").strip()
+                    if pin:
+                        set_active_project_root(pin)
+                    else:
+                        pinned = self._try_pin_desktop_project_from_user(
+                            resolved_input or extracted_input or user_input
+                        )
+                        if pinned:
+                            self._last_local_project_path = pinned
         except Exception:
             pass
         logger.debug(f"DEBUG: allowed_tool_names for query: {allowed_tool_names}")
@@ -11389,9 +11792,11 @@ class EchoSpeakAgent:
 
         context = ""
         self._last_context_budget_report = None
+        active_work_ctx = self._active_work_context_block()
         if include_memory:
             blocks = [
                 ContextBlock("time", time_context, 1, "Current system time", protected=True),
+                ContextBlock("active_work", active_work_ctx, 1, "Active work fingerprint", min_chars=80, protected=True),
                 ContextBlock("continuity", "\n".join(continuity_lines), 2, "Conversation continuity", min_chars=80, protected=True),
                 ContextBlock("pending_action", pending_action_context, 3, "Pending action", min_chars=80, protected=True),
                 ContextBlock("active_task_plan", active_plan_context, 4, "Active task plan", min_chars=120, protected=True),
@@ -11466,35 +11871,89 @@ class EchoSpeakAgent:
             (extracted_input or user_input or "").lower()
         )
         if local_intent:
-            # Full deep-scan only for explicit desktop/folder inspect (first contact)
+            # Deep-scan + durable active-work + forced brief (skip Stage-4 "what game is it?")
             self._add_pipeline_reasoning(
                 "⚙️ Stage 3: Shortcut Queries",
-                "Local filesystem / Desktop project intent — deep-scan: pin → list interior → read entry files.",
+                "Local Desktop project — deep-scan, persist active work, return project brief.",
             )
             try:
                 self._ensure_workspace_for_intent(user_input)
-                self._run_local_project_deep_scan(user_input)
+                # Prefer durable fingerprint when already inspected (no Desktop re-list loop)
+                aw_prior = self._load_active_work()
+                if (
+                    aw_prior
+                    and aw_prior.is_active()
+                    and aw_prior.code_digest
+                    and len(aw_prior.code_digest) > 80
+                    and aw_prior.project_path
+                ):
+                    self._hydrate_from_active_work(aw_prior)
+                    # Re-pin if user named a different folder
+                    try:
+                        pinned = self._try_pin_desktop_project_from_user(user_input)
+                        if pinned and Path(pinned).resolve() != Path(aw_prior.project_path).resolve():
+                            scan = self._run_local_project_deep_scan(user_input)
+                        else:
+                            scan = {
+                                "path": aw_prior.project_path,
+                                "listing": aw_prior.listing,
+                                "samples": aw_prior.code_digest,
+                            }
+                            # Refresh goal text if user re-opened
+                            self._save_active_work_from_scan(
+                                user_input,
+                                path=aw_prior.project_path,
+                                listing=aw_prior.listing,
+                                samples=aw_prior.code_digest,
+                                phase="ready" if aw_prior.phase in ("", "idle", "inspect") else aw_prior.phase,
+                            )
+                    except Exception:
+                        scan = {
+                            "path": aw_prior.project_path,
+                            "listing": aw_prior.listing,
+                            "samples": aw_prior.code_digest,
+                        }
+                else:
+                    scan = self._run_local_project_deep_scan(user_input)
+                path = str((scan or {}).get("path") or getattr(self, "_last_local_project_path", "") or "")
+                samples = str(
+                    (scan or {}).get("samples") or getattr(self, "_last_local_project_samples", "") or ""
+                )
+                if path and samples:
+                    brief = self._synthesize_local_project_brief(user_input)
+                    if brief and len(brief.strip()) > 40:
+                        self._pending_detail = None
+                        self._last_tts_text = self._select_tts_text(user_input, brief)
+                        self._note_active_work_after_turn(user_input, brief)
+                        self._record_turn(user_input, brief)
+                        logger.info("Active-work brief returned for project={}", path)
+                        return brief, True
             except Exception as exc:
                 logger.debug("Desktop project deep-scan failed: {}", exc)
             return None
         if coding_local:
-            # Coding follow-ups: pin project, do NOT re-list Desktop every turn
+            # Coding follow-ups: restore durable pin + goal; never re-list Desktop
             self._add_pipeline_reasoning(
                 "⚙️ Stage 3: Shortcut Queries",
-                "Coding intent — pin project root, skip web; Stage 4 file tools.",
+                "Coding intent — restore active work, pin project, Stage 4 file tools only.",
             )
             try:
                 self._ensure_workspace_for_intent(user_input)
-                from agent.tools import get_active_project_root, set_active_project_root
+                self._update_active_work_goal(user_input)
+                aw = self._load_active_work()
+                if aw and getattr(aw, "project_path", ""):
+                    self._hydrate_from_active_work(aw)
+                else:
+                    from agent.tools import get_active_project_root, set_active_project_root
 
-                if get_active_project_root() is None:
-                    pinned = self._try_pin_desktop_project_from_user(user_input)
-                    if not pinned:
-                        pin = str(getattr(self, "_last_local_project_path", "") or "").strip()
-                        if pin:
-                            set_active_project_root(pin)
-                    elif pinned:
-                        self._last_local_project_path = pinned
+                    if get_active_project_root() is None:
+                        pinned = self._try_pin_desktop_project_from_user(user_input)
+                        if not pinned:
+                            pin = str(getattr(self, "_last_local_project_path", "") or "").strip()
+                            if pin:
+                                set_active_project_root(pin)
+                        elif pinned:
+                            self._last_local_project_path = pinned
             except Exception as exc:
                 logger.debug("Coding pin failed: {}", exc)
             return None
@@ -12665,6 +13124,15 @@ class EchoSpeakAgent:
             response_text = self._ensure_local_project_deep_scan(
                 user_input, response_text or "", callbacks_local,
             )
+            # Durable active-work continuity: if fingerprint exists and model re-listed
+            # Desktop / forgot goal / stalled mid-implement — recover from disk state.
+            response_text = self._ensure_active_work_continuity(
+                user_input, response_text or "", callbacks_local,
+            )
+            try:
+                self._note_active_work_after_turn(user_input, response_text or "")
+            except Exception:
+                pass
             # Small models often say "I'll check the weather" after get_system_time and stop.
             # If live facts were required but web_search never ran, force it here.
             response_text = self._ensure_live_web_search(
