@@ -1,10 +1,18 @@
 import os
 import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent.context_budget import ContextBlock, ContextBudgetManager
-from agent.research import SearchGrounder, build_search_intent
+from agent.context_budget import ContextBlock, ContextBudgetManager, compress_text
+from agent.research import (
+    GroundedSearchResult,
+    SearchGrounder,
+    build_search_intent,
+    format_grounded_tool_output,
+    is_grounded_search_output,
+)
 from agent.session_memory import SessionMemoryDistiller
 from agent.verification import VerificationTelemetry
 
@@ -122,6 +130,26 @@ def test_context_budget_reports_graduated_pressure_and_protected_blocks():
     assert report.stage in {"soft_trim", "summarize", "compact"}
 
 
+def test_context_budget_summarize_compact_actually_compresses():
+    manager = ContextBudgetManager(context_window=400, reserve_tokens=50, enabled=True)
+    huge = ("word " * 2000) + "UNIQUE_TAIL_MARKER_999"
+    fitted, report = manager.fit_text(huge, overhead_tokens=50, label="tool_dump")
+
+    assert len(fitted) < len(huge)
+    assert report.stage in {"soft_trim", "summarize", "compact"}
+    assert report.compressed_blocks or "compressed for context headroom" in fitted or "trimmed for context headroom" in fitted
+    # Tail is retained when budget allows; otherwise compression marker proves shrink happened.
+    assert "MARKER_999" in fitted or "compressed for context headroom" in fitted
+
+
+def test_compress_text_keeps_head_and_tail():
+    text = "AAAA" * 100 + "MID" + "BBBB" * 100
+    out = compress_text(text, 120, label="demo")
+    assert len(out) <= 140
+    assert "AAAA" in out
+    assert "BBBB" in out or "compressed" in out
+
+
 def test_session_memory_updates_durable_summary_file(tmp_path):
     distiller = SessionMemoryDistiller(tmp_path, update_turns=1)
     state = distiller.update_turn(
@@ -163,3 +191,179 @@ def test_verification_telemetry_weights_known_failure_clusters():
 
     telemetry.record("tool_call_syntax_unrecognized", reason="raw execute_tool leaked")
     assert telemetry.verification_level("file_read", "tool_call_syntax_unrecognized") == "high"
+
+
+def test_format_grounded_tool_output_blocks_confident_answer_when_insufficient():
+    result = GroundedSearchResult(
+        chosen_query="who's playing today?",
+        candidates=[],
+        evidence=[],
+        rejected_candidates=[{"query": "who's playing today?", "reason": "Evidence did not contain the requested specific current answer.", "score": 0.1}],
+        condensed_evidence="1. Schedule page\n   Evidence: Sunday schedule nav only",
+        raw_output="raw",
+        accepted=False,
+    )
+    text = format_grounded_tool_output(result)
+
+    assert is_grounded_search_output(text)
+    assert "SEARCH_EVIDENCE_INSUFFICIENT: true" in text
+    assert "Do NOT invent" in text
+    assert "BEST_AVAILABLE_EVIDENCE:" in text
+    assert "who's playing today?" in text
+
+
+def test_format_grounded_tool_output_marks_accepted_evidence():
+    result = GroundedSearchResult(
+        chosen_query="Canada score live",
+        candidates=[],
+        evidence=[],
+        rejected_candidates=[],
+        condensed_evidence="1. Live\n   Evidence: Canada 2-1 Morocco",
+        raw_output="raw",
+        accepted=True,
+    )
+    text = format_grounded_tool_output(result)
+
+    assert is_grounded_search_output(text)
+    assert "accepted=true" in text
+    assert "Canada 2-1 Morocco" in text
+    assert "SEARCH_EVIDENCE_INSUFFICIENT" not in text
+
+
+def test_grounded_web_search_single_path_persists_and_formats(monkeypatch):
+    """Stage 3 / TaskPlanner / native tools all call the same helper."""
+    from agent.core import EchoSpeakAgent
+
+    agent = EchoSpeakAgent.__new__(EchoSpeakAgent)
+    agent._current_subject_text = "Canada vs Morocco"
+    agent._last_web_query_context = ""
+    agent._last_grounded_search_result = None
+    agent._verification_telemetry = VerificationTelemetry(enabled=False)
+    agent._emit_tool_start = MagicMock()
+    agent._emit_tool_end = MagicMock()
+    agent._emit_tool_error = MagicMock()
+    agent._emit_thinking_step = MagicMock()
+    agent._fetch_search_result_page_text = MagicMock(return_value="")
+
+    calls = []
+
+    def fake_raw(query: str) -> str:
+        calls.append(query)
+        return (
+            "1. Live scoreboard\n"
+            "   URL: https://example.com/live\n"
+            "   Snippet: Canada 2-1 Morocco live score result."
+        )
+
+    agent._raw_web_search_execute = fake_raw
+
+    # Force grounding on regardless of env
+    import config as cfg
+
+    monkeypatch.setattr(cfg, "search_grounding_enabled", True, raising=False)
+    monkeypatch.setattr(cfg, "search_grounding_max_candidates", 2, raising=False)
+
+    out = agent._grounded_web_search(
+        "Canada vs Morocco score right now",
+        original_request="Canada vs Morocco score right now",
+        emit_tool_events=True,
+    )
+
+    assert is_grounded_search_output(out)
+    assert "accepted=true" in out.lower() or "2-1" in out
+    assert agent._last_grounded_search_result is not None
+    assert agent._last_grounded_search_result.get("accepted") is True
+    assert calls  # raw search was used as execute backend
+
+
+def test_web_task_reflector_skips_double_grounding():
+    from agent.core import WebTaskReflector
+
+    agent = SimpleNamespace(_grounded_web_search=MagicMock(return_value="should-not-call"))
+    reflector = WebTaskReflector(agent)
+    already = "[GROUNDED_SEARCH] accepted=true query=test\n\n1. Evidence here"
+    task = {"index": 0, "params": {"q": "test query"}}
+
+    out = reflector.reflect_and_retry(task, "web_search", already, tools=[], callbacks=None)
+
+    assert out == already
+    agent._grounded_web_search.assert_not_called()
+
+
+def test_lc_tool_wrapper_routes_to_grounded_helper():
+    from agent.core import EchoSpeakAgent
+
+    agent = EchoSpeakAgent.__new__(EchoSpeakAgent)
+    agent._grounded_web_search = MagicMock(return_value="[GROUNDED_SEARCH] accepted=true\n\nok")
+
+    class FakeTool:
+        name = "web_search"
+        description = "Search the web"
+        args_schema = None
+
+    wrapped = agent._make_grounded_web_search_lc_tool(FakeTool())
+    result = wrapped.invoke({"query": "live scores today"})
+
+    agent._grounded_web_search.assert_called()
+    assert is_grounded_search_output(result)
+    call_kwargs = agent._grounded_web_search.call_args
+    assert "live scores today" in str(call_kwargs)
+
+
+def test_looks_like_raw_tool_syntax_covers_common_variants():
+    from agent.core import EchoSpeakAgent
+
+    agent = EchoSpeakAgent.__new__(EchoSpeakAgent)
+    assert agent._looks_like_raw_tool_syntax("|TOOL| terminal_run {\"command\":\"ls\"}")
+    assert agent._looks_like_raw_tool_syntax('<execute_tool>file_write(path="a.txt", content="x")</execute_tool>')
+    assert agent._looks_like_raw_tool_syntax("Action: file_write(path='x.html', content='hi')")
+    assert agent._looks_like_raw_tool_syntax("file_write(path='x.html', content='hi')")
+    assert not agent._looks_like_raw_tool_syntax("I can write a file for you if you want.")
+
+
+def test_partial_tool_synthesis_and_harvest():
+    from agent.core import EchoSpeakAgent
+
+    agent = EchoSpeakAgent.__new__(EchoSpeakAgent)
+    agent._partial_tool_results = []
+    agent._clamp_tts_text = lambda s: s
+    agent._invoke_visible_llm = MagicMock(return_value="Canada won 2-1.")
+
+    class ToolMsg:
+        def __init__(self, name, content):
+            self.name = name
+            self.content = content
+            self.tool_call_id = "tc1"
+
+    class AIMsg:
+        type = "ai"
+        content = ""
+
+    result = {
+        "messages": [
+            ToolMsg("web_search", "[GROUNDED_SEARCH] accepted=true\n\nCanada 2-1 Morocco"),
+            AIMsg(),
+        ]
+    }
+    agent._harvest_tool_results_from_graph(result)
+    assert any(tr["tool"] == "web_search" for tr in agent._partial_tool_results)
+
+    out = agent._synthesize_from_partial_tools("what was the score?", context="")
+    assert "2-1" in out or "Canada" in out
+    agent._invoke_visible_llm.assert_called()
+    prompt = agent._invoke_visible_llm.call_args[0][0]
+    assert "Tool results" in prompt
+    assert "web_search" in prompt
+
+
+def test_partial_tool_blocker_when_synthesis_impossible():
+    from agent.core import EchoSpeakAgent
+
+    agent = EchoSpeakAgent.__new__(EchoSpeakAgent)
+    agent._partial_tool_results = [{"tool": "web_search", "output": "evidence..."}]
+    agent._clamp_tts_text = lambda s: s
+    agent._invoke_visible_llm = MagicMock(side_effect=RuntimeError("llm down"))
+
+    out = agent._synthesize_from_partial_tools("score?", "")
+    assert "web_search" in out
+    assert "could not finish" in out.lower() or "Partial results" in out

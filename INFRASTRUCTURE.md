@@ -4,7 +4,7 @@ This document explains how EchoSpeak's backend is currently wired, how requests 
 
 It is written for Ty and future contributors who need to understand the full backend, not just one feature at a time.
 
-Current baseline: v7.3.1 reliability architecture pass.
+Current baseline: v7.4.4 Harness Completeness complete (A–F, Gemma-first).
 
 ---
 
@@ -1283,25 +1283,13 @@ Next refinement:
 - Add UI controls for pinning, pruning, and editing session-derived items.
 - Keep raw chat, session summary, and profile/pinned memory visibly separate.
 
-### Gap 2: Context budget needs end-to-end coverage
+### Gap 2: Context budget end-to-end — largely closed in v7.4.2
 
-Stage 2 now uses `ContextBudgetManager`, but direct fallback prompts and every native tool-result reinjection path should be audited for the same budget discipline.
+Stage 2, Stage 5 finalize, mid-task tool outputs, and `fit_text` reinjection use the same manager. Summarize/compact **compress** non-protected content (head+tail). Remaining: UI/doctor visibility polish and model-specific token estimators.
 
-Next refinement:
+### Gap 3: Search grounding path parity — closed in v7.4.0
 
-- Apply budget reports to every prompt construction path.
-- Add UI/doctor visibility for kept/trimmed block names.
-- Add model-specific token estimators when available.
-
-### Gap 3: Search grounding needs more evaluations
-
-`SearchGrounder` now handles candidate generation, follow-up anchoring, score/result query language, evidence scoring, and condensed packets for shortcut searches.
-
-Next refinement:
-
-- Apply grounding to every native model `web_search` tool result, not only shortcut paths and compatibility reflection.
-- Add fixtures for news, finance, sports, schedule, Discord-context, and local-project research.
-- Track accepted/rejected candidates in the Research panel.
+`_grounded_web_search()` is the single entry point for Stage 3, TaskPlanner/WebTaskReflector, and native LangGraph `web_search` tools. Insufficient evidence returns structured `SEARCH_EVIDENCE_INSUFFICIENT` packets. Remaining work is multi-domain eval fixtures (v7.4.4) and Research-panel surfacing of accepted/rejected candidates.
 
 ### Gap 4: Verification telemetry needs UI and policy feedback
 
@@ -1317,9 +1305,9 @@ Next refinement:
 
 ## 29. Recommended Next Implementation Order
 
-### Step 1: Native Tool-Call Grounding
+### Step 1: Native Tool-Call Grounding — done (v7.4.0)
 
-Highest leverage after v7.3.1: apply `SearchGrounder` to model-native `web_search` tool results in the LangGraph/ReAct path, not just shortcut searches.
+Shared `_grounded_web_search()` wraps Stage 3, TaskPlanner, and native LangGraph tools.
 
 ### Step 2: Reliability UI
 

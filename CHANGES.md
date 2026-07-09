@@ -1,5 +1,56 @@
 # Changes
 
+## v7.4.4 - Eval Harness E1–E10 (CI fixtures)
+
+### Backend / Tests
+- Added `tests/test_eval_harness_e1_e10.py` with deterministic recorded fixtures (no live Tavily).
+- Scenarios: E1 printed file_write pending, E2 live-score reject/retry, E3 full-page buried schedule, E4 capability-gap odds, E5 subject continuity, E6 terminal ExitCode=1, E7 LM Studio readiness, E8 coding write pending, E9 weak evidence insufficient, E10 context flood protects subject.
+- Baseline board: **10/10** harness fixtures pass in CI (product bar ≥8/10). Live Gemma 4 runs remain manual.
+
+## v7.4.3 - Full Suite Green + Endpoint Contracts
+
+### Tests
+- Updated research routing tests to patch `_raw_web_search_execute` (shared grounder backend) instead of tool.invoke.
+- Hardened web_search timeout test so DuckDuckGo fallback cannot mask Tavily timeouts.
+- Added endpoint contracts: `/coding/readiness`, `/memory/compact`, terminal denylist allow/deny, readiness response shape.
+- Full backend suite: **244 passed**.
+
+## v7.4.2 - Context Budget Completeness
+
+### Backend
+- `ContextBudgetManager` now **compresses** non-protected blocks under soft_trim/summarize/compact (head+tail) instead of only logging pressure.
+- Protected overflow under compact can hard-clip with compression markers.
+- Stage 5 finalize builds prompts through the same budget manager (partial tools protected; history/docs compressible).
+- Mid-task tool outputs are fit/compressed and written back into `_partial_tool_results`.
+- Added `compress_text()`, `fit_text()`, and `compressed_blocks` on budget reports.
+
+## v7.4.1 - Tool-Call Contract + Stage 4 Recovery
+
+### Backend
+- Expanded printed-tool detection (`Action:`, `call_tool:`, function-call shapes) and last-line defense that never leaves raw tool markup in chat.
+- Unrecognized tool-shaped text always records `tool_call_syntax_unrecognized` telemetry.
+- Recovered `web_search` from printed syntax runs through `_grounded_web_search`; action tools stay **pending confirm**.
+- Harvest LangGraph ToolMessages into partial-tool state; synthesize answers when the graph returns empty after tools ran.
+- Stage 4 cascade end: partial-tool synthesis or explicit blocker — never silent amnesia of completed tool work.
+- Stage 5 injects partial tool context into direct-LLM fallback prompts.
+
+## v7.4.0 - Search Path Parity (Harness Completeness)
+
+### Backend
+- Added a single shared `_grounded_web_search()` on `EchoSpeakAgent` as the only grounding entry point for web search (Workstream A).
+- Raw Tavily execution is isolated in `_raw_web_search_execute()` so candidate loops never re-enter the grounder.
+- Stage 3 shortcut path, TaskPlanner/WebTaskReflector, and native LangGraph/ReAct `web_search` tools all use the same helper.
+- Wrapped `lc_tools` `web_search` via `_apply_search_grounding_to_lc_tools` / `_make_grounded_web_search_lc_tool` so Gemma 4 native tool-calling cannot bypass grounding.
+- `self.tools` `web_search` wrapper also routes through `_grounded_web_search`.
+- Added `format_grounded_tool_output()` / `is_grounded_search_output()` / `GROUNDED_SEARCH_MARKER` in `research.py`.
+- Insufficient evidence returns structured `SEARCH_EVIDENCE_INSUFFICIENT` text that forbids inventing scores/schedules and blocks confident empty answers.
+- Accepted evidence is marked `accepted=true` with condensation for synthesis only.
+- Grounded results always persist to `_last_grounded_search_result` (doctor/Research panel) regardless of path.
+- WebTaskReflector skips re-grounding when output already carries the grounded marker (no double-ground).
+
+### Verification
+- Extended `tests/test_reliability_architecture.py` for insufficient/accepted formatting, single-path persistence, double-ground skip, and lc-tool wrapper routing (15 tests passing).
+
 ## v7.3.2 - Reliability Contract Cleanup
 
 ### Backend
