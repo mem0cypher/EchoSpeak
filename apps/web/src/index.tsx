@@ -52,11 +52,54 @@ type StreamEvent =
   | { type: "final"; text: string }
   | { type: "error"; message: string };
 
+type MessageUsage = {
+  /** Estimated tokens in this bubble */
+  tokens: number;
+  /** Estimated session/context tokens used after this message */
+  contextUsed: number;
+  /** Configured context window at send time */
+  contextWindow: number;
+  provider?: string;
+  model?: string;
+};
+
 type Message = {
   id: string;
   role: Role;
   text: string;
   at: number;
+  usage?: MessageUsage;
+  /** True when the reply was already shown live via stream tokens — skip typewriter re-reveal */
+  skipTypewriter?: boolean;
+};
+
+/** Rough client-side token estimate (chars / 3.5) — matches context meter */
+const estimateTokens = (text: string): number =>
+  Math.max(0, Math.round(String(text || "").length / 3.5));
+
+const formatTokenCount = (n: number): string => {
+  if (!Number.isFinite(n) || n < 0) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(Math.round(n));
+};
+
+const buildMessageUsage = (
+  text: string,
+  priorMessages: Message[],
+  contextWindow: number,
+  meta?: { provider?: string; model?: string }
+): MessageUsage => {
+  const tokens = estimateTokens(text);
+  const prior = priorMessages.reduce((sum, m) => sum + (m.usage?.tokens ?? estimateTokens(m.text)), 0);
+  const window = contextWindow > 0 ? contextWindow : 32768;
+  return {
+    tokens,
+    contextUsed: prior + tokens,
+    contextWindow: window,
+    provider: meta?.provider,
+    model: meta?.model,
+  };
 };
 
 type AgentStreamEvent =
@@ -70,7 +113,8 @@ type AgentStreamEvent =
   | { type: "task_plan"; data: any[]; at?: number; request_id?: string }
   | { type: "task_step"; data: { index: number; status: string; description?: string; tool?: string; result_preview?: string; total?: number }; at?: number; request_id?: string }
   | { type: "task_reflection"; data: { index: number; accepted: boolean; reason?: string; cycle?: number }; at?: number; request_id?: string }
-  | { type: "final"; response: string; spoken_text?: string; success: boolean; memory_count: number; doc_sources?: DocSource[]; research?: ResearchRun[]; execution_id?: string; trace_id?: string; thread_state?: ThreadSessionState | null; request_id?: string; at: number }
+  | { type: "partial_reply"; response: string; speak?: boolean; segment?: number; reason?: string; request_id?: string; at: number }
+  | { type: "final"; response: string; spoken_text?: string; success: boolean; memory_count: number; doc_sources?: DocSource[]; research?: ResearchRun[]; execution_id?: string; trace_id?: string; thread_state?: ThreadSessionState | null; partial_replies?: string[]; request_id?: string; at: number }
   | { type: "error"; message: string; at: number; request_id?: string };
 
 /** Square spinner — Echo's shape, no emoji */
@@ -116,7 +160,7 @@ type ThinkingStep = {
   id: string;
   type: "thought" | "search" | "read" | "tool";
   content: string;
-  status: "running" | "done";
+  status: "running" | "done" | "failed";
   at: number;
 };
 
@@ -410,7 +454,6 @@ type AvatarConfig = {
   breathing_speed: number;
   eye_size: number;
   body_roundness: number;
-  enable_particles: boolean;
   enable_glow: boolean;
   enable_idle_activities: boolean;
   custom_status_text: string;
@@ -425,17 +468,16 @@ const defaultAvatarConfig: AvatarConfig = {
   breathing_speed: 1,
   eye_size: 1,
   body_roundness: 14,
-  enable_particles: true,
   enable_glow: true,
   enable_idle_activities: true,
   custom_status_text: "",
 };
 
 const globalCss = `
-         :root { --ui-scale: 1.1; }
-         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap');
+         :root { --ui-scale: 1.2; }
+         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
          * { box-sizing: border-box; }
-         body { margin: 0; background: ${colors.bg}; font-family: 'Manrope', sans-serif; -webkit-font-smoothing: antialiased; }
+         body { margin: 0; background: ${colors.bg}; font-family: 'Inter', 'Manrope', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
          * { scrollbar-width: thin; scrollbar-color: #333 transparent; }
          *::-webkit-scrollbar { width: 6px; height: 6px; }
          *::-webkit-scrollbar-track { background: transparent; }
@@ -445,6 +487,11 @@ const globalCss = `
          
          .chat-markdown p:first-of-type { margin-top: 0; }
          .chat-markdown p:last-of-type { margin-bottom: 0; }
+         .chat-markdown { font-size: 15px; line-height: 1.65; letter-spacing: 0.01em; }
+         .chat-text { font-size: 15px; line-height: 1.65; letter-spacing: 0.01em; }
+         .chat-line-user { color: rgba(255,255,255,0.55); text-align: right; }
+         .chat-line-assistant { color: rgba(255,255,255,0.92); text-align: left; }
+         .chat-flat { background: transparent !important; border: none !important; box-shadow: none !important; border-radius: 0 !important; backdrop-filter: none !important; }
          
          .app-shell {
            width: calc(100vw / var(--ui-scale) + 4px);
@@ -507,10 +554,10 @@ const globalCss = `
           flex: 1;
           display: flex;
           flex-direction: column;
-          padding: 28px;
+          padding: 20px 20px 18px;
           overflow: hidden;
           min-height: 0;
-          gap: 24px;
+          gap: 14px;
         }
         .research-panel {
           position: relative;
@@ -520,7 +567,7 @@ const globalCss = `
           flex: 1;
           overflow: hidden;
           min-height: 0;
-          gap: 20px;
+          gap: 12px;
         }
         .tab-bar {
           display: flex;
@@ -607,23 +654,217 @@ const globalCss = `
            overflow-y: auto;
            display: flex;
            flex-direction: column;
-           gap: 16px;
-           padding-right: 8px;
+           gap: 14px;
+           padding: 0;
+           width: 100%;
          }
          .research-card {
-           background: linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01));
-           backdrop-filter: blur(12px);
-           -webkit-backdrop-filter: blur(12px);
-           border: 1px solid rgba(255, 255, 255, 0.1);
-           border-radius: 16px;
-           padding: 16px 20px;
-           transition: all 0.3s ease;
-           box-shadow: 0 4px 16px -4px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.05);
+           background: rgba(255,255,255,0.03);
+           border: 1px solid rgba(255, 255, 255, 0.08);
+           border-radius: 4px;
+           padding: 16px 18px;
+           transition: border-color 0.2s ease, background 0.2s ease;
+           box-shadow: none;
+           backdrop-filter: none;
          }
          .research-card:hover {
-           border-color: rgba(255, 255, 255, 0.2);
-           transform: translateY(-2px);
-           box-shadow: 0 8px 24px -4px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.08);
+           border-color: rgba(255, 255, 255, 0.16);
+           transform: none;
+           background: rgba(255,255,255,0.045);
+           box-shadow: none;
+         }
+         /* ── EchoSpeak Studio shell ── */
+         .studio-shell {
+           position: fixed;
+           inset: 0;
+           z-index: 200;
+           display: flex;
+           flex-direction: column;
+           background:
+             radial-gradient(ellipse 80% 50% at 50% -20%, rgba(255,255,255,0.06), transparent 55%),
+             radial-gradient(ellipse 40% 30% at 100% 100%, rgba(79,142,255,0.05), transparent 45%),
+             #030406;
+           color: #fff;
+           overflow: hidden;
+         }
+         .studio-shell::before {
+           content: "";
+           pointer-events: none;
+           position: absolute;
+           inset: 0;
+           background-image:
+             linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+             linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+           background-size: 48px 48px;
+           mask-image: radial-gradient(ellipse 70% 60% at 50% 40%, #000 20%, transparent 75%);
+           opacity: 0.7;
+         }
+         .studio-top {
+           position: relative;
+           z-index: 2;
+           display: flex;
+           align-items: center;
+           justify-content: space-between;
+           gap: 16px;
+           padding: 18px 28px 14px;
+           border-bottom: 1px solid rgba(255,255,255,0.08);
+           background: rgba(0,0,0,0.4);
+         }
+         .studio-brand {
+           display: flex;
+           align-items: center;
+           gap: 14px;
+           min-width: 0;
+         }
+         .studio-brand-mark {
+           width: 28px;
+           height: 28px;
+           border-radius: 3px;
+           border: 1px solid rgba(255,255,255,0.2);
+           display: flex;
+           align-items: center;
+           justify-content: center;
+           background: rgba(255,255,255,0.04);
+           flex-shrink: 0;
+         }
+         .studio-brand-mark img {
+           width: 16px;
+           height: 16px;
+           border-radius: 1px;
+         }
+         .studio-title {
+           font-family: 'Space Grotesk', Inter, sans-serif;
+           font-size: 13px;
+           font-weight: 700;
+           letter-spacing: 0.14em;
+           text-transform: uppercase;
+         }
+         .studio-sub {
+           font-family: 'JetBrains Mono', ui-monospace, monospace;
+           font-size: 10px;
+           letter-spacing: 0.08em;
+           color: rgba(255,255,255,0.38);
+           margin-top: 2px;
+         }
+         .studio-x {
+           width: 40px;
+           height: 40px;
+           border-radius: 3px;
+           border: 1px solid rgba(255,255,255,0.18);
+           background: transparent;
+           color: #fff;
+           cursor: pointer;
+           display: flex;
+           align-items: center;
+           justify-content: center;
+           transition: background 0.15s ease, border-color 0.15s ease;
+           flex-shrink: 0;
+         }
+         .studio-x:hover {
+           background: rgba(255,255,255,0.08);
+           border-color: rgba(255,255,255,0.35);
+         }
+         .studio-nav {
+           position: relative;
+           z-index: 2;
+           display: flex;
+           justify-content: center;
+           border-bottom: 1px solid rgba(255,255,255,0.06);
+           background: rgba(255,255,255,0.015);
+         }
+         .studio-nav-inner {
+           display: flex;
+           gap: 0;
+           overflow-x: auto;
+           max-width: 960px;
+           width: 100%;
+           padding: 0 8px;
+           scrollbar-width: none;
+         }
+         .studio-nav-inner::-webkit-scrollbar { display: none; }
+         .studio-tab {
+           height: 44px;
+           padding: 0 16px;
+           border: none;
+           border-bottom: 2px solid transparent;
+           background: transparent;
+           color: rgba(255,255,255,0.4);
+           font-size: 12px;
+           font-weight: 600;
+           letter-spacing: 0.06em;
+           cursor: pointer;
+           white-space: nowrap;
+           transition: color 0.15s ease;
+           font-family: Inter, system-ui, sans-serif;
+         }
+         .studio-tab:hover { color: rgba(255,255,255,0.75); }
+         .studio-tab.active {
+           color: #fff;
+           border-bottom-color: #fff;
+         }
+         .studio-body {
+           position: relative;
+           z-index: 1;
+           flex: 1;
+           min-height: 0;
+           display: flex;
+           justify-content: center;
+           overflow: hidden;
+         }
+         .studio-column {
+           width: 100%;
+           max-width: 960px;
+           height: 100%;
+           min-height: 0;
+           display: flex;
+           flex-direction: column;
+           padding: 24px 28px 40px;
+           box-sizing: border-box;
+           overflow: hidden;
+         }
+         .studio-hero {
+           display: flex;
+           align-items: baseline;
+           justify-content: space-between;
+           gap: 12px;
+           margin-bottom: 18px;
+           padding-bottom: 14px;
+           border-bottom: 1px solid rgba(255,255,255,0.06);
+           flex-shrink: 0;
+         }
+         .studio-hero h2 {
+           margin: 0;
+           font-family: 'Space Grotesk', Inter, sans-serif;
+           font-size: 22px;
+           font-weight: 700;
+           letter-spacing: -0.02em;
+         }
+         .studio-hero span {
+           font-family: 'JetBrains Mono', ui-monospace, monospace;
+           font-size: 10px;
+           letter-spacing: 0.1em;
+           text-transform: uppercase;
+           color: rgba(255,255,255,0.35);
+         }
+         .studio-dock {
+           position: absolute;
+           right: 24px;
+           bottom: 24px;
+           width: 88px;
+           height: 88px;
+           border-radius: 3px;
+           overflow: hidden;
+           border: 1px solid rgba(255,255,255,0.12);
+           background: rgba(0,0,0,0.7);
+           z-index: 4;
+         }
+         .studio-shell .research-scroll {
+           align-items: stretch;
+           width: 100%;
+         }
+         .studio-shell .research-card {
+           width: 100%;
+           box-sizing: border-box;
          }
          .research-title {
            font-size: 16px;
@@ -656,206 +897,195 @@ const globalCss = `
          .chat-scroll {
            flex: 1;
            overflow-y: auto;
+           overflow-x: hidden;
            display: flex;
            flex-direction: column;
-           gap: 20px;
+           gap: 18px;
            width: 100%;
-           padding-right: 0;
+           /* Keep text clear of the scrollbar track */
+           padding: 4px 22px 8px 4px;
+           scrollbar-gutter: stable;
+           scrollbar-width: thin;
+           scrollbar-color: rgba(255,255,255,0.18) transparent;
          }
-       .input-bar {
+         .chat-scroll::-webkit-scrollbar {
+           width: 8px;
+         }
+         .chat-scroll::-webkit-scrollbar-track {
+           background: transparent;
+           margin: 8px 0;
+         }
+         .chat-scroll::-webkit-scrollbar-thumb {
+           background: rgba(255,255,255,0.14);
+           border-radius: 2px;
+           border: 2px solid transparent;
+           background-clip: padding-box;
+         }
+         .chat-scroll::-webkit-scrollbar-thumb:hover {
+           background: rgba(255,255,255,0.28);
+           background-clip: padding-box;
+           border: 2px solid transparent;
+         }
+
+         /* ── Composer dock ── */
+         .input-bar {
            margin-top: auto;
            display: flex;
            flex-direction: column;
-           gap: 12px;
+           gap: 10px;
+           padding-top: 10px;
+           border-top: 1px solid rgba(255,255,255,0.06);
          }
          .input-row {
            display: flex;
-           gap: 12px;
+           gap: 10px;
            align-items: flex-end;
          }
          .input-field {
            box-sizing: border-box;
            flex: 1;
            min-width: 0;
-           background: linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01));
-           backdrop-filter: blur(12px);
-           -webkit-backdrop-filter: blur(12px);
+           background: rgba(255,255,255,0.03);
            border: 1px solid rgba(255, 255, 255, 0.12);
-           border-radius: 16px;
-           padding: 16px 20px;
+           border-radius: 3px;
+           padding: 14px 16px;
            color: ${colors.text};
-           font-size: 16px;
+           font-size: 15px;
            outline: none;
-           transition: all 0.3s ease;
-           box-shadow: inset 0 2px 4px rgba(0,0,0,0.2), 0 4px 16px -4px rgba(0,0,0,0.3);
+           transition: border-color 0.15s ease, background 0.15s ease;
+           box-shadow: none;
+           backdrop-filter: none;
          }
          .input-field:focus {
-           background: linear-gradient(135deg, rgba(45,108,255,0.08), rgba(255,255,255,0.02));
-           border-color: rgba(140,180,255,0.4);
-           box-shadow: inset 0 2px 4px rgba(0,0,0,0.2), 0 0 0 2px rgba(45,108,255,0.2), 0 4px 16px -4px rgba(0,0,0,0.3);
+           background: rgba(255,255,255,0.045);
+           border-color: rgba(255,255,255,0.28);
+           box-shadow: none;
          }
          textarea.input-field {
-           min-height: 52px;
-           max-height: 156px;
+           min-height: 48px;
+           max-height: 148px;
            resize: none;
-           line-height: 1.45;
+           line-height: 1.5;
            overflow-y: auto;
            font-family: inherit;
          }
          .send-button {
-           width: 52px;
-           height: 52px;
+           width: 48px;
+           height: 48px;
+           flex: 0 0 48px;
            display: grid;
            place-items: center;
-           background: linear-gradient(135deg, rgba(45,108,255,0.2), rgba(45,108,255,0.05));
-           backdrop-filter: blur(12px);
-           -webkit-backdrop-filter: blur(12px);
-           border: 1px solid rgba(140,180,255,0.4);
-           border-radius: 16px;
+           background: rgba(255,255,255,0.08);
+           border: 1px solid rgba(255,255,255,0.22);
+           border-radius: 3px;
            color: #fff;
            cursor: pointer;
-           transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+           transition: background 0.15s ease, border-color 0.15s ease;
            position: relative;
            overflow: hidden;
-           box-shadow: 0 4px 16px -4px rgba(45,108,255,0.3), inset 0 1px 0 rgba(255,255,255,0.2);
-         }
-         .send-button::before {
-           content: '';
-           position: absolute;
-           inset: -40%;
-           background: linear-gradient(
-             120deg,
-             rgba(255, 255, 255, 0.00) 0%,
-             rgba(255, 255, 255, 0.20) 18%,
-             rgba(255, 255, 255, 0.05) 38%,
-             rgba(255, 255, 255, 0.25) 55%,
-             rgba(255, 255, 255, 0.00) 72%
-           );
-           transform: translateX(-35%) rotate(8deg);
-           opacity: 0;
-           transition: opacity 0.22s ease;
-           pointer-events: none;
-         }
-         .send-button > * { position: relative; z-index: 1; }
-         @keyframes liquid-metal-shift {
-           0% { transform: translateX(-45%) rotate(8deg); }
-           100% { transform: translateX(45%) rotate(8deg); }
+           box-shadow: none;
          }
          .send-button:hover {
-           background: linear-gradient(135deg, rgba(45,108,255,0.3), rgba(45,108,255,0.1));
-           border-color: rgba(140,180,255,0.6);
-           transform: translateY(-2px);
-           box-shadow: 0 6px 20px -4px rgba(45,108,255,0.4), inset 0 1px 0 rgba(255,255,255,0.3);
-         }
-         .send-button:hover::before {
-           opacity: 1;
-           animation: liquid-metal-shift 0.9s ease-in-out infinite alternate;
+           background: rgba(255,255,255,0.14);
+           border-color: rgba(255,255,255,0.4);
+           transform: none;
+           box-shadow: none;
          }
          .send-button:active {
-           transform: translateY(0);
-         }
-         .controls-row {
-           display: grid;
-           grid-template-columns: repeat(4, minmax(0, 1fr));
-           align-items: stretch;
-           gap: 12px;
-           width: 100%;
+           background: rgba(255,255,255,0.1);
          }
 
+         /* Unified control rail under the composer */
+         .controls-row {
+           display: grid;
+           grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr) minmax(0, 1fr) minmax(0, 1.2fr);
+           align-items: stretch;
+           gap: 1px;
+           width: 100%;
+           background: rgba(255,255,255,0.08);
+           border: 1px solid rgba(255,255,255,0.1);
+           border-radius: 3px;
+           overflow: visible;
+         }
          .control-slot {
            display: flex;
+           flex-direction: column;
            align-items: stretch;
            min-width: 0;
            width: 100%;
-         }
-
-         .session-slot {
+           background: #0a0a0a;
            position: relative;
          }
-
+         .control-slot::before {
+           content: attr(data-label);
+           display: block;
+           padding: 6px 12px 0;
+           font-family: 'JetBrains Mono', ui-monospace, monospace;
+           font-size: 9px;
+           font-weight: 600;
+           letter-spacing: 0.12em;
+           text-transform: uppercase;
+           color: rgba(255,255,255,0.32);
+           line-height: 1;
+         }
+         .session-slot { position: relative; }
          .mode-slot,
          .provider-slot,
          .model-slot {
            width: 100%;
          }
-
          .input-side-tools {
            display: flex;
            align-items: flex-end;
-           gap: 10px;
-           padding-bottom: 4px;
+           gap: 8px;
+           padding-bottom: 0;
          }
 
-         /* Liquid Metal Base for Bottom Controls */
          .icon-button, .mic-button, .provider-picker, .model-picker, .mode-picker, .toolbar-button {
            position: relative;
            overflow: hidden;
-           background: linear-gradient(135deg, rgba(255,255,255,0.12), rgba(255,255,255,0.02));
-           backdrop-filter: blur(12px);
-           -webkit-backdrop-filter: blur(12px);
-           border: 1px solid rgba(255, 255, 255, 0.25);
-           box-shadow: inset 0 1px 0 rgba(255,255,255,0.2), 0 4px 12px rgba(0,0,0,0.15);
+           background: transparent;
+           border: 1px solid transparent;
+           box-shadow: none;
            color: #fff;
            cursor: pointer;
-           transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+           transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+           backdrop-filter: none;
          }
-         .icon-button::before, .mic-button::before, .provider-picker::before, .model-picker::before, .mode-picker::before, .toolbar-button::before {
-           content: '';
-           position: absolute;
-           inset: -40%;
-           background: linear-gradient(
-             120deg,
-             rgba(255, 255, 255, 0.00) 0%,
-             rgba(255, 255, 255, 0.20) 18%,
-             rgba(255, 255, 255, 0.05) 38%,
-             rgba(255, 255, 255, 0.25) 55%,
-             rgba(255, 255, 255, 0.00) 72%
-           );
-           transform: translateX(-35%) rotate(8deg);
-           opacity: 0;
-           transition: opacity 0.22s ease;
-           pointer-events: none;
-           z-index: 0;
-         }
-         .icon-button > *, .mic-button > *, .provider-picker > *, .model-picker > *, .mode-picker > *, .toolbar-button > * { position: relative; z-index: 1; }
-         
          .icon-button:hover:not(:disabled), .mic-button:hover:not(:disabled), .provider-picker:hover:not(:disabled), .model-picker:hover:not(:disabled), .mode-picker:hover:not(:disabled), .toolbar-button:hover:not(:disabled) {
-           background: linear-gradient(135deg, rgba(255,255,255,0.18), rgba(255,255,255,0.05));
-           border-color: rgba(255, 255, 255, 0.4);
-           transform: translateY(-2px);
-           box-shadow: 0 6px 20px -4px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.3);
-         }
-         .icon-button:hover:not(:disabled)::before, .mic-button:hover:not(:disabled)::before, .provider-picker:hover:not(:disabled)::before, .model-picker:hover:not(:disabled)::before, .mode-picker:hover:not(:disabled)::before, .toolbar-button:hover:not(:disabled)::before {
-           opacity: 1;
-           animation: liquid-metal-shift 0.9s ease-in-out infinite alternate;
+           background: rgba(255,255,255,0.05);
+           border-color: transparent;
+           transform: none;
+           box-shadow: none;
          }
          .icon-button:active:not(:disabled), .mic-button:active:not(:disabled), .provider-picker:active:not(:disabled), .model-picker:active:not(:disabled), .mode-picker:active:not(:disabled), .toolbar-button:active:not(:disabled) {
-           transform: translateY(0);
+           transform: none;
+           background: rgba(255,255,255,0.07);
          }
 
          .icon-button {
            display: flex;
            align-items: center;
            justify-content: center;
-           border-radius: 8px;
+           border-radius: 3px;
+           border: 1px solid rgba(255,255,255,0.12);
          }
-         
+
          .mic-button {
-           width: 44px;
-           height: 44px;
-           flex: 0 0 44px;
+           width: 48px;
+           height: 48px;
+           flex: 0 0 48px;
            display: grid;
            place-items: center;
-           border-radius: 12px;
+           border-radius: 3px;
+           border: 1px solid rgba(255,255,255,0.14);
+           background: rgba(255,255,255,0.03);
          }
          .mic-button.active {
-           background: linear-gradient(135deg, rgba(239,68,68,0.25), rgba(239,68,68,0.08));
-           border-color: rgba(239,68,68,0.5);
-           color: #ef4444;
-           box-shadow: inset 0 1px 0 rgba(255,255,255,0.15), 0 2px 12px rgba(239,68,68,0.3);
-         }
-         .mic-button.active::before {
-           background: linear-gradient(120deg, rgba(239,68,68,0) 0%, rgba(239,68,68,0.3) 18%, rgba(239,68,68,0.05) 38%, rgba(239,68,68,0.4) 55%, rgba(239,68,68,0) 72%);
+           background: rgba(239,68,68,0.12);
+           border-color: rgba(239,68,68,0.45);
+           color: #f87171;
+           box-shadow: none;
          }
          .inline-switcher {
            display: flex;
@@ -877,16 +1107,18 @@ const globalCss = `
          }
          .switcher-dot.online { background: #22c55e; box-shadow: 0 0 8px #22c55e44; }
          .switcher-dot.offline { background: #ef4444; box-shadow: 0 0 8px #ef444444; }
-         
+
          .provider-picker, .model-picker, .mode-picker, .toolbar-button {
-           height: 44px;
-           border-radius: 14px;
-           font-size: 13px;
-           font-weight: 600;
+           height: 36px;
+           border-radius: 0;
+           font-size: 12px;
+           font-weight: 500;
            outline: none;
-           padding: 0 14px;
+           padding: 0 12px 8px;
            line-height: 1.2;
            min-width: 0;
+           font-family: 'JetBrains Mono', ui-monospace, monospace;
+           letter-spacing: 0.01em;
          }
          .toolbar-button {
            width: 100%;
@@ -894,34 +1126,63 @@ const globalCss = `
            align-items: center;
            justify-content: space-between;
            text-align: left;
+           gap: 8px;
+         }
+         .toolbar-button.active-rail {
+           background: rgba(255,255,255,0.06);
          }
          .provider-picker, .model-picker, .mode-picker {
            width: 100%;
            max-width: none;
            appearance: none;
+           background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='rgba(255,255,255,0.45)' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+           background-repeat: no-repeat;
+           background-position: right 10px center;
+           padding-right: 28px;
          }
-
          .provider-picker option, .model-picker option, .mode-picker option {
-           background: #1e222d;
+           background: #111;
            color: ${colors.text};
          }
-         
-         /* Fix native dropdown options being white in the browser */
          select {
            color: ${colors.text};
          }
          select option {
-           background: #1e222d;
+           background: #111;
            color: ${colors.text};
+         }
+         .session-menu {
+           position: absolute;
+           bottom: calc(100% + 6px);
+           left: 0;
+           width: min(280px, 70vw);
+           background: #0c0c0c;
+           border: 1px solid rgba(255,255,255,0.12);
+           border-radius: 3px;
+           box-shadow: 0 16px 40px rgba(0,0,0,0.55);
+           z-index: 100;
+           padding: 8px;
+           display: flex;
+           flex-direction: column;
+           gap: 2px;
+         }
+         .session-menu-label {
+           padding: 6px 10px 8px;
+           font-size: 10px;
+           font-weight: 600;
+           color: rgba(255,255,255,0.35);
+           text-transform: uppercase;
+           letter-spacing: 0.1em;
+           font-family: 'JetBrains Mono', ui-monospace, monospace;
          }
          @media (max-width: 980px) {
            .controls-row {
-             grid-template-columns: repeat(4, minmax(180px, 1fr));
-             overflow-x: auto;
-             padding-bottom: 2px;
+             grid-template-columns: repeat(2, minmax(0, 1fr));
            }
-           .control-slot {
-             min-width: 180px;
+         }
+         @media (max-width: 560px) {
+           .controls-row {
+             grid-template-columns: 1fr;
            }
          }
        `;
@@ -1440,53 +1701,131 @@ const useMicStreamer = (onFinalTranscript?: (text: string) => void) => {
   };
 };
 
-const ContextRing: React.FC<{ messages: Message[]; contextWindow: number }> = ({ messages, contextWindow }) => {
+const ContextMeter: React.FC<{ messages: Message[]; contextWindow: number }> = ({ messages, contextWindow }) => {
   const [hover, setHover] = React.useState(false);
   if (!contextWindow || contextWindow <= 0) return null;
-  const totalChars = messages.reduce((sum, m) => sum + (m.text?.length || 0), 0);
-  const estimatedTokens = Math.round(totalChars / 3.5);
+  const estimatedTokens = messages.reduce((sum, m) => sum + (m.usage?.tokens ?? estimateTokens(m.text)), 0);
   const pct = Math.min(estimatedTokens / contextWindow, 1);
   const displayPct = Math.round(pct * 100);
-  const size = 32;
-  const stroke = 3;
-  const radius = (size - stroke) / 2;
-  const circumference = 2 * Math.PI * radius;
-  const dashOffset = circumference * (1 - pct);
-  const ringColor =
-    pct > 0.85 ? "rgba(255,80,80,0.9)" : pct > 0.6 ? "rgba(255,180,60,0.9)" : "rgba(140,180,255,0.7)";
-  const formatTokens = (n: number) => (n >= 1000000 ? `${(n / 1000000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n));
+  const size = 36;
+  // White by default; warm/alert only when pressure is high
+  const fillColor =
+    pct > 0.85 ? "rgba(255,255,255,0.95)" : pct > 0.6 ? "rgba(255,255,255,0.88)" : "rgba(255,255,255,0.92)";
+  const trackColor = "rgba(255,255,255,0.12)";
+  const warnTint =
+    pct > 0.85 ? "rgba(255,90,90,0.18)" : pct > 0.6 ? "rgba(255,200,80,0.12)" : "transparent";
+
   return (
     <div
-      style={{ position: "relative", display: "grid", placeItems: "center", width: size, height: size, cursor: "default", flexShrink: 0 }}
+      style={{
+        position: "relative",
+        width: size,
+        height: size,
+        flexShrink: 0,
+        cursor: "default",
+        display: "grid",
+        placeItems: "center",
+      }}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
+      title={`Context ${displayPct}%`}
     >
-      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} style={{ transform: "rotate(-90deg)" }}>
-        <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={stroke} />
-        <circle
-          cx={size / 2} cy={size / 2} r={radius} fill="none"
-          stroke={ringColor} strokeWidth={stroke} strokeLinecap="round"
-          strokeDasharray={circumference} strokeDashoffset={dashOffset}
-          style={{ transition: "stroke-dashoffset 0.4s ease, stroke 0.3s ease" }}
+      <div
+        style={{
+          position: "relative",
+          width: size,
+          height: size,
+          borderRadius: 8,
+          background: warnTint,
+          border: `1.5px solid ${trackColor}`,
+          boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.25)",
+          overflow: "hidden",
+        }}
+      >
+        {/* Track */}
+        <div style={{ position: "absolute", inset: 3, borderRadius: 4, background: "rgba(255,255,255,0.04)" }} />
+        {/* Vertical fill from bottom */}
+        <div
+          style={{
+            position: "absolute",
+            left: 3,
+            right: 3,
+            bottom: 3,
+            height: `calc((100% - 6px) * ${pct})`,
+            borderRadius: 3,
+            background: `linear-gradient(180deg, ${fillColor} 0%, rgba(255,255,255,0.55) 100%)`,
+            boxShadow: pct > 0.05 ? "0 0 10px rgba(255,255,255,0.18)" : "none",
+            transition: "height 0.4s ease",
+          }}
         />
-      </svg>
-      <span style={{
-        position: "absolute", fontSize: 8, fontWeight: 700, color: ringColor,
-        letterSpacing: "-0.3px", lineHeight: 1, userSelect: "none",
-      }}>
-        {displayPct}%
-      </span>
+        {/* % label */}
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "grid",
+            placeItems: "center",
+            fontSize: 9,
+            fontWeight: 800,
+            letterSpacing: "-0.4px",
+            color: pct > 0.45 ? "rgba(0,0,0,0.78)" : "rgba(255,255,255,0.72)",
+            textShadow: pct > 0.45 ? "0 1px 0 rgba(255,255,255,0.25)" : "0 1px 2px rgba(0,0,0,0.45)",
+            userSelect: "none",
+            fontVariantNumeric: "tabular-nums",
+          }}
+        >
+          {displayPct}
+        </div>
+      </div>
       {hover && (
-        <div style={{
-          position: "absolute", bottom: "calc(100% + 8px)", left: "50%", transform: "translateX(-50%)",
-          background: "rgba(20,22,30,0.95)", border: "1px solid rgba(255,255,255,0.12)",
-          borderRadius: 10, padding: "8px 12px", whiteSpace: "nowrap", zIndex: 999,
-          boxShadow: "0 4px 20px rgba(0,0,0,0.5)", backdropFilter: "blur(12px)",
-          fontSize: 12, color: colors.text, lineHeight: 1.5,
-        }}>
-          <div style={{ fontWeight: 600, marginBottom: 2, color: ringColor }}>Context Window</div>
-          <div><span style={{ color: colors.textDim }}>Used ≈</span> {formatTokens(estimatedTokens)} / {formatTokens(contextWindow)} tokens</div>
-          <div><span style={{ color: colors.textDim }}>Fill</span> {displayPct}%</div>
+        <div
+          style={{
+            position: "absolute",
+            bottom: "calc(100% + 10px)",
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "rgba(12,12,14,0.96)",
+            border: "1px solid rgba(255,255,255,0.14)",
+            borderRadius: 10,
+            padding: "10px 12px",
+            whiteSpace: "nowrap",
+            zIndex: 999,
+            boxShadow: "0 8px 28px rgba(0,0,0,0.55)",
+            backdropFilter: "blur(12px)",
+            fontSize: 12,
+            color: colors.text,
+            lineHeight: 1.5,
+            minWidth: 160,
+          }}
+        >
+          <div style={{ fontWeight: 700, marginBottom: 4, color: "#fff", letterSpacing: "-0.02em" }}>Context</div>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 16 }}>
+            <span style={{ color: colors.textDim }}>Used</span>
+            <span style={{ fontWeight: 600 }}>{formatTokenCount(estimatedTokens)}</span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 16 }}>
+            <span style={{ color: colors.textDim }}>Window</span>
+            <span style={{ fontWeight: 600 }}>{formatTokenCount(contextWindow)}</span>
+          </div>
+          <div
+            style={{
+              marginTop: 8,
+              height: 4,
+              borderRadius: 2,
+              background: "rgba(255,255,255,0.1)",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                width: `${displayPct}%`,
+                height: "100%",
+                background: "#fff",
+                borderRadius: 2,
+                transition: "width 0.3s ease",
+              }}
+            />
+          </div>
         </div>
       )}
     </div>
@@ -1498,10 +1837,14 @@ const ChatBubble: React.FC<{
   streaming?: boolean;
   typewriter?: boolean;
   onQuickReply?: (text: string) => void;
-}> = ({ msg, streaming, typewriter = false, onQuickReply }) => {
+  contextWindow?: number;
+  providerLabel?: string;
+  modelLabel?: string;
+}> = ({ msg, streaming, typewriter = false, onQuickReply, contextWindow = 0, providerLabel, modelLabel }) => {
   const isUser = msg.role === "user";
   const isConfirmPrompt = !isUser ? isConfirmPromptText(msg.text || "") : false;
   const [shown, setShown] = useState(isUser || !typewriter ? msg.text : "");
+  const [metaHover, setMetaHover] = useState(false);
 
   useEffect(() => {
     if (isUser || !typewriter) {
@@ -1530,49 +1873,45 @@ const ChatBubble: React.FC<{
   return (
     <motion.div
       layout
-      initial={{ opacity: 0, scale: 0.95, y: 10 }}
-      animate={{ opacity: 1, scale: 1, y: 0 }}
-      exit={{ opacity: 0, scale: 0.95, y: -8 }}
-      transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-      style={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start", position: "relative", width: "100%" }}
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -4 }}
+      transition={{ duration: 0.2, ease: "easeOut" }}
+      style={{
+        display: "flex",
+        justifyContent: isUser ? "flex-end" : "flex-start",
+        position: "relative",
+        width: "100%",
+        padding: "10px 4px",
+      }}
     >
       <div
+        className="chat-flat"
         style={{
           position: "relative",
-          maxWidth: isUser ? "78%" : "84%",
-          background: isUser
-            ? "linear-gradient(135deg, rgba(45,108,255,0.18), rgba(45,108,255,0.06))"
-            : "linear-gradient(135deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02))",
-          backdropFilter: "blur(12px)",
-          WebkitBackdropFilter: "blur(12px)",
+          maxWidth: isUser ? "88%" : "100%",
+          width: isUser ? "auto" : "100%",
           color: colors.text,
-          border: isUser
-            ? "1px solid rgba(140,180,255,0.3)"
-            : isConfirmPrompt
-              ? "1px solid rgba(250,204,21,0.45)"
-              : "1px solid rgba(255,255,255,0.12)",
-          borderRadius: isUser ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
-          padding: "12px 16px",
-          boxShadow: isUser
-            ? "0 4px 16px -4px rgba(45,108,255,0.2), inset 0 1px 0 rgba(255,255,255,0.1)"
-            : "0 4px 16px -4px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.05)",
-          overflow: "hidden"
+          padding: "2px 0",
+          overflow: "visible",
         }}
       >
         {isUser ? (
-          <div className="chat-text">{bodyText}</div>
+          <div className="chat-text chat-line-user" style={{ fontFamily: "'JetBrains Mono', ui-monospace, monospace", fontSize: 13.5 }}>
+            {bodyText}
+          </div>
         ) : (
-          <div className="chat-markdown">
+          <div className="chat-markdown chat-line-assistant">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{bodyText}</ReactMarkdown>
             {stillTyping ? (
               <span
                 style={{
                   display: "inline-block",
-                  width: 7,
-                  height: 14,
-                  marginLeft: 2,
+                  width: 8,
+                  height: 15,
+                  marginLeft: 3,
                   borderRadius: 1,
-                  background: "rgba(140,160,255,0.9)",
+                  background: "rgba(255,255,255,0.75)",
                   animation: "pulse 0.8s infinite",
                   verticalAlign: "text-bottom",
                 }}
@@ -1582,19 +1921,22 @@ const ChatBubble: React.FC<{
         )}
 
         {!isUser && isConfirmPrompt ? (
-          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
             <button
               onClick={() => onQuickReply?.("confirm")}
               disabled={!canQuickReply}
               style={{
-                padding: "8px 10px",
-                borderRadius: 8,
-                border: `1px solid ${colors.line}`,
-                background: canQuickReply ? "rgba(34,197,94,0.14)" : "rgba(148,163,184,0.12)",
+                padding: "7px 12px",
+                borderRadius: 2,
+                border: `1px solid ${canQuickReply ? "rgba(255,255,255,0.35)" : colors.line}`,
+                background: "transparent",
                 color: colors.text,
                 cursor: canQuickReply ? "pointer" : "not-allowed",
-                fontSize: 13,
+                fontSize: 12,
                 fontWeight: 600,
+                fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+                letterSpacing: "0.04em",
+                textTransform: "uppercase",
               }}
             >
               Confirm
@@ -1603,211 +1945,222 @@ const ChatBubble: React.FC<{
               onClick={() => onQuickReply?.("cancel")}
               disabled={!canQuickReply}
               style={{
-                padding: "8px 10px",
-                borderRadius: 8,
+                padding: "7px 12px",
+                borderRadius: 2,
                 border: `1px solid ${colors.line}`,
-                background: canQuickReply ? "rgba(239,68,68,0.12)" : "rgba(148,163,184,0.12)",
-                color: colors.text,
+                background: "transparent",
+                color: colors.textDim,
                 cursor: canQuickReply ? "pointer" : "not-allowed",
-                fontSize: 13,
+                fontSize: 12,
                 fontWeight: 600,
+                fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+                letterSpacing: "0.04em",
+                textTransform: "uppercase",
               }}
             >
               Cancel
             </button>
           </div>
         ) : null}
-        <div style={{ marginTop: 4, fontSize: 10.5, color: colors.textDim }}>{new Date(msg.at).toLocaleTimeString()}</div>
+        {(() => {
+          const msgTokens = msg.usage?.tokens ?? estimateTokens(msg.text);
+          const ctxUsed = msg.usage?.contextUsed ?? msgTokens;
+          const ctxWindow = msg.usage?.contextWindow || contextWindow || 32768;
+          const ctxPct = ctxWindow > 0 ? Math.min(100, Math.round((ctxUsed / ctxWindow) * 100)) : 0;
+          const prov = msg.usage?.provider || providerLabel || "";
+          const model = msg.usage?.model || modelLabel || "";
+          return (
+            <div
+              style={{
+                marginTop: 6,
+                fontSize: 10,
+                color: "rgba(255,255,255,0.28)",
+                fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+                letterSpacing: "0.06em",
+                textAlign: isUser ? "right" : "left",
+                display: "flex",
+                justifyContent: isUser ? "flex-end" : "flex-start",
+                alignItems: "center",
+                gap: 6,
+                position: "relative",
+                flexWrap: "wrap",
+              }}
+            >
+              <span>{new Date(msg.at).toLocaleTimeString()}</span>
+              <span style={{ opacity: 0.45 }}>·</span>
+              <span
+                onMouseEnter={() => setMetaHover(true)}
+                onMouseLeave={() => setMetaHover(false)}
+                style={{
+                  cursor: "default",
+                  borderBottom: "1px dotted rgba(255,255,255,0.18)",
+                  paddingBottom: 1,
+                }}
+              >
+                ~{formatTokenCount(msgTokens)} tok
+                {!isUser ? (
+                  <>
+                    <span style={{ opacity: 0.45 }}> · </span>
+                    {ctxPct}% ctx
+                  </>
+                ) : null}
+              </span>
+              {metaHover && (
+                <div
+                  style={{
+                    position: "absolute",
+                    bottom: "calc(100% + 8px)",
+                    [isUser ? "right" : "left"]: 0,
+                    background: "rgba(12,12,14,0.96)",
+                    border: "1px solid rgba(255,255,255,0.14)",
+                    borderRadius: 8,
+                    padding: "9px 11px",
+                    zIndex: 50,
+                    boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+                    backdropFilter: "blur(12px)",
+                    fontSize: 11,
+                    color: colors.text,
+                    lineHeight: 1.55,
+                    minWidth: 168,
+                    letterSpacing: "0.02em",
+                    textAlign: "left",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  <div style={{ fontWeight: 700, color: "#fff", marginBottom: 4, letterSpacing: "-0.02em" }}>
+                    {isUser ? "Message" : "Response"} usage
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 18 }}>
+                    <span style={{ color: colors.textDim }}>This bubble</span>
+                    <span style={{ fontWeight: 600 }}>~{formatTokenCount(msgTokens)}</span>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 18 }}>
+                    <span style={{ color: colors.textDim }}>Context used</span>
+                    <span style={{ fontWeight: 600 }}>~{formatTokenCount(ctxUsed)}</span>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 18 }}>
+                    <span style={{ color: colors.textDim }}>Window</span>
+                    <span style={{ fontWeight: 600 }}>{formatTokenCount(ctxWindow)}</span>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 18 }}>
+                    <span style={{ color: colors.textDim }}>Fill</span>
+                    <span style={{ fontWeight: 600 }}>{ctxPct}%</span>
+                  </div>
+                  {(prov || model) && (
+                    <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(255,255,255,0.08)", color: colors.textDim, fontSize: 10 }}>
+                      {[prov, model].filter(Boolean).join(" · ")}
+                    </div>
+                  )}
+                  <div style={{ marginTop: 4, fontSize: 9, color: "rgba(255,255,255,0.28)" }}>
+                    Estimates (chars ÷ 3.5)
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
       </div>
     </motion.div>
   );
 };
 
 const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; content: string; at: number; steps?: ThinkingStep[]; request_id?: string } }> = ({ item }) => {
-  const [expanded, setExpanded] = useState(true);
-  const badge = { label: "Live", color: "rgba(140,160,255,0.9)" };
-  const content = (item.content || "").trim();
-  const steps = item.steps || [];
-  const hasContent = content.length > 0;
+  // One clean list: drop pure thought dumps; keep at most one soft "thinking…" if nothing else yet.
+  const rawSteps = item.steps || [];
+  const workSteps = rawSteps.filter((s) => s.type !== "thought");
+  const hasRealWork = workSteps.some(
+    (s) => !/^(thinking|thinking…|waiting|working)(\s|\.|…)*$/i.test(String(s.content || "").trim())
+  );
+  const steps: ThinkingStep[] = hasRealWork
+    ? workSteps.filter(
+        (s) => !/^(thinking|thinking…|waiting|working)(\s|\.|…)*$/i.test(String(s.content || "").trim())
+      )
+    : workSteps.length > 0
+      ? [workSteps[workSteps.length - 1]] // single placeholder spinner row
+      : [];
   const anyRunning = steps.some((s) => s.status === "running");
-  const title = hasContent ? "Reasoning" : anyRunning ? "Working" : "Waiting";
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Typewriter effect state
-  const [displayedContent, setDisplayedContent] = useState("");
-
-  useEffect(() => {
-    let timer: ReturnType<typeof setInterval>;
-    const target = content;
-    if (displayedContent.length < target.length) {
-      const interval = 15;
-      const charsPerTick = 4;
-      timer = setInterval(() => {
-        setDisplayedContent((prev) => {
-          if (prev.length >= target.length) {
-            clearInterval(timer);
-            return target;
-          }
-          // Self-correct if target changed and diverged
-          if (!target.startsWith(prev)) {
-            return target.slice(0, charsPerTick);
-          }
-          return prev + target.slice(prev.length, prev.length + charsPerTick);
-        });
-      }, interval);
-    } else if (displayedContent !== target) {
-      setDisplayedContent(target);
-    }
-    return () => clearInterval(timer);
-  }, [content, displayedContent.length]);
-
-  const isPipeline = content.startsWith("###");
-  const preview = displayedContent.length > 280 && !isPipeline ? `${displayedContent.slice(0, 280).trimEnd()}…` : displayedContent;
-  const body = expanded || isPipeline ? displayedContent : preview;
-
-  // Auto-scroll when content or steps change
   useEffect(() => {
     const el = containerRef.current?.closest(".chat-scroll");
     if (el) {
-      const threshold = 150;
       const distFromBottom = el.scrollHeight - Math.ceil(el.scrollTop) - el.clientHeight;
-      if (distFromBottom <= threshold) {
-        el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
-      }
+      if (distFromBottom <= 150) el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
     }
-  }, [displayedContent, steps]);
+  }, [steps.map((s) => `${s.id}:${s.status}`).join("|"), anyRunning]);
+
+  if (steps.length === 0) {
+    return null;
+  }
 
   return (
     <motion.div
       layout
-      initial={{ opacity: 0, y: 10 }}
+      initial={{ opacity: 0, y: 4 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -8 }}
-      transition={{ duration: 0.22, ease: "easeOut" }}
-      style={{ display: "flex", justifyContent: "flex-start" }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.18, ease: "easeOut" }}
+      style={{ display: "flex", justifyContent: "flex-start", width: "100%", padding: "4px 0 8px" }}
       ref={containerRef}
     >
-      <div
-        style={{
-          maxWidth: "84%",
-          minWidth: steps.length || hasContent ? 260 : 160,
-          width: "fit-content",
-          color: colors.text,
-          padding: "2px 8px 4px 8px",
-          background: "transparent",
-          border: "none",
-          borderRadius: 0,
-          boxShadow: "none",
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between", flexWrap: "wrap" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <div
-              style={{
-                fontSize: 10,
-                fontWeight: 700,
-                letterSpacing: 0.5,
-                textTransform: "uppercase",
-                padding: 0,
-                borderRadius: 0,
-                color: badge.color,
-                background: "transparent",
-              }}
-            >
-              <span>{badge.label}</span>
-            </div>
-            <div style={{ fontSize: 12, fontWeight: 600, color: colors.textDim }}>
-              {title}
-            </div>
-          </div>
-          {!isPipeline && (content.length > 280 || steps.length > 0) ? (
-            <button
-              type="button"
-              onClick={() => setExpanded((v) => !v)}
-              style={{
-                background: "transparent",
-                color: badge.color,
-                border: "none",
-                padding: "2px 6px",
-                fontSize: 12,
-                fontWeight: 700,
-                cursor: "pointer",
-                opacity: 0.7,
-              }}
-              onMouseEnter={(e) => e.currentTarget.style.opacity = "1"}
-              onMouseLeave={(e) => e.currentTarget.style.opacity = "0.7"}
-            >
-              {expanded ? "Hide" : "Show"}
-            </button>
-          ) : null}
-        </div>
-        
-        {/* Show reasoning steps when expanded */}
-        {expanded && steps.length > 0 && (
-          <div style={{ marginTop: 8, fontSize: 12, lineHeight: 1.55, color: colors.textDim }}>
-            {steps.map((step, idx) => (
-              <motion.div
+      <div className="chat-flat" style={{ width: "100%", maxWidth: "100%", color: colors.textDim }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {steps.map((step) => {
+            const failed = step.status === "failed";
+            const running = step.status === "running";
+            return (
+              <div
                 key={step.id}
-                initial={{ opacity: 0, x: -10 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ duration: 0.3, delay: idx * 0.1 }}
-                style={{ marginBottom: 5, display: "flex", alignItems: "flex-start", gap: 8 }}
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: 10,
+                  fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+                  fontSize: 12,
+                  lineHeight: 1.5,
+                  letterSpacing: "0.02em",
+                  color: failed
+                    ? "rgba(255,140,150,0.85)"
+                    : running
+                      ? "rgba(255,255,255,0.72)"
+                      : "rgba(255,255,255,0.38)",
+                }}
               >
-                <span style={{ color: badge.color, minWidth: 18, marginTop: 2 }}>
-                  {step.status === "running" ? (
-                    <SquareLoader size={10} color={badge.color} />
-                  ) : (
+                <span style={{ marginTop: 3, flexShrink: 0 }}>
+                  {running ? (
+                    <SquareLoader size={9} color="rgba(255,255,255,0.85)" />
+                  ) : failed ? (
                     <span
                       style={{
                         display: "inline-block",
                         width: 8,
                         height: 8,
                         borderRadius: 1,
-                        background: badge.color,
-                        opacity: 0.7,
+                        background: "rgba(248,113,113,0.9)",
+                      }}
+                      title="failed"
+                    />
+                  ) : (
+                    <span
+                      style={{
+                        display: "inline-block",
+                        width: 7,
+                        height: 7,
+                        borderRadius: 1,
+                        background: "rgba(255,255,255,0.28)",
                       }}
                     />
                   )}
                 </span>
-                <span
-                  style={{
-                    flex: 1,
-                    fontFamily: step.type === "tool" || step.type === "search" || step.type === "read"
-                      ? "'JetBrains Mono', 'Fira Code', ui-monospace, monospace"
-                      : "inherit",
-                    fontSize: step.type === "tool" || step.type === "search" || step.type === "read" ? 11.5 : 12,
-                  }}
-                >
+                <span style={{ flex: 1 }}>
                   {step.content}
+                  {failed && !/fail/i.test(step.content) ? " — failed" : ""}
                 </span>
-              </motion.div>
-            ))}
-          </div>
-        )}
-        
-        {hasContent ? (
-          <div className="chat-markdown" style={{ marginTop: 8, fontSize: 13, lineHeight: 1.6, color: colors.textDim }}>
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>
-            {displayedContent.length < content.length && (
-              <span style={{ display: "inline-block", width: 6, height: 14, background: badge.color, animation: "pulse 0.8s infinite", verticalAlign: "text-bottom", marginLeft: 2, borderRadius: 1 }} />
-            )}
-          </div>
-        ) : steps.length === 0 ? (
-          <div style={{ marginTop: 8, fontSize: 12, color: colors.textDim, display: "flex", alignItems: "center", gap: 8 }}>
-            <SquareLoader size={12} color={badge.color} />
-            <span>Waiting for tokens</span>
-          </div>
-        ) : null}
+              </div>
+            );
+          })}
+        </div>
       </div>
-      <style>{`
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.5; }
-        }
-        @keyframes echo-square-spin {
-          to { transform: rotate(360deg); }
-        }
-      `}</style>
     </motion.div>
   );
 };
@@ -1836,173 +2189,66 @@ const ActivityCard: React.FC<{ item: ActivityItem }> = ({ item }) => {
   }
 
   if (item.kind === "error") {
-    const badge = { label: "Error", color: "rgba(255,120,140,0.95)", bg: "rgba(255,77,109,0.10)", border: "rgba(255,77,109,0.35)" };
-    const title = "Agent error";
-    const body = item.message;
     return (
       <motion.div
         layout
-        initial={{ opacity: 0, y: 10 }}
+        initial={{ opacity: 0, y: 4 }}
         animate={{ opacity: 1, y: 0 }}
-        exit={{ opacity: 0, y: -8 }}
-        transition={{ duration: 0.22, ease: "easeOut" }}
-        style={{ display: "flex", justifyContent: "flex-start" }}
+        exit={{ opacity: 0 }}
+        transition={{ duration: 0.18 }}
+        style={{ display: "flex", justifyContent: "flex-start", padding: "6px 0" }}
       >
-        <div
-          style={{
-            maxWidth: "96%",
-            width: "fit-content",
-            background: colors.panel2,
-            color: colors.text,
-            border: `1px solid ${colors.line}`,
-            borderRadius: 10,
-            padding: "12px 14px",
-            boxShadow: "none",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div
-              style={{
-                fontSize: 10.5,
-                fontWeight: 700,
-                letterSpacing: 0.5,
-                textTransform: "uppercase",
-                padding: "4px 8px",
-                borderRadius: 999,
-                color: badge.color,
-                background: badge.bg,
-                border: `1px solid ${badge.border}`,
-              }}
-            >
-              <span>{badge.label}</span>
-            </div>
-            <div style={{ fontSize: 13, fontWeight: 650 }}>{title}</div>
+        <div className="chat-flat" style={{ width: "100%", fontFamily: "'JetBrains Mono', ui-monospace, monospace" }}>
+          <div style={{ fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", color: "rgba(255,120,140,0.9)", marginBottom: 4 }}>
+            error
           </div>
-          <div style={{ marginTop: 6, fontSize: 12.5, lineHeight: 1.5, color: colors.textDim, whiteSpace: "pre-wrap" }}>{body}</div>
+          <div style={{ fontSize: 13, lineHeight: 1.55, color: "rgba(255,180,190,0.85)", whiteSpace: "pre-wrap" }}>{item.message}</div>
         </div>
       </motion.div>
     );
   }
 
-  const toolName = (item.name || "").toLowerCase();
-  const isTerminal = item.kind === "tool" && toolName === "terminal_run";
-  const isConsoleTool = isTerminal;
-
-  // Apply the same "liquid metal" / dark aesthetic to both terminal and browser
-  const badge =
+  // Standalone tool activity items — flat digital lines (tools also appear in thinking steps).
+  const body =
     item.status === "running"
-      ? {
-        label: isConsoleTool ? "Terminal" : "Tool",
-        color: "rgba(255,255,255,0.9)",
-        bg: "rgba(255,255,255,0.06)",
-        border: "rgba(255,255,255,0.15)",
-      }
-      : item.status === "error"
-        ? {
-          label: isConsoleTool ? "Terminal" : "Tool",
-          color: "rgba(255,140,160,0.95)",
-          bg: "rgba(255,77,109,0.10)",
-          border: "rgba(255,77,109,0.35)",
-        }
-        : {
-          label: isConsoleTool ? "Terminal" : "Tool",
-          color: "rgba(255,255,255,0.7)",
-          bg: "transparent",
-          border: "rgba(255,255,255,0.1)",
-        };
-  const title = isConsoleTool ? "" : `Using ${item.name}`;
-  const body = item.status === "running" ? item.input || "Running…" : item.output || (item.status === "error" ? "Tool failed" : "Done");
+      ? item.input || "running…"
+      : item.output || (item.status === "error" ? "failed" : "done");
+  const label = item.name || "tool";
 
   return (
     <motion.div
       layout
-      initial={{ opacity: 0, y: 10 }}
+      initial={{ opacity: 0, y: 4 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -8 }}
-      transition={{ duration: 0.22, ease: "easeOut" }}
-      style={{ display: "flex", justifyContent: "flex-start" }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.18 }}
+      style={{ display: "flex", justifyContent: "flex-start", padding: "4px 0 8px", width: "100%" }}
     >
-      <div
-        style={{
-          maxWidth: "96%",
-          width: "fit-content",
-          background: "linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01))",
-          backdropFilter: "blur(12px)",
-          WebkitBackdropFilter: "blur(12px)",
-          color: colors.text,
-          border: "1px solid rgba(255,255,255,0.1)",
-          borderRadius: 14,
-          padding: "10px 12px",
-          boxShadow: "0 4px 16px -4px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.05)",
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div
-            style={{
-              fontSize: 10.5,
-              fontWeight: 700,
-              letterSpacing: 0.5,
-              textTransform: "uppercase",
-              padding: "4px 8px",
-              borderRadius: 6,
-              color: badge.color,
-              background: badge.bg,
-              border: `1px solid ${badge.border}`,
-              boxShadow: `inset 0 1px 0 rgba(255,255,255,0.1), 0 0 12px ${badge.border}`,
-              display: "flex",
-              alignItems: "center",
-              gap: 7,
-            }}
-          >
-            {item.kind === "tool" && item.status === "running" ? (
-              <span
-                style={{
-                  width: 8,
-                  height: 8,
-                  borderRadius: 99,
-                  background: colors.accent,
-                  boxShadow: "0 0 10px rgba(45,108,255,0.8)",
-                }}
-              />
-            ) : null}
-            <span>{badge.label}</span>
-          </div>
-          {title && <div style={{ fontSize: 13, fontWeight: 650 }}>{title}</div>}
+      <div className="chat-flat" style={{ width: "100%", maxWidth: "100%" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 10,
+            fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+            fontSize: 12,
+            lineHeight: 1.5,
+            letterSpacing: "0.02em",
+            color: item.status === "running" ? "rgba(255,255,255,0.7)" : "rgba(255,255,255,0.38)",
+          }}
+        >
+          <span style={{ marginTop: 3, flexShrink: 0 }}>
+            {item.status === "running" ? (
+              <SquareLoader size={9} color="rgba(255,255,255,0.7)" />
+            ) : (
+              <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: 1, background: "rgba(255,255,255,0.28)" }} />
+            )}
+          </span>
+          <span style={{ flex: 1, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+            <span style={{ color: "rgba(255,255,255,0.45)" }}>{label}</span>
+            {body ? `  ${String(body).slice(0, 240)}${String(body).length > 240 ? "…" : ""}` : ""}
+          </span>
         </div>
-        {isConsoleTool ? (
-          <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 8 }}>
-            <div
-              style={{
-                fontSize: 12.5,
-                lineHeight: 1.5,
-                color: colors.textDim,
-                whiteSpace: "pre-wrap",
-              }}
-            >
-              {item.status === "running" ? "Command" : "Result"}
-            </div>
-            <div
-              style={{
-                border: `1px solid ${colors.line}`,
-                borderRadius: 12,
-                padding: "10px 12px",
-                background: "rgba(0,0,0,0.25)",
-                fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
-                fontSize: 12.5,
-                lineHeight: 1.55,
-                color: colors.text,
-                whiteSpace: "pre-wrap",
-                overflowX: "auto",
-                overflowY: "auto",
-                maxHeight: 280,
-              }}
-            >
-              {body}
-            </div>
-          </div>
-        ) : (
-          <div style={{ marginTop: 6, fontSize: 12.5, lineHeight: 1.5, color: colors.textDim, whiteSpace: "pre-wrap" }}>{body}</div>
-        )}
       </div>
     </motion.div>
   );
@@ -2339,6 +2585,7 @@ export const Dashboard: React.FC = () => {
   const [agentActivity, dispatchActivity] = useReducer(agentActivityReducer, undefined, initialAgentActivity);
   const [visualizerPin, setVisualizerPin] = useState<null | "ring" | "research" | "coding" | "tasks">(null);
   const [liveReplyDraft, setLiveReplyDraft] = useState("");
+  const liveReplyDraftRef = useRef("");
   const [codeSessions, setCodeSessions] = useState<CodeDiffSession[]>([]);
   const [activeCodeTab, setActiveCodeTab] = useState<number>(0);
   const [avatarConfig, setAvatarConfig] = useState<AvatarConfig>(defaultAvatarConfig);
@@ -3259,7 +3506,20 @@ export const Dashboard: React.FC = () => {
         })
       ),
     ];
-    merged.sort((a, b) => a.at - b.at);
+    // Chronological, but within the same turn: task plan sits above search/tool activity.
+    const kindRank = (k: TimelineItem["kind"]) =>
+      k === "message" ? 0 : k === "task_plan" ? 1 : k === "activity" ? 2 : 3;
+    merged.sort((a, b) => {
+      const dt = a.at - b.at;
+      // Same second / close events: tasks above search/tools.
+      if (Math.abs(dt) < 120_000 && a.kind !== "message" && b.kind !== "message") {
+        const ra = kindRank(a.kind);
+        const rb = kindRank(b.kind);
+        if (ra !== rb) return ra - rb;
+      }
+      if (dt !== 0) return dt;
+      return kindRank(a.kind) - kindRank(b.kind);
+    });
     return merged;
   }, [messages, activities, taskPlans]);
 
@@ -3340,16 +3600,53 @@ export const Dashboard: React.FC = () => {
     const desktopContext = shouldAttachMonitor(raw) ? clampContext(monitorText, 1200) : "";
     const requestText = desktopContext ? `${raw}\n\nLive desktop context:\n${desktopContext}` : raw;
 
-    const userMsg: Message = { id: crypto.randomUUID(), role: "user", text: raw, at: Date.now() };
+    const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
+    const userMsg: Message = {
+      id: crypto.randomUUID(),
+      role: "user",
+      text: raw,
+      at: Date.now(),
+      usage: buildMessageUsage(raw, messages, ctxWindow, {
+        provider: providerInfo?.provider,
+        model: providerInfo?.model,
+      }),
+    };
     addMessage(userMsg);
     setInput("");
     setUserIsTyping(false);
     if (userTypingTimerRef.current) clearTimeout(userTypingTimerRef.current);
     setDocSources([]);
     activeTaskPlanIdRef.current = null;
+    liveReplyDraftRef.current = "";
     setLiveReplyDraft("");
     dispatchActivity({ type: "stream_start" });
     setStreaming(true);
+    // Seed a visible "working" step immediately so chat always shows progress
+    // (avatar can animate before the first tool/thinking event arrives).
+    const runRequestId = crypto.randomUUID();
+    const bootstrapStepId = `${runRequestId}:working`;
+    let finalHandled = false;
+    /** Mid-turn spoken beats already committed (so final doesn't re-add them). */
+    const partialReplies: string[] = [];
+    setActivities((prev) => [
+      ...prev,
+      {
+        kind: "thinking",
+        id: crypto.randomUUID(),
+        content: "thinking…",
+        at: Date.now(),
+        request_id: runRequestId,
+        steps: [
+          {
+            id: bootstrapStepId,
+            type: "tool",
+            content: "thinking…",
+            status: "running",
+            at: Date.now(),
+          },
+        ],
+      },
+    ]);
     try {
       const resp = await fetch(`${apiBase}/query/stream`, {
         method: "POST",
@@ -3373,19 +3670,106 @@ export const Dashboard: React.FC = () => {
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      const runRequestId = crypto.randomUUID();
-      const eventRequestId = (evt: { request_id?: string }) => evt.request_id || runRequestId;
+      // Always pin this turn's activity to one id so we don't spawn duplicate thinking cards
+      // when the backend also sends its own request_id.
+      const eventRequestId = (_evt?: { request_id?: string }) => runRequestId;
+      const markThinkingStep = (
+        evt: { request_id?: string },
+        stepId: string,
+        patch: Partial<ThinkingStep>,
+        opts?: { toolName?: string; stepType?: ThinkingStep["type"] },
+      ) => {
+        const reqId = eventRequestId(evt);
+        setActivities((prev) =>
+          prev.map((p) => {
+            if (p.kind !== "thinking" || p.request_id !== reqId || !p.steps?.length) return p;
+            let matched = false;
+            const steps = p.steps.map((s) => {
+              if (s.id === stepId) {
+                matched = true;
+                return { ...s, ...patch };
+              }
+              return s;
+            });
+            // Fallback: complete oldest running step of same tool/type when ids diverge
+            // (grounder multi-candidate + thinking_step use different ids).
+            if (!matched && (patch.status === "done" || patch.status === "failed")) {
+              const wantType = opts?.stepType;
+              const wantName = (opts?.toolName || "").toLowerCase();
+              let fallbackIdx = -1;
+              for (let i = 0; i < steps.length; i++) {
+                const s = steps[i];
+                if (s.status !== "running") continue;
+                if (wantType && s.type === wantType) {
+                  fallbackIdx = i;
+                  break;
+                }
+                if (wantName && s.content.toLowerCase().includes(wantName)) {
+                  fallbackIdx = i;
+                  break;
+                }
+              }
+              if (fallbackIdx < 0) {
+                // Last resort: first running step
+                fallbackIdx = steps.findIndex((s) => s.status === "running");
+              }
+              if (fallbackIdx >= 0) {
+                steps[fallbackIdx] = { ...steps[fallbackIdx], ...patch, id: steps[fallbackIdx].id };
+                matched = true;
+              }
+            }
+            return matched ? { ...p, steps } : p;
+          })
+        );
+      };
+
       const appendThinkingStep = (evt: { request_id?: string }, step: ThinkingStep) => {
         const reqId = eventRequestId(evt);
+        // Ignore raw thought dumps — they duplicate the bootstrap spinner and clutter chat.
+        if (step.type === "thought") {
+          const short = String(step.content || "").trim().slice(0, 80);
+          if (!short) return;
+          setActivities((prev) =>
+            prev.map((p) => {
+              if (p.kind !== "thinking" || p.request_id !== reqId) return p;
+              const steps = (p.steps || []).map((s) =>
+                s.id === bootstrapStepId && s.status === "running"
+                  ? { ...s, content: short.endsWith("…") ? short : `${short}…` }
+                  : s
+              );
+              return { ...p, content: short, steps };
+            })
+          );
+          return;
+        }
         setActivities((prev) => {
           const existingIdx = prev.findIndex((p) => p.kind === "thinking" && p.request_id === reqId);
           if (existingIdx !== -1) {
             const updated = [...prev];
             const existing = updated[existingIdx] as Extract<ActivityItem, { kind: "thinking" }>;
+            // Real work arrives → drop bootstrap so we don't stack "thinking…" + tool rows.
+            let prevSteps = (existing.steps || []).filter((s) =>
+              step.id === bootstrapStepId ? true : s.id !== bootstrapStepId
+            );
+            // Upsert by id so tool_end can complete the same row.
+            const byId = prevSteps.findIndex((s) => s.id === step.id);
+            let nextSteps: ThinkingStep[];
+            if (byId >= 0) {
+              nextSteps = prevSteps.map((s, i) => (i === byId ? { ...s, ...step } : s));
+            } else if (step.status === "done" || step.status === "failed") {
+              const runIdx = prevSteps.findIndex((s) => s.status === "running" && s.type === step.type);
+              if (runIdx >= 0) {
+                nextSteps = prevSteps.map((s, i) => (i === runIdx ? { ...s, ...step, id: s.id } : s));
+              } else {
+                nextSteps = [...prevSteps, step];
+              }
+            } else {
+              nextSteps = [...prevSteps, step];
+            }
             updated[existingIdx] = {
               ...existing,
               at: Math.min(existing.at, step.at || Date.now()),
-              steps: [...(existing.steps || []), step],
+              steps: nextSteps,
             };
             return updated;
           }
@@ -3401,6 +3785,26 @@ export const Dashboard: React.FC = () => {
             },
           ];
         });
+      };
+
+      const completeAllRunningSteps = (status: "done" | "failed" = "done") => {
+        setActivities((prev) =>
+          prev.map((p) => {
+            if (p.kind !== "thinking" || !p.steps?.length) return p;
+            return {
+              ...p,
+              steps: p.steps.map((s) =>
+                s.status === "running"
+                  ? {
+                      ...s,
+                      status,
+                      content: status === "failed" && !/fail/i.test(s.content) ? `${s.content} — failed` : s.content,
+                    }
+                  : s
+              ),
+            };
+          })
+        );
       };
       const upsertTaskPlan = (evt: AgentStreamEvent) => {
         const reqId = eventRequestId(evt);
@@ -3443,47 +3847,78 @@ export const Dashboard: React.FC = () => {
             evt.name === "terminal_run" ? "Running" :
             "Using";
           const inputPreview = String(evt.input || "").replace(/\s+/g, " ").trim();
-          appendThinkingStep(evt, {
-            id: evt.id,
-            type: evt.name === "web_search" ? "search" : evt.name === "file_read" ? "read" : "tool",
-            content: inputPreview ? `${toolVerb} ${evt.name}: ${inputPreview}` : `${toolVerb} ${evt.name}`,
-            status: "running",
-            at: normalizeTimestampMs(evt.at || Date.now()),
-          });
+          // Hide silent/internal tools from the chat step list (time inject, calc, …).
+          const silentTools = new Set([
+            "get_system_time",
+            "calculate",
+            "system_info",
+            "project_update_context",
+            "store_memory",
+            "save_memory",
+            "recall_memory",
+            "search_memory",
+            "query_memory",
+          ]);
+          if (!silentTools.has(String(evt.name || "").toLowerCase())) {
+            appendThinkingStep(evt, {
+              id: evt.id,
+              type: evt.name === "web_search" ? "search" : evt.name === "file_read" ? "read" : "tool",
+              content: inputPreview ? `${toolVerb} ${evt.name}: ${inputPreview}` : `${toolVerb} ${evt.name}`,
+              status: "running",
+              at: normalizeTimestampMs(evt.at || Date.now()),
+            });
+          }
           return;
         }
 
         if (evt.type === "tool_end") {
           dispatchActivity({ type: "tool_end", id: evt.id });
           const info = toolInfoRef.current[evt.id];
-          if (info?.name === "web_search") {
-            const normalized = normalizeResearchRun(evt.research) || buildResearchRunFromToolEvent(evt.id, info?.name || evt.name || "", info?.input || "", evt.output || "", evt.at || Date.now());
+          const toolName = info?.name || evt.name || "tool";
+          const silentTools = new Set([
+            "get_system_time",
+            "calculate",
+            "system_info",
+            "project_update_context",
+            "store_memory",
+            "save_memory",
+            "recall_memory",
+            "search_memory",
+            "query_memory",
+          ]);
+          if (silentTools.has(String(toolName || "").toLowerCase())) {
+            return;
+          }
+          if (toolName === "web_search") {
+            const normalized = normalizeResearchRun(evt.research) || buildResearchRunFromToolEvent(evt.id, toolName, info?.input || "", evt.output || "", evt.at || Date.now());
             if (normalized) {
               prependResearchRun(normalized);
             }
             const count = normalized?.evidence_count || 0;
-            const summary = count ? `Captured ${count} sources (see Research panel)` : "No sources found";
-            setActivities((prev) =>
-              prev.map((p) => {
-                if (p.kind === "thinking" && p.steps) {
-                  return {
-                    ...p,
-                    steps: p.steps.map((s) =>
-                      s.id === evt.id ? { ...s, status: "done", content: `Used web_search (${summary})` } : s
-                    ),
-                  };
-                }
-                return p;
-              })
+            const outLow = String(evt.output || "").toLowerCase();
+            const insufficient =
+              outLow.includes("search_evidence_insufficient") ||
+              outLow.includes("accepted=false") ||
+              (count === 0 && outLow.includes("insufficient"));
+            const summary = insufficient
+              ? "Search finished — evidence insufficient"
+              : count
+                ? `Search done (${count} sources)`
+                : "Search done";
+            markThinkingStep(
+              evt,
+              evt.id,
+              { status: "done", content: summary },
+              { toolName: "web_search", stepType: "search" },
             );
             return;
           }
           // Capture code blocks for CodeVisualizer
           const codingTools = new Set(["file_write", "file_read", "artifact_write", "terminal_run", "notepad_write"]);
-          if (codingTools.has(info?.name || "")) {
+          if (codingTools.has(toolName)) {
             const rawInput = info?.input || "";
-            const filename = rawInput.split(/[\n,]/)[0]?.replace(/^.*?['"]([^'"]+)['"].*$/, "$1") || info?.name || "output";
-            const lang = info?.name === "terminal_run" ? "bash" : filename.split(".").pop() || "text";
+            const filename = rawInput.split(/[\n,]/)[0]?.replace(/^.*?['"]([^'"]+)['"].*$/, "$1") || toolName || "output";
+            const lang = toolName === "terminal_run" ? "bash" : filename.split(".").pop() || "text";
             const content = evt.output || "";
             if (content.length > 0) {
               latestCodeFilenameRef.current = filename;
@@ -3491,7 +3926,7 @@ export const Dashboard: React.FC = () => {
                 const existing = prev.find((session) => session.filename === filename);
                 let nextSession: CodeDiffSession;
 
-                if (info?.name === "file_read") {
+                if (toolName === "file_read") {
                   nextSession = {
                     filename,
                     language: lang,
@@ -3500,7 +3935,7 @@ export const Dashboard: React.FC = () => {
                     status: "read",
                     summary: `Loaded ${content.length} chars`,
                   };
-                } else if (info?.name === "file_write") {
+                } else if (toolName === "file_write") {
                   if (isFileWriteSummary(content)) {
                     nextSession = {
                       filename,
@@ -3527,7 +3962,7 @@ export const Dashboard: React.FC = () => {
                     originalContent: content,
                     currentContent: content,
                     status: "output",
-                    summary: info?.name === "terminal_run" ? "Terminal output" : undefined,
+                    summary: toolName === "terminal_run" ? "Terminal output" : undefined,
                   };
                 }
 
@@ -3537,24 +3972,17 @@ export const Dashboard: React.FC = () => {
               setVisualizerPin("coding");
             }
           }
-          // For file tools, show a short summary in the activity feed
-          const toolName = info?.name || "";
           const isFileOp = codingTools.has(toolName);
           const activityOutput = isFileOp && (evt.output || "").length > 200
             ? `${toolName === "file_read" ? "Read" : "Wrote"} ${(evt.output || "").length} chars`
-            : evt.output || "done";
-          setActivities((prev) =>
-            prev.map((p) => {
-              if (p.kind === "thinking" && p.steps) {
-                return {
-                  ...p,
-                  steps: p.steps.map((s) =>
-                    s.id === evt.id ? { ...s, status: "done", content: `Used ${toolName} (${activityOutput})` } : s
-                  ),
-                };
-              }
-              return p;
-            })
+            : (evt.output || "done").slice(0, 120);
+          const stepType: ThinkingStep["type"] =
+            toolName === "file_read" ? "read" : toolName === "web_search" ? "search" : "tool";
+          markThinkingStep(
+            evt,
+            evt.id,
+            { status: "done", content: `${toolName}: ${activityOutput}` },
+            { toolName, stepType },
           );
           return;
         }
@@ -3562,18 +3990,14 @@ export const Dashboard: React.FC = () => {
         if (evt.type === "tool_error") {
           dispatchActivity({ type: "tool_error", id: evt.id, message: evt.error });
           const info = toolInfoRef.current[evt.id];
-          setActivities((prev) =>
-            prev.map((p) => {
-              if (p.kind === "thinking" && p.steps) {
-                return {
-                  ...p,
-                  steps: p.steps.map((s) =>
-                    s.id === evt.id ? { ...s, status: "done", content: `Failed ${info?.name || "tool"}: ${evt.error}` } : s
-                  ),
-                };
-              }
-              return p;
-            })
+          const toolName = info?.name || "tool";
+          const stepType: ThinkingStep["type"] =
+            toolName === "web_search" ? "search" : toolName === "file_read" ? "read" : "tool";
+          markThinkingStep(
+            evt,
+            evt.id,
+            { status: "failed", content: `Failed ${toolName}: ${evt.error}` },
+            { toolName, stepType },
           );
           setEchoReaction("error");
         }
@@ -3605,39 +4029,84 @@ export const Dashboard: React.FC = () => {
           } else if (evt.type === "tool_start" || evt.type === "tool_end" || evt.type === "tool_error") {
             upsertTool(evt);
           } else if (evt.type === "thinking_step") {
+            const stepType = (evt.step_type || "tool") as ThinkingStep["type"];
+            const st = String(evt.status || "running").toLowerCase();
+            const status: ThinkingStep["status"] =
+              st === "failed" || st === "error" ? "failed" : st === "done" || st === "complete" ? "done" : "running";
+            // Prefer stable ids so running → done maps to one row (no stuck spinner).
+            const stableId = `${eventRequestId(evt)}:${stepType}:${String(evt.content || "").slice(0, 48)}`;
             appendThinkingStep(evt, {
-              id: evt.step_type + "_" + Date.now(),
-              type: evt.step_type as "thought" | "search" | "read" | "tool",
+              id: stableId,
+              type: stepType,
               content: evt.content,
-              status: evt.status as "running" | "done",
+              status,
               at: normalizeTimestampMs(evt.at || Date.now()),
             });
           } else if (evt.type === "agent_token") {
             const tok = String(evt.data || "");
             if (tok) {
               dispatchActivity({ type: "agent_token", token: tok });
-              setLiveReplyDraft((prev) => prev + tok);
+              const prev = liveReplyDraftRef.current;
+              const next = prev + tok;
+              liveReplyDraftRef.current = next;
+              // First token — remove bootstrap spinner (reply is the progress now).
+              if (!prev) {
+                setActivities((acts) =>
+                  acts.map((p) => {
+                    if (p.kind !== "thinking" || p.request_id !== eventRequestId(evt)) return p;
+                    return {
+                      ...p,
+                      steps: (p.steps || []).filter((s) => s.id !== bootstrapStepId),
+                    };
+                  })
+                );
+              }
+              setLiveReplyDraft(next);
             }
+          } else if (evt.type === "partial_reply") {
+            // Multi-beat: seal the chatty preamble (e.g. "doing great") before tools run.
+            const text = String(evt.response || liveReplyDraftRef.current || "").trim();
+            if (!text) continue;
+            if (partialReplies.some((p) => p.trim() === text)) continue;
+            partialReplies.push(text);
+            const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
+            addMessage({
+              id: crypto.randomUUID(),
+              role: "assistant",
+              text,
+              at: Date.now(),
+              skipTypewriter: true,
+              usage: buildMessageUsage(text, useAppStore.getState().messages, ctxWindow, {
+                provider: providerInfo?.provider,
+                model: providerInfo?.model,
+              }),
+            });
+            liveReplyDraftRef.current = "";
+            setLiveReplyDraft("");
+            // Speak this beat now — tools may follow, then a second reply.
+            if (evt.speak !== false) {
+              void speakText(text);
+            }
+            dispatchActivity({ type: "thinking", content: "working" });
           } else if (evt.type === "thinking") {
             const content = (evt.content || "").trim();
             const reqId = eventRequestId(evt);
             if (content) {
               dispatchActivity({ type: "thinking", content });
-              setActivities((prev) => {
-                const existingIdx = prev.findIndex((p) => p.kind === "thinking" && p.request_id === reqId);
-                if (existingIdx !== -1) {
-                  const updated = [...prev];
-                  const existing = updated[existingIdx] as Extract<ActivityItem, { kind: "thinking" }>;
-                  updated[existingIdx] = {
-                    ...existing,
-                    content: content,
-                    at: Math.min(existing.at, normalizeTimestampMs(evt.at || Date.now())),
-                  } as ActivityItem;
-                  return updated;
-                }
-                if (prev.some((p) => p.kind === "thinking" && p.request_id === reqId && p.content === content)) return prev;
-                return [...prev, { kind: "thinking" as const, id: crypto.randomUUID(), content, at: normalizeTimestampMs(evt.at || Date.now()), request_id: reqId }];
-              });
+              // Only nudge the single bootstrap label — never stack extra rows.
+              setActivities((prev) =>
+                prev.map((p) => {
+                  if (p.kind !== "thinking" || p.request_id !== reqId) return p;
+                  return {
+                    ...p,
+                    steps: (p.steps || []).map((s) =>
+                      s.id === bootstrapStepId && s.status === "running"
+                        ? { ...s, content: "thinking…" }
+                        : s
+                    ),
+                  };
+                })
+              );
             }
           } else if (evt.type === "memory_saved") {
             setActivities((prev) => [
@@ -3657,16 +4126,43 @@ export const Dashboard: React.FC = () => {
             setStreaming(false);
             dispatchActivity({ type: "error", message: evt.message });
             setLiveReplyDraft("");
+            completeAllRunningSteps("failed");
             setActivities((prev) => [
               ...prev,
               { kind: "error", id: crypto.randomUUID(), message: evt.message, at: Date.now() },
             ]);
             setEchoReaction("error");
           } else if (evt.type === "final") {
-            const reply = evt.response || "(no response)";
-            const spoken = (evt.spoken_text || "").trim();
-            dispatchActivity({ type: "final", response: reply });
-            setLiveReplyDraft("");
+            // Guard: stream can surface final more than once; never double-commit chat/TTS.
+            if (finalHandled) continue;
+            finalHandled = true;
+
+            const liveDraft = liveReplyDraftRef.current.trim();
+            let reply = String(evt.response || liveDraft || "").trim();
+            // Drop any mid-turn beats already committed as partial_reply.
+            for (const part of [...partialReplies, ...(Array.isArray(evt.partial_replies) ? evt.partial_replies : [])]) {
+              const p = String(part || "").trim();
+              if (!p) continue;
+              if (reply === p) {
+                reply = "";
+                break;
+              }
+              if (reply.startsWith(p)) {
+                reply = reply.slice(p.length).replace(/^[\s\n\-–—]+/, "").trim();
+              }
+            }
+            // Prefer remaining live draft (post-tool generation) when backend still echoes preamble.
+            if ((!reply || partialReplies.some((p) => reply === p.trim())) && liveDraft) {
+              let draft = liveDraft;
+              for (const part of partialReplies) {
+                const p = part.trim();
+                if (draft.startsWith(p)) draft = draft.slice(p.length).replace(/^[\s\n\-–—]+/, "").trim();
+              }
+              if (draft) reply = draft;
+            }
+
+            dispatchActivity({ type: "final", response: reply || partialReplies[partialReplies.length - 1] || "" });
+            completeAllRunningSteps("done");
             if (typeof evt.memory_count === "number") {
               setMemoryCount(evt.memory_count);
             }
@@ -3683,13 +4179,40 @@ export const Dashboard: React.FC = () => {
             if (Array.isArray(evt.research) && evt.research.length) {
               replaceResearchRuns(evt.research.map((item) => normalizeResearchRun(item)).filter((item): item is ResearchRun => Boolean(item)));
             }
-            const botMsg: Message = { id: crypto.randomUUID(), role: "assistant", text: reply, at: Date.now() };
-            addMessage(botMsg);
-            // Speak exactly what the user sees in the chat bubble.
-            // Only use backend-provided spoken_text if it matches the displayed reply.
-            const speakVal = spoken && spoken === reply.trim() ? spoken : reply;
-            speakText(speakVal);
+
+            liveReplyDraftRef.current = "";
+            setLiveReplyDraft("");
             setStreaming(false);
+
+            // Second beat (tool result): only add/speak if there's new content after partials.
+            if (reply && !partialReplies.some((p) => p.trim() === reply)) {
+              const alreadyStreamed = liveDraft.length > 0;
+              const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
+              addMessage({
+                id: crypto.randomUUID(),
+                role: "assistant",
+                text: reply,
+                at: Date.now(),
+                skipTypewriter: alreadyStreamed || partialReplies.length > 0,
+                usage: buildMessageUsage(reply, useAppStore.getState().messages, ctxWindow, {
+                  provider: providerInfo?.provider,
+                  model: providerInfo?.model,
+                }),
+              });
+              const spoken = (evt.spoken_text || "").trim();
+              const speakVal = spoken && spoken === reply ? spoken : reply;
+              void speakText(speakVal);
+            } else if (!partialReplies.length && !reply) {
+              // True empty — still surface something so the turn doesn't ghost.
+              addMessage({
+                id: crypto.randomUUID(),
+                role: "assistant",
+                text: "(no response)",
+                at: Date.now(),
+                skipTypewriter: true,
+              });
+            }
+
             setEchoReaction(isConfirmPromptText(reply) ? null : "success");
             setAgentMode("idle");
             refreshPendingApproval(activeThreadId);
@@ -3711,8 +4234,38 @@ export const Dashboard: React.FC = () => {
       setEchoReaction("error");
     } finally {
       setStreaming(false);
+      // If stream died without final but we already streamed tokens, promote draft once.
+      if (!finalHandled && liveReplyDraftRef.current.trim()) {
+        const orphan = liveReplyDraftRef.current;
+        const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
+        addMessage({
+          id: crypto.randomUUID(),
+          role: "assistant",
+          text: orphan,
+          at: Date.now(),
+          skipTypewriter: true,
+          usage: buildMessageUsage(orphan, useAppStore.getState().messages, ctxWindow, {
+            provider: providerInfo?.provider,
+            model: providerInfo?.model,
+          }),
+        });
+        void speakText(orphan);
+      }
+      liveReplyDraftRef.current = "";
       setLiveReplyDraft("");
       dispatchActivity({ type: "stream_end" });
+      // Safety net: any still-running step rows stop spinning when the stream closes.
+      // Do not call stopTts here — that was cutting off speech when final→finally raced.
+      setActivities((prev) =>
+        prev.map((p) => {
+          if (p.kind !== "thinking" || !p.steps?.length) return p;
+          if (!p.steps.some((s) => s.status === "running")) return p;
+          return {
+            ...p,
+            steps: p.steps.map((s) => (s.status === "running" ? { ...s, status: "done" as const } : s)),
+          };
+        })
+      );
     }
   };
 
@@ -4090,6 +4643,11 @@ export const Dashboard: React.FC = () => {
     { id: "services", label: "Services", group: "Automation" },
   ];
   const studioOpen = leftTab !== "chat" && leftTab !== "research";
+  const studioActiveTab = studioTabs.find((t) => t.id === leftTab);
+  const closeStudio = () => {
+    setLeftTab("chat");
+    setShowVisualizer(true);
+  };
 
   return (
     <div
@@ -4389,7 +4947,7 @@ export const Dashboard: React.FC = () => {
                     const pendingConfirm =
                       agentActivity.pendingConfirmation || Boolean(pendingApproval?.has_pending);
                     return (
-                      <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", transform: "translateY(-24px)" }}>
+                      <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", transform: "translateY(-7px) scale(1)", transformOrigin: "center center" }}>
                         <SquareAvatarVisual
                           speaking={speaking}
                           backendOnline={backendOnline}
@@ -4430,7 +4988,7 @@ export const Dashboard: React.FC = () => {
                 className="icon-button"
                 onClick={() => {
                   if (studioOpen) {
-                    setLeftTab("chat");
+                    closeStudio();
                     return;
                   }
                   setShowVisualizer(true);
@@ -4652,7 +5210,10 @@ export const Dashboard: React.FC = () => {
                             key={`msg-${t.id}`}
                             msg={t.msg}
                             streaming={streaming}
-                            typewriter={t.msg.role === "assistant"}
+                            typewriter={t.msg.role === "assistant" && !t.msg.skipTypewriter}
+                            contextWindow={Number(providerInfo?.context_window || 0) || 32768}
+                            providerLabel={providerInfo?.provider}
+                            modelLabel={providerInfo?.model}
                             onQuickReply={(text) => {
                               try {
                                 stopTts();
@@ -4670,17 +5231,13 @@ export const Dashboard: React.FC = () => {
                       )}
                     </AnimatePresence>
                     {streaming && liveReplyDraft ? (
-                      <div style={{ display: "flex", justifyContent: "flex-start", marginTop: 4, marginBottom: 8 }}>
+                      <div style={{ display: "flex", justifyContent: "flex-start", padding: "10px 4px 8px", width: "100%" }}>
                         <div
+                          className="chat-flat chat-line-assistant"
                           style={{
-                            maxWidth: "84%",
-                            padding: "10px 14px",
-                            borderRadius: "14px 14px 14px 4px",
-                            border: "1px solid rgba(140,160,255,0.28)",
-                            background: "rgba(140,160,255,0.06)",
-                            fontSize: 14,
-                            lineHeight: 1.55,
-                            color: colors.text,
+                            width: "100%",
+                            fontSize: 15,
+                            lineHeight: 1.65,
                             whiteSpace: "pre-wrap",
                           }}
                         >
@@ -4688,11 +5245,11 @@ export const Dashboard: React.FC = () => {
                           <span
                             style={{
                               display: "inline-block",
-                              width: 7,
-                              height: 14,
-                              marginLeft: 2,
+                              width: 8,
+                              height: 15,
+                              marginLeft: 3,
                               borderRadius: 1,
-                              background: "rgba(140,160,255,0.9)",
+                              background: "rgba(255,255,255,0.75)",
                               animation: "pulse 0.8s infinite",
                               verticalAlign: "text-bottom",
                             }}
@@ -4700,7 +5257,12 @@ export const Dashboard: React.FC = () => {
                         </div>
                       </div>
                     ) : null}
-                    {streaming && !liveReplyDraft && agentActivity.phase !== "idle" ? (
+                    {/* Footer spinner only if timeline has no running step yet (avoids double spinners). */}
+                    {streaming &&
+                    !liveReplyDraft &&
+                    !activities.some(
+                      (a) => a.kind === "thinking" && (a.steps || []).some((s) => s.status === "running")
+                    ) ? (
                       <div
                         style={{
                           display: "flex",
@@ -4708,11 +5270,13 @@ export const Dashboard: React.FC = () => {
                           gap: 8,
                           padding: "6px 4px 10px",
                           fontSize: 12,
-                          color: colors.textDim,
+                          color: "rgba(255,255,255,0.45)",
+                          fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+                          letterSpacing: "0.04em",
                         }}
                       >
-                        <SquareLoader size={12} />
-                        <span>{agentActivity.label}</span>
+                        <SquareLoader size={11} color="rgba(255,255,255,0.85)" />
+                        <span>{(agentActivity.label || "Working").toLowerCase()}</span>
                       </div>
                     ) : null}
                     <div ref={chatBottomRef} style={{ height: 1 }} />
@@ -4757,7 +5321,7 @@ export const Dashboard: React.FC = () => {
                         }}
                         placeholder="Ask Echo anything..."
                       />
-                      <ContextRing messages={messages} contextWindow={providerInfo?.context_window || 0} />
+                      <ContextMeter messages={messages} contextWindow={providerInfo?.context_window || 0} />
                       <button className="send-button" onClick={() => sendText()} type="button">
                         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                           <path d="M5 12L19 12M19 12L13 6M19 12L13 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
@@ -4765,52 +5329,30 @@ export const Dashboard: React.FC = () => {
                       </button>
                     </div>
                     <div className="controls-row">
-                      <div className="control-slot session-slot">
+                      <div className="control-slot session-slot" data-label="Session">
                         <button
                           type="button"
-                          className="toolbar-button"
+                          className={"toolbar-button" + (showSessions ? " active-rail" : "")}
                           onClick={() => setShowSessions(!showSessions)}
                           title="Sessions"
-                          style={{
-                            background: showSessions ? "rgba(255,255,255,0.1)" : "transparent",
-                          }}
                         >
-                          <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-                            </svg>
-                            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{threads.find(t => t.id === activeThreadId)?.name || "Session"}</span>
+                          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {threads.find(t => t.id === activeThreadId)?.name || "default"}
                           </span>
-                          <span style={{ fontSize: 10, opacity: 0.6 }}>{showSessions ? "▲" : "▼"}</span>
+                          <span style={{ fontSize: 9, opacity: 0.45, flexShrink: 0 }}>{showSessions ? "▲" : "▼"}</span>
                         </button>
 
                         <AnimatePresence>
                           {showSessions && (
                             <motion.div
-                              initial={{ opacity: 0, y: 10, scale: 0.95 }}
-                              animate={{ opacity: 1, y: 0, scale: 1 }}
-                              exit={{ opacity: 0, y: 10, scale: 0.95 }}
-                              style={{
-                                position: "absolute",
-                                bottom: "100%",
-                                left: 0,
-                                marginBottom: 8,
-                                width: 240,
-                                background: colors.panel2,
-                                border: `1px solid ${colors.line}`,
-                                borderRadius: 12,
-                                boxShadow: "0 10px 25px -5px rgba(0, 0, 0, 0.4), 0 8px 10px -6px rgba(0, 0, 0, 0.4)",
-                                zIndex: 100,
-                                padding: 8,
-                                display: "flex",
-                                flexDirection: "column",
-                                gap: 4
-                              }}
+                              className="session-menu"
+                              initial={{ opacity: 0, y: 6 }}
+                              animate={{ opacity: 1, y: 0 }}
+                              exit={{ opacity: 0, y: 6 }}
+                              transition={{ duration: 0.15 }}
                             >
-                              <div style={{ padding: "4px 8px 8px 8px", fontSize: 11, fontWeight: 600, color: colors.textDim, textTransform: "uppercase", letterSpacing: 0.5 }}>
-                                Recent Sessions
-                              </div>
-                              <div style={{ maxHeight: 300, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
+                              <div className="session-menu-label">Sessions</div>
+                              <div style={{ maxHeight: 260, overflowY: "auto", display: "flex", flexDirection: "column", gap: 1 }}>
                                 {threads.map((t) => (
                                   <div
                                     key={t.id}
@@ -4820,22 +5362,21 @@ export const Dashboard: React.FC = () => {
                                     }}
                                     style={{
                                       padding: "8px 10px",
-                                      borderRadius: 8,
-                                      background: t.id === activeThreadId ? "rgba(255,255,255,0.08)" : "transparent",
+                                      borderRadius: 2,
+                                      background: t.id === activeThreadId ? "rgba(255,255,255,0.07)" : "transparent",
                                       cursor: "pointer",
                                       display: "flex",
                                       justifyContent: "space-between",
                                       alignItems: "center",
-                                      transition: "background 0.2s"
                                     }}
                                     onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.05)")}
-                                    onMouseLeave={(e) => (e.currentTarget.style.background = t.id === activeThreadId ? "rgba(255,255,255,0.08)" : "transparent")}
+                                    onMouseLeave={(e) => (e.currentTarget.style.background = t.id === activeThreadId ? "rgba(255,255,255,0.07)" : "transparent")}
                                   >
-                                    <div style={{ display: "flex", flexDirection: "column", gap: 2, overflow: "hidden" }}>
-                                      <span style={{ fontSize: 13, fontWeight: t.id === activeThreadId ? 600 : 400, color: t.id === activeThreadId ? colors.text : colors.textDim, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                    <div style={{ display: "flex", flexDirection: "column", gap: 2, overflow: "hidden", minWidth: 0 }}>
+                                      <span style={{ fontSize: 12, fontFamily: "'JetBrains Mono', ui-monospace, monospace", fontWeight: t.id === activeThreadId ? 600 : 400, color: t.id === activeThreadId ? colors.text : "rgba(255,255,255,0.55)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                                         {t.name}
                                       </span>
-                                      <span style={{ fontSize: 10, color: colors.textDim }}>{new Date(t.at).toLocaleDateString()}</span>
+                                      <span style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", fontFamily: "'JetBrains Mono', ui-monospace, monospace" }}>{new Date(t.at).toLocaleDateString()}</span>
                                     </div>
                                     {threads.length > 1 && (
                                       <button
@@ -4843,55 +5384,53 @@ export const Dashboard: React.FC = () => {
                                         style={{
                                           background: "transparent",
                                           border: "none",
-                                          color: colors.textDim,
+                                          color: "rgba(255,255,255,0.35)",
                                           cursor: "pointer",
                                           padding: 4,
-                                          borderRadius: 4,
                                           display: "flex",
                                           alignItems: "center",
-                                          justifyContent: "center"
+                                          justifyContent: "center",
                                         }}
                                         onMouseEnter={(e) => (e.currentTarget.style.color = colors.danger)}
-                                        onMouseLeave={(e) => (e.currentTarget.style.color = colors.textDim)}
+                                        onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(255,255,255,0.35)")}
                                       >
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2v2"></path></svg>
+                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
                                       </button>
                                     )}
                                   </div>
                                 ))}
                               </div>
-                              <div style={{ height: 1, background: colors.line, margin: "4px 0" }} />
+                              <div style={{ height: 1, background: "rgba(255,255,255,0.08)", margin: "6px 0" }} />
                               <button
                                 onClick={() => {
                                   createNewThread();
                                   setShowSessions(false);
                                 }}
                                 style={{
-                                  padding: "10px",
-                                  borderRadius: 8,
-                                  background: "rgba(255,255,255,0.05)",
-                                  border: `1px dashed ${colors.line}`,
+                                  padding: "9px 10px",
+                                  borderRadius: 2,
+                                  background: "transparent",
+                                  border: "1px solid rgba(255,255,255,0.12)",
                                   color: colors.text,
                                   cursor: "pointer",
-                                  fontSize: 12,
+                                  fontSize: 11,
                                   fontWeight: 600,
+                                  letterSpacing: "0.06em",
+                                  textTransform: "uppercase",
+                                  fontFamily: "'JetBrains Mono', ui-monospace, monospace",
                                   display: "flex",
                                   alignItems: "center",
                                   justifyContent: "center",
                                   gap: 8,
-                                  transition: "background 0.2s"
                                 }}
-                                onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.1)")}
-                                onMouseLeave={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.05)")}
                               >
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-                                New Session
+                                + New
                               </button>
                             </motion.div>
                           )}
                         </AnimatePresence>
                       </div>
-                      <div className="control-slot mode-slot">
+                      <div className="control-slot mode-slot" data-label="Mode">
                         <select
                           className="mode-picker"
                           value={workspaceMode}
@@ -4907,7 +5446,7 @@ export const Dashboard: React.FC = () => {
                           ))}
                         </select>
                       </div>
-                      <div className="control-slot provider-slot">
+                      <div className="control-slot provider-slot" data-label="Provider">
                         <div className="inline-switcher">
                           <select
                             className="provider-picker"
@@ -4924,7 +5463,7 @@ export const Dashboard: React.FC = () => {
                           </select>
                         </div>
                       </div>
-                      <div className="control-slot model-slot">
+                      <div className="control-slot model-slot" data-label="Model">
                         <select
                           className="model-picker"
                           value={modelPickerValue}
@@ -4946,68 +5485,53 @@ export const Dashboard: React.FC = () => {
 
               {studioOpen && (
                 <motion.div
-                  layout
-                  initial={{ opacity: 0, y: 12 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 8 }}
-                  transition={{ duration: 0.18 }}
-                  style={{
-                    position: "fixed",
-                    top: 0,
-                    left: 0,
-                    right: showVisualizer ? "50%" : 0,
-                    bottom: 0,
-                    width: showVisualizer ? "50vw" : "100vw",
-                    maxWidth: "none",
-                    zIndex: 80,
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 12,
-                    padding: "16px 18px 18px",
-                    background: "rgba(5,8,16,0.97)",
-                    backdropFilter: "blur(18px)",
-                    WebkitBackdropFilter: "blur(18px)",
-                    border: "none",
-                    borderRight: showVisualizer ? `1px solid ${colors.line}` : "none",
-                    borderRadius: 0,
-                    boxShadow: "none",
-                    overflow: "hidden",
-                  }}
+                  className="studio-shell"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.2 }}
                 >
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                      <div style={{ fontSize: 13, fontWeight: 800, color: colors.text }}>Studio</div>
-                      <div style={{ fontSize: 11, color: colors.textDim }}>
-                        Full workspace for knowledge, config, and automation. Chat stays on the right.
+                  <div className="studio-top">
+                    <div className="studio-brand">
+                      <div className="studio-brand-mark">
+                        <img src="/logo.png" alt="" />
+                      </div>
+                      <div>
+                        <div className="studio-title">EchoSpeak Studio</div>
+                        <div className="studio-sub">your machine · your rules</div>
                       </div>
                     </div>
                     <button
                       type="button"
-                      className="icon-button"
-                      onClick={() => setLeftTab("chat")}
-                      style={{ height: 30, padding: "0 12px", fontSize: 12, fontWeight: 700 }}
+                      className="studio-x"
+                      onClick={closeStudio}
+                      title="Close Studio"
+                      aria-label="Close Studio"
                     >
-                      Close
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+                        <path d="M18 6L6 18M6 6l12 12" />
+                      </svg>
                     </button>
                   </div>
-                  {/* Mini Echo dock — avatar yields the full stage while Studio is open */}
-                  <div
-                    style={{
-                      position: "absolute",
-                      right: 16,
-                      bottom: 16,
-                      width: 88,
-                      height: 88,
-                      borderRadius: 14,
-                      overflow: "hidden",
-                      border: `1px solid ${colors.line}`,
-                      background: "rgba(0,0,0,0.55)",
-                      zIndex: 2,
-                      boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
-                    }}
-                    title={agentActivity.label}
-                  >
-                    <div style={{ transform: "scale(0.28)", transformOrigin: "top left", width: 320, height: 320 }}>
+
+                  <div className="studio-nav">
+                    <div className="studio-nav-inner">
+                      {studioTabs.map((tab) => (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          className={"studio-tab" + (leftTab === tab.id ? " active" : "")}
+                          onClick={() => setLeftTab(tab.id)}
+                          title={tab.group}
+                        >
+                          {tab.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="studio-dock" title={agentActivity.label}>
+                    <div style={{ transform: "scale(0.185)", transformOrigin: "top left", width: 320, height: 320 }}>
                       <SquareAvatarVisual
                         speaking={speaking}
                         backendOnline={backendOnline}
@@ -5022,28 +5546,14 @@ export const Dashboard: React.FC = () => {
                       />
                     </div>
                   </div>
-                  <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 2 }}>
-                    {studioTabs.map((tab) => (
-                      <button
-                        key={tab.id}
-                        type="button"
-                        className="icon-button"
-                        onClick={() => setLeftTab(tab.id)}
-                        title={tab.group}
-                        style={{
-                          height: 30,
-                          padding: "0 10px",
-                          fontSize: 12,
-                          flex: "0 0 auto",
-                          borderColor: leftTab === tab.id ? "rgba(140,180,255,0.42)" : colors.line,
-                          background: leftTab === tab.id ? "rgba(140,180,255,0.14)" : "rgba(255,255,255,0.04)",
-                        }}
-                      >
-                        {tab.label}
-                      </button>
-                    ))}
-                  </div>
-                  <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+
+                  <div className="studio-body">
+                    <div className="studio-column">
+                      <div className="studio-hero">
+                        <h2>{studioActiveTab?.label || "Studio"}</h2>
+                        <span>{studioActiveTab?.group || "workspace"}</span>
+                      </div>
+                      <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column", width: "100%" }}>
 
               {/* Memory Tab */}
               {leftTab === "memory" && (
@@ -8104,6 +8614,8 @@ I am EchoSpeak, a personal AI assistant...
                   </div>
                 </div>
               )}
+                      </div>
+                    </div>
                   </div>
                 </motion.div>
               )}

@@ -10,7 +10,6 @@ export type AvatarConfig = {
   breathing_speed: number;
   eye_size: number;
   body_roundness: number;
-  enable_particles: boolean;
   enable_glow: boolean;
   enable_idle_activities: boolean;
   custom_status_text: string;
@@ -25,7 +24,6 @@ export const DEFAULT_AVATAR_CONFIG: AvatarConfig = {
   breathing_speed: 1,
   eye_size: 1,
   body_roundness: 14,
-  enable_particles: true,
   enable_glow: true,
   enable_idle_activities: true,
   custom_status_text: "",
@@ -274,17 +272,18 @@ export const AvatarEditor: React.FC<AvatarEditorProps> = ({ apiBase, colors, onC
                   <span style={{ fontSize: 12, color: colors.textDim }}>Idle Mode</span>
                   <select value={config.idle_activity} onChange={(e) => updateField("idle_activity", e.target.value)} style={{ ...inputStyle, paddingRight: 32 }}>
                     <option value="auto">Auto</option>
-                    <option value="gaming">Gaming</option>
-                    <option value="floating">Floating</option>
+                    <option value="phone">On Phone</option>
+                    <option value="daydream">Daydream</option>
+                    <option value="weight_shift">Weight Shift</option>
+                    <option value="fidget">Fidget</option>
+                    <option value="stretching">Stretching</option>
                     <option value="napping">Napping</option>
                     <option value="vibing">Vibing</option>
-                    <option value="stretching">Stretching</option>
                     <option value="none">Static</option>
                   </select>
                 </div>
                 {([
                   ["Glow", "enable_glow"],
-                  ["Particles", "enable_particles"],
                   ["Idle Activities", "enable_idle_activities"],
                 ] as const).map(([label, field]) => (
                   <div key={field} style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -303,13 +302,6 @@ export const AvatarEditor: React.FC<AvatarEditorProps> = ({ apiBase, colors, onC
               <div style={labelStyle}>Live Preview</div>
               <div style={{ position: "relative", height: 260, borderRadius: 18, border: `1px solid ${colors.line}`, overflow: "hidden", background: `radial-gradient(circle at center, ${config.bg_color} 0%, rgba(0,0,0,0) 75%)` }}>
                 <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                  {config.enable_particles ? (
-                    <>
-                      {[0, 1, 2].map((i) => (
-                        <motion.div key={i} animate={{ y: [0, -16, 0], opacity: [0.2, 0.55, 0.2] }} transition={{ duration: 3 + i, repeat: Infinity, ease: "easeInOut", delay: i * 0.3 }} style={{ position: "absolute", top: `${28 + i * 16}%`, left: `${30 + i * 14}%`, width: 8, height: 8, borderRadius: 999, background: config.glow_color, filter: "blur(1px)" }} />
-                      ))}
-                    </>
-                  ) : null}
                   <motion.div animate={{ y: [0, -4 * config.breathing_speed, 0] }} transition={{ duration: Math.max(0.9, 3 / Math.max(0.25, config.breathing_speed)), repeat: Infinity, repeatType: "reverse", ease: "easeInOut" }} style={{ width: 136, height: 136, borderRadius: config.body_roundness, background: `linear-gradient(135deg, ${config.body_color}, ${config.body_color}dd)`, boxShadow: config.enable_glow ? `0 0 36px ${config.glow_color}55` : "none", border: config.enable_glow ? `4px solid ${config.glow_color}33` : "4px solid rgba(255,255,255,0.08)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", position: "relative" }}>
                     <div style={{ display: "flex", gap: Math.max(22, 28 + config.eye_size * 6), marginTop: -18 }}>
                       <div style={{ width: 18 * config.eye_size, height: 22 * config.eye_size, borderRadius: 999, background: config.eye_color }} />
@@ -334,7 +326,7 @@ export const AvatarEditor: React.FC<AvatarEditorProps> = ({ apiBase, colors, onC
             <div style={cardStyle}>
               <div style={labelStyle}>What is wired</div>
               <div style={{ display: "grid", gap: 8, fontSize: 12, color: colors.textDim, lineHeight: 1.55 }}>
-                <div>Colors, roundness, eye size, breathing, glow, particles, idle mode, and status text all feed the visualizer live.</div>
+                <div>Colors, roundness, eye size, breathing, glow, idle mode, and status text all feed the visualizer live.</div>
                 <div>Save persists the profile to the backend API. Reset restores the default server-side profile.</div>
               </div>
             </div>

@@ -236,7 +236,7 @@ class LocalModelConfig(BaseModel):
     model_name: str = "qwen3.5-2b-uncensored-hauhaucs-aggressive"
     temperature: float = 0.7
     max_tokens: int = 4096
-    context_length: int = 8192
+    context_length: int = 32768
     gpu_layers: int = -1
     use_mmap: bool = True
     use_mlock: bool = False
@@ -371,7 +371,7 @@ class Config:
             model_name=os.getenv("LOCAL_MODEL_NAME", "qwen3.5-2b-uncensored-hauhaucs-aggressive"),
             temperature=float(os.getenv("LOCAL_MODEL_TEMPERATURE", "0.7")),
             max_tokens=int(os.getenv("LOCAL_MODEL_MAX_TOKENS", "4096")),
-            context_length=int(os.getenv("LOCAL_MODEL_CONTEXT", "8192")),
+            context_length=int(os.getenv("LOCAL_MODEL_CONTEXT", "32768")),
             gpu_layers=int(os.getenv("LOCAL_MODEL_GPU_LAYERS", "-1")),
             use_mmap=os.getenv("LOCAL_MODEL_USE_MMAP", "true").lower() == "true",
             use_mlock=os.getenv("LOCAL_MODEL_USE_MLOCK", "false").lower() == "true",

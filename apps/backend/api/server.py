@@ -10,6 +10,7 @@ import json
 import queue
 import asyncio
 import importlib.util
+import re
 import threading
 import time
 import uuid
@@ -909,6 +910,15 @@ class _StreamingHandler(BaseCallbackHandler):
         self._in_think_block = False
         self._loop_blocks: list[str] = []
         self._current_reasoning = ""
+        # Visible answer text for the *current* LLM generation (pre-tool beat).
+        self._visible_gen = ""
+        self._partial_count = 0
+        self.partial_replies: list[str] = []
+        # One guaranteed preamble beat per LLM generation that invokes tools.
+        self._preamble_done_this_gen = False
+        # Optional: agent generates free-form wording when the model produced none.
+        self._preamble_fn = None  # type: ignore[assignment]
+        self._on_partial = None  # type: ignore[assignment]
         # No-progress detection: track repeated tool call signatures
         self._tool_call_signatures: dict[str, int] = {}  # hash -> count
         self._loop_warning_sent = False
@@ -917,6 +927,161 @@ class _StreamingHandler(BaseCallbackHandler):
     def research_runs(self) -> list[dict[str, Any]]:
         return list(self._research_runs)
 
+    def set_preamble_fn(self, fn) -> None:
+        """Wire agent-side free-form beat generator (decision stays in code)."""
+        self._preamble_fn = fn
+
+    def set_on_partial(self, fn) -> None:
+        """Notify agent when a mid-turn spoken beat is sealed."""
+        self._on_partial = fn
+
+    # Internal / silent tools must NOT trigger a spoken beat (time inject, calc, memory…).
+    # User-facing tools (web_search, files, browser, etc.) always do.
+    _PREAMBLE_SKIP_TOOLS = frozenset({
+        "get_system_time",
+        "calculate",
+        "system_info",
+        "project_update_context",
+        "store_memory",
+        "save_memory",
+        "recall_memory",
+        "search_memory",
+        "query_memory",
+        "memory_store",
+        "memory_recall",
+    })
+
+    def _tool_requires_preamble(self, tool_name: str) -> bool:
+        n = re.sub(r"[^a-z0-9_]+", "", str(tool_name or "").strip().lower())
+        if not n:
+            return False
+        if n in self._PREAMBLE_SKIP_TOOLS:
+            return False
+        if "memory" in n and n not in {"memory_store", "memory_recall"}:
+            # catch-all for other memory helpers
+            if n.startswith("memory") or n.endswith("memory"):
+                return False
+        return True
+
+    def _looks_like_tool_payload(self, text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return True
+        # Pure tool/function JSON — not something we should speak mid-turn.
+        if t.startswith("{") and ("\"name\"" in t or "\"tool\"" in t or "arguments" in t):
+            return True
+        if t.startswith("```") and "function" in t.lower():
+            return True
+        return False
+
+    def _is_usable_preamble(self, text: str) -> bool:
+        t = (text or "").strip()
+        if len(t) < 3:
+            return False
+        if self._looks_like_tool_payload(t):
+            return False
+        # Reject pure reasoning dumps / markdown thought headers
+        low = t.lower()
+        if low.startswith("### ") or "model thoughts" in low or low.startswith("<think"):
+            return False
+        return True
+
+    def _emit_partial(self, text: str, reason: str) -> None:
+        text = (text or "").strip()
+        if not self._is_usable_preamble(text):
+            return
+        if self.partial_replies and self.partial_replies[-1].strip() == text:
+            return
+        self._partial_count += 1
+        self.partial_replies.append(text)
+        self._preamble_done_this_gen = True
+        # Keep agent state in sync so finalize can forbid re-greetings.
+        try:
+            if callable(self._on_partial):
+                self._on_partial(text)
+        except Exception:
+            pass
+        self._q.put(
+            {
+                "type": "partial_reply",
+                "response": text,
+                "speak": True,
+                "segment": self._partial_count,
+                "reason": reason,
+                "at": time.time(),
+                "request_id": self._request_id,
+            }
+        )
+
+    def _flush_partial_reply(
+        self,
+        reason: str = "tool",
+        *,
+        tool_name: str = "",
+        tool_input: str = "",
+        force: bool = True,
+    ) -> None:
+        """
+        Code-level guarantee: before tools run, emit exactly one spoken beat.
+
+        Wording preference order:
+          1) Model-streamed visible text for this generation (if any)
+          2) Fresh free-form line from agent preamble generator
+          3) Soft varied fallback (only if generation fails)
+
+        Decision to emit is never left to the model remembering a prompt.
+        """
+        # Already sealed this generation (e.g. multi-tool burst) — one beat max per gen.
+        if self._preamble_done_this_gen:
+            self._visible_gen = ""
+            return
+
+        text = (self._visible_gen or "").strip()
+        self._visible_gen = ""
+        if not self._is_usable_preamble(text):
+            text = ""
+
+        # Always consult generator when available: it enforces social-first order
+        # when the user greeted / asked how Echo is (model often skips that).
+        if callable(self._preamble_fn):
+            try:
+                generated = str(
+                    self._preamble_fn(tool_name or "tool", tool_input or "", text) or ""
+                ).strip()
+                if self._is_usable_preamble(generated):
+                    text = generated
+            except TypeError:
+                # Older 2-arg callback
+                try:
+                    if not text:
+                        text = str(self._preamble_fn(tool_name or "tool", tool_input or "") or "").strip()
+                except Exception as exc:
+                    logger.warning("Preamble generator failed: %s", exc)
+            except Exception as exc:
+                logger.warning("Preamble generator failed: %s", exc)
+
+        if not self._is_usable_preamble(text):
+            # Last-resort variety — never say the raw tool id ("web search").
+            import random
+            tool = re.sub(r"[_\-]+", " ", str(tool_name or "")).strip().lower()
+            if tool in {"web search", "websearch", "search"}:
+                task = "that"
+            elif tool:
+                task = tool
+            else:
+                task = "that"
+            options = [
+                f"On it — pulling {task} up.",
+                f"One sec, checking {task}.",
+                f"Alright, looking into {task}.",
+                "Checking that now.",
+                "Let me pull that up.",
+                "Hang on, grabbing it.",
+            ]
+            text = random.choice(options)
+
+        self._emit_partial(text, reason)
+
     def _start_new_generation(self):
         # Save previous loop's reasoning before starting a new one
         if self._current_reasoning.strip():
@@ -924,6 +1089,11 @@ class _StreamingHandler(BaseCallbackHandler):
             header = f"### Model Thoughts (Loop {loop_idx})"
             self._loop_blocks.append(f"{header}\n{self._current_reasoning.strip()}")
         self._current_reasoning = ""
+        # New LLM generation after tools — start a fresh visible buffer
+        # (prior preamble should already have been flushed on tool_start).
+        self._visible_gen = ""
+        self._in_think_block = False
+        self._preamble_done_this_gen = False
         # Reliable phase signal for avatar/chat (was only set on tool_start before).
         self._q.put({
             "type": "status",
@@ -976,9 +1146,10 @@ class _StreamingHandler(BaseCallbackHandler):
                 "request_id": self._request_id
             })
 
-        # 3. Stream non-reasoning answer tokens so the chat can show live text
-        # (final still sends the full response for correctness).
+        # 3. Stream non-reasoning answer tokens so the chat can show live text.
+        # Buffer per generation so we can seal a partial spoken beat before tools.
         if visible_token and not self._in_think_block and not reasoning:
+            self._visible_gen += visible_token
             self._q.put({
                 "type": "agent_token",
                 "data": visible_token,
@@ -1018,9 +1189,18 @@ class _StreamingHandler(BaseCallbackHandler):
     def on_tool_start(self, serialized: dict, input_str: str, run_id: str, parent_run_id: Optional[str] = None, **kwargs):
         tool_name = (serialized or {}).get("name") or (serialized or {}).get("id") or "tool"
         call_id = str(run_id)
+        raw_input = input_str if isinstance(input_str, str) else str(input_str)
+        # Deterministic beat only for user-facing tools — never for silent injects
+        # like get_system_time (that was firing "Checking that now." then skipping weather).
+        if self._tool_requires_preamble(str(tool_name or "")):
+            self._flush_partial_reply(
+                "tool_start",
+                tool_name=str(tool_name or ""),
+                tool_input=raw_input,
+                force=True,
+            )
         self._tool_run_map[call_id] = tool_name
         self._tool_started_at[call_id] = time.perf_counter()
-        raw_input = input_str if isinstance(input_str, str) else str(input_str)
         self._tool_input_map[call_id] = raw_input
         _metric_inc("tool_calls", 1)
 
@@ -1111,6 +1291,21 @@ def _start_agent_thread(
     def run_agent():
         try:
             handler = _StreamingHandler(q, request_id)
+            # Decision = code (on tool_start). Wording = free model generation when needed.
+            try:
+                # Fresh multi-beat state for this turn
+                agent._turn_partial_beats = []
+                handler.set_preamble_fn(
+                    lambda tool_name, tool_input, model_text="": agent.generate_tool_preamble_beat(
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        user_query=message,
+                        model_text=model_text,
+                    )
+                )
+                handler.set_on_partial(lambda text: agent.record_turn_partial_beat(text))
+            except Exception:
+                pass
             thread_state = _apply_thread_scope(agent, thread_id, workspace)
             memory_before = int(getattr(agent.memory, "memory_count", 0) or 0)
             response, success = agent.process_query(
@@ -1128,18 +1323,40 @@ def _start_agent_thread(
                 spoken_text = str(agent.get_last_tts_text() or "")
             except Exception:
                 spoken_text = ""
+            # Prefer the last generation's visible text when partials already covered the preamble.
+            final_response = str(response or "")
+            if handler.partial_replies:
+                # Strip already-spoken beats from final so we don't re-say "I'm great" after weather.
+                trimmed = final_response
+                for part in handler.partial_replies:
+                    p = (part or "").strip()
+                    if not p:
+                        continue
+                    if trimmed.startswith(p):
+                        trimmed = trimmed[len(p):].lstrip(" \n\t-–—")
+                    elif p in trimmed:
+                        # Soft fallback: drop first occurrence only
+                        trimmed = trimmed.replace(p, "", 1).strip()
+                # If stripping wiped everything, keep last non-empty partial out and use leftover live gen
+                leftover_gen = (handler._visible_gen or "").strip()
+                if trimmed.strip():
+                    final_response = trimmed.strip()
+                elif leftover_gen:
+                    final_response = leftover_gen
+                # else keep original response (better than empty)
             memory_after = int(getattr(agent.memory, "memory_count", 0) or 0)
             if memory_after > memory_before:
                 q.put({"type": "memory_saved", "memory_count": memory_after, "at": time.time(), "request_id": request_id})
             q.put(
                 {
                     "type": "final",
-                    "response": response,
+                    "response": final_response,
                     "success": success,
                     "memory_count": memory_after,
                     "doc_sources": doc_sources,
                     "research": handler.research_runs,
-                    "spoken_text": spoken_text,
+                    "spoken_text": spoken_text if not handler.partial_replies else (final_response or spoken_text),
+                    "partial_replies": list(handler.partial_replies),
                     "execution_id": execution.id if execution else None,
                     "trace_id": execution.trace_id if execution else None,
                     "thread_state": latest_state or thread_state,
@@ -4670,8 +4887,8 @@ async def get_provider_info():
             if "flash" in m:
                 return (1048576, 8192)
             return (1048576, 8192)
-        # Local providers: use config
-        ctx = int(getattr(config.local, "context_length", 0) or 0) or 8192
+        # Local providers: use config (default 32k to match LM Studio / local setups)
+        ctx = int(getattr(config.local, "context_length", 0) or 0) or 32768
         out = int(getattr(config.local, "max_tokens", 0) or 0) or 4096
         return (ctx, out)
 
@@ -5114,7 +5331,6 @@ _DEFAULT_AVATAR_CONFIG = {
     "breathing_speed": 1.0,
     "eye_size": 1.0,
     "body_roundness": 14,
-    "enable_particles": True,
     "enable_glow": True,
     "enable_idle_activities": True,
     "custom_status_text": "",

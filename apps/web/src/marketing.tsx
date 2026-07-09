@@ -1054,7 +1054,7 @@ export const Marketing: React.FC = () => {
                 width: '352px', height: '352px',
                 display: 'flex', alignItems: 'center', justifyContent: 'center'
               }}>
-                <div style={{ transform: 'scale(2.4)' }}>
+                <div style={{ transform: 'scale(1.55)' }}>
                   <SquareAvatarVisual speaking={false} backendOnline={true} isThinking={false} />
                 </div>
               </div>
