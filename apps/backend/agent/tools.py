@@ -172,14 +172,61 @@ def _file_tool_extra_roots() -> list[Path]:
 
 def _file_tool_roots() -> list[Path]:
     roots = [_file_tool_root()]
+    # Always allow user Desktop (common coding destination)
+    try:
+        desk = _desktop_root()
+        if desk not in roots:
+            roots.append(desk)
+    except Exception:
+        pass
     for root in _file_tool_extra_roots():
         if root not in roots:
             roots.append(root)
+    # Active coding project (may be under Desktop or a discovered path)
+    try:
+        if _active_project_root is not None:
+            ap = _active_project_root.resolve()
+            # Allow the project dir itself and its parent (for relative resolves)
+            if ap not in roots:
+                roots.append(ap)
+            parent = ap.parent
+            if parent not in roots:
+                roots.append(parent)
+    except Exception:
+        pass
     return roots
 
 
 def _desktop_root() -> Path:
     return (Path.home() / "Desktop").expanduser().resolve()
+
+
+# Active coding project root — relative paths like "index.html" resolve here
+# instead of the EchoSpeak repo (live bug: white-screen write to EchoSpeak/index.html).
+_active_project_root: Optional[Path] = None
+
+
+def set_active_project_root(path: Optional[str]) -> None:
+    """Agent sets this when a coding project folder is known (e.g. Desktop/2d-shooter-game)."""
+    global _active_project_root
+    raw = str(path or "").strip()
+    if not raw:
+        _active_project_root = None
+        return
+    # Clear first so _candidate_file_path does not recurse into the old project root
+    _active_project_root = None
+    try:
+        p = _candidate_file_path(raw, _file_tool_root()).resolve()
+        _active_project_root = p
+    except Exception:
+        try:
+            _active_project_root = Path(raw).expanduser().resolve()
+        except Exception:
+            _active_project_root = None
+
+
+def get_active_project_root() -> Optional[Path]:
+    return _active_project_root
 
 
 def _candidate_file_path(path: str, root: Path) -> Path:
@@ -189,11 +236,20 @@ def _candidate_file_path(path: str, root: Path) -> Path:
         return _desktop_root()
     for prefix in ("desktop/", "~/desktop/", "%userprofile%/desktop/"):
         if low.startswith(prefix):
-            suffix = raw.replace("\\", "/")[len(prefix):]
+            suffix = raw.replace("\\", "/")[len(prefix) :]
             return _desktop_root() / suffix
     candidate = Path(raw).expanduser()
-    if not candidate.is_absolute():
-        candidate = root / candidate
+    if candidate.is_absolute():
+        return candidate
+    # Bare relative paths during coding → project folder, not EchoSpeak repo root
+    proj = _active_project_root
+    if proj is not None and not low.startswith(("desktop/", "apps/", "src/")):
+        try:
+            if proj.exists() or True:
+                return proj / raw
+        except Exception:
+            pass
+    candidate = root / raw
     return candidate
 
 
@@ -338,8 +394,12 @@ class FileListArgs(BaseModel):
 
 
 class FileReadArgs(BaseModel):
-    path: str = Field(..., validation_alias=AliasChoices("path", "file", "filepath", "filename"))
-    max_chars: int = Field(default=4000, ge=200, le=20000)
+    path: str = Field(
+        ...,
+        validation_alias=AliasChoices("path", "file", "filepath", "filename"),
+        description="Path to read; use Desktop/<project>/file for user projects",
+    )
+    max_chars: int = Field(default=100000, ge=200, le=200000)
 
 
 class FileWriteArgs(BaseModel):
@@ -473,25 +533,85 @@ def file_list(path: Optional[str] = ".", limit: int = 50) -> str:
         return f"Failed to list files: {str(e)}"
 
 
+def _echo_file_payload(path: Path | str, content: str, *, action: str = "read") -> str:
+    """Structured payload so the Code visualizer can show real file text (not just summaries)."""
+    p = str(path or "").replace("\\", "/")
+    body = content if content is not None else ""
+    # Cap stream payload size while keeping enough for real source files
+    max_body = 120_000
+    truncated = False
+    if len(body) > max_body:
+        body = body[:max_body]
+        truncated = True
+    header = f"<<<ECHO_FILE action={action} path={p} chars={len(content or '')}{' truncated=1' if truncated else ''}>>>"
+    return f"{header}\n{body}\n<<<END_ECHO_FILE>>>"
+
+
 @tool(args_schema=FileReadArgs, description="Read a text file from an allowed workspace directory.")
-def file_read(path: str, max_chars: int = 4000) -> str:
+def file_read(path: str, max_chars: int = 100000) -> str:
     target = _safe_file_path(path)
     if target is None:
-        return "Path not allowed."
+        roots = _format_file_tool_roots()
+        return (
+            f"Path not allowed: {path!r}. Allowed roots: {roots}. "
+            f"Use Desktop/<project>/filename or an absolute path under an allowed root."
+        )
     if not target.exists():
-        return "File not found."
+        # Helpful hint when relative path missed the active project
+        proj = get_active_project_root()
+        hint = f" Active project is {proj}." if proj else " No active project pin — pass Desktop/<project>/file."
+        return f"File not found: {target}.{hint}"
     if target.is_dir():
-        return "Path is a directory."
+        return f"Path is a directory: {target}. Use file_list to list children."
     try:
         data = target.read_bytes()
         if b"\x00" in data[:2000]:
             return "Binary file detected; text read skipped."
         text = data.decode("utf-8", errors="ignore")
-        if max_chars and len(text) > max_chars:
-            text = text[:max_chars].rstrip() + "…"
-        return text if text.strip() else "(empty file)"
+        limit = int(max_chars) if max_chars else 100000
+        if limit and len(text) > limit:
+            text = text[:limit].rstrip() + "\n…(truncated)"
+        if not text.strip():
+            return _echo_file_payload(target, "(empty file)", action="read")
+        # Lead with human line + structured body for UI + model
+        return f"Read {len(text)} chars from {target}\n{_echo_file_payload(target, text, action='read')}"
     except Exception as e:
         return f"Failed to read file: {str(e)}"
+
+
+def _looks_like_code_stub(path: str, content: str) -> bool:
+    """Reject comment-only / tiny placeholder writes that leave a white-screen game."""
+    p = str(path or "").lower().replace("\\", "/")
+    if not any(p.endswith(ext) for ext in (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".html", ".htm", ".css", ".py")):
+        return False
+    c = str(content or "").strip()
+    if not c:
+        return True
+    # Tiny stubs (live: game.js became "// Implement collision…" only)
+    if len(c) < 100:
+        lines = [ln.strip() for ln in c.splitlines() if ln.strip()]
+        if not lines:
+            return True
+        commentish = all(
+            ln.startswith(("//", "/*", "*", "#", "<!--", "pass", "..."))
+            or ln in {"{}", "[]", ";"}
+            or re.match(r"^//.*", ln)
+            for ln in lines
+        )
+        if commentish or len(c) < 60:
+            return True
+    # Entire file is only comments / TODO placeholders
+    code_lines = [
+        ln
+        for ln in c.splitlines()
+        if ln.strip()
+        and not ln.strip().startswith(("//", "/*", "*", "#", "<!--"))
+        and "todo" not in ln.lower()
+        and "implement " not in ln.lower()
+    ]
+    if len(c) < 400 and not code_lines:
+        return True
+    return False
 
 
 @tool(args_schema=FileWriteArgs, description="Write text to a file (restricted; opt-in system action).")
@@ -500,14 +620,33 @@ def file_write(path: str, content: str, append: bool = False) -> str:
         return "File write is disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
     target = _safe_file_path(path)
     if target is None:
-        return "Path not allowed."
+        return f"Path not allowed. Allowed roots: {_format_file_tool_roots()}. Prefer Desktop/<project>/filename for user projects."
+    body = content or ""
+    if not append and _looks_like_code_stub(str(path), body):
+        return (
+            "Rejected stub write: content is too small or comment-only for a code file. "
+            "Write the FULL working file content (not '// Implement …' placeholders). "
+            f"Path was: {target}"
+        )
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
+        # If writing into a new project dir, pin active project for later relative paths
+        try:
+            if target.parent.is_dir() and target.parent.name and target.parent != _file_tool_root():
+                # Pin parent when it looks like a project folder under Desktop
+                desk = _desktop_root()
+                if str(target.parent).startswith(str(desk)) or (
+                    _active_project_root and str(target).startswith(str(_active_project_root))
+                ):
+                    set_active_project_root(str(target.parent))
+        except Exception:
+            pass
         mode = "a" if append else "w"
         with open(target, mode, encoding="utf-8") as f:
-            f.write(content or "")
+            f.write(body)
         action = "Appended" if append else "Wrote"
-        return f"{action} {len(content or '')} chars to {target}"
+        # Include file body so Code visualizer can show real source (not "Wrote N chars")
+        return f"{action} {len(body)} chars to {target}\n{_echo_file_payload(target, body, action='write')}"
     except Exception as e:
         return f"Failed to write file: {str(e)}"
 
@@ -592,9 +731,14 @@ def file_mkdir(path: str, parents: bool = True, exist_ok: bool = True) -> str:
         return "File operations are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
     target = _safe_file_path(path)
     if target is None:
-        return "Path not allowed."
+        return f"Path not allowed. Allowed roots: {_format_file_tool_roots()}"
     try:
         target.mkdir(parents=bool(parents), exist_ok=bool(exist_ok))
+        # Pin coding project so later bare "index.html" / "game.js" resolve here
+        try:
+            set_active_project_root(str(target))
+        except Exception:
+            pass
         return f"Created folder: {target}"
     except Exception as e:
         return f"Failed to create folder: {str(e)}"
@@ -1435,7 +1579,7 @@ def _encode_image_b64(img: "np.ndarray") -> str:
 
 
 class SportsLiveArgs(BaseModel):
-    query: str = Field(description="Live score, odds, or standings request (e.g. 'Oilers score right now', 'Lakers moneyline')")
+    query: str = Field(description="Live score, odds, or standings request (e.g. 'team score right now', 'moneyline odds')")
 
 
 @tool(

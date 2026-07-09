@@ -21,7 +21,7 @@ class DailyBriefingArgs(BaseModel):
     """Arguments for the daily_briefing tool."""
     location: Optional[str] = Field(
         default=None,
-        description="Optional location for weather info (e.g. 'Edmonton, Canada')"
+        description="Optional location for weather info (e.g. 'city, country')"
     )
     topics: Optional[str] = Field(
         default=None,

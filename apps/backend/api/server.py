@@ -1241,9 +1241,16 @@ class _StreamingHandler(BaseCallbackHandler):
             logger.warning("No-progress detected: tool '%s' called %d times with identical input", tool_name, repeat_count)
 
         inp = raw_input
-        inp = " ".join((inp or "").split())
-        if len(inp) > 600:
-            inp = inp[:600] + "…"
+        # Coding tools need full path/content for the Code visualizer — do not collapse to 600 chars.
+        tname = str(tool_name or "")
+        if tname in {"file_write", "file_read", "artifact_write", "notepad_write", "terminal_run"}:
+            # Keep structure; only hard-cap huge writes for stream safety
+            if len(inp) > 120_000:
+                inp = inp[:120_000] + "…"
+        else:
+            inp = " ".join((inp or "").split())
+            if len(inp) > 600:
+                inp = inp[:600] + "…"
         self._q.put(
             {
                 "type": "tool_start",
@@ -1263,7 +1270,13 @@ class _StreamingHandler(BaseCallbackHandler):
         out = output if isinstance(output, str) else str(output)
         tool_name = self._tool_run_map.get(call_id, "")
         raw_input = self._tool_input_map.pop(call_id, "")
-        max_len = 8000 if tool_name == "web_search" else 800
+        # File/terminal payloads must reach the Code visualizer intact
+        if tool_name in {"file_read", "file_write", "artifact_write", "notepad_write", "terminal_run"}:
+            max_len = 120_000
+        elif tool_name == "web_search":
+            max_len = 8000
+        else:
+            max_len = 800
         if len(out) > max_len:
             out = out[:max_len] + "…"
         started = self._tool_started_at.pop(call_id, None)

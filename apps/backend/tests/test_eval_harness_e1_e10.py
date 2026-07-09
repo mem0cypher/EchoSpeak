@@ -496,26 +496,27 @@ def test_e12_search_query_not_raw_chat_prompt():
 
     raw = "how're you feeling? and i wonder when that new trailer comes out for trailer 3 for gta 6 hey?"
     compact = normalize_web_search_query(raw)
-    assert "GTA 6 Trailer 3" in compact and "release" in compact.lower(), compact
-    assert "feeling" not in compact.lower()
-    assert "wonder" not in compact.lower()
+    cl = compact.lower()
+    assert "gta 6" in cl and "trailer" in cl and "3" in cl and "release" in cl, compact
+    assert "feeling" not in cl and "wonder" not in cl and "hey" not in cl
 
     agent = _bare_agent()
     extracted = agent._extract_search_query(raw)
-    assert "GTA 6 Trailer 3" in extracted and "release" in extracted.lower(), extracted
+    el = extracted.lower()
+    assert "gta 6" in el and "trailer" in el and "release" in el, extracted
     # \"won\" inside \"wonder\" must not trip sports triggers by itself
     assert agent._is_live_web_intent("i wonder how you are") is False
     # trailer + come out still is live/web-worthy
     assert agent._is_live_web_intent(raw.lower()) is True
 
     intent = build_search_intent(raw, extracted, "")
-    assert "GTA 6 Trailer 3" in intent.resolved_request
+    assert "gta 6" in intent.resolved_request.lower() and "trailer" in intent.resolved_request.lower()
     assert intent.specific_answer_need is True
     assert intent.recency_need is True
     cands = SearchGrounder(max_candidates=3).build_candidates(intent)
     assert cands
     assert all("feeling" not in c.query.lower() for c in cands)
-    assert any("GTA 6 Trailer 3" in c.query for c in cands)
+    assert any("gta 6" in c.query.lower() and "trailer" in c.query.lower() for c in cands)
 
     # Stage-4 style: model passes full user message as tool arg
     seen = []
@@ -539,7 +540,7 @@ def test_e12_search_query_not_raw_chat_prompt():
     out = agent._grounded_web_search(raw, original_request=raw, emit_tool_events=False)
     assert seen, "expected search execute"
     assert all("feeling" not in s.lower() and "wonder" not in s.lower() for s in seen), seen
-    assert any("GTA 6" in s or "Trailer 3" in s for s in seen), seen
+    assert any("gta 6" in s.lower() or "trailer 3" in s.lower() or "trailer" in s.lower() for s in seen), seen
     assert out
 
 
@@ -968,30 +969,29 @@ def test_e15_single_preamble_per_request():
 
 
 def test_e16_schedule_signal_accepts_next_game_snippets():
-    """Next-game snippets with date/matchup must be accepted, not force 'check NHL.com'."""
-    from agent.research import SearchGrounder, build_search_intent
+    """Next-game snippets with date/matchup must be accepted (structural, any team phrase)."""
+    from agent.research import SearchGrounder, build_search_intent, _normalize_sports_query
 
     g = SearchGrounder(max_candidates=3)
-    intent = build_search_intent(
-        "when do the edmonton oilers play next",
-        "Edmonton Oilers next game schedule NHL",
-        "",
-    )
+    user = "when do the edmonton oilers play next"
+    compact = _normalize_sports_query(user)
+    intent = build_search_intent(user, compact, "")
     assert intent.schedule_need is True
     assert intent.mode == "schedule"
+    assert "oilers" in compact.lower() or "edmonton" in compact.lower()
     fixture = (
-        "1. Oilers schedule\n"
-        "   URL: https://www.nhl.com/oilers/schedule\n"
+        "1. Team schedule\n"
+        "   URL: https://www.nhl.com/schedule\n"
         "   Snippet: Next game: Edmonton Oilers vs Calgary Flames Oct 12, 2026 7:00 PM MT."
     )
-    evidence = g.score_evidence(fixture, "Edmonton Oilers next game schedule NHL", intent)
+    evidence = g.score_evidence(fixture, compact, intent)
     assert evidence, "expected scored evidence"
     assert g._has_schedule_signal(fixture.lower())
     assert g._accept_evidence(evidence, intent) is True
 
-    # Deeper pass exists when first candidates fail
-    deeper = g._deeper_schedule_candidates("Edmonton Oilers next game schedule NHL", intent)
-    assert any("nhl.com" in c.query.lower() or "next game" in c.query.lower() for c in deeper)
+    # Deeper pass exists when first candidates fail (authority from league keyword if present)
+    deeper = g._deeper_schedule_candidates(compact + " NHL", intent)
+    assert any("next game" in c.query.lower() or "espn" in c.query.lower() or "nhl.com" in c.query.lower() for c in deeper)
 
 
 def test_e14_weather_without_city_no_recursion():
@@ -1073,9 +1073,11 @@ def test_e14_weather_without_city_no_recursion():
 
 def test_e13_oilers_and_weather_split_not_blended():
     """
-    Live bug: \"next edmonton oiler game and what the weather is? also you look great\"
-    became a single blended query like \"oilers game weather forecast\" (wrong city/temps,
-    no schedule). Must fan out into Oilers schedule + Edmonton weather searches.
+    Live bug: sports+weather multi-intent blended into one query.
+
+    Must fan out into separate schedule + weather searches. Weather must NOT invent
+    a city from the team nickname (no team→city hardcode); place comes from explicit
+    text or stays generic.
     """
     from agent.research import SearchGrounder, build_search_intent, split_web_search_queries
 
@@ -1084,13 +1086,21 @@ def test_e13_oilers_and_weather_split_not_blended():
         "also im really liking how you look today! look great!"
     )
     parts = split_web_search_queries(raw)
-    assert len(parts) == 2, parts
-    assert any("Oilers" in p and "schedule" in p.lower() for p in parts), parts
-    assert any("Edmonton weather" in p and "forecast" in p.lower() for p in parts), parts
+    assert len(parts) >= 2, parts
+    sports_parts = [
+        p for p in parts
+        if ("oiler" in p.lower() or "edmonton" in p.lower())
+        and ("schedule" in p.lower() or "game" in p.lower() or "next" in p.lower())
+    ]
+    weather_parts = [p for p in parts if "weather" in p.lower() or "forecast" in p.lower()]
+    assert sports_parts, parts
+    assert weather_parts, parts
     assert all("look great" not in p.lower() and "liking" not in p.lower() for p in parts)
+    # No blended single query
+    assert not any("weather" in p.lower() and "oiler" in p.lower() and "schedule" in p.lower() for p in parts)
 
-    sports = next(p for p in parts if "Oilers" in p)
-    weather = next(p for p in parts if "weather" in p.lower())
+    sports = sports_parts[0]
+    weather = weather_parts[0]
     si = build_search_intent(raw, sports, "")
     wi = build_search_intent(raw, weather, "")
     assert si.mode == "schedule" and si.weather_need is False
@@ -1098,7 +1108,7 @@ def test_e13_oilers_and_weather_split_not_blended():
     # Sports candidates must NOT be weather-rewritten
     sc = SearchGrounder().build_candidates(si)
     assert sc and all("temperature" not in c.query.lower() for c in sc), [c.query for c in sc]
-    assert any("Oilers" in c.query for c in sc)
+    assert any("oiler" in c.query.lower() or "edmonton" in c.query.lower() for c in sc)
 
     agent = _bare_agent()
     seen = []
@@ -1127,13 +1137,13 @@ def test_e13_oilers_and_weather_split_not_blended():
     agent._emit_tool_error = MagicMock()
     out = agent._grounded_web_search(raw, original_request=raw, emit_tool_events=True)
     assert len(seen) >= 2, seen
-    assert any("Oilers" in s for s in seen), seen
-    assert any("weather" in s.lower() and "Edmonton" in s for s in seen), seen
+    assert any("oiler" in s.lower() or "edmonton" in s.lower() for s in seen if "weather" not in s.lower()), seen
+    assert any("weather" in s.lower() for s in seen), seen
     assert all("look great" not in s.lower() for s in seen)
     # Multi-intent should emit per-query tool events for chat visibility
     assert agent._emit_tool_start.call_count >= 2
     assert agent._emit_tool_end.call_count >= 2
-    assert "Oilers" in out or "weather" in out.lower() or "24" in out
+    assert "Oilers" in out or "oiler" in out.lower() or "weather" in out.lower() or "24" in out
 
 
 def test_e12_social_plus_gta_trailer_preamble_answers_feeling():
@@ -1233,13 +1243,16 @@ def test_e20_deeper_search_uses_subject_not_meta_phrase():
 def test_e20b_tomorrow_schedule_and_spelling():
     from agent.research import apply_spelling_fixes, build_search_intent
 
-    assert "morocco" in apply_spelling_fixes("who is playing tomorrow maracco world cup").lower()
+    # Day-word STT is structural (tommrrow→tomorrow). Country/team typos are not
+    # hard-fixed in production — search + model handle free-form spellings.
+    fixed_day = apply_spelling_fixes("who is playing tommrrow world cup")
+    assert "tomorrow" in fixed_day.lower()
     intent = build_search_intent(
         "who is playing tomorrow maracco world cup",
         "who is playing tomorrow maracco world cup",
     )
     assert intent.schedule_need is True or intent.current_day_need is True
-    assert "morocco" in intent.resolved_request.lower()
+    assert "world cup" in intent.resolved_request.lower() or "tomorrow" in intent.resolved_request.lower()
     fixture = (
         "1. FIFA World Cup fixtures\n"
         "   URL: https://example.com/fixtures\n"

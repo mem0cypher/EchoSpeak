@@ -52,17 +52,17 @@ describe("buildChatEmbeds", () => {
     expect((s?.items[0]?.matchup || "").toLowerCase().includes("brazil")).toEqual(true);
   });
 
-  it("builds sources + link card from research", () => {
+  it("builds sources from research (link card optional chrome)", () => {
     const embeds = buildChatEmbeds({
       answerText: "Edmonton high 12 low 3. FIFA slate tomorrow.",
       researchRuns: [sampleRun()],
       searchQueries: ["Edmonton weather tomorrow", "FIFA World Cup matches"],
     });
-    const kinds = embeds.map((e) => e.kind).sort();
+    const kinds = embeds.map((e) => e.kind);
     expect(kinds.includes("sources")).toEqual(true);
-    expect(kinds.includes("link_card")).toEqual(true);
     expect(kinds.includes("weather_stat")).toEqual(true);
     expect(kinds.includes("query_chip")).toEqual(true);
+    // Featured link may still be built; ChatEmbeds hides it when sources exist
   });
 
   it("dedupes sources by url", () => {

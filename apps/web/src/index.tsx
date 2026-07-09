@@ -19,7 +19,7 @@ import { buildResearchRunFromToolEvent, normalizeResearchRun } from "./features/
 import { useResearchStore } from "./features/research/store";
 import type { ResearchRun } from "./features/research/types";
 import { buildChatEmbeds } from "./features/embeds/buildChatEmbeds";
-import { ChatEmbeds } from "./features/embeds/ChatEmbeds";
+import { ChatEmbeds, ChatEmbedFooter } from "./features/embeds/ChatEmbeds";
 import type { ChatEmbed } from "./features/embeds/types";
 import {
   agentActivityReducer,
@@ -546,6 +546,86 @@ const replaceCodeSession = (sessions: CodeDiffSession[], nextSession: CodeDiffSe
 
 const isFileWriteSummary = (value: string): boolean => /^(Wrote|Appended) \d+ chars to /.test(value);
 
+/** Parse <<<ECHO_FILE ...>>> ... <<<END_ECHO_FILE>>> blocks from tool output. */
+const parseEchoFileBlock = (
+  raw: string
+): { path: string; content: string; action: string; chars: number } | null => {
+  const text = String(raw || "");
+  const m = text.match(
+    /<<<ECHO_FILE\s+([^>]*?)>>>\r?\n?([\s\S]*?)\r?\n?<<<END_ECHO_FILE>>>/i
+  );
+  if (!m) return null;
+  const meta = m[1] || "";
+  const content = m[2] ?? "";
+  const pathM = meta.match(/\bpath=([^\s]+)/i);
+  const actionM = meta.match(/\baction=([^\s]+)/i);
+  const charsM = meta.match(/\bchars=(\d+)/i);
+  return {
+    path: (pathM?.[1] || "").replace(/^["']|["']$/g, ""),
+    content,
+    action: actionM?.[1] || "read",
+    chars: charsM ? Number(charsM[1]) : content.length,
+  };
+};
+
+/** Extract path + content from tool input (JSON / kwargs / free form). */
+const parseFileToolInput = (rawInput: string): { path: string; content: string } => {
+  const raw = String(rawInput || "");
+  let path = "";
+  let content = "";
+  try {
+    const j = JSON.parse(raw);
+    if (j && typeof j === "object") {
+      path = String(j.path || j.file_path || j.filepath || j.filename || "").trim();
+      content = typeof j.content === "string" ? j.content : typeof j.text === "string" ? j.text : "";
+      if (path || content) return { path, content };
+    }
+  } catch {
+    /* not JSON */
+  }
+  const pathM =
+    raw.match(/['"]path['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    raw.match(/\bpath\s*=\s*['"]([^'"]+)['"]/i) ||
+    raw.match(/\bpath\s*[:=]\s*([^\s,}\]]+)/i);
+  if (pathM) path = pathM[1].replace(/^['"]|['"]$/g, "");
+  // content after content= / "content": "
+  const contentKey = raw.search(/['"]content['"]\s*:/i);
+  if (contentKey >= 0) {
+    const after = raw.slice(contentKey);
+    const quoted = after.match(/['"]content['"]\s*:\s*(")([\s\S]*)$/i);
+    if (quoted) {
+      // naive unescape of JSON string remainder
+      let body = quoted[2];
+      // trim trailing ", append flags
+      const end = body.lastIndexOf('"');
+      if (end >= 0) body = body.slice(0, end);
+      content = body.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    }
+  }
+  if (!path) {
+    // first path-like token
+    const bare = raw.match(/(?:Desktop[/\\][^\s,'"]+\.\w{1,8}|[A-Za-z]:\\[^\s,'"]+|\/[^\s,'"]+\.\w{1,8}|[\w./\\-]+\.\w{1,8})/);
+    if (bare) path = bare[0];
+  }
+  return { path, content };
+};
+
+const basenamePath = (p: string): string => {
+  const s = String(p || "").replace(/\\/g, "/");
+  const parts = s.split("/").filter(Boolean);
+  return parts[parts.length - 1] || s || "file";
+};
+
+const langFromFilename = (filename: string, toolName: string): string => {
+  if (toolName === "terminal_run") return "bash";
+  const ext = (filename.split(".").pop() || "text").toLowerCase();
+  if (ext === "js" || ext === "mjs" || ext === "cjs") return "javascript";
+  if (ext === "ts" || ext === "tsx") return "typescript";
+  if (ext === "py") return "python";
+  if (ext === "htm") return "html";
+  return ext || "text";
+};
+
 const fallbackProviders: ProviderListItem[] = [
   { id: "openai", name: "OpenAI", local: false, description: "OpenAI GPT models" },
   { id: "gemini", name: "Google Gemini", local: false, description: "Google Gemini models" },
@@ -1048,20 +1128,9 @@ const globalCss = `
            overflow: hidden;
            text-overflow: ellipsis;
          }
-         .chat-embed-link:hover {
-           opacity: 0.92;
-         }
-         .chat-embed-link:hover .chat-embed-source-title {
-           border-bottom-color: currentColor !important;
-         }
-         .chat-embed-source-title:hover {
-           border-bottom-color: currentColor !important;
-           opacity: 0.95;
-         }
-         .chat-embed-source-open:hover,
-         .chat-embed-source-url:hover {
-           opacity: 1 !important;
-           text-decoration: underline;
+         .chat-embed-source-link:hover {
+           color: rgba(255,255,255,0.62) !important;
+           border-bottom-color: rgba(255,255,255,0.35) !important;
          }
          .research-source:hover {
            opacity: 1;
@@ -2093,7 +2162,7 @@ const ChatBubble: React.FC<{
           </div>
         )}
 
-        {/* Rich embeds under assistant text (sources / weather / fixtures / links) */}
+        {/* Body embeds only (weather / fixtures) — sources live under time row */}
         {!isUser && !stillTyping && msg.embeds && msg.embeds.length > 0 ? (
           <ChatEmbeds embeds={msg.embeds} colors={colors} />
         ) : null}
@@ -2237,6 +2306,11 @@ const ChatBubble: React.FC<{
             </div>
           );
         })()}
+
+        {/* sources · N · searched · M — below time/tokens, same meta style */}
+        {!isUser && !stillTyping && msg.embeds && msg.embeds.length > 0 ? (
+          <ChatEmbedFooter embeds={msg.embeds} colors={colors} />
+        ) : null}
       </div>
     </motion.div>
   );
@@ -4105,64 +4179,86 @@ export const Dashboard: React.FC = () => {
               turnSearchQueries.push(String(info.input).replace(/\s+/g, " ").trim().slice(0, 120));
             }
           }
-          // Capture code blocks for CodeVisualizer
+          // Capture code for Code visualizer (needs real file bodies, not "Wrote 15 chars")
           const codingTools = new Set(["file_write", "file_read", "artifact_write", "terminal_run", "notepad_write"]);
           if (codingTools.has(toolName)) {
             const rawInput = info?.input || "";
-            const filename = rawInput.split(/[\n,]/)[0]?.replace(/^.*?['"]([^'"]+)['"].*$/, "$1") || toolName || "output";
-            const lang = toolName === "terminal_run" ? "bash" : filename.split(".").pop() || "text";
-            const content = evt.output || "";
-            if (content.length > 0) {
-              latestCodeFilenameRef.current = filename;
-              setCodeSessions((prev) => {
-                const existing = prev.find((session) => session.filename === filename);
-                let nextSession: CodeDiffSession;
+            const rawOutput = String(evt.output || "");
+            const echo = parseEchoFileBlock(rawOutput);
+            const parsedIn = parseFileToolInput(rawInput);
+            const pathFromSummary = (rawOutput.match(/(?:Wrote|Appended|Read) \d+ chars (?:to|from) (.+?)(?:\n|$)/i) || [])[1]?.trim() || "";
+            const fullPath = echo?.path || parsedIn.path || pathFromSummary || "";
+            const filename = basenamePath(fullPath) || basenamePath(parsedIn.path) || toolName || "output";
+            const lang = langFromFilename(filename, toolName);
 
-                if (toolName === "file_read") {
-                  nextSession = {
-                    filename,
-                    language: lang,
-                    originalContent: content,
-                    currentContent: content,
-                    status: "read",
-                    summary: `Loaded ${content.length} chars`,
-                  };
-                } else if (toolName === "file_write") {
-                  if (isFileWriteSummary(content)) {
-                    nextSession = {
-                      filename,
-                      language: lang,
-                      originalContent: existing?.originalContent || existing?.currentContent || "",
-                      currentContent: existing?.currentContent || "",
-                      status: "saved",
-                      summary: content,
-                    };
-                  } else {
-                    nextSession = {
-                      filename,
-                      language: lang,
-                      originalContent: existing?.originalContent || existing?.currentContent || "",
-                      currentContent: content,
-                      status: "draft",
-                      summary: `Preview ${content.length} chars`,
-                    };
-                  }
-                } else {
-                  nextSession = {
-                    filename,
-                    language: lang,
-                    originalContent: content,
-                    currentContent: content,
-                    status: "output",
-                    summary: toolName === "terminal_run" ? "Terminal output" : undefined,
-                  };
-                }
-
-                const [nextSessions] = replaceCodeSession(prev, nextSession);
-                return nextSessions;
-              });
-              setVisualizerPin("coding");
+            let fileBody = "";
+            if (echo?.content != null && echo.content.length > 0) {
+              fileBody = echo.content;
+            } else if (toolName === "file_write" && parsedIn.content) {
+              fileBody = parsedIn.content;
+            } else if (toolName === "file_read" && rawOutput && !/^File not found|^Path not allowed|^Failed to read|^Path is a directory|^Binary file/i.test(rawOutput.trim())) {
+              // legacy: raw file body without ECHO_FILE wrapper
+              const stripped = rawOutput.replace(/^Read \d+ chars from .+\n?/i, "");
+              fileBody = stripped || rawOutput;
+            } else if (toolName === "terminal_run" || toolName === "notepad_write" || toolName === "artifact_write") {
+              fileBody = rawOutput;
             }
+
+            // Always open the coding pane on file ops (even errors — show the message)
+            const displayContent =
+              fileBody ||
+              (rawOutput.trim() ? rawOutput : `(no content returned for ${filename})`);
+            const isError =
+              /^(File not found|Path not allowed|Failed to |Path is a directory|Binary file|Rejected stub)/i.test(
+                rawOutput.trim()
+              );
+
+            latestCodeFilenameRef.current = filename;
+            setCodeSessions((prev) => {
+              const existing =
+                prev.find((session) => session.filename === filename) ||
+                prev.find((session) => fullPath && session.filename === fullPath);
+              let nextSession: CodeDiffSession;
+
+              if (toolName === "file_read") {
+                nextSession = {
+                  filename: fullPath || filename,
+                  language: lang,
+                  originalContent: isError ? "" : displayContent,
+                  currentContent: displayContent,
+                  status: isError ? "output" : "read",
+                  summary: isError
+                    ? rawOutput.slice(0, 120)
+                    : `Loaded ${displayContent.length.toLocaleString()} chars`,
+                };
+              } else if (toolName === "file_write") {
+                const hasBody = Boolean(fileBody);
+                nextSession = {
+                  filename: fullPath || filename,
+                  language: lang,
+                  originalContent: existing?.originalContent || existing?.currentContent || "",
+                  currentContent: hasBody ? fileBody : existing?.currentContent || displayContent,
+                  status: isFileWriteSummary(rawOutput.split("\n")[0] || "") || hasBody ? "saved" : "draft",
+                  summary: hasBody
+                    ? `Saved ${fileBody.length.toLocaleString()} chars → ${basenamePath(fullPath || filename)}`
+                    : (rawOutput.split("\n")[0] || `Write ${filename}`).slice(0, 160),
+                };
+              } else {
+                nextSession = {
+                  filename: fullPath || filename,
+                  language: lang,
+                  originalContent: displayContent,
+                  currentContent: displayContent,
+                  status: "output",
+                  summary: toolName === "terminal_run" ? "Terminal output" : undefined,
+                };
+              }
+
+              const [nextSessions] = replaceCodeSession(prev, nextSession);
+              return nextSessions;
+            });
+            setVisualizerPin("coding");
+            setAgentMode("coding");
           }
           // Unified done label: built-in, sports, MCP (mcp__server__tool), skills, …
           markThinkingStep(

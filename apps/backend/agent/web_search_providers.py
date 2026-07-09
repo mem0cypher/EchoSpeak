@@ -93,7 +93,7 @@ def _is_sportsish(q: str) -> bool:
         t in low
         for t in (
             "schedule", "fixture", "nhl", "nba", "nfl", "mlb", "fifa", "world cup",
-            "oilers", "score", "match", "kickoff",
+            "score", "match", "kickoff", "vs", "versus", "hockey", "basketball",
         )
     )
 
@@ -114,13 +114,23 @@ def build_query_variants(query: str, *, max_variants: int = 3) -> List[str]:
         if month_year.lower() not in low:
             out.append(f"{q} {month_year}")
 
-    # Authority site variants (mimic paid "quality ranking" a bit)
+    # Authority site variants by *league/domain keyword* — never franchise nicknames
     if _is_weatherish(q) and "site:" not in low:
         out.append(f"{q} site:accuweather.com OR site:weather.gc.ca OR site:weather.com")
-    if _is_sportsish(q) and "site:" not in low and "fifa" in low:
-        out.append(f"{q} site:fifa.com OR site:espn.com")
-    elif _is_sportsish(q) and "site:" not in low and re.search(r"\bnhl|oilers|flames\b", low):
+    if _is_sportsish(q) and "site:" not in low and re.search(r"\b(fifa|world cup)\b", low):
+        out.append(f"{q} site:fifa.com OR site:espn.com OR site:foxsports.com")
+        # Kickoff-oriented variant when user/follow-up needs times
+        if re.search(r"\b(kickoff|time|timezone|mnt|mountain|schedule)\b", low):
+            out.append(f"{q} kickoff times ET list")
+    elif _is_sportsish(q) and "site:" not in low and re.search(r"\b(nhl|hockey)\b", low):
         out.append(f"{q} site:nhl.com OR site:espn.com")
+    elif _is_sportsish(q) and "site:" not in low and re.search(r"\b(nba|basketball)\b", low):
+        out.append(f"{q} site:nba.com OR site:espn.com")
+    elif _is_sportsish(q) and "site:" not in low and re.search(r"\b(nfl)\b", low):
+        out.append(f"{q} site:nfl.com OR site:espn.com")
+    elif _is_sportsish(q) and "site:" not in low:
+        # Generic sports authority when no league keyword
+        out.append(f"{q} site:espn.com OR site:cbssports.com")
 
     # Simplified retry form: drop filler words
     simple = re.sub(

@@ -34,8 +34,10 @@ def test_live_mode_classification():
 
 
 def test_infer_sport_key():
-    assert infer_sport_key("edmonton oilers score") == "icehockey_nhl"
-    assert infer_sport_key("lakers vs celtics score") == "basketball_nba"
+    # League/sport keywords only — franchise nicknames alone do not invent a sport key
+    assert infer_sport_key("nhl score right now") == "icehockey_nhl"
+    assert infer_sport_key("nba lakers vs celtics score") == "basketball_nba"
+    assert infer_sport_key("some random club score") is None
 
 
 def test_missing_key_falls_back():

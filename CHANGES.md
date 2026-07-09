@@ -1,5 +1,75 @@
 # Changes
 
+## v7.6.9 - Code visualizer + file read/write payload pipeline
+
+### Live bugs
+- Code pane showed “Loaded 15 chars” / summary only — no real source
+- `tool_end` truncated non-search tools to **800** chars; `tool_start` input to **600**
+- `file_write` returned only `Wrote N chars to path` (UI had nothing to render)
+- `file_read` default max 4k; errors opaque (“File not found.”)
+
+### Fix
+- `<<<ECHO_FILE path=…>>>…<<<END_ECHO_FILE>>>` on read/write so UI gets real bodies
+- Stream limits: coding tools up to 120k input/output
+- Web Code pane: parse ECHO_FILE + robust path/content extraction; show full source in InlineCodeDiff
+- Clearer path errors with allowed roots + active project hint
+
+## v7.6.8 - Anti-hardcode audit: structural coding + product title extraction
+
+### Principle
+Fix the *capability gap*, not the reported example. No “add 2d-shooter / 3D shooter to a list.”
+
+### Replaced
+- Coding intent: structural `build/create me a <anything>` (not genre noun list)
+- Desktop project pin: match user tokens → **real Desktop folders** (discovery)
+- GTA-only normalizers → free-form **title entity extraction** (trailer/cast/release/price)
+- Weak-answer refine: no more injected `FIFA World Cup …` if not in the query
+- Match detection: `vs` / structure, not country whitelist
+
+### Tests
+- `tests/test_general_no_hardcode.py` — mystery adventure, rhythm game, tower defense, silksong/dune titles, NHL refine without FIFA inject
+
+## v7.6.7 - Coding path pin + reject stub writes (white-screen game fix)
+
+### Live 2d-shooter session failures
+- `game.js` ended as `// Implement collision…` (~55 chars) — plan steps overwrote real code with stubs
+- Bare `index.html` resolved to **EchoSpeak repo root**, not `Desktop/2d-shooter-game/`
+- file_read "File not found" then wrote `EchoSpeak\index.html` ("Game Loaded!")
+
+### Fix
+- `set_active_project_root` / mkdir+write pin Desktop project; relative paths resolve there
+- `file_write` rejects comment-only / tiny code stubs
+- Pending actions rewrite bare paths via `_normalize_coding_file_path`
+- Working shooter scaffold written for the user project
+
+## v7.6.6 - System-wide keep-trying for web answers (not plan-only)
+
+### Why Echo "gave up"
+- `WebTaskReflector` **no-op'd all grounded search packets** (`is_grounded_search_output` → return immediately)
+- Stage 3: search once → summarize → ship, even if draft said "I don't have the time"
+- `ReflectionEngine` only runs on multi-step **plans** (size ≥ 2)
+- Weather had a one-off repair; FIFA/timezone/price did not
+
+### Fix
+- Grounded packets are quality-gated; weak schedule/timezone evidence **retries** with sharper queries
+- Stage 3: `_web_research_answer_with_retries` — if answer abdicates or lacks required facts → re-search + re-summarize (×2) → force evidence-bound rewrite
+- Stage 4: `_ensure_web_answer_does_not_give_up` when tools already ran
+- Anti-give-up rules in web summary prompts
+- Tests: abdication detection + grounded packet acceptability
+
+## v7.6.5 - Clarifier follow-ups (timezone / currency / deictics)
+
+### Live bug
+- FIFA: “France vs Morocco 4pm” → “4pm my time? MNT time or when?” searched bare **MNT time zone** and lost the match.
+- Root cause: timezone/currency clarifiers were **not** referential; `in cad?` falsely matched **location swap**.
+
+### Fix (`core.py`)
+- Detect timezone / currency / short deictic clarifiers; bind to `current_subject`
+- Resolve e.g. `… France Morocco … kickoff timezone MNT Mountain …` / `bitcoin price in CAD`
+- Reject CAD/USD/MNT as city location swaps
+- `_active_user_query` uses resolved rewrite so multi-search can’t drop subject
+- Tests: `test_clarifier_followups_bind_timezone_and_currency_to_subject`
+
 ## v7.6.4b - Orphan cost rebind + stale tool labels
 
 ### Live retest (GTA come out + how much will it cost + FIFA today)

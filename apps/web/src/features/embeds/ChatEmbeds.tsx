@@ -8,292 +8,256 @@ type Palette = {
   textDim: string;
 };
 
-/** Sleek source row — no pill/bubble chrome; title is the primary click target. */
-const SourceRow: React.FC<{
-  item: ChatEmbedSourceItem;
-  index: number;
-  colors: Palette;
-  expanded: boolean;
+/** Same visual language as the bubble time / token meta line. */
+const metaFont: React.CSSProperties = {
+  fontSize: 10,
+  color: "rgba(255,255,255,0.28)",
+  fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+  letterSpacing: "0.06em",
+};
+
+const shortLabel = (item: ChatEmbedSourceItem): string => {
+  const d = (item.domain || "").replace(/^www\./, "").trim();
+  if (d) return d.length > 22 ? `${d.slice(0, 20)}…` : d;
+  const t = (item.title || "source").trim();
+  return t.length > 22 ? `${t.slice(0, 20)}…` : t;
+};
+
+const BODY_KINDS = new Set(["weather_stat", "stat_row", "schedule_list"]);
+const FOOTER_KINDS = new Set(["sources", "query_chip", "link_card"]);
+
+/**
+ * Collapsed toggle + expand panel for sources.
+ * When `inline`, no outer block margin (lives in a horizontal footer row).
+ */
+const SourcesToggle: React.FC<{
+  embed: Extract<ChatEmbed, { kind: "sources" }>;
+  open: boolean;
   onToggle: () => void;
-}> = ({ item, index, colors, expanded, onToggle }) => {
-  const hasUrl = Boolean(item.url);
-  const hasSnippet = Boolean(item.snippet && item.snippet.trim());
-
-  const titleEl = (
-    <span
+}> = ({ embed, open, onToggle }) => {
+  const n = embed.items.length;
+  if (!n) return null;
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={open}
       style={{
-        fontSize: 13,
-        fontWeight: 550,
-        color: hasUrl ? colors.text : colors.textDim,
-        lineHeight: 1.35,
-        textDecoration: hasUrl ? "none" : undefined,
-        borderBottom: hasUrl ? "1px solid transparent" : undefined,
-        transition: "border-color 0.12s ease, color 0.12s ease",
+        ...metaFont,
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 5,
+        padding: 0,
+        border: "none",
+        background: "none",
+        cursor: "pointer",
+        userSelect: "none",
       }}
-      className={hasUrl ? "chat-embed-source-title" : undefined}
+      title={open ? "Hide sources" : "Show sources"}
     >
-      {item.title}
-    </span>
+      <span style={{ opacity: 0.9 }}>sources · {n}</span>
+      <span style={{ opacity: 0.45, fontSize: 9 }}>{open ? "▾" : "▸"}</span>
+    </button>
   );
+};
 
+const SourcesExpanded: React.FC<{
+  embed: Extract<ChatEmbed, { kind: "sources" }>;
+}> = ({ embed }) => {
+  const [detailId, setDetailId] = useState<string | null>(null);
   return (
     <div
       style={{
-        display: "grid",
-        gridTemplateColumns: "22px 1fr",
-        gap: "2px 10px",
-        padding: "10px 0",
-        borderTop: index === 0 ? "none" : `1px solid ${colors.line}`,
-        alignItems: "start",
+        marginTop: 4,
+        display: "flex",
+        flexDirection: "column",
+        gap: 2,
+        width: "100%",
       }}
     >
-      <span
-        style={{
-          fontSize: 11,
-          color: colors.textDim,
-          fontFamily: "'JetBrains Mono', ui-monospace, monospace",
-          lineHeight: "18px",
-          paddingTop: 1,
-          opacity: 0.75,
-        }}
-      >
-        {index + 1}
-      </span>
-
-      <div style={{ minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
-          {hasUrl ? (
-            <a
-              href={item.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              title={item.url}
-              style={{ textDecoration: "none", color: "inherit", minWidth: 0 }}
-            >
-              {titleEl}
-            </a>
-          ) : (
-            titleEl
-          )}
-          {(item.domain || item.recency) && (
-            <span
+      {embed.items.map((item, i) => {
+        const label = shortLabel(item);
+        const hasUrl = Boolean(item.url);
+        const detail = detailId === item.id;
+        const hasSnippet = Boolean(item.snippet?.trim());
+        return (
+          <div key={item.id} style={{ minWidth: 0 }}>
+            <div
               style={{
-                fontSize: 11,
-                color: colors.textDim,
-                opacity: 0.85,
-                whiteSpace: "nowrap",
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                ...metaFont,
+                color: "rgba(255,255,255,0.38)",
+                lineHeight: 1.45,
               }}
             >
-              {item.domain || "web"}
-              {item.recency ? ` · ${item.recency}` : ""}
-            </span>
-          )}
-          {hasUrl ? (
-            <a
-              href={item.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              aria-label={`Open ${item.title}`}
-              style={{
-                fontSize: 11,
-                color: colors.textDim,
-                textDecoration: "none",
-                opacity: 0.7,
-                marginLeft: "auto",
-                flexShrink: 0,
-              }}
-              className="chat-embed-source-open"
-            >
-              Open ↗
-            </a>
-          ) : null}
-        </div>
-
-        {hasSnippet ? (
-          <>
-            <button
-              type="button"
-              onClick={onToggle}
-              aria-expanded={expanded}
-              style={{
-                display: "block",
-                marginTop: 4,
-                padding: 0,
-                border: "none",
-                background: "none",
-                cursor: "pointer",
-                textAlign: "left",
-                width: "100%",
-                font: "inherit",
-              }}
-            >
+              <span style={{ opacity: 0.4, minWidth: 12 }}>{i + 1}</span>
+              {hasUrl ? (
+                <a
+                  href={item.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={item.title || item.url}
+                  style={{
+                    color: "rgba(255,255,255,0.42)",
+                    textDecoration: "none",
+                    borderBottom: "1px dotted rgba(255,255,255,0.16)",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    maxWidth: 200,
+                  }}
+                  className="chat-embed-source-link"
+                >
+                  {label}
+                </a>
+              ) : (
+                <span
+                  style={{
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    maxWidth: 200,
+                  }}
+                >
+                  {label}
+                </span>
+              )}
+              {hasSnippet || hasUrl ? (
+                <button
+                  type="button"
+                  onClick={() => setDetailId((cur) => (cur === item.id ? null : item.id))}
+                  style={{
+                    ...metaFont,
+                    padding: 0,
+                    border: "none",
+                    background: "none",
+                    cursor: "pointer",
+                    opacity: 0.55,
+                    flexShrink: 0,
+                  }}
+                >
+                  {detail ? "less" : "more"}
+                </button>
+              ) : null}
+            </div>
+            {detail ? (
               <div
                 style={{
-                  fontSize: 12,
-                  color: colors.textDim,
-                  lineHeight: 1.45,
-                  ...(expanded
-                    ? {}
-                    : {
-                        display: "-webkit-box",
-                        WebkitLineClamp: 1,
-                        WebkitBoxOrient: "vertical" as const,
-                        overflow: "hidden",
-                      }),
+                  margin: "2px 0 4px 18px",
+                  ...metaFont,
+                  color: "rgba(255,255,255,0.32)",
+                  letterSpacing: "0.02em",
+                  lineHeight: 1.4,
+                  maxWidth: 420,
                 }}
               >
-                {item.snippet}
+                {item.title ? (
+                  <div
+                    style={{
+                      color: "rgba(255,255,255,0.45)",
+                      marginBottom: 2,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {item.title}
+                  </div>
+                ) : null}
+                {hasSnippet ? (
+                  <div
+                    style={{
+                      display: "-webkit-box",
+                      WebkitLineClamp: 3,
+                      WebkitBoxOrient: "vertical",
+                      overflow: "hidden",
+                    }}
+                  >
+                    {item.snippet}
+                  </div>
+                ) : null}
+                {hasUrl ? (
+                  <a
+                    href={item.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{
+                      display: "inline-block",
+                      marginTop: 3,
+                      color: "rgba(255,255,255,0.4)",
+                      textDecoration: "underline",
+                      textUnderlineOffset: 2,
+                      wordBreak: "break-all",
+                      fontSize: 9,
+                    }}
+                  >
+                    open ↗
+                  </a>
+                ) : null}
               </div>
-              <span
-                style={{
-                  fontSize: 10.5,
-                  color: colors.textDim,
-                  opacity: 0.65,
-                  marginTop: 2,
-                  display: "inline-block",
-                }}
-              >
-                {expanded ? "Hide snippet" : "What it found · click to expand"}
-              </span>
-            </button>
-            {expanded && hasUrl ? (
-              <a
-                href={item.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{
-                  display: "inline-block",
-                  marginTop: 6,
-                  fontSize: 11.5,
-                  color: colors.text,
-                  opacity: 0.8,
-                  textDecoration: "underline",
-                  textUnderlineOffset: 3,
-                  wordBreak: "break-all",
-                }}
-              >
-                {item.url}
-              </a>
             ) : null}
-          </>
-        ) : hasUrl ? (
-          <a
-            href={item.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              display: "block",
-              marginTop: 3,
-              fontSize: 11,
-              color: colors.textDim,
-              opacity: 0.7,
-              textDecoration: "none",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-            }}
-            className="chat-embed-source-url"
-          >
-            {item.url}
-          </a>
-        ) : null}
-      </div>
+          </div>
+        );
+      })}
     </div>
   );
 };
 
-const SourcesList: React.FC<{
-  embed: Extract<ChatEmbed, { kind: "sources" }>;
-  colors: Palette;
-}> = ({ embed, colors }) => {
-  const [openId, setOpenId] = useState<string | null>(null);
-
+const SearchedToggle: React.FC<{
+  embed: Extract<ChatEmbed, { kind: "query_chip" }>;
+  open: boolean;
+  onToggle: () => void;
+}> = ({ embed, open, onToggle }) => {
+  const n = embed.queries.length;
+  if (!n) return null;
   return (
-    <div style={{ maxWidth: 520 }}>
-      <div
-        style={{
-          fontSize: 11,
-          color: colors.textDim,
-          letterSpacing: "0.08em",
-          textTransform: "uppercase",
-          fontWeight: 550,
-          marginBottom: 2,
-          opacity: 0.8,
-        }}
-      >
-        {embed.title || "Sources"}
-      </div>
-      <div>
-        {embed.items.map((item, i) => (
-          <SourceRow
-            key={item.id}
-            item={item}
-            index={i}
-            colors={colors}
-            expanded={openId === item.id}
-            onToggle={() => setOpenId((cur) => (cur === item.id ? null : item.id))}
-          />
-        ))}
-      </div>
-    </div>
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={open}
+      style={{
+        ...metaFont,
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 5,
+        padding: 0,
+        border: "none",
+        background: "none",
+        cursor: "pointer",
+        userSelect: "none",
+      }}
+      title={open ? "Hide searches" : "Show searches"}
+    >
+      <span>searched · {n}</span>
+      <span style={{ opacity: 0.45, fontSize: 9 }}>{open ? "▾" : "▸"}</span>
+    </button>
   );
 };
 
-const LinkCard: React.FC<{ embed: Extract<ChatEmbed, { kind: "link_card" }>; colors: Palette }> = ({
-  embed,
-  colors,
-}) => (
-  <a
-    href={embed.url}
-    target="_blank"
-    rel="noopener noreferrer"
-    style={{ textDecoration: "none", color: "inherit", display: "block" }}
-  >
-    <div
-      style={{
-        borderTop: `1px solid ${colors.line}`,
-        padding: "10px 0",
-        transition: "opacity 0.15s ease",
-      }}
-      className="chat-embed-link"
-    >
-      <div style={{ fontSize: 11, color: colors.textDim, marginBottom: 3, letterSpacing: "0.04em" }}>
-        {embed.domain || "Link"} · featured
-      </div>
+const SearchedExpanded: React.FC<{
+  embed: Extract<ChatEmbed, { kind: "query_chip" }>;
+}> = ({ embed }) => (
+  <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 2, width: "100%" }}>
+    {embed.queries.map((q) => (
       <div
+        key={q}
+        title={q}
         style={{
-          fontSize: 13.5,
-          fontWeight: 650,
-          color: colors.text,
-          lineHeight: 1.35,
-          display: "-webkit-box",
-          WebkitLineClamp: 2,
-          WebkitBoxOrient: "vertical",
+          ...metaFont,
+          color: "rgba(255,255,255,0.34)",
           overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          maxWidth: 420,
+          letterSpacing: "0.02em",
         }}
-        className="chat-embed-source-title"
       >
-        {embed.title}
+        {q}
       </div>
-      {embed.snippet ? (
-        <div
-          style={{
-            fontSize: 12,
-            color: colors.textDim,
-            marginTop: 4,
-            lineHeight: 1.4,
-            display: "-webkit-box",
-            WebkitLineClamp: 2,
-            WebkitBoxOrient: "vertical",
-            overflow: "hidden",
-          }}
-        >
-          {embed.snippet}
-        </div>
-      ) : null}
-      <div style={{ fontSize: 11, color: colors.textDim, marginTop: 6, opacity: 0.75 }}>Open ↗</div>
-    </div>
-  </a>
+    ))}
+  </div>
 );
 
 const WeatherStat: React.FC<{
@@ -302,25 +266,17 @@ const WeatherStat: React.FC<{
 }> = ({ embed, colors }) => {
   const unit = embed.unit ? `°${embed.unit}` : "°";
   return (
-    <div
-      style={{
-        padding: "10px 0",
-        borderTop: `1px solid ${colors.line}`,
-        display: "flex",
-        alignItems: "stretch",
-        gap: 14,
-      }}
-    >
+    <div style={{ padding: "8px 0 2px", display: "flex", alignItems: "stretch", gap: 12 }}>
       <div
         style={{
-          width: 40,
-          height: 40,
-          borderRadius: 10,
+          width: 36,
+          height: 36,
+          borderRadius: 8,
           background: "rgba(120,180,255,0.1)",
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
-          fontSize: 20,
+          fontSize: 18,
           flexShrink: 0,
         }}
         aria-hidden
@@ -338,11 +294,11 @@ const WeatherStat: React.FC<{
           {embed.place || "Forecast"}
           {embed.condition ? ` · ${embed.condition}` : ""}
         </div>
-        <div style={{ display: "flex", gap: 16, marginTop: 6, flexWrap: "wrap", alignItems: "baseline" }}>
+        <div style={{ display: "flex", gap: 14, marginTop: 4, flexWrap: "wrap", alignItems: "baseline" }}>
           {embed.high != null ? (
             <div>
               <span style={{ fontSize: 10, color: colors.textDim }}>High</span>
-              <div style={{ fontSize: 22, fontWeight: 700, color: colors.text, fontVariantNumeric: "tabular-nums" }}>
+              <div style={{ fontSize: 20, fontWeight: 700, color: colors.text, fontVariantNumeric: "tabular-nums" }}>
                 {embed.high}
                 {unit}
               </div>
@@ -351,7 +307,7 @@ const WeatherStat: React.FC<{
           {embed.low != null ? (
             <div>
               <span style={{ fontSize: 10, color: colors.textDim }}>Low</span>
-              <div style={{ fontSize: 22, fontWeight: 700, color: colors.text, fontVariantNumeric: "tabular-nums" }}>
+              <div style={{ fontSize: 20, fontWeight: 700, color: colors.text, fontVariantNumeric: "tabular-nums" }}>
                 {embed.low}
                 {unit}
               </div>
@@ -360,7 +316,7 @@ const WeatherStat: React.FC<{
           {embed.current != null ? (
             <div>
               <span style={{ fontSize: 10, color: colors.textDim }}>Now</span>
-              <div style={{ fontSize: 22, fontWeight: 700, color: colors.text, fontVariantNumeric: "tabular-nums" }}>
+              <div style={{ fontSize: 20, fontWeight: 700, color: colors.text, fontVariantNumeric: "tabular-nums" }}>
                 {embed.current}
                 {unit}
               </div>
@@ -376,29 +332,23 @@ const ScheduleList: React.FC<{
   embed: Extract<ChatEmbed, { kind: "schedule_list" }>;
   colors: Palette;
 }> = ({ embed, colors }) => (
-  <div style={{ padding: "8px 0", borderTop: `1px solid ${colors.line}` }}>
+  <div style={{ padding: "6px 0 2px" }}>
     <div
       style={{
         fontSize: 11,
         color: colors.textDim,
         letterSpacing: "0.06em",
         textTransform: "uppercase",
-        marginBottom: 6,
+        marginBottom: 4,
       }}
     >
       {embed.title || "Schedule"}
     </div>
-    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
       {embed.items.map((item, i) => (
         <div
           key={`${item.matchup}-${i}`}
-          style={{
-            display: "flex",
-            gap: 10,
-            alignItems: "baseline",
-            padding: "5px 0",
-            borderTop: i === 0 ? "none" : `1px solid ${colors.line}`,
-          }}
+          style={{ display: "flex", gap: 10, alignItems: "baseline", padding: "3px 0" }}
         >
           {item.when ? (
             <span
@@ -419,23 +369,19 @@ const ScheduleList: React.FC<{
   </div>
 );
 
+/** Body embeds under the answer (weather / schedule / stats) — not sources. */
 export const ChatEmbeds: React.FC<{ embeds?: ChatEmbed[]; colors: Palette }> = ({ embeds, colors }) => {
   if (!embeds || !embeds.length) return null;
+  const body = embeds.filter((e) => BODY_KINDS.has(e.kind));
+  if (!body.length) return null;
 
-  // Order: weather/stats → schedule → query chips → link card → source strip
-  const order = ["weather_stat", "stat_row", "schedule_list", "query_chip", "link_card", "sources"];
-  const sorted = [...embeds].sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
+  const order = ["weather_stat", "stat_row", "schedule_list"];
+  const sorted = [...body].sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
 
   return (
     <div
       className="chat-embeds"
-      style={{
-        marginTop: 14,
-        display: "flex",
-        flexDirection: "column",
-        gap: 4,
-        maxWidth: 520,
-      }}
+      style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 2, maxWidth: 520 }}
     >
       {sorted.map((embed) => {
         if (embed.kind === "weather_stat") {
@@ -444,84 +390,109 @@ export const ChatEmbeds: React.FC<{ embeds?: ChatEmbed[]; colors: Palette }> = (
         if (embed.kind === "schedule_list") {
           return <ScheduleList key={embed.id} embed={embed} colors={colors} />;
         }
-        if (embed.kind === "query_chip") {
-          // Text-only searched queries — no pill bubbles
-          return (
-            <div
-              key={embed.id}
-              style={{
-                padding: "8px 0",
-                borderTop: `1px solid ${colors.line}`,
-                display: "flex",
-                flexDirection: "column",
-                gap: 4,
-              }}
-            >
-              <div
-                style={{
-                  fontSize: 11,
-                  color: colors.textDim,
-                  letterSpacing: "0.06em",
-                  textTransform: "uppercase",
-                  opacity: 0.75,
-                }}
-              >
-                Searched
-              </div>
-              {embed.queries.map((q) => (
-                <div
-                  key={q}
-                  title={q}
-                  style={{
-                    fontSize: 12,
-                    color: colors.textDim,
-                    lineHeight: 1.4,
-                    paddingLeft: 2,
-                    borderLeft: `2px solid ${colors.line}`,
-                    marginLeft: 1,
-                    paddingTop: 1,
-                    paddingBottom: 1,
-                    paddingRight: 4,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {q}
-                </div>
-              ))}
-            </div>
-          );
-        }
-        if (embed.kind === "link_card") {
-          return <LinkCard key={embed.id} embed={embed} colors={colors} />;
-        }
-        if (embed.kind === "sources") {
-          return (
-            <div key={embed.id} style={{ borderTop: `1px solid ${colors.line}`, paddingTop: 10 }}>
-              <SourcesList embed={embed} colors={colors} />
-            </div>
-          );
-        }
         if (embed.kind === "stat_row") {
           return (
             <div
               key={embed.id}
               style={{
-                padding: "10px 0",
-                borderTop: `1px solid ${colors.line}`,
+                padding: "6px 0",
                 display: "flex",
                 justifyContent: "space-between",
                 gap: 12,
+                ...metaFont,
+                color: "rgba(255,255,255,0.38)",
               }}
             >
-              <span style={{ color: colors.textDim, fontSize: 12 }}>{embed.label}</span>
-              <span style={{ color: colors.text, fontWeight: 650, fontSize: 13 }}>{embed.value}</span>
+              <span>{embed.label}</span>
+              <span style={{ color: "rgba(255,255,255,0.5)" }}>{embed.value}</span>
             </div>
           );
         }
         return null;
       })}
+    </div>
+  );
+};
+
+/**
+ * Footer meta row BELOW time/tokens: "sources · N  ·  searched · M" on one line.
+ * Expand panels open under the row.
+ */
+export const ChatEmbedFooter: React.FC<{ embeds?: ChatEmbed[]; colors: Palette }> = ({ embeds }) => {
+  const [openSources, setOpenSources] = useState(false);
+  const [openSearched, setOpenSearched] = useState(false);
+
+  if (!embeds || !embeds.length) return null;
+
+  const hasSources = embeds.some((e) => e.kind === "sources");
+  const footer = embeds.filter((e) => {
+    if (!FOOTER_KINDS.has(e.kind)) return false;
+    if (e.kind === "link_card" && hasSources) return false;
+    return true;
+  });
+  if (!footer.length) return null;
+
+  const sources = footer.find((e): e is Extract<ChatEmbed, { kind: "sources" }> => e.kind === "sources");
+  const searched = footer.find(
+    (e): e is Extract<ChatEmbed, { kind: "query_chip" }> => e.kind === "query_chip"
+  );
+  const linkOnly = !sources
+    ? footer.find((e): e is Extract<ChatEmbed, { kind: "link_card" }> => e.kind === "link_card")
+    : undefined;
+
+  if (!sources && !searched && !linkOnly) return null;
+
+  return (
+    <div className="chat-embed-footer" style={{ marginTop: 4, maxWidth: 520 }}>
+      {/* Single horizontal meta row — sources and searched side by side */}
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          gap: 6,
+          ...metaFont,
+        }}
+      >
+        {sources ? (
+          <SourcesToggle
+            embed={sources}
+            open={openSources}
+            onToggle={() => {
+              setOpenSources((v) => !v);
+              if (openSources) {
+                /* closing */
+              }
+            }}
+          />
+        ) : null}
+        {sources && searched ? <span style={{ opacity: 0.45 }}>·</span> : null}
+        {searched ? (
+          <SearchedToggle
+            embed={searched}
+            open={openSearched}
+            onToggle={() => setOpenSearched((v) => !v)}
+          />
+        ) : null}
+        {linkOnly ? (
+          <>
+            {(sources || searched) && <span style={{ opacity: 0.45 }}>·</span>}
+            <a
+              href={linkOnly.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ ...metaFont, color: "rgba(255,255,255,0.38)", textDecoration: "none" }}
+              className="chat-embed-source-link"
+              title={linkOnly.title}
+            >
+              {(linkOnly.domain || "link").replace(/^www\./, "")} ↗
+            </a>
+          </>
+        ) : null}
+      </div>
+
+      {openSources && sources ? <SourcesExpanded embed={sources} /> : null}
+      {openSearched && searched ? <SearchedExpanded embed={searched} /> : null}
     </div>
   );
 };

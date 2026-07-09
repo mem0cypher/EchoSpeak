@@ -55,11 +55,18 @@ export const parseWeatherStat = (
     );
   if (!looksWeather) return null;
 
-  const placeMatch = hay.match(
-    /\b(?:in|for)\s+([A-Z][a-zA-Z.'-]{2,}(?:\s+[A-Z][a-zA-Z.'-]{2,})?)\b/
-  ) || hay.match(
-    /\b(Edmonton|Calgary|Vancouver|Toronto|Montreal|Winnipeg|Ottawa|Seattle|Denver|Boston|Chicago|Dallas)\b/
-  );
+  // Structural place: "in Osaka" / "for Cape Town" / leading "Osaka tomorrow: high…"
+  // — never a fixed city whitelist.
+  const placeMatch =
+    hay.match(
+      /\b(?:in|for|near|around)\s+([A-Z][a-zA-Z.'-]{2,}(?:\s+[A-Z][a-zA-Z.'-]{2,}){0,2})\b/
+    ) ||
+    hay.match(
+      /^([A-Z][a-zA-Z.'-]{2,}(?:\s+[A-Z][a-zA-Z.'-]{2,}){0,2})\s+(?:tomorrow|today|tonight|:)/
+    ) ||
+    hay.match(
+      /\b([A-Z][a-zA-Z.'-]{2,}(?:\s+[A-Z][a-zA-Z.'-]{2,}){0,2})\s+(?:high|low|weather|forecast)\b/
+    );
   const place = placeMatch ? placeMatch[1] : undefined;
 
   // high 12 / high of 12 / highs near 56

@@ -60,29 +60,11 @@ _SCHEDULE_TERMS = {
     "for tomorrow",
 }
 
-# Common STT / typo variants → canonical (sports & countries). Applied before search.
+# Speech/typo fixes that are *structural* (day words, compound forms) — not entity lists.
+# Never put team/city/country names here; that routes by test vocabulary.
 _SPELLING_FIXES = {
-    "maracco": "morocco",
-    "morroco": "morocco",
-    "moroco": "morocco",
-    "marocco": "morocco",
-    "cananda": "canada",
-    "canadah": "canada",
-    "edmontom": "edmonton",
-    "edminton": "edmonton",
-    "oilors": "oilers",
-    "oilres": "oilers",
-    "flams": "flames",
-    "canuks": "canucks",
-    "portugul": "portugal",
-    "portugual": "portugal",
-    "spane": "spain",
-    "brazile": "brazil",
-    "argintina": "argentina",
-    "argentia": "argentina",
     "wordlcup": "world cup",
     "worldcup": "world cup",
-    # Common speech/typo day words (must land before relative-day labels)
     "tommrrow": "tomorrow",
     "tommorow": "tomorrow",
     "tommorrow": "tomorrow",
@@ -222,48 +204,22 @@ _RELEASE_DATE_RE = re.compile(
     r")"
 )
 
-# Team → home city for bare "what's the weather" alongside a sports ask.
-_TEAM_CITY = {
-    "oilers": "Edmonton",
-    "oiler": "Edmonton",
-    "flames": "Calgary",
-    "canucks": "Vancouver",
-    "leafs": "Toronto",
-    "maple leafs": "Toronto",
-    "canadiens": "Montreal",
-    "habs": "Montreal",
-    "jets": "Winnipeg",
-    "senators": "Ottawa",
-    "sens": "Ottawa",
-    "rangers": "New York",
-    "bruins": "Boston",
-    "blackhawks": "Chicago",
-    "kings": "Los Angeles",
-    "ducks": "Anaheim",
-    "sharks": "San Jose",
-    "knights": "Las Vegas",
-    "avalanche": "Denver",
-    "avs": "Denver",
-    "stars": "Dallas",
-    "wild": "Minnesota",
-    "predators": "Nashville",
-    "blues": "St. Louis",
-    "red wings": "Detroit",
-    "penguins": "Pittsburgh",
-    "capitals": "Washington",
-    "caps": "Washington",
-    "raptors": "Toronto",
-    "blue jays": "Toronto",
-    "jays": "Toronto",
-    "elks": "Edmonton",
-    "stampeders": "Calgary",
-    "roughriders": "Regina",
-    "bombers": "Winnipeg",
+# Stopwords stripped when extracting free-form team / place / vs sides (structure only).
+_SPORTS_STOP = {
+    "when", "is", "the", "next", "upcoming", "game", "games", "match", "matches",
+    "schedule", "for", "of", "what", "time", "times", "a", "an", "do", "does",
+    "did", "play", "plays", "playing", "who", "whom", "whose", "are", "was",
+    "were", "will", "would", "can", "could", "please", "check", "look", "up",
+    "get", "me", "my", "our", "their", "and", "or", "also", "then", "today",
+    "tonight", "tomorrow", "this", "that", "week", "weekend", "score", "scores",
+    "live", "right", "now", "fixture", "fixtures", "kickoff", "kick", "off",
+    "versus", "vs", "against", "at", "on", "in", "to", "from", "with", "about",
+    "happening", "being", "played", "explain", "tell", "show", "find", "search",
 }
 
 
 def apply_spelling_fixes(text: str) -> str:
-    """Fix common speech-to-text / typo variants in search queries (maracco→morocco)."""
+    """Apply structural speech/typo fixes (day words, world-cup compound). No entity map."""
     s = str(text or "")
     if not s:
         return s
@@ -280,7 +236,6 @@ def apply_spelling_fixes(text: str) -> str:
         fixed = _SPELLING_FIXES.get(key)
         if not fixed:
             return word
-        # Preserve simple capitalization
         if word.isupper():
             return fixed.upper()
         if word[:1].isupper():
@@ -290,27 +245,73 @@ def apply_spelling_fixes(text: str) -> str:
     return re.sub(r"[A-Za-z][A-Za-z']*", _fix_token, s)
 
 
+_PLACE_STOP = {
+    "the", "a", "an", "my", "our", "today", "tonight", "tomorrow",
+    "weather", "forecast", "temperature", "temp", "me", "you", "us",
+    "this", "that", "week", "weekend", "morning", "evening", "night",
+    "what", "whats", "what's", "check", "look", "get", "tell", "please",
+    "can", "could", "would", "how", "is", "are", "like", "for", "me",
+    "check the", "what the", "whats the", "what's the", "the weather",
+    # League/sport tokens must never become "city" from "for fifa" / "in nhl"
+    "fifa", "nhl", "nba", "nfl", "mlb", "uefa", "mls", "soccer", "football",
+    "hockey", "basketball", "baseball", "world", "cup", "matches", "match",
+    "games", "game", "score", "schedule", "fixture", "fixtures",
+}
+
+
+def _trim_place_candidate(place: str) -> str:
+    """Keep leading place tokens; stop before day/weather/chat stopwords."""
+    toks = []
+    for tok in (place or "").split():
+        if tok.lower() in _PLACE_STOP:
+            break
+        if re.search(r"(?i)^(high|low|degrees?)$", tok):
+            break
+        toks.append(tok)
+    return " ".join(toks).strip()
+
+
+def _looks_like_place(place: str) -> bool:
+    p = _trim_place_candidate(place)
+    if not p or len(p) < 2:
+        return False
+    low = p.lower()
+    if low in _PLACE_STOP:
+        return False
+    if any(tok in _PLACE_STOP for tok in low.split()):
+        return False
+    if re.search(r"(?i)\b(high|low|degrees?|check|weather|forecast)\b", p):
+        return False
+    return True
+
+
 def _infer_city_from_text(text: str) -> str:
-    low = (text or "").lower()
-    # Explicit city first
+    """
+    Structural place extraction only — never invents a city from a team nickname.
+
+    Accepts: 'in Denver', 'weather for Osaka', leading 'Seattle weather…'.
+    Rejects: team→home-city maps and fixed city whitelists.
+    """
+    raw = text or ""
+    # Explicit preposition + place (allow lower or Title case from speech)
     m = re.search(
-        r"\b(?:in|for|near|around)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
-        text or "",
+        r"(?i)\b(?:in|for|near|around|at)\s+([A-Za-z][A-Za-z.'-]{1,}(?:\s+[A-Za-z][A-Za-z.'-]{1,}){0,2})\b",
+        raw,
     )
     if m:
-        place = m.group(1).strip()
-        if place.lower() not in {"the", "a", "an", "my", "our", "today", "tonight"}:
-            return place
-    for team, city in sorted(_TEAM_CITY.items(), key=lambda kv: -len(kv[0])):
-        if re.search(rf"\b{re.escape(team)}\b", low):
-            return city
-    # Common bare city names
-    for city in (
-        "Edmonton", "Calgary", "Vancouver", "Toronto", "Montreal", "Winnipeg",
-        "Ottawa", "Seattle", "Denver", "Boston", "Chicago", "Dallas",
-    ):
-        if re.search(rf"\b{re.escape(city)}\b", text or "", flags=re.IGNORECASE):
-            return city
+        place = _trim_place_candidate(m.group(1).strip())
+        if _looks_like_place(place):
+            return place.title() if place.islower() else place
+    # Leading place before weather/forecast: "Osaka weather tomorrow"
+    m2 = re.search(
+        r"(?i)^\s*([A-Za-z][A-Za-z.'-]{1,}(?:\s+[A-Za-z][A-Za-z.'-]{1,}){0,2})\s+"
+        r"(?:weather|forecast|temperature|temps?)\b",
+        raw.strip(),
+    )
+    if m2:
+        place = _trim_place_candidate(m2.group(1).strip())
+        if _looks_like_place(place):
+            return place.title() if place.islower() else place
     return ""
 
 
@@ -324,9 +325,34 @@ def _is_weather_clause(text: str) -> bool:
     return False
 
 
-def _is_schedule_or_sports_clause(text: str) -> bool:
-    """True for schedules, fixtures, leagues — not only NHL team names."""
+def _is_local_or_software_game_context(text: str) -> bool:
+    """Video-game / code-project language — must NOT be classified as sports."""
     low = (text or "").lower()
+    if not low:
+        return False
+    if re.search(
+        r"\b(desktop|folder|directory|codebase|repo|workspace|file_list|file_read|"
+        r"html|css|javascript|typescript|python|godot|unity|unreal|pygame|"
+        r"2d|3d|shooter|platformer|roguelike|rpg|sandbox|indie)\b",
+        low,
+    ):
+        return True
+    # "build/code/make a game" / "start the X game" with software framing
+    if re.search(r"\b(build|code|make|create|scaffold|implement|develop)\b.{0,40}\bgame\b", low):
+        return True
+    if re.search(r"\bgame\b.{0,40}\b(project|folder|desktop|files?|code|scan|together)\b", low):
+        return True
+    if re.search(r"\b(project|folder|desktop|files?|code|scan)\b.{0,40}\bgame\b", low):
+        return True
+    return False
+
+
+def _is_schedule_or_sports_clause(text: str) -> bool:
+    """True for schedules, fixtures, leagues — structural, not team-name lists."""
+    low = (text or "").lower()
+    # Software / local project "game" is never sports
+    if _is_local_or_software_game_context(low):
+        return False
     if any(t in low for t in _SCHEDULE_TERMS):
         return True
     if re.search(r"\b(next|upcoming)\s+(game|match|matches|fixture|fixtures)\b", low):
@@ -334,16 +360,28 @@ def _is_schedule_or_sports_clause(text: str) -> bool:
     # Plural matches/games alone + competition or day
     if re.search(r"\b(matches|games|fixtures)\b", low) and re.search(
         r"\b(today|tonight|tomorrow|this week|weekend|schedule|happening|playing|fifa|world cup|"
-        r"nhl|nba|nfl|mlb|soccer|football|premier|uefa|mls)\b",
+        r"nhl|nba|nfl|mlb|soccer|football|premier|uefa|mls|hockey|basketball)\b",
         low,
     ):
         return True
-    if re.search(r"\b(game|match|schedule|fixture)\b", low) and (
-        any(team in low for team in _TEAM_CITY)
-        or re.search(
-            r"\b(nhl|nba|nfl|mlb|oilers?|flames|canucks|leafs|fifa|world cup|soccer|football)\b",
+    # game/match/schedule + league OR vs-structure OR residual team-ish noun
+    # Bare "game" + residual words alone is too weak (catches "2d shooter game")
+    if re.search(r"\b(match|schedule|fixture)\b", low) and (
+        re.search(
+            r"\b(nhl|nba|nfl|mlb|fifa|world cup|soccer|football|hockey|basketball|uefa|mls)\b",
             low,
         )
+        or re.search(r"\b(?:vs\.?|versus|against)\b", low)
+        or _extract_teamish_phrase(low)
+    ):
+        return True
+    if re.search(r"\bgame\b", low) and (
+        re.search(
+            r"\b(nhl|nba|nfl|mlb|fifa|world cup|soccer|football|hockey|basketball|uefa|mls|"
+            r"next game|upcoming game|score|kickoff)\b",
+            low,
+        )
+        or re.search(r"\b(?:vs\.?|versus|against)\b", low)
     ):
         return True
     # League + day/playing without the word "match"
@@ -353,6 +391,82 @@ def _is_schedule_or_sports_clause(text: str) -> bool:
     ):
         return True
     return False
+
+
+def _extract_vs_sides(text: str) -> str:
+    """
+    Structural matchup parse: 'France vs Morocco', 'A versus B', 'X against Y'.
+    No country/team whitelist — any free-form sides (unicode letters OK).
+    """
+    # \w with UNICODE includes accented letters (Curaçao, São Paulo, …)
+    m = re.search(
+        r"(?iu)\b([\w][\w .'-]{0,40}?)\s+(?:vs\.?|versus|against)\s+([\w][\w .'-]{0,40}?)\b",
+        text or "",
+    )
+    if not m:
+        return ""
+    def _side(s: str) -> str:
+        s = _normalize_text(s)
+        # Drop leading articles / chatty interrogatives ("who wins Senegal" → "Senegal")
+        for _ in range(4):
+            nxt = re.sub(
+                r"(?i)^(the|a|an|who|what|which|when|wins?|win|plays?|playing)\s+",
+                "",
+                s,
+            )
+            if nxt == s:
+                break
+            s = nxt
+        # Drop competition/league words so sides aren't "world cup Senegal"
+        s = re.sub(
+            r"(?i)\b(fifa|world\s*cup|nhl|nba|nfl|mlb|uefa|premier\s*league|champions\s*league|"
+            r"soccer|football|hockey|basketball|baseball)\b",
+            " ",
+            s,
+        )
+        s = re.sub(
+            r"(?i)\s+\b(kickoff|time|schedule|fixtures?|matches?|games?|today|tomorrow|tonight|"
+            r"et|pt|mt|ct|utc|gmt|mnt|mst|est|pst)\b.*$",
+            "",
+            s,
+        )
+        s = _normalize_text(s)
+        # Prefer last 1–3 tokens if still chatty
+        toks = s.split()
+        if len(toks) > 3:
+            s = " ".join(toks[-3:])
+        return _normalize_text(s)
+
+    a, b = _side(m.group(1)), _side(m.group(2))
+    if not a or not b or len(a) < 2 or len(b) < 2:
+        return ""
+    if a.lower() in _SPORTS_STOP or b.lower() in _SPORTS_STOP:
+        return ""
+    return f"{a} {b}"
+
+
+def _extract_teamish_phrase(text: str) -> str:
+    """
+    Residual team/org phrase after stripping schedule stopwords.
+    Works for any club/nation — not a nickname map.
+    """
+    words = re.findall(r"(?u)[\w]+(?:['-][\w]+)?", text or "")
+    # Drop pure digits
+    words = [w for w in words if not w.isdigit()]
+    keep = [w for w in words if w.lower() not in _SPORTS_STOP]
+    # Drop pure league tokens from the "team" phrase (kept separately by caller)
+    leagueish = {
+        "nhl", "nba", "nfl", "mlb", "fifa", "uefa", "mls", "soccer", "football",
+        "hockey", "basketball", "world", "cup", "premier", "league", "champions",
+    }
+    keep = [w for w in keep if w.lower() not in leagueish]
+    if not keep:
+        return ""
+    # Cap length so we don't re-absorb the whole chatty utterance
+    phrase = " ".join(keep[:5])
+    if len(phrase) < 2:
+        return ""
+    return phrase
 
 
 def intent_domains(text: str) -> set[str]:
@@ -368,10 +482,13 @@ def intent_domains(text: str) -> set[str]:
     domains: set[str] = set()
     if _is_weather_clause(low):
         domains.add("weather")
-    if _is_schedule_or_sports_clause(low) or re.search(
-        r"\b(fifa|world cup|nhl|nba|nfl|mlb|soccer|football|premier league|"
-        r"match(?:es)?|score(?:s)?|standings|playoff)\b",
-        low,
+    if not _is_local_or_software_game_context(low) and (
+        _is_schedule_or_sports_clause(low)
+        or re.search(
+            r"\b(fifa|world cup|nhl|nba|nfl|mlb|soccer|football|premier league|"
+            r"match(?:es)?|score(?:s)?|standings|playoff)\b",
+            low,
+        )
     ):
         domains.add("sports")
     if re.search(
@@ -380,9 +497,9 @@ def intent_domains(text: str) -> set[str]:
     ):
         domains.add("finance")
     if re.search(
-        r"\b(movie|film|trailer|netflix|show|series|album|gta|rockstar|box office)\b",
+        r"\b(movie|film|trailer|netflix|show|series|album|box office|dlc|sequel|pre-?order)\b",
         low,
-    ) or _has_trailer_intent(low) or _has_character_cast_intent(low):
+    ) or _has_trailer_intent(low) or _has_character_cast_intent(low) or _has_product_title_context(low):
         domains.add("entertainment")
     if re.search(r"\b(news|headline|breaking|headlines)\b", low) and "weather" not in domains:
         domains.add("news")
@@ -426,51 +543,108 @@ def _explicit_calendar_date_label(text: str) -> str:
 
 
 def _normalize_sports_query(text: str) -> str:
+    """
+    Compact sports/schedule search string via structure (league, vs-sides, day, TZ).
+    Never rewrites to a hard-coded franchise string (no team→canonical map).
+    """
     q = _normalize_text(apply_spelling_fixes(text or ""))
     low = q.lower()
     day, cal = _relative_day_labels(low)
     explicit = _explicit_calendar_date_label(low)
-    # FIFA / World Cup fixtures (general league normalize — not multi-intent recipe)
-    if re.search(r"\b(fifa|world cup)\b", low):
-        # Keep named sides when present (morocco, portugal, …)
-        named = re.findall(
-            r"\b(morocco|portugal|spain|brazil|argentina|france|germany|england|"
-            r"canada|mexico|usa|japan|korea|croatia|netherlands|italy|belgium|"
-            r"uruguay|colombia|senegal|australia)\b",
+    # Timezone conversion follow-ups must NOT collapse to a fresh full-day slate
+    # (lost prior match/clock context on "what time MNT?").
+    tz_convert = bool(
+        re.search(
+            r"\b("
+            r"timezone|time\s*zone|convert\s+local|my\s+time|local\s+time|"
+            r"mountain\s+time|pacific\s+time|eastern\s+time|central\s+time|"
+            r"\bmnt\b|\bmst\b|\bmdt\b|\best\b|\bedt\b|\bpst\b|\bpdt\b|\butc\b|\bgmt\b"
+            r")\b",
             low,
         )
-        side = " ".join(dict.fromkeys(named))  # stable unique
-        # Ask for teams + kickoff so DDG/snippets surface concrete matchups, not tournament fluff
-        base = "FIFA World Cup matchups teams kickoff schedule fixtures"
-        if side:
-            base = f"FIFA World Cup {side} matchups teams kickoff schedule fixtures"
-        # Pin calendar date so Tavily doesn't return a random tournament month
+    )
+    side = _extract_vs_sides(q)
+    clock = ""
+    tm = re.search(
+        r"\b(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|am|pm))\b",
+        low,
+        flags=re.IGNORECASE,
+    )
+    if tm:
+        clock = tm.group(1).strip()
+    league = ""
+    if re.search(r"\b(fifa|world cup)\b", low):
+        league = "FIFA World Cup"
+    elif re.search(r"\bnhl\b|\bhockey\b", low):
+        league = "NHL"
+    elif re.search(r"\bnba\b|\bbasketball\b", low):
+        league = "NBA"
+    elif re.search(r"\bnfl\b", low):
+        league = "NFL"
+    elif re.search(r"\bmlb\b|\bbaseball\b", low):
+        league = "MLB"
+    elif re.search(r"\buefa|premier league|champions league\b", low):
+        league = "soccer"
+
+    def _pin() -> str:
         if day and cal:
-            return f"{base} {day} {cal}"
-        if day:
-            return f"{base} {day}"
-        if explicit:
-            return f"{base} {explicit}"
-        return base
-    # Edmonton Oilers / Oilers
-    if re.search(r"\boilers?\b", low):
-        if re.search(r"\b(next|upcoming|when)\b", low) or "schedule" in low or "game" in low:
-            return "Edmonton Oilers next game schedule NHL"
-        return "Edmonton Oilers " + q
-    if re.search(r"\bflames\b", low) and re.search(r"\b(next|game|schedule)\b", low):
-        return "Calgary Flames next game schedule NHL"
-    if re.search(r"\bcanucks\b", low) and re.search(r"\b(next|game|schedule)\b", low):
-        return "Vancouver Canucks next game schedule NHL"
-    if re.search(r"\b(next|upcoming)\s+(game|match)\b", low):
-        team = re.sub(
-            r"(?i)\b(when|is|the|next|upcoming|game|match|schedule|for|of|what|time)\b",
-            " ",
-            q,
+            return f"{day} {cal}".strip()
+        return day or explicit or ""
+
+    if tz_convert:
+        tz_bits = re.findall(
+            r"\b(mnt|mst|mdt|est|edt|pst|pdt|cst|cdt|utc|gmt|mt|et|pt|"
+            r"mountain|pacific|eastern|central)\b",
+            low,
         )
-        team = _normalize_text(team)
+        tz_label = " ".join(dict.fromkeys(tz_bits[:3])) or "Mountain Time"
+        pin = _pin() or "today"
+        if not side and not league:
+            team = _extract_teamish_phrase(q)
+            head = team or "match"
+            return f"{head} kickoff {pin} convert to {tz_label} timezone ET schedule".strip()
+        if not side:
+            head = league or "sports"
+            return (
+                f"{head} {pin} full match list each kickoff time "
+                f"ET and {tz_label} convert timezone schedule"
+            ).strip()
+        parts = [league or "match", side, "kickoff"]
+        if clock:
+            parts.append(clock)
+        parts.append(f"what time is that in {tz_label} convert timezone ET")
+        if pin:
+            parts.append(pin)
+        return " ".join(p for p in parts if p).strip()
+
+    # League slate (World Cup / NHL / …) — demand concrete kickoffs, pin calendar
+    if league and re.search(r"\b(fifa|world cup)\b", low):
+        if side:
+            base = f"{league} {side} kickoff time ET schedule fixtures"
+        else:
+            base = f"{league} match list kickoff times ET each game schedule fixtures"
+        if clock:
+            base = f"{base} {clock}"
+        pin = _pin()
+        if pin:
+            return f"{base} {pin}".strip()
+        return base
+
+    # Next/upcoming game for any free-form team phrase (no franchise rewrite)
+    if re.search(r"\b(next|upcoming)\s+(game|match)\b", low) or (
+        re.search(r"\b(when|schedule)\b", low) and re.search(r"\b(game|match|play)\b", low)
+    ):
+        team = _extract_teamish_phrase(q)
         if team:
-            return f"{team} next game schedule"
-    # Generic "matches/games happening" + relative day or explicit calendar date
+            bits = [team, "next game schedule"]
+            if league:
+                bits.append(league)
+            pin = _pin()
+            if pin:
+                bits.append(pin)
+            return " ".join(bits).strip()
+
+    # Generic matches/games happening + relative day or explicit calendar date
     if re.search(r"\b(matches|games|fixtures|playing|matchup)\b", low) and (day or explicit):
         cleaned = re.sub(
             r"(?i)\b(what|which|are|is|happening|for|the|a|an|also|just|wondering|sorry|not|"
@@ -479,11 +653,27 @@ def _normalize_sports_query(text: str) -> str:
             q,
         )
         cleaned = _normalize_text(cleaned) or q
-        pin = f"{day} {cal}".strip() if day and cal else (day or explicit)
-        # Prefer league/context words if present; else compact "games schedule DATE"
+        pin = _pin()
+        if side:
+            head = f"{league} {side}".strip() if league else side
+            return f"{head} schedule fixtures {pin}".strip()
         if re.search(r"\b(fifa|world cup|nhl|nba|nfl|mlb|soccer|football)\b", cleaned.lower()):
             return f"{cleaned} schedule fixtures {pin}".strip()
+        if league:
+            return f"{league} schedule fixtures {pin}".strip()
+        team = _extract_teamish_phrase(cleaned)
+        if team:
+            return f"{team} schedule fixtures {pin}".strip()
         return f"sports games matches schedule fixtures {pin}".strip()
+
+    # Bare vs-sides without day
+    if side:
+        bits = [league, side, "schedule fixtures"]
+        pin = _pin()
+        if pin:
+            bits.append(pin)
+        return " ".join(b for b in bits if b).strip()
+
     return q
 
 
@@ -528,21 +718,105 @@ def _normalize_weather_query(text: str, *, city_hint: str = "") -> str:
     # that path used to recurse: weather → single → weather → …).
     cleaned = _strip_weather_chat_filler(text)
     cleaned = re.sub(r"(?i)\b(weather|forecast|temperature|temp)\b", " ", cleaned)
-    cleaned = re.sub(r"(?i)\b(the|a|an|for|me|my|you|your|tomorrow|today|tonight)\b", " ", cleaned)
+    cleaned = re.sub(
+        r"(?i)\b(the|a|an|for|me|my|you|your|tomorrow|today|tonight|check|look|up|"
+        r"please|can|could|would|get|tell|like|whats|what's|how|is|are)\b",
+        " ",
+        cleaned,
+    )
     cleaned = _normalize_text(cleaned)
     # Only keep cleaned if it looks like a place name (short, no leftover chatter/day words)
     if (
         cleaned
         and 2 <= len(cleaned) <= 40
         and len(cleaned.split()) <= 4
-        and not re.search(r"(?i)\b(high|low|going|be|what|matches|fifa)\b", cleaned)
+        and not re.search(
+            r"(?i)\b(high|low|going|be|what|matches|fifa|check|tho|though|well|hope)\b",
+            cleaned,
+        )
     ):
         return f"{cleaned} weather {day_part} high low temperature forecast"
     return f"weather {day_part} high low temperature forecast"
 
 
+def _clean_title_entity(raw: str) -> str:
+    """Strip chat filler from a free-form title/product span."""
+    s = _normalize_text(raw)
+    s = re.sub(
+        r"(?i)\b(i need you to|can you|could you|please|search for|search when|look up|find out|explain to me)\b",
+        " ",
+        s,
+    )
+    s = re.sub(
+        r"(?i)^(the|a|an|new|latest|that|this|for|about|of|when|does|is|will|do|did|search)\s+",
+        "",
+        s,
+    )
+    # Chat particles that leak into titles from social openers ("gta 6 hey")
+    s = re.sub(r"(?i)\b(hey|hi|hello|yo|sup|please|thanks|thank you)\b", " ", s)
+    s = re.sub(
+        r"(?i)\b(the|a|an|new|latest|please|trailer|release|price|cost|characters?|cast|search|when)\b",
+        " ",
+        s,
+    )
+    s = _normalize_text(s)
+    # Trailing roman/word sequels only (any title): "Foo VI" / "Foo six" → "Foo 6"
+    s = re.sub(r"(?i)\s+(vi|six)\s*$", " 6", s)
+    s = re.sub(r"(?i)\s+(v|five)\s*$", " 5", s)
+    if len(s) > 40:
+        s = " ".join(s.split()[-4:])
+    return s
+
+
+def _extract_title_entity(text: str) -> str:
+    """
+    Free-form product/title extraction from the user utterance.
+
+    No whitelist of games/movies — only structural patterns
+    (\"X trailer 3\", \"when does X come out\", \"price of X\").
+    """
+    work = _normalize_text(apply_spelling_fixes(text or ""))
+    if not work:
+        return ""
+    # Light structural cleanup: trailing roman/word sequels only (no franchise aliases)
+    work = re.sub(r"(?i)\s+(vi|six)\b", " 6", work)
+
+    patterns = (
+        # Short subject: "when X is released" (X <= 5 tokens)
+        r"(?i)\bwhen\s+((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,4})\s+is\s+(?:released|launching|dropping)\b",
+        r"(?i)\bwhen\s+(?:does|is|will)\s+((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,4})\s+(?:come\s+out|release|launch|drop)\b",
+        r"(?i)\bhow much (?:does|will|is)\s+((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,4})\s+(?:cost|be|go for)\b",
+        r"(?i)\b(?:price of|cost of)\s+((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,5})\b",
+        r"(?i)\btrailer\s*(?:#?\s*)?(?:\d+|three|two|one)\s+(?:for|of)\s+((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,5})\b",
+        r"(?i)\b((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,5})\s+trailer\s*(?:#?\s*)?(?:\d+|three|two|one)\b",
+        r"(?i)\b(?:characters?|cast|protagonists?)\s+(?:of|in|for)\s+((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,5})\b",
+        r"(?i)\b(?:for|about)\s+(?:the\s+)?(?:new\s+)?((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,5})\s+(?:trailer|release|price|cast)\b",
+    )
+    for pat in patterns:
+        m = re.search(pat, work)
+        if m:
+            ent = _clean_title_entity(m.group(1))
+            bad = {"i need", "you to", "search when", "search", "when", "how much"}
+            if ent and len(ent) >= 2 and ent.lower() not in bad and not ent.lower().startswith("i need"):
+                return ent
+    return ""
+
+
+def _has_product_title_context(text: str) -> bool:
+    """True when utterance carries a title/product entity (any franchise — not GTA-only)."""
+    if _extract_title_entity(text):
+        return True
+    # Explicit media/product markers with some content around them
+    low = (text or "").lower()
+    return bool(
+        re.search(r"\b(trailer|pre-?order|box office|dlc|sequel|season pass)\b", low)
+        and len((text or "").split()) >= 3
+    )
+
+
+# Backward-compatible alias (tests/history) — now product-general
 def _has_gta_context(text: str) -> bool:
-    return bool(re.search(r"(?i)\b(?:gta|grand theft auto)\b", text or ""))
+    return _has_product_title_context(text)
 
 
 def _has_trailer_intent(text: str) -> bool:
@@ -554,16 +828,17 @@ def _has_character_cast_intent(text: str) -> bool:
     return bool(
         re.search(r"\b(characters?|cast|protagonists?|playable)\b", low)
         or re.search(r"\bnames of the (?:characters?|cast)\b", low)
-        # "who is in the cast" / "who are the characters" — not "who is the president"
         or re.search(r"\bwho (?:is|are) (?:in|the) (?:cast|characters?|game|movie|film)\b", low)
         or re.search(r"\bwho (?:is|are) (?:playable|protagonists?)\b", low)
     )
 
 
-def _has_gta_release_intent(text: str) -> bool:
+def _has_product_release_intent(text: str) -> bool:
     low = (text or "").lower()
-    if not _has_gta_context(low):
-        return False
+    if not (_has_product_title_context(low) or _extract_title_entity(text)):
+        # "when does it release" with product only in subject is handled via rebind
+        if not re.search(r"\b(it|this|that|game|movie|show|album)\b", low):
+            return False
     return bool(
         re.search(
             r"\b(release(?:s|d)?|come\s+out|coming\s+out|launch(?:es|ing)?|drop(?:s|ping)?|"
@@ -573,11 +848,8 @@ def _has_gta_release_intent(text: str) -> bool:
     )
 
 
-def _has_gta_price_intent(text: str) -> bool:
+def _has_product_price_intent(text: str) -> bool:
     low = (text or "").lower()
-    if not _has_gta_context(low) and not re.search(r"\b(it|game|edition)\b", low):
-        # Bare cost only counts when GTA is already in the full message context
-        return False
     return bool(
         re.search(
             r"\b(how much|cost(?:s|ing)?|price|pricing|msrp|pre-?order|edition(?:s)?|"
@@ -587,28 +859,57 @@ def _has_gta_price_intent(text: str) -> bool:
     )
 
 
-def _normalize_gta_trailer_query(text: str, full_context: str = "") -> str:
+def _has_gta_release_intent(text: str) -> bool:
+    return _has_product_release_intent(text)
+
+
+def _has_gta_price_intent(text: str) -> bool:
+    return _has_product_price_intent(text)
+
+
+def _normalize_product_trailer_query(text: str, full_context: str = "") -> str:
     blob = f"{text or ''} {full_context or ''}"
+    entity = _extract_title_entity(blob) or _extract_title_entity(text) or "trailer"
     m = re.search(r"(?i)\btrailer\s*(?:#?\s*)?(\d+|three|two|one)\b", blob)
     num = ""
     if m:
         raw_n = m.group(1).lower()
         num = {"one": "1", "two": "2", "three": "3"}.get(raw_n, raw_n)
     if num:
-        return f"GTA 6 Trailer {num} release date announcement Rockstar"
-    return "GTA 6 Trailer 3 release date announcement Rockstar"
+        return f"{entity} Trailer {num} release date announcement"
+    return f"{entity} trailer release date announcement"
+
+
+def _normalize_product_cast_query(text: str = "") -> str:
+    entity = _extract_title_entity(text) or "title"
+    return f"{entity} characters cast protagonists known details"
+
+
+def _normalize_product_release_query(text: str = "") -> str:
+    entity = _extract_title_entity(text) or "title"
+    return f"{entity} release date launch platforms official"
+
+
+def _normalize_product_price_query(text: str = "") -> str:
+    entity = _extract_title_entity(text) or "title"
+    return f"{entity} price cost pre-order editions"
+
+
+# Backward-compatible aliases used by older tests/call sites
+def _normalize_gta_trailer_query(text: str, full_context: str = "") -> str:
+    return _normalize_product_trailer_query(text, full_context=full_context)
 
 
 def _normalize_gta_characters_query(text: str = "") -> str:
-    return "GTA 6 characters cast Lucia Jason Duval known details plot"
+    return _normalize_product_cast_query(text)
 
 
 def _normalize_gta_release_query(text: str = "") -> str:
-    return "GTA 6 release date launch platforms Rockstar official"
+    return _normalize_product_release_query(text)
 
 
 def _normalize_gta_price_query(text: str = "") -> str:
-    return "GTA 6 price cost pre-order editions PS5 Xbox"
+    return _normalize_product_price_query(text)
 
 
 def _prep_search_work_text(text: str) -> str:
@@ -637,10 +938,12 @@ def _is_hollow_secondary_clause(text: str) -> bool:
         return False
     # Already has a concrete product/topic noun → keep as its own query
     if re.search(
-        r"(?i)\b(gta|microphone|mic|iphone|laptop|bitcoin|fifa|weather|stock|"
-        r"python|nvidia|tesla|oilers|trailer)\b",
+        r"(?i)\b(microphone|mic|iphone|laptop|bitcoin|weather|stock|"
+        r"python|nvidia|tesla|trailer|price|release|score|schedule)\b",
         low,
     ):
+        return False
+    if _extract_title_entity(low) or _extract_teamish_phrase(low):
         return False
     if re.search(
         r"(?i)^\s*(?:and\s+)?(?:also\s+)?(?:please\s+)?"
@@ -667,8 +970,8 @@ def _is_smalltalk_clause(text: str) -> bool:
         t in low
         for t in (
             "score", "odds", "price", "stock", "news", "headline", "trailer",
-            "release", "gta", "forecast", "temperature", "schedule", "fixture",
-            "games", "matches", "fifa", "python", "bitcoin",
+            "release", "forecast", "temperature", "schedule", "fixture",
+            "games", "matches", "fifa", "python", "bitcoin", "cast", "characters",
         )
     ):
         return False
@@ -797,11 +1100,12 @@ def recipe_multi_search_queries(text: str) -> list[str]:
     city_hint = _infer_city_from_text(work)
     has_weather = _is_weather_clause(work)
     has_sports = _is_schedule_or_sports_clause(work)
-    has_gta = _has_gta_context(work)
+    has_product = _has_product_title_context(work)
     has_trailer = _has_trailer_intent(work)
     has_chars = _has_character_cast_intent(work)
 
     out: list[str] = []
+    # Domain-pair recipe: weather+sports (structural domains, not a product whitelist)
     if has_sports and has_weather:
         clauses = [
             c.strip(" ,;:")
@@ -813,11 +1117,12 @@ def recipe_multi_search_queries(text: str) -> list[str]:
         out.append(_normalize_sports_query(sports_clause))
         w_city = _infer_city_from_text(weather_clause) or city_hint
         out.append(_normalize_weather_query(weather_clause, city_hint=w_city))
-    elif (has_trailer or has_chars) and (has_gta or has_trailer):
+    # Product multi: trailer and/or cast for whatever title was mentioned
+    elif (has_trailer or has_chars) and (has_product or has_trailer):
         if has_trailer:
-            out.append(_normalize_gta_trailer_query(work, full_context=work))
-        if has_chars or (has_gta and re.search(r"(?i)\b(who|names?|know|cast)\b", work)):
-            out.append(_normalize_gta_characters_query(work))
+            out.append(_normalize_product_trailer_query(work, full_context=work))
+        if has_chars or (has_product and re.search(r"(?i)\b(who|names?|know|cast)\b", work)):
+            out.append(_normalize_product_cast_query(work))
 
     return _dedupe_queries(out)[:4]
 
@@ -841,12 +1146,22 @@ def _is_orphan_price_query(q: str) -> bool:
         return False
     if not re.search(r"(?i)\b(how much|cost(?:s|ing)?|price|pricing|msrp|pre-?order)\b", low):
         return False
-    # Already entity-grounded
-    if re.search(
-        r"(?i)\b(gta|grand theft auto|bitcoin|btc|ethereum|stock|iphone|ps5|xbox|"
-        r"rockstar|game|fifa|python|nvidia|tesla|apple|microsoft)\b",
-        low,
-    ):
+    # Already entity-grounded: free-form title OR residual non-price tokens (any product)
+    if _extract_title_entity(q):
+        return False
+    if re.search(r"(?i)\b(bitcoin|btc|ethereum|stock|iphone|ps5|xbox|python|nvidia|tesla)\b", low):
+        return False
+    price_stop = {
+        "how", "much", "will", "it", "cost", "costs", "costing", "price", "pricing",
+        "msrp", "pre", "order", "preorder", "editions", "edition", "the", "a", "an",
+        "for", "of", "does", "is", "be", "go", "what", "dollars", "money", "and",
+    }
+    residual = [
+        t for t in re.findall(r"[a-z0-9]+", low)
+        if t not in price_stop and not t.isdigit()
+    ]
+    # "gta 6 price…" / "silksong price…" have residual product tokens → not orphan
+    if residual:
         return False
     # Short cost-only / "will it cost" clauses
     if len(low.split()) <= 8:
@@ -855,14 +1170,14 @@ def _is_orphan_price_query(q: str) -> bool:
 
 
 def _rebind_orphan_queries(work: str, queries: list[str]) -> list[str]:
-    """Attach bare cost/price sub-queries to GTA (or other) entity from full message."""
+    """Attach bare cost/price sub-queries to title/entity from full message."""
     work_n = _normalize_text(work)
     if not work_n or not queries:
         return queries
     out: list[str] = []
     for q in queries:
-        if _is_orphan_price_query(q) and _has_gta_context(work_n):
-            out.append(_normalize_gta_price_query(work_n))
+        if _is_orphan_price_query(q) and _has_product_title_context(work_n):
+            out.append(_normalize_product_price_query(work_n))
         elif _is_orphan_price_query(q) and re.search(r"(?i)\b(bitcoin|btc)\b", work_n):
             out.append("current bitcoin price USD")
         else:
@@ -880,28 +1195,29 @@ def _normalize_clause_for_search(part: str, *, full_context: str = "") -> str:
         return _normalize_weather_query(p, city_hint=_infer_city_from_text(p) or _infer_city_from_text(ctx))
     if _is_schedule_or_sports_clause(p) and not _is_weather_clause(p):
         return _normalize_sports_query(p)
-    if _has_trailer_intent(p) and (_has_gta_context(p) or _has_gta_context(ctx) or _has_trailer_intent(p)):
-        if _has_character_cast_intent(p):
-            # Both in one clause — leave to recipe; single side only here
-            pass
-        return _normalize_gta_trailer_query(p, full_context=ctx)
-    if (_has_gta_context(p) or _has_gta_context(ctx)) and _has_character_cast_intent(p):
-        return _normalize_gta_characters_query(p)
-    if (_has_gta_context(p) or _has_gta_context(ctx)) and (
-        _has_gta_release_intent(p) or _has_gta_release_intent(f"{p} {ctx}" if _has_gta_context(ctx) else p)
+    if _has_trailer_intent(p) and (
+        _has_product_title_context(p) or _has_product_title_context(ctx) or _has_trailer_intent(p)
     ):
-        # "when does gta 6 come out" on this clause, or release intent only on full text
-        if _has_gta_context(p) and _has_gta_release_intent(p):
-            return _normalize_gta_release_query(p)
-        if _has_gta_context(p) and re.search(r"(?i)\b(how much|cost|price|money)\b", p):
-            return _normalize_gta_price_query(p)
-        if _has_gta_release_intent(p) and _has_gta_context(ctx):
-            return _normalize_gta_release_query(ctx)
-    # Bare "how much will it cost" after a GTA clause in the same message
-    if _is_orphan_price_query(p) and _has_gta_context(ctx):
-        return _normalize_gta_price_query(ctx)
-    if _has_gta_context(p) and re.search(r"(?i)\b(how much|cost|price|money)\b", p):
-        return _normalize_gta_price_query(p)
+        if _has_character_cast_intent(p):
+            pass
+        return _normalize_product_trailer_query(p, full_context=ctx)
+    if (_has_product_title_context(p) or _has_product_title_context(ctx)) and _has_character_cast_intent(p):
+        return _normalize_product_cast_query(p if _extract_title_entity(p) else ctx)
+    if (_has_product_title_context(p) or _has_product_title_context(ctx)) and (
+        _has_product_release_intent(p)
+        or _has_product_release_intent(f"{p} {ctx}" if _has_product_title_context(ctx) else p)
+    ):
+        if _has_product_title_context(p) and _has_product_release_intent(p):
+            return _normalize_product_release_query(p)
+        if _has_product_title_context(p) and re.search(r"(?i)\b(how much|cost|price|money)\b", p):
+            return _normalize_product_price_query(p)
+        if _has_product_release_intent(p) and _has_product_title_context(ctx):
+            return _normalize_product_release_query(ctx)
+    # Bare "how much will it cost" after a product clause in the same message
+    if _is_orphan_price_query(p) and _has_product_title_context(ctx):
+        return _normalize_product_price_query(ctx)
+    if _has_product_title_context(p) and re.search(r"(?i)\b(how much|cost|price|money)\b", p):
+        return _normalize_product_price_query(p)
     n = normalize_web_search_query_single(p) or p
     return _normalize_text(n)
 
@@ -952,11 +1268,12 @@ def _force_domain_decompose(text: str) -> list[str]:
             out.append(wq)
 
     if "sports" in domains:
-        # Start near sports keywords — NEVER from message start (GTA clause used to
-        # swallow the whole string, then _clip_span_to_clause dropped FIFA).
+        # Start near sports keywords — NEVER from message start (product clause used to
+        # swallow the whole string, then _clip_span_to_clause dropped the sports half).
         kw = re.search(
             r"(?i)\b(?:fifa|world\s*cup|nhl|nba|nfl|mlb|uefa|premier\s*league|"
-            r"matches?|games?|fixtures?|matchup|score|playing|oilers?|flames|canucks|lakers)\b",
+            r"matches?|games?|fixtures?|matchup|score|playing|"
+            r"vs\.?|versus|against|next\s+game|schedule)\b",
             work,
         )
         if kw:
@@ -974,15 +1291,22 @@ def _force_domain_decompose(text: str) -> list[str]:
         span = _clip_span_to_clause(span)
         # If clip still landed on a non-sports half, take from keyword only
         if kw and not _is_schedule_or_sports_clause(span) and not re.search(
-            r"(?i)\b(fifa|world cup|match|game|score|nhl|nba|nfl|mlb)\b", span
+            r"(?i)\b(fifa|world cup|match|game|score|nhl|nba|nfl|mlb|vs\.?|versus)\b", span
         ):
             span = work[kw.start() : min(len(work), kw.end() + 90)]
-        span = re.sub(r"(?i)\b(temp(?:erature)?s?|weather|forecast|humidity|bitcoin|stock|gta)\b", " ", span)
+        span = re.sub(
+            r"(?i)\b(temp(?:erature)?s?|weather|forecast|humidity|bitcoin|stock)\b",
+            " ",
+            span,
+        )
         # Orphan "who is playing" alone → keep parent sports context
         if re.search(r"(?i)^\s*who\s+is\s+playing\s*$", span.strip()) and kw:
             span = work[max(0, kw.start() - 40) : min(len(work), kw.end() + 90)]
         sq = _normalize_sports_query(span)
-        if sq and not _is_weather_clause(sq) and not _has_gta_context(sq):
+        # Avoid treating a pure product-title span as sports
+        if sq and not _is_weather_clause(sq) and not (
+            _has_product_title_context(sq) and not _is_schedule_or_sports_clause(sq)
+        ):
             out.append(sq)
         elif re.search(r"(?i)\b(fifa|world cup)\b", work):
             out.append(_normalize_sports_query("fifa world cup matches " + (span or "")))
@@ -1009,32 +1333,29 @@ def _force_domain_decompose(text: str) -> list[str]:
                 out.append(span)
 
     if "entertainment" in domains:
-        if _has_gta_context(work) or _has_trailer_intent(work):
+        if _has_product_title_context(work) or _has_trailer_intent(work):
             if _has_trailer_intent(work):
-                out.append(_normalize_gta_trailer_query(work, full_context=work))
+                out.append(_normalize_product_trailer_query(work, full_context=work))
             if _has_character_cast_intent(work):
-                out.append(_normalize_gta_characters_query(work))
-            # Release / launch (not trailer-only)
-            if _has_gta_release_intent(work) and not _has_trailer_intent(work):
-                out.append(_normalize_gta_release_query(work))
-            # Price / cost / editions — separate search so release evidence isn't the only hit
-            if _has_gta_price_intent(work) or (
-                _has_gta_context(work)
+                out.append(_normalize_product_cast_query(work))
+            if _has_product_release_intent(work) and not _has_trailer_intent(work):
+                out.append(_normalize_product_release_query(work))
+            if _has_product_price_intent(work) or (
+                _has_product_title_context(work)
                 and re.search(r"(?i)\b(how much|cost|price|money it costs|pre-?order)\b", work)
             ):
-                out.append(_normalize_gta_price_query(work))
-            # Bare GTA with no specific intent → release as default fact ask
+                out.append(_normalize_product_price_query(work))
             if (
-                _has_gta_context(work)
+                _has_product_title_context(work)
                 and not _has_trailer_intent(work)
                 and not _has_character_cast_intent(work)
-                and not _has_gta_release_intent(work)
+                and not _has_product_release_intent(work)
                 and not re.search(r"(?i)\b(how much|cost|price)\b", work)
             ):
-                out.append(_normalize_gta_release_query(work))
+                out.append(_normalize_product_release_query(work))
         else:
             m = re.search(
-                r"(?i)(?:when|what).{0,40}\b(?:movie|film|trailer|release|netflix|show|dune)\b.{0,40}",
+                r"(?i)(?:when|what).{0,40}\b(?:movie|film|trailer|release|netflix|show|series|album)\b.{0,40}",
                 work,
             )
             if m:
@@ -1122,20 +1443,22 @@ def _heuristic_decompose(text: str) -> list[str]:
         )
         # "how much will it cost" alone still matches cost — require entity-grounded price
         has_grounded_price = any(
-            re.search(r"(?i)\b(gta|price cost|pre-?order|bitcoin|msrp)\b", q)
-            and re.search(r"(?i)\b(price|cost|pre-?order|msrp)\b", q)
-            for q in out
-        ) or any(
-            re.search(r"(?i)\b(gta|grand theft auto).{0,40}\b(price|cost)\b", q)
-            or re.search(r"(?i)\b(price|cost).{0,40}\b(gta|grand theft auto)\b", q)
+            re.search(r"(?i)\b(price|cost|pre-?order|msrp)\b", q)
+            and (
+                _extract_title_entity(q)
+                or re.search(r"(?i)\b(bitcoin|btc|ethereum|msrp|edition)\b", q)
+                or len(q.split()) >= 4
+            )
             for q in out
         )
         missing_price = bool(re.search(r"(?i)\b(how much|cost|price)\b", work)) and not has_grounded_price
         orphan_price = any(_is_orphan_price_query(q) for q in out)
-        missing_fifa = re.search(r"(?i)\b(fifa|world cup)\b", work) and not any(
-            re.search(r"(?i)\b(fifa|world cup)\b", q) for q in out
+        # Sports domain present in work but missing from outputs
+        missing_sports = "sports" in intent_domains(work) and not any(
+            _is_schedule_or_sports_clause(q) or re.search(r"(?i)\b(fifa|world cup|nhl|nba|nfl|mlb|schedule|fixture)\b", q)
+            for q in out
         )
-        if chatty or missing_price or orphan_price or missing_fifa or len(forced) > len(out):
+        if chatty or missing_price or orphan_price or missing_sports or len(forced) > len(out):
             return forced[:5]
     return out[:5]
 
@@ -1189,16 +1512,19 @@ def decompose_search_intents(text: str, llm_invoke=None) -> list[str]:
 
 
 def enrich_sports_query_with_subject(query: str, subject: str) -> str:
-    """Pin league/team from prior subject onto bare schedule follow-ups.
+    """Pin league/match context from prior subject onto bare schedule follow-ups.
 
-    Live: \"july 9th what games?\" after a FIFA turn should not search generic \"sports games\".
+    Structural: \"july 9th what games?\" after a World Cup turn keeps competition context.
+    Never injects a hard-coded franchise nickname.
     """
     q = _normalize_text(query)
     sub = _normalize_text(subject)
     if not q or not sub:
         return q
-    # Already league-specific
-    if re.search(r"(?i)\b(fifa|world\s*cup|nhl|nba|nfl|mlb|uefa|premier\s*league|oilers|flames)\b", q):
+    # Already has league or a vs-side matchup
+    if re.search(r"(?i)\b(fifa|world\s*cup|nhl|nba|nfl|mlb|uefa|premier\s*league)\b", q):
+        return q
+    if _extract_vs_sides(q):
         return q
     # Only enrich schedule / slate style asks
     if not (
@@ -1209,19 +1535,26 @@ def enrich_sports_query_with_subject(query: str, subject: str) -> str:
     # Don't rewrite non-sports subjects
     if not (
         _is_schedule_or_sports_clause(sub)
-        or re.search(r"(?i)\b(fifa|world\s*cup|nhl|nba|nfl|mlb|match|score|oilers)\b", sub)
+        or re.search(r"(?i)\b(fifa|world\s*cup|nhl|nba|nfl|mlb|match|score|vs\.?|versus)\b", sub)
     ):
         return q
     if re.search(r"(?i)\b(fifa|world\s*cup)\b", sub):
         return _normalize_sports_query(f"FIFA World Cup {q}")
-    if re.search(r"(?i)\b(nhl|oilers|flames|canucks)\b", sub):
+    if re.search(r"(?i)\bnhl\b|\bhockey\b", sub):
         return _normalize_sports_query(f"NHL {q}")
-    if re.search(r"(?i)\bnba\b", sub):
+    if re.search(r"(?i)\bnba\b|\bbasketball\b", sub):
         return _normalize_sports_query(f"NBA {q}")
     if re.search(r"(?i)\bnfl\b", sub):
         return _normalize_sports_query(f"NFL {q}")
-    if re.search(r"(?i)\bmlb\b", sub):
+    if re.search(r"(?i)\bmlb\b|\bbaseball\b", sub):
         return _normalize_sports_query(f"MLB {q}")
+    # Prior subject has free-form sides or team phrase — prepend them
+    sides = _extract_vs_sides(sub)
+    if sides:
+        return _normalize_sports_query(f"{sides} {q}")
+    team = _extract_teamish_phrase(sub)
+    if team and team.lower() not in q.lower():
+        return _normalize_sports_query(f"{team} {q}")
     return q
 
 
@@ -1307,15 +1640,12 @@ def resolve_web_search_queries(
         if len(forced) >= 2:
             multi = forced
 
-    # Rebind bare "how much will it cost" → GTA price when parent turn has GTA
+    # Rebind bare "how much will it cost" → product price when parent turn has a title
     multi = _rebind_orphan_queries(multi_src, multi)
-    # If GTA+price still missing grounded price query, inject it
-    if _has_gta_context(multi_src) and re.search(r"(?i)\b(how much|cost|price)\b", multi_src):
-        if not any(
-            re.search(r"(?i)\b(price|cost|pre-?order)\b", q) and re.search(r"(?i)\bgta\b", q)
-            for q in multi
-        ):
-            multi = _dedupe_queries(list(multi) + [_normalize_gta_price_query(multi_src)])
+    # If product+price still missing grounded price query, inject it
+    if _has_product_title_context(multi_src) and re.search(r"(?i)\b(how much|cost|price)\b", multi_src):
+        if not any(re.search(r"(?i)\b(price|cost|pre-?order)\b", q) for q in multi):
+            multi = _dedupe_queries(list(multi) + [_normalize_product_price_query(multi_src)])
 
     return _dedupe_queries(multi)[:5]
 
@@ -1350,13 +1680,12 @@ def split_web_search_queries(text: str) -> list[str]:
     if _is_schedule_or_sports_clause(work) and not _is_weather_clause(work):
         return [_normalize_sports_query(work)]
     if (_has_trailer_intent(work) or _has_character_cast_intent(work)) and (
-        _has_gta_context(work) or _has_trailer_intent(work)
+        _has_product_title_context(work) or _has_trailer_intent(work)
     ):
-        # Single side of GTA (only trailer or only cast) — one query
         if _has_trailer_intent(work) and not _has_character_cast_intent(work):
-            return [_normalize_gta_trailer_query(work, full_context=work)]
+            return [_normalize_product_trailer_query(work, full_context=work)]
         if _has_character_cast_intent(work) and not _has_trailer_intent(work):
-            return [_normalize_gta_characters_query(work)]
+            return [_normalize_product_cast_query(work)]
 
     single = normalize_web_search_query_single(work)
     return [single] if single else []
@@ -1403,7 +1732,7 @@ def normalize_web_search_query_single(query: str) -> str:
         score = 0
         if _RELEASE_DATE_RE.search(c):
             score += 5
-        if any(t in low for t in ("weather", "forecast", "score", "trailer", "gta", "news", "price", "stock")):
+        if any(t in low for t in ("weather", "forecast", "score", "trailer", "news", "price", "stock", "release")):
             score += 3
         if re.search(r"\b(when|what|who|where|which|how much|how many)\b", low):
             score += 2
@@ -1433,52 +1762,29 @@ def normalize_web_search_query_single(query: str) -> str:
         q_notes = re.sub(r"(?i)\b(latest|new|official|current)\b", " ", q_notes)
         q_notes = _normalize_text(q_notes)
         # Prefer crisp doc query
-        if re.search(r"(?i)\bpython\b", q_notes):
-            return "Python latest release notes changelog official"
+        # Keep whatever product/language the user named (not Python-only)
         if q_notes:
-            return q_notes if "release notes" in q_notes.lower() else f"{q_notes} release notes"
+            if "release notes" in q_notes.lower() or "changelog" in q_notes.lower():
+                return q_notes
+            return f"{q_notes} release notes changelog official"
         return "release notes changelog official"
 
-    # Known entity rewrite: GTA / Grand Theft Auto trailer N (and bare "trailer 3")
-    if _has_trailer_intent(q) and (_has_gta_context(q) or _has_trailer_intent(q)):
-        # Prefer GTA Trailer N when trailer number present (default franchise context)
-        return _normalize_gta_trailer_query(q, full_context=q)
-    if _has_gta_context(q) and _has_character_cast_intent(q):
-        return _normalize_gta_characters_query(q)
-    # GTA release / price (single-intent compact — multi fans out elsewhere)
-    if _has_gta_context(q):
-        wants_price = bool(
-            re.search(r"(?i)\b(how much|cost|price|money it costs|pre-?order|editions?)\b", q)
-        )
-        wants_release = _has_gta_release_intent(q) or bool(
+    # Product/title rewrite: any franchise with trailer / cast / release / price structure
+    if _has_trailer_intent(q) and (_has_product_title_context(q) or _has_trailer_intent(q)):
+        return _normalize_product_trailer_query(q, full_context=q)
+    if _has_product_title_context(q) and _has_character_cast_intent(q):
+        return _normalize_product_cast_query(q)
+    if _has_product_title_context(q) or _extract_title_entity(q):
+        wants_price = _has_product_price_intent(q)
+        wants_release = _has_product_release_intent(q) or bool(
             re.search(r"(?i)\b(when|release|launch|come out)\b", q)
         )
         if wants_price and not wants_release:
-            return _normalize_gta_price_query(q)
+            return _normalize_product_price_query(q)
         if wants_release:
-            # Prefer release for single-string path; multi-intent adds price separately
-            return _normalize_gta_release_query(q)
+            return _normalize_product_release_query(q)
         if wants_price:
-            return _normalize_gta_price_query(q)
-    gta = re.search(
-        r"(?i)\b(?:gta|grand theft auto)\s*(?:6|vi|six)?\b.*?\btrailer\s*(\d+)\b"
-        r"|\btrailer\s*(\d+)\b.*?\b(?:gta|grand theft auto)\s*(?:6|vi|six)?\b",
-        q,
-    )
-    if not gta:
-        # "trailer 3 for gta 6" / "new trailer ... gta 6"
-        gta = re.search(
-            r"(?i)\btrailer\s*(\d+)\b.{0,40}\b(?:gta|grand theft auto)\s*(6|vi|six)\b"
-            r"|\b(?:gta|grand theft auto)\s*(6|vi|six)\b.{0,40}\btrailer\s*(\d+)\b"
-            r"|\b(?:gta|grand theft auto)\s*(6|vi|six)\b.{0,40}\btrailer\b",
-            q,
-        )
-    if gta:
-        nums = [g for g in gta.groups() if g]
-        trailer_n = next((n for n in nums if n.isdigit()), None)
-        if trailer_n:
-            return f"GTA 6 Trailer {trailer_n} release date announcement Rockstar"
-        return "GTA 6 trailer release date announcement Rockstar"
+            return _normalize_product_price_query(q)
 
     # Sports / next-game compact form
     if _is_schedule_or_sports_clause(q):
@@ -1538,11 +1844,6 @@ def normalize_web_search_query(query: str) -> str:
     For multi-intent (sports + weather), returns the *primary* query only.
     Callers that need every intent must use ``split_web_search_queries``.
 
-    Examples:
-      "how're you feeling? and i wonder when that new trailer comes out for trailer 3 for gta 6 hey?"
-        → "GTA 6 Trailer 3 release date"
-      "search for canada vs morocco score"
-        → "canada vs morocco score"
     """
     parts = split_web_search_queries(query)
     if parts:
@@ -1554,12 +1855,15 @@ def normalize_web_search_query(query: str) -> str:
                 t in low
                 for t in (
                     "weather", "forecast", "score", "schedule", "trailer", "odds",
-                    "price", "nhl", "world cup", "gta", "temperature",
+                    "price", "nhl", "nba", "nfl", "mlb", "world cup", "temperature",
+                    "release", "cast", "characters",
                 )
             ):
                 score += 6
             if re.search(r"\b(vs|versus|tomorrow|today|tonight|release)\b", low):
                 score += 3
+            if _extract_title_entity(p) or _extract_teamish_phrase(p):
+                score += 2
             if _is_smalltalk_clause(p):
                 score -= 10
             score += min(len(p.split()), 6)
@@ -1645,8 +1949,8 @@ def _infer_mode(query: str) -> str:
 
 def build_search_intent(original_request: str, resolved_request: str = "", current_subject: str = "") -> SearchIntent:
     # Classify primarily from the *resolved* compact query so a multi-intent
-    # original ("oilers game and weather") does not force weather mode onto a
-    # sports-only resolved string (that produced "oilers game weather forecast").
+    # original ("team game and weather") does not force weather mode onto a
+    # sports-only resolved string.
     original = apply_spelling_fixes(_normalize_text(original_request))
     raw_resolved = apply_spelling_fixes(_normalize_text(resolved_request or original_request))
     # Already-compact caller query (from multi-split): refine single-intent only.
@@ -1677,24 +1981,48 @@ def build_search_intent(original_request: str, resolved_request: str = "", curre
     )
     sports_event = bool(
         re.search(
-            r"\b(world cup|fifa|nhl|nba|nfl|mlb|soccer|football|hockey|match(?:es)?|fixture|tournament)\b",
+            r"\b(world cup|fifa|nhl|nba|nfl|mlb|soccer|football|hockey|basketball|"
+            r"match(?:es)?|fixture|tournament|vs\.?|versus)\b",
             combined,
         )
+        or bool(_extract_teamish_phrase(low) and re.search(r"\b(game|match|schedule|score)\b", low))
     )
     schedule = (
         any(term in low for term in _SCHEDULE_TERMS)
         or any(term in low_orig for term in _SCHEDULE_TERMS)
         or bool(re.search(r"\b(next game|schedule|fixture)\b", low))
-        or bool(re.search(r"\b(oilers|flames|canucks|nhl)\b", low) and re.search(r"\b(game|match)\b", low))
+        or bool(
+            re.search(r"\b(game|match)\b", low)
+            and (
+                re.search(r"\b(nhl|nba|nfl|mlb|fifa|world cup)\b", low)
+                or _extract_teamish_phrase(low)
+                or _extract_vs_sides(low)
+            )
+        )
         or (who_playing and (near_future or sports_event))
         or (near_future and sports_event and re.search(r"\b(play|playing|game|match|vs|versus)\b", combined))
     )
-    live_score = any(term in low for term in _LIVE_SCORE_TERMS) and any(
-        sport in low
-        for sport in [
-            "game", "match", "fifa", "world cup", "soccer", "football",
-            "nhl", "nba", "nfl", "mlb", "canada", "morocco", "oilers",
-        ]
+    # Product "price" / "live price" is never a sports live-score intent
+    productish = bool(
+        re.search(
+            r"\b(price|cost|msrp|pre-?order|trailer|release date|steam|bitcoin|btc|crypto)\b",
+            low,
+        )
+    )
+    live_score = (not productish) and any(term in low for term in _LIVE_SCORE_TERMS) and (
+        re.search(
+            r"\b(game|match|fifa|world cup|soccer|football|nhl|nba|nfl|mlb|vs\.?|versus|"
+            r"score|scores|who won)\b",
+            low,
+        )
+        or (
+            # Bare "live" is not enough — need score language or a vs-side
+            bool(_extract_vs_sides(low))
+            or (
+                re.search(r"\b(score|scores)\b", low)
+                and bool(_extract_teamish_phrase(low))
+            )
+        )
     )
     recency = (
         any(term in low for term in _RECENT_TERMS)
@@ -1727,10 +2055,15 @@ def build_search_intent(original_request: str, resolved_request: str = "", curre
     ambiguous = bool(current_subject and re.search(r"\b(deeper|more|again|that|this|it|continue|go further)\b", low_orig))
     mode = "recent" if recency else "general"
     # Never force weather mode onto a pure sports/schedule query.
+    # Teamish phrase alone is not sportsy (place names like "Edmonton weather" are not schedules).
     sportsy = bool(
         re.search(
-            r"\b(oilers|flames|canucks|nhl|nba|nfl|mlb|next game|schedule|fixture|world cup|fifa)\b",
+            r"\b(nhl|nba|nfl|mlb|next game|schedule|fixture|world cup|fifa|vs\.?|versus)\b",
             low,
+        )
+        or (
+            _extract_teamish_phrase(low)
+            and re.search(r"\b(game|match|score|schedule|fixture|play|playing)\b", low)
         )
     ) or schedule
     if weather and not sportsy:
@@ -1854,7 +2187,7 @@ class SearchGrounder:
                     ["schedule", "date"],
                 ),
                 SearchCandidate(
-                    f"{base} fixtures {day_word} ESPN OR FIFA.com",
+                    f"{base} fixtures {day_word} site:espn.com OR site:cbssports.com",
                     "schedule authority",
                     0.9,
                     ["schedule", "source"],
@@ -1882,11 +2215,26 @@ class SearchGrounder:
     def _deeper_schedule_candidates(self, base: str, intent: SearchIntent) -> list[SearchCandidate]:
         """Second-pass queries when first schedule candidates were weak."""
         year = datetime.now().strftime("%Y")
-        team = _normalize_text(re.sub(r"(?i)\b(next game|schedule|nhl|date|time|this year)\b", " ", base))
+        team = _normalize_text(
+            re.sub(r"(?i)\b(next game|schedule|nhl|nba|nfl|mlb|fifa|world cup|date|time|this year)\b", " ", base)
+        )
         team = team or base
+        low = (base or "").lower()
+        # Authority site from league keyword in query — not a fixed franchise host
+        site = "site:espn.com"
+        if re.search(r"\b(nhl|hockey)\b", low):
+            site = "site:nhl.com OR site:espn.com"
+        elif re.search(r"\b(nba|basketball)\b", low):
+            site = "site:nba.com OR site:espn.com"
+        elif re.search(r"\b(nfl)\b", low):
+            site = "site:nfl.com OR site:espn.com"
+        elif re.search(r"\b(mlb|baseball)\b", low):
+            site = "site:mlb.com OR site:espn.com"
+        elif re.search(r"\b(fifa|world cup)\b", low):
+            site = "site:fifa.com OR site:espn.com"
         return [
             SearchCandidate(f"{team} next game {year}", "deeper next game year", 0.92, ["schedule", "deeper"]),
-            SearchCandidate(f"site:nhl.com {team} schedule", "deeper nhl.com", 0.91, ["schedule", "deeper"]),
+            SearchCandidate(f"{site} {team} schedule", "deeper authority", 0.91, ["schedule", "deeper"]),
             SearchCandidate(f"{team} upcoming games schedule ESPN", "deeper espn", 0.88, ["schedule", "deeper"]),
         ]
 
@@ -1983,20 +2331,28 @@ class SearchGrounder:
                         accepted=True,
                     )
 
-        # Soft-accept entertainment / cast / trailer rumors when named entities appear
-        # (prevents "no information about characters" after sources mention Lucia/Jason).
+        # Soft-accept entertainment / cast / trailer when evidence carries structure
+        # (named people, trailer windows) — no franchise-specific character lists.
         low_resolved = (intent.resolved_request or "").lower()
         if best_evidence and (
             "character" in low_resolved
             or "cast" in low_resolved
             or "trailer" in low_resolved
-            or "lucia" in low_resolved
-            or "gta" in low_resolved
+            or "protagonist" in low_resolved
+            or "release" in low_resolved
         ):
             for e in best_evidence[:5]:
                 hay = f"{e.title} {e.summary}".lower()
+                # Structural name signals: First Last pairs, or "playable/protagonist" language
                 has_names = bool(
-                    re.search(r"\b(lucia|jason|duval|caminos|leonida|vice city|rockstar)\b", hay)
+                    re.search(
+                        r"\b[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}\b",
+                        f"{e.title} {e.summary}",
+                    )
+                    or re.search(
+                        r"\b(protagonist|playable|cast includes|voiced by|stars?)\b",
+                        hay,
+                    )
                 )
                 has_trailer_window = bool(
                     re.search(
@@ -2265,7 +2621,7 @@ class SearchGrounder:
             return True
         if has_next and (has_date or has_time or has_matchup):
             return True
-        if has_time and any(w in hay for w in ("game", "match", "play", "host", "visit", "face", "oilers", "flames")):
+        if has_time and any(w in hay for w in ("game", "match", "play", "host", "visit", "face", "kickoff", "vs")):
             return True
         if has_date and has_matchup:
             return True

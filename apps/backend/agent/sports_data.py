@@ -68,9 +68,10 @@ def is_live_sports_data_intent(text: str) -> bool:
         return True
     if _LIVE_SCORE_RE.search(low):
         return True
-    # "oilers score" / "lakers game score"
+    # "score" + game language / live deictics / vs-structure — not a team nickname list
     if re.search(r"(?i)\bscore\b", low) and re.search(
-        r"(?i)\b(game|match|oilers|flames|canucks|lakers|nhl|nba|nfl|mlb|fifa|world cup)\b",
+        r"(?i)\b(game|match|vs\.?|versus|nhl|nba|nfl|mlb|fifa|world cup|"
+        r"live|right now|currently|tonight|today)\b",
         low,
     ):
         return True
@@ -89,16 +90,17 @@ def live_sports_mode(text: str) -> str:
     return "scores"
 
 
-# Sport key mapping for The Odds API
+# Sport key mapping for The Odds API — league/sport keywords only (no franchise nicknames).
+# Unknown team without a league keyword → None → web fallback (correct capability boundary).
 _SPORT_KEYS: List[Tuple[re.Pattern, str]] = [
-    (re.compile(r"(?i)\b(nhl|hockey|oilers|flames|canucks|leafs|bruins)\b"), "icehockey_nhl"),
-    (re.compile(r"(?i)\b(nba|lakers|celtics|raptors|basketball)\b"), "basketball_nba"),
-    (re.compile(r"(?i)\b(nfl|super\s*bowl|football\s*game)\b"), "americanfootball_nfl"),
-    (re.compile(r"(?i)\b(mlb|baseball|blue\s*jays|yankees)\b"), "baseball_mlb"),
-    (re.compile(r"(?i)\b(mls|soccer)\b"), "soccer_usa_mls"),
+    (re.compile(r"(?i)\b(nhl|hockey)\b"), "icehockey_nhl"),
+    (re.compile(r"(?i)\b(nba|basketball)\b"), "basketball_nba"),
+    (re.compile(r"(?i)\b(nfl|super\s*bowl)\b"), "americanfootball_nfl"),
+    (re.compile(r"(?i)\b(mlb|baseball)\b"), "baseball_mlb"),
+    (re.compile(r"(?i)\b(mls)\b"), "soccer_usa_mls"),
     (re.compile(r"(?i)\b(epl|premier\s*league)\b"), "soccer_epl"),
     (re.compile(r"(?i)\b(fifa|world\s*cup|uefa)\b"), "soccer_fifa_world_cup"),
-    (re.compile(r"(?i)\bnfl\b"), "americanfootball_nfl"),
+    (re.compile(r"(?i)\bsoccer\b"), "soccer_usa_mls"),
 ]
 
 
@@ -109,18 +111,36 @@ def infer_sport_key(text: str) -> Optional[str]:
     return None
 
 
+_TEAM_TOKEN_STOP = {
+    "the", "a", "an", "score", "scores", "game", "games", "match", "matches",
+    "live", "right", "now", "currently", "tonight", "today", "tomorrow",
+    "odds", "moneyline", "spread", "standings", "what", "whats", "who", "won",
+    "winning", "for", "of", "and", "vs", "versus", "against", "at", "in",
+    "nhl", "nba", "nfl", "mlb", "fifa", "world", "cup", "hockey", "basketball",
+    "soccer", "football", "baseball", "please", "check", "get", "me", "my",
+}
+
+
 def infer_team_tokens(text: str) -> List[str]:
-    low = (text or "").lower()
-    teams = []
-    for tok in (
-        "oilers", "flames", "canucks", "leafs", "bruins", "rangers",
-        "lakers", "celtics", "raptors", "warriors", "knicks",
-        "cowboys", "chiefs", "eagles", "blue jays", "yankees",
-        "canada", "morocco", "portugal", "spain", "brazil",
-    ):
-        if tok in low:
-            teams.append(tok)
-    return teams
+    """Free-form residual tokens — not a franchise whitelist."""
+    words = re.findall(r"[A-Za-z][A-Za-z'-]*", text or "")
+    out: List[str] = []
+    for w in words:
+        lw = w.lower()
+        if lw in _TEAM_TOKEN_STOP or len(lw) < 2:
+            continue
+        if lw not in out:
+            out.append(lw)
+    # Prefer multi-word vs sides if present
+    m = re.search(
+        r"(?i)\b([a-z][a-z'-]+)\s+(?:vs\.?|versus|against)\s+([a-z][a-z'-]+)\b",
+        text or "",
+    )
+    if m:
+        for side in (m.group(1).lower(), m.group(2).lower()):
+            if side not in _TEAM_TOKEN_STOP and side not in out:
+                out.insert(0, side)
+    return out[:6]
 
 
 @dataclass
