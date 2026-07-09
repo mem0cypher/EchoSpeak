@@ -9714,6 +9714,24 @@ class EchoSpeakAgent:
             if str(tr.get("tool") or "").strip()
         }
 
+    def _is_software_game_coding_context(self, text: str) -> bool:
+        """Game/code edit talk — never treat 'score/kill/enemy' as live sports web search."""
+        low = re.sub(r"\s+", " ", str(text or "").lower())
+        if not low:
+            return False
+        if re.search(
+            r"\b(javascript|\.js\b|html|css|canvas|game\.js|index\.html|"
+            r"enemy|enemies|enimies|npc|player|bullet|shooter|spawn|"
+            r"desktop[/\\].*game|2d[- ]?shooter|code it|edit the game)\b",
+            low,
+        ):
+            return True
+        if re.search(r"\b(kill|score|hit)\b", low) and re.search(
+            r"\b(enemy|enemies|enimies|player|npc|bullet|game)\b", low
+        ):
+            return True
+        return False
+
     def _needs_live_web_fulfillment(self, user_input: str) -> bool:
         """True when the user clearly needs fresh web facts (weather, scores, news…).
 
@@ -9724,6 +9742,19 @@ class EchoSpeakAgent:
         low = re.sub(r"\s+", " ", q.strip().lower())
         if not low:
             return False
+        # Coding / Desktop project / software game edits never need live web recovery
+        if (
+            self._is_coding_project_intent(user_input)
+            or self._is_local_filesystem_intent(user_input)
+            or self._is_software_game_coding_context(user_input)
+            or self._coding_workspace_active()
+        ):
+            if not re.search(
+                r"\b(search the web|google|look up online|weather|forecast|stock price|"
+                r"bitcoin|news headlines|fifa|world cup)\b",
+                low,
+            ):
+                return False
         # Hard gate: local work wins over any accidental live-web signal
         if self._is_local_filesystem_intent(user_input) or self._is_local_filesystem_intent(q):
             # Allow only if they ALSO asked for pure web facts with clear online markers
@@ -9868,12 +9899,24 @@ class EchoSpeakAgent:
         (common with small models: they *say* they'll check and stop), force a search
         and rewrite the answer from results.
         """
-        # Never inject internet search into Desktop/project/file turns
-        if self._is_local_filesystem_intent(user_input):
+        # Never inject internet search into Desktop/project/coding turns
+        # Live bug: "add a score when we kill enemies" → forced web_search as sports.
+        if (
+            self._is_local_filesystem_intent(user_input)
+            or self._is_coding_project_intent(user_input)
+            or self._is_software_game_coding_context(user_input)
+            or self._coding_workspace_active()
+        ):
+            return response_text
+        # Respect per-turn tool allowlist (coding turns exclude web_search)
+        allowed = getattr(self, "_current_allowed_tools", None)
+        if allowed is not None and "web_search" not in allowed:
+            return response_text
+        used = self._tools_used_this_turn()
+        if used & {"file_read", "file_write", "file_list", "file_mkdir", "terminal_run"}:
             return response_text
         if not self._needs_live_web_fulfillment(user_input):
             return response_text
-        used = self._tools_used_this_turn()
         if "web_search" in used:
             return response_text
         if not self._tool_available_in_current_context("web_search"):
@@ -10593,25 +10636,97 @@ class EchoSpeakAgent:
             _fe_edit_match = re.search(r"\b(fix|edit|trim|shorten|update|change|modify|rewrite|cut|reduce|shrink|make .+ more)\b", _fe_low)
             if _fe_file_match and _fe_edit_match:
                 logger.info("File-edit intent detected, routing through task planner pipeline")
-                # Resolve the file path
+                # Resolve the file path — prefer active Desktop project, never EchoSpeak root by accident
                 _fe_filename = _fe_file_match.group(1)
+                # "javascript file" / "game" without name → game.js when project is a shooter
+                if re.search(r"(?i)\b(javascript|js file|game\.js|the game)\b", user_input) and not re.search(
+                    r"(?i)\.js\b", _fe_filename
+                ):
+                    if re.search(r"(?i)index\.html", _fe_filename) and re.search(
+                        r"(?i)\b(javascript|game\.js|js file)\b", user_input
+                    ):
+                        # User asked for both JS and HTML — prefer game.js as primary edit target
+                        # (index only if no game.js; multi handled below)
+                        pass
                 if _fe_filename.lower() in ("soul", "soul.md"):
                     _fe_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "SOUL.md")
                 else:
-                    # Try to resolve relative to workspace file root
-                    _ws_root = Path(getattr(config, "file_tool_root", ".") or ".").resolve()
-                    _candidate = (_ws_root / _fe_filename).resolve()
-                    # Safety: ensure the resolved path is within the workspace
+                    _fe_path = None
+                    _base = Path(_fe_filename).name  # index.html / game.js
+                    # 1) Active project root (Desktop/2d-shooter-game)
                     try:
-                        _candidate.relative_to(_ws_root)
-                    except ValueError:
-                        _candidate = None
-                    if _candidate and _candidate.exists():
-                        _fe_path = str(_candidate)
-                    elif Path(_fe_filename).exists():
-                        _fe_path = str(Path(_fe_filename).resolve())
-                    else:
-                        _fe_path = _fe_filename  # Let file_read handle the error
+                        from agent.tools import get_active_project_root, set_active_project_root
+
+                        _proj = get_active_project_root()
+                        if _proj is None:
+                            _pin = str(getattr(self, "_last_local_project_path", "") or "").strip()
+                            if _pin:
+                                set_active_project_root(_pin)
+                                _proj = get_active_project_root()
+                        if _proj is None:
+                            _pinned = self._try_pin_desktop_project_from_user(user_input)
+                            if _pinned:
+                                self._last_local_project_path = _pinned
+                                _proj = get_active_project_root()
+                        if _proj is not None:
+                            _cand = (_proj / _base).resolve()
+                            if _cand.exists():
+                                _fe_path = str(_cand)
+                    except Exception:
+                        pass
+                    # 2) Desktop/<project>/file from path-like mentions
+                    if not _fe_path and re.search(r"(?i)desktop", user_input):
+                        try:
+                            from agent.tools import _desktop_root
+
+                            _d = _desktop_root()
+                            for _child in _d.iterdir():
+                                if _child.is_dir() and (_child / _base).exists():
+                                    # Prefer project mentioned in subject / last pin
+                                    _subj = str(getattr(self, "_last_local_project_path", "") or "").lower()
+                                    if _subj and _child.name.lower() in _subj:
+                                        _fe_path = str((_child / _base).resolve())
+                                        break
+                            if not _fe_path:
+                                for _child in _d.iterdir():
+                                    if _child.is_dir() and (_child / _base).exists():
+                                        if re.search(r"(?i)game|shooter|project", _child.name):
+                                            _fe_path = str((_child / _base).resolve())
+                                            break
+                        except Exception:
+                            pass
+                    # 3) Workspace file root (EchoSpeak) — last resort only
+                    if not _fe_path:
+                        _ws_root = Path(getattr(config, "file_tool_root", ".") or ".").resolve()
+                        _candidate = (_ws_root / _fe_filename).resolve()
+                        try:
+                            _candidate.relative_to(_ws_root)
+                        except ValueError:
+                            _candidate = None
+                        # Avoid hijacking to EchoSpeak/index.html when a Desktop game exists
+                        if _candidate and _candidate.exists():
+                            if _base.lower() in {"index.html", "game.js", "style.css"}:
+                                # Prefer not to edit EchoSpeak repo game stubs
+                                if "echospeak" in str(_candidate).lower() and "desktop" not in str(_candidate).lower():
+                                    _candidate = None
+                        if _candidate and _candidate.exists():
+                            _fe_path = str(_candidate)
+                        elif Path(_fe_filename).exists():
+                            _fe_path = str(Path(_fe_filename).resolve())
+                        else:
+                            _fe_path = _fe_filename  # Let file_read handle the error
+
+                # If user asked for JS + HTML, edit game.js first (game logic), not EchoSpeak index
+                if re.search(r"(?i)\b(javascript|game\.js|js file)\b", user_input):
+                    try:
+                        from agent.tools import get_active_project_root
+
+                        _proj = get_active_project_root()
+                        if _proj and (_proj / "game.js").exists():
+                            _fe_path = str((_proj / "game.js").resolve())
+                            _fe_filename = "game.js"
+                    except Exception:
+                        pass
 
                 # Build a deterministic 2-task plan: read → write (confirmation-gated)
                 tasks = [
@@ -11235,6 +11350,24 @@ class EchoSpeakAgent:
         chat_history = self._history_as_messages() if include_memory else []
         graph_thread_id = thread_id if include_memory else None
         allowed_tool_names = self._allowed_lc_tool_names(resolved_input or extracted_input)
+        # Stash for post-Stage4 guards (_ensure_live_web_search must honor allowlist)
+        self._current_allowed_tools = allowed_tool_names
+        # Restore Desktop project pin across turns (lost when agent re-inits mid-session)
+        try:
+            from agent.tools import get_active_project_root, set_active_project_root
+
+            if get_active_project_root() is None:
+                pin = str(getattr(self, "_last_local_project_path", "") or "").strip()
+                if pin:
+                    set_active_project_root(pin)
+                else:
+                    pinned = self._try_pin_desktop_project_from_user(
+                        resolved_input or extracted_input or user_input
+                    )
+                    if pinned:
+                        self._last_local_project_path = pinned
+        except Exception:
+            pass
         logger.debug(f"DEBUG: allowed_tool_names for query: {allowed_tool_names}")
         logger.debug(f"DEBUG: lc_tools names: {[getattr(t, 'name', '') for t in (self.lc_tools or [])]}")
         time_context = ""
@@ -11332,16 +11465,38 @@ class EchoSpeakAgent:
         coding_local = (not local_intent) and self._is_coding_project_intent(user_input) and not self._is_explicit_web_query(
             (extracted_input or user_input or "").lower()
         )
-        if local_intent or coding_local:
+        if local_intent:
+            # Full deep-scan only for explicit desktop/folder inspect (first contact)
             self._add_pipeline_reasoning(
                 "⚙️ Stage 3: Shortcut Queries",
-                "Local filesystem / project intent — deep-scan: pin → list interior → read entry files.",
+                "Local filesystem / Desktop project intent — deep-scan: pin → list interior → read entry files.",
             )
             try:
                 self._ensure_workspace_for_intent(user_input)
                 self._run_local_project_deep_scan(user_input)
             except Exception as exc:
                 logger.debug("Desktop project deep-scan failed: {}", exc)
+            return None
+        if coding_local:
+            # Coding follow-ups: pin project, do NOT re-list Desktop every turn
+            self._add_pipeline_reasoning(
+                "⚙️ Stage 3: Shortcut Queries",
+                "Coding intent — pin project root, skip web; Stage 4 file tools.",
+            )
+            try:
+                self._ensure_workspace_for_intent(user_input)
+                from agent.tools import get_active_project_root, set_active_project_root
+
+                if get_active_project_root() is None:
+                    pinned = self._try_pin_desktop_project_from_user(user_input)
+                    if not pinned:
+                        pin = str(getattr(self, "_last_local_project_path", "") or "").strip()
+                        if pin:
+                            set_active_project_root(pin)
+                    elif pinned:
+                        self._last_local_project_path = pinned
+            except Exception as exc:
+                logger.debug("Coding pin failed: {}", exc)
             return None
 
         # Detect query type with keyword heuristics (zero LLM cost)

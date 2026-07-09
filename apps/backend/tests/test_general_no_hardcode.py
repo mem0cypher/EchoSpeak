@@ -179,6 +179,46 @@ def test_weather_place_structural_not_city_list():
     assert "weather" in bare.lower()
 
 
+def test_coding_score_enemy_never_forces_web_search():
+    """Live: 'add score when kill enemies' must not become live sports web_search."""
+    from agent.core import EchoSpeakAgent
+    import tempfile
+
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    q = (
+        "can we add a score everytime we kill one of the enimies and also make sure "
+        "that if they hit the player they disapear"
+    )
+    assert agent._is_software_game_coding_context(q) is True
+    assert agent._needs_live_web_fulfillment(q) is False
+    tools = agent._allowed_lc_tool_names(q)
+    agent._current_allowed_tools = tools
+    agent._partial_tool_results = [{"tool": "file_read", "output": "game.js ok"}]
+    out = agent._ensure_live_web_search(q, "I'll edit game.js for score and collision.")
+    assert "Unreal" not in out and "Unity" not in out
+    assert "I'll edit game.js" in out
+    assert "web_search" not in tools
+
+
+def test_file_edit_resolves_desktop_project_not_echospeak_root():
+    """index.html edit during shooter work must hit Desktop/2d-shooter-game, not EchoSpeak."""
+    from pathlib import Path
+    from agent.tools import set_active_project_root, get_active_project_root, _desktop_root
+
+    desk = _desktop_root()
+    proj = desk / "2d-shooter-game"
+    if not proj.is_dir():
+        return  # skip if not present
+    set_active_project_root(str(proj))
+    assert get_active_project_root() is not None
+    from agent.tools import _candidate_file_path, _file_tool_root
+
+    p = _candidate_file_path("index.html", _file_tool_root())
+    assert "2d-shooter-game" in str(p).replace("\\", "/")
+    assert "echospeak" not in str(p).lower() or "2d-shooter" in str(p).lower()
+    assert p.name == "index.html"
+
+
 def test_reflector_does_not_retry_accepted_grounded_packet():
     """Log bug: accepted=true still triggered reflector attempts 1 and 2."""
     from agent.core import EchoSpeakAgent, WebTaskReflector
