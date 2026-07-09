@@ -564,6 +564,58 @@ def _normalize_evidence(item: dict[str, Any], *, tool_name: str, fallback_query:
     }
 
 
+# Marker so wrappers can detect already-grounded tool output and avoid double-grounding.
+GROUNDED_SEARCH_MARKER = "[GROUNDED_SEARCH]"
+
+
+def is_grounded_search_output(text: str) -> bool:
+    return GROUNDED_SEARCH_MARKER in str(text or "")
+
+
+def format_grounded_tool_output(result: GroundedSearchResult) -> str:
+    """Format grounded search for LLM/tool consumers.
+
+    Accepted evidence is condensed for synthesis. Rejected / insufficient evidence
+    returns a structured block that forbids inventing a confident answer.
+    """
+    chosen = _normalize_text(result.chosen_query)
+    if result.accepted:
+        body = _normalize_text(result.condensed_evidence or result.raw_output)
+        return (
+            f"{GROUNDED_SEARCH_MARKER} accepted=true query={chosen}\n"
+            "Use ONLY the evidence below. Prefer concrete facts from these sources. "
+            "Do not invent scores, times, or outcomes not present here.\n\n"
+            f"{body}"
+        ).strip()
+
+    reason = "No candidate reached the relevance threshold."
+    if result.rejected_candidates:
+        reason = str(result.rejected_candidates[-1].get("reason") or reason)
+    best = _normalize_text(result.condensed_evidence or result.raw_output) or "(no usable snippets)"
+    rejected_lines = []
+    for item in (result.rejected_candidates or [])[:5]:
+        rejected_lines.append(
+            f"- query={_normalize_text(item.get('query'))}; "
+            f"score={item.get('score')}; "
+            f"reason={_normalize_text(item.get('reason'))}"
+        )
+    rejected_block = "\n".join(rejected_lines) if rejected_lines else "- (none recorded)"
+    return (
+        f"{GROUNDED_SEARCH_MARKER} accepted=false\n"
+        "SEARCH_EVIDENCE_INSUFFICIENT: true\n"
+        f"REASON: {reason}\n"
+        f"CHOSEN_QUERY: {chosen}\n"
+        "INSTRUCTION: Do NOT invent an answer. Do NOT claim a specific score, result, schedule, "
+        "odds, or release fact unless it appears in BEST_AVAILABLE_EVIDENCE below. "
+        "Tell the user the search evidence was insufficient for a confident answer, "
+        "summarize only what is weakly available if helpful, and offer a narrower retry query. "
+        "Never rephrase this as 'nothing found' when evidence exists but is weak — say the evidence "
+        "was insufficient to confirm the requested answer.\n"
+        f"REJECTED_CANDIDATES:\n{rejected_block}\n"
+        f"BEST_AVAILABLE_EVIDENCE:\n{best}"
+    ).strip()
+
+
 def build_research_run(*, run_id: str, tool_name: str, tool_input: str, output: str, at: float) -> Optional[dict[str, Any]]:
     if tool_name != "web_search":
         return None
@@ -572,10 +624,26 @@ def build_research_run(*, run_id: str, tool_name: str, tool_input: str, output: 
     if not raw or raw.lower().startswith("search failed") or raw.lower().startswith("no search results"):
         evidence: list[dict[str, Any]] = []
     else:
-        evidence = [_normalize_evidence(item, tool_name=tool_name, fallback_query=query, position=index) for index, item in enumerate(_parse_numbered_blocks(raw), start=1)]
+        # Strip grounded headers so the research panel still parses numbered blocks.
+        parse_src = raw
+        if is_grounded_search_output(raw):
+            # Prefer BEST_AVAILABLE_EVIDENCE / body after the instruction block.
+            marker_split = re.split(r"BEST_AVAILABLE_EVIDENCE:\s*", raw, maxsplit=1, flags=re.IGNORECASE)
+            if len(marker_split) == 2:
+                parse_src = marker_split[1]
+            else:
+                # accepted=true body after blank line following header
+                parts = raw.split("\n\n", 1)
+                parse_src = parts[1] if len(parts) == 2 else raw
+        evidence = [_normalize_evidence(item, tool_name=tool_name, fallback_query=query, position=index) for index, item in enumerate(_parse_numbered_blocks(parse_src), start=1)]
 
     evidence = [item for item in evidence if item.get("title") or item.get("url") or item.get("summary")]
     mode = _infer_mode(query)
+    grounded_accepted: Optional[bool] = None
+    if is_grounded_search_output(raw):
+        grounded_accepted = "accepted=true" in raw.splitlines()[0].lower() if raw else None
+        if grounded_accepted is None:
+            grounded_accepted = "SEARCH_EVIDENCE_INSUFFICIENT: true" not in raw
     return {
         "id": run_id,
         "tool": tool_name,
@@ -585,4 +653,6 @@ def build_research_run(*, run_id: str, tool_name: str, tool_input: str, output: 
         "recency_intent": mode == "recent",
         "evidence_count": len(evidence),
         "evidence": evidence,
+        "grounded": is_grounded_search_output(raw),
+        "grounded_accepted": grounded_accepted,
     }

@@ -1,8 +1,43 @@
 # EchoSpeak Roadmap
 
+## v7.4 — Harness Completeness (Gemma-first)
+
+**Status:** Done ✅ (spine A–F)  
+**Primary model:** Gemma 4 4B via LM Studio (native tool-calling golden path)  
+**Success bar:** ≥8/10 of E1–E10 eval fixtures stable; zero raw tool-call syntax in chat  
+**Autonomy:** confirm-default for all of v7.4 (no trusted-autonomous mode yet)  
+**CI eval board:** 10/10 deterministic fixtures pass (`tests/test_eval_harness_e1_e10.py`)  
+**Full suite:** 244 passed
+
+### Decisions locked
+
+- Search architecture: wrap tools with one shared `_grounded_web_search()` — do not re-enable Stage 3 for Gemma only.
+- Qwen (also auto tool-calling) benefits for free from generic tool wrapping; do not block on Qwen-specific testing.
+- Telegram OWNER-default security gap: separate small PR; does not block search parity.
+- `core.py` split: only after full suite green + eval board (now eligible for a later milestone).
+
+### Delivery sequence
+
+| Tag | Workstream | Status |
+|-----|------------|--------|
+| **v7.4.0** | **A — Search path parity** | **Done** |
+| **v7.4.1** | **B+C — Tool-call contract + Stage 4 recovery** | **Done** |
+| **v7.4.2** | **D — Context budget on Stage 5 + real summarize/compact** | **Done** |
+| **v7.4.3** | **E — Full suite green + endpoint contracts** | **Done** |
+| **v7.4.4** | **F — E1–E10 eval fixture board** | **Done** |
+
+### Completed
+
+- Shared `_grounded_web_search()` for Stage 3, TaskPlanner, and native LangGraph tools; structured insufficient-evidence packets.
+- Printed-tool intercept + telemetry; partial-tool synthesis after LangGraph failure.
+- Context budget compresses under pressure; Stage 5 + mid-task reinjection covered.
+- Endpoint contracts + full suite green; E1–E10 CI board with recorded fixtures.
+
+---
+
 ## v7.2.0 - Agent Reliability, Coding Lifecycle, and Memory Doctor
 
-**Status:** Proposed  
+**Status:** Largely shipped via v7.2–v7.3.x; remaining items folded into v7.4  
 **Baseline:** See [docs/AGENTIC_BASELINE_2026.md](docs/AGENTIC_BASELINE_2026.md)
 
 ### Priorities

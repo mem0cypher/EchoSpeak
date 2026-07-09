@@ -249,9 +249,13 @@ class _TraceHandler:
             pass
 
 from config import config, ModelProvider, get_llm_config, DATA_DIR
-from agent.context_budget import ContextBlock, ContextBudgetManager, estimate_tokens
+from agent.context_budget import ContextBlock, ContextBudgetManager, compress_text, estimate_tokens
 from agent.memory import AgentMemory
-from agent.research import SearchGrounder
+from agent.research import (
+    SearchGrounder,
+    format_grounded_tool_output,
+    is_grounded_search_output,
+)
 from agent.session_memory import SessionMemoryDistiller
 from agent.skills_registry import (
     build_skills_prompt,
@@ -579,58 +583,21 @@ class WebTaskReflector:
         
         q = str(task.get("params", {}).get("q") or task.get("params", {}).get("query") or "")
 
-        if bool(getattr(config, "search_grounding_enabled", True)):
-            target_tool = next((t for t in tools if t.name == tool_name), None)
-            if target_tool is not None and q:
-                used_original = False
+        # v7.4: single grounding path. Tool wrappers already ground native/TaskPlanner
+        # web_search results; never double-ground condensed packets.
+        if is_grounded_search_output(original_result):
+            return str(original_result or "")
 
-                def execute_candidate(candidate_q: str) -> str:
-                    nonlocal used_original
-                    if not used_original and candidate_q.strip().lower() == q.strip().lower():
-                        used_original = True
-                        return str(original_result or "")
-                    run_id = str(uuid.uuid4())
-                    try:
-                        if callbacks and hasattr(self.agent, "_emit_tool_start"):
-                            self.agent._emit_tool_start(callbacks, tool_name, candidate_q, run_id)
-                        result = str(target_tool.invoke(q=candidate_q) or "")
-                        if callbacks and hasattr(self.agent, "_emit_tool_end"):
-                            self.agent._emit_tool_end(callbacks, result, run_id)
-                        return result
-                    except Exception as exc:
-                        if callbacks and hasattr(self.agent, "_emit_tool_error"):
-                            self.agent._emit_tool_error(callbacks, exc, run_id)
-                        return ""
-
-                grounded = SearchGrounder(max_candidates=int(getattr(config, "search_grounding_max_candidates", 3) or 3)).ground(
+        if bool(getattr(config, "search_grounding_enabled", True)) and hasattr(self.agent, "_grounded_web_search"):
+            if q:
+                return self.agent._grounded_web_search(
+                    q,
                     original_request=q,
-                    resolved_request=q,
-                    current_subject=str(getattr(self.agent, "_current_subject_text", "") or ""),
-                    execute=execute_candidate,
-                    fetch_url=getattr(self.agent, "_fetch_search_result_page_text", None),
+                    callbacks=callbacks,
+                    emit_tool_events=True,
                 )
-                try:
-                    self.agent._last_grounded_search_result = grounded.as_dict()
-                    telemetry = getattr(self.agent, "_verification_telemetry", None)
-                    if telemetry is not None:
-                        for rejected in grounded.rejected_candidates:
-                            telemetry.record(
-                                "search_query_rejected",
-                                tool=tool_name,
-                                reason=str(rejected.get("reason") or "Search candidate rejected."),
-                                metadata={"query": rejected.get("query"), "score": rejected.get("score")},
-                            )
-                        if not grounded.accepted:
-                            telemetry.record(
-                                "search_evidence_insufficient",
-                                tool=tool_name,
-                                reason="WebTaskReflector compatibility grounding did not find strong evidence.",
-                                metadata={"chosen_query": grounded.chosen_query},
-                            )
-                except Exception:
-                    pass
-                return str(grounded.condensed_evidence or grounded.raw_output or original_result or "")
-        
+            return str(original_result or "")
+
         # If result is already good, return it
         if self._is_result_acceptable(q, original_result):
             logger.info(f"WebTaskReflector: original result accepted for query: {q[:80]}")
@@ -1749,7 +1716,8 @@ class EchoSpeakAgent:
             logger.warning(f"Failed to initialize MCP servers: {e}")
 
         # lc_tools = tools filtered by config safety gates
-        self.lc_tools = ToolRegistry.get_config_filtered_funcs(config)
+        # v7.4: wrap web_search so native LangGraph/ReAct tool calls hit SearchGrounder.
+        self.lc_tools = self._apply_search_grounding_to_lc_tools(ToolRegistry.get_config_filtered_funcs(config))
         self.tools = self._create_tools()
 
         # Merge MCP tools into self.tools
@@ -2531,7 +2499,7 @@ class EchoSpeakAgent:
             skill_tool_names.extend(new_tools)
         # Refresh lc_tools if new skill tools were registered
         if skill_tool_names:
-            self.lc_tools = ToolRegistry.get_config_filtered_funcs(config)
+            self.lc_tools = self._apply_search_grounding_to_lc_tools(ToolRegistry.get_config_filtered_funcs(config))
 
         # Skill → Plugin Bridge: load pipeline plugins from active skills
         for skill_def in skill_defs:
@@ -2838,6 +2806,16 @@ class EchoSpeakAgent:
                 candidates.extend(calls)
                 candidates.append(body)
 
+        # Common weak-model prose wrappers: "Action: file_write(...)", "call_tool: web_search ..."
+        for match in re.finditer(
+            r"(?:Action|call_tool|run_tool|invoke_tool)\s*:\s*((?:%s)\b.*)" % "|".join(sorted(map(re.escape, allowed))),
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            body = match.group(1).strip()
+            candidates.extend(_extract_function_calls(body))
+            candidates.append(body)
+
         for match in re.finditer(r"<\|tool_call\|?>(.*?)(?:<\|/tool_call\|?>|$)", text, flags=re.IGNORECASE | re.DOTALL):
             body = match.group(1).strip()
             calls = _extract_function_calls(body)
@@ -3020,10 +2998,52 @@ class EchoSpeakAgent:
             return f"Run terminal command in {cwd_val}: {str(cmd_val).strip()}"
         return display
 
+    def _looks_like_raw_tool_syntax(self, response_text: str) -> bool:
+        """Detect tool-shaped model output that must never leak as chat text."""
+        text = str(response_text or "")
+        if not text.strip():
+            return False
+        patterns = (
+            r"\|tool\|",
+            r"<execute_tool\b",
+            r"<tool_call\b",
+            r"<tool_code\b",
+            r"<\|tool_call\|?>",
+            r"```(?:json|tool|tool_call|execute_tool|tool_code)\b",
+            r"\b(?:call|run|invoke)_tool\s*\(",
+            r"\bAction\s*:\s*(?:file_write|terminal_run|web_search|file_read)\b",
+            r"\b(?:file_write|terminal_run|file_read|file_list|web_search)\s*\(",
+            r"call:\s*(?:file_write|terminal_run|web_search)\b",
+        )
+        return any(re.search(p, text, flags=re.IGNORECASE) for p in patterns)
+
+    def _record_tool_syntax_telemetry(self, reason: str, preview: str = "") -> None:
+        telemetry = getattr(self, "_verification_telemetry", None)
+        if telemetry is None:
+            return
+        try:
+            telemetry.record(
+                "tool_call_syntax_unrecognized",
+                reason=reason,
+                metadata={"preview": str(preview or "")[:500]},
+            )
+        except Exception:
+            pass
+
     def _handle_printed_tool_directive(self, response_text: str, user_input: str) -> Optional[str]:
         data = self._parse_printed_tool_directive(response_text)
-        if data is None and re.search(r"(\|tool\||<execute_tool\b|<tool_call\b|<tool_code\b|<\|tool_call\|?>|```(?:json|tool|tool_call|execute_tool|tool_code)?\s*\{)", str(response_text or ""), flags=re.IGNORECASE):
-            return "I recognized a tool-call-shaped response, but I could not safely parse it into an available action. Please restate the action in normal language."
+        toolish = self._looks_like_raw_tool_syntax(response_text)
+        if data is None and toolish:
+            # parse already records unrecognized when it saw toolish markers;
+            # also cover expanded patterns that only this detector knows about.
+            self._record_tool_syntax_telemetry(
+                "Printed tool-call-like text could not be parsed into an action.",
+                str(response_text or ""),
+            )
+            return (
+                "I recognized a tool-call-shaped response, but I could not safely parse it "
+                "into an available action. Please restate the action in normal language."
+            )
         if data and str(data.get("action") or "").strip().lower() == "file_write":
             has_path = any(str(data.get(k) or "").strip() for k in ("path", "file_path", "filepath", "filename"))
             if not has_path:
@@ -3031,6 +3051,48 @@ class EchoSpeakAgent:
                 if inferred_path:
                     data["path"] = inferred_path
         normalized = self._normalize_candidate_action(data) if data else None
+        if normalized is not None:
+            action = str(normalized.get("action") or "").strip().lower()
+            # Safe read-only / research tools: execute via harness (never silent side effects).
+            if action == "web_search":
+                q = str(normalized.get("query") or normalized.get("q") or "").strip()
+                if not q:
+                    q = str(user_input or "").strip()
+                grounded = self._grounded_web_search(q, original_request=user_input or q, emit_tool_events=True)
+                if is_grounded_search_output(grounded) and "SEARCH_EVIDENCE_INSUFFICIENT" in grounded:
+                    return (
+                        "I ran a web search from the model's tool-shaped output, but the evidence "
+                        "was insufficient for a confident answer.\n\n"
+                        f"{grounded}"
+                    )
+                try:
+                    summary = self._summarize_web_results(
+                        user_input or q,
+                        user_input or q,
+                        grounded,
+                        q,
+                        "",
+                        False,
+                        getattr(self, "_current_callbacks", None),
+                    )
+                    if summary:
+                        return summary
+                except Exception:
+                    pass
+                return grounded or "Search completed but returned no usable output."
+            if action in {"file_read", "file_list"}:
+                # Read-only: execute if allowed; never invent file contents.
+                tool = next((t for t in (self.tools or []) if t.name == action), None)
+                path = str(normalized.get("path") or "").strip()
+                if tool is not None and path and self._tool_allowed(action):
+                    try:
+                        if action == "file_read":
+                            return str(tool.invoke(path=path) or "")
+                        return str(tool.invoke(path=path) or "")
+                    except Exception as exc:
+                        return f"I tried to run {action} from printed tool syntax but it failed: {exc}"
+                return f"I recognized a {action} request but could not run it in the current workspace."
+
         pending = self._candidate_to_pending_action(normalized, user_input) if normalized else None
         if normalized is not None and pending is None:
             telemetry = getattr(self, "_verification_telemetry", None)
@@ -3047,6 +3109,7 @@ class EchoSpeakAgent:
             return "I recognized a tool request in the model output, but that tool is not available in the current workspace."
         if pending is None:
             return None
+        # v7.4: recovered action tools always become pending confirmation — never silent execute.
         preview = self._pending_preview_for_candidate(pending)
         self._set_pending_action(pending, preview, user_input)
         display = self._format_pending_action(self._pending_action or pending)
@@ -3667,7 +3730,11 @@ class EchoSpeakAgent:
         )
 
         tools = [
-            Tool("web_search", lambda q: web_search.invoke({"query": q}), "Search the web for information"),
+            Tool(
+                "web_search",
+                lambda q, _agent=self: _agent._grounded_web_search(q),
+                "Search the web for information (evidence-grounded)",
+            ),
             Tool("get_system_time", lambda: get_system_time.invoke({}), "Get current system time"),
             Tool("calculate", lambda expression: calculate.invoke({"expression": expression}), "Perform mathematical calculations"),
             Tool("system_info", lambda: system_info.invoke({}), "Get basic OS/CPU/GPU/RAM info"),
@@ -4221,6 +4288,204 @@ class EchoSpeakAgent:
         if q:
             self._last_web_query_context = q
 
+    def _raw_web_search_execute(self, query: str) -> str:
+        """Execute the underlying Tavily/web_search tool without grounding.
+
+        Used only as the SearchGrounder execute callback so candidate loops never
+        re-enter _grounded_web_search.
+        """
+        from agent.tools import web_search as raw_web_search
+
+        q = str(query or "").strip()
+        if not q:
+            return ""
+        try:
+            return str(raw_web_search.invoke({"query": q}) or "")
+        except TypeError:
+            try:
+                return str(raw_web_search.invoke(q) or "")
+            except Exception as exc:
+                logger.warning(f"raw web_search failed: {exc}")
+                return ""
+        except Exception as exc:
+            logger.warning(f"raw web_search failed: {exc}")
+            return ""
+
+    def _apply_search_grounding_to_lc_tools(self, tools: Optional[list]) -> list:
+        """Wrap web_search StructuredTools so native tool-calling hits grounding."""
+        out: list = []
+        for tool in tools or []:
+            name = str(getattr(tool, "name", "") or "")
+            if name == "web_search":
+                out.append(self._make_grounded_web_search_lc_tool(tool))
+            else:
+                out.append(tool)
+        return out
+
+    def _make_grounded_web_search_lc_tool(self, original: Any) -> Any:
+        """Build a LangChain tool that routes through _grounded_web_search."""
+        agent = self
+        description = (
+            str(getattr(original, "description", "") or "").strip()
+            or "Search the web for current information."
+        )
+        if "ground" not in description.lower():
+            description = description.rstrip(".") + " Results are evidence-grounded before return."
+
+        def _run(query: str = "", **kwargs: Any) -> str:
+            q = str(query or kwargs.get("query") or kwargs.get("q") or "").strip()
+            return agent._grounded_web_search(q, original_request=q, emit_tool_events=False)
+
+        try:
+            from langchain_core.tools import StructuredTool
+        except ImportError:
+            try:
+                from langchain.tools import StructuredTool  # type: ignore
+            except ImportError:
+                # Fallback: monkey-patch invoke on a thin wrapper object.
+                class _GroundedWebSearchTool:
+                    name = "web_search"
+                    description = description
+
+                    def invoke(self, input=None, **kwargs):  # noqa: A002
+                        if isinstance(input, dict):
+                            return _run(**input)
+                        if input is not None and not kwargs:
+                            return _run(str(input))
+                        return _run(**kwargs)
+
+                    def __call__(self, *args, **kwargs):
+                        if args:
+                            return _run(str(args[0]))
+                        return _run(**kwargs)
+
+                return _GroundedWebSearchTool()
+
+        schema = getattr(original, "args_schema", None)
+        try:
+            return StructuredTool.from_function(
+                func=_run,
+                name="web_search",
+                description=description,
+                args_schema=schema,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to wrap web_search with StructuredTool: {exc}")
+            return original
+
+    def _grounded_web_search(
+        self,
+        query: str,
+        *,
+        original_request: str = "",
+        callbacks: Optional[list] = None,
+        emit_tool_events: bool = True,
+    ) -> str:
+        """Single source of truth for web search grounding (v7.4 Workstream A).
+
+        Used by:
+        - Stage 3 shortcut path (_invoke_web_research_query)
+        - TaskPlanner / WebTaskReflector (via tool wrappers + reflector delegate)
+        - Native LangGraph/ReAct tool calls (lc_tools wrapper)
+        """
+        q = str(query or "").strip()
+        if not q:
+            return ""
+
+        if not bool(getattr(config, "search_grounding_enabled", True)):
+            run_id = str(uuid.uuid4())
+            if emit_tool_events:
+                self._emit_tool_start(callbacks, "web_search", q, run_id)
+            try:
+                raw = self._raw_web_search_execute(q)
+                if emit_tool_events:
+                    self._emit_tool_end(callbacks, raw, run_id)
+                return raw
+            except Exception as exc:
+                if emit_tool_events:
+                    self._emit_tool_error(callbacks, exc, run_id)
+                return ""
+
+        grounder = SearchGrounder(
+            max_candidates=int(getattr(config, "search_grounding_max_candidates", 3) or 3)
+        )
+        current_subject = str(
+            getattr(self, "_current_subject_text", "")
+            or getattr(self, "_last_web_query_context", "")
+            or ""
+        )
+        orig = str(original_request or q).strip() or q
+
+        def execute_candidate(candidate_query: str) -> str:
+            candidate_run_id = str(uuid.uuid4())
+            if emit_tool_events:
+                self._emit_tool_start(callbacks, "web_search", candidate_query, candidate_run_id)
+            try:
+                candidate_output = self._raw_web_search_execute(candidate_query)
+                if emit_tool_events:
+                    self._emit_tool_end(callbacks, candidate_output, candidate_run_id)
+                return candidate_output
+            except Exception as exc:
+                if emit_tool_events:
+                    self._emit_tool_error(callbacks, exc, candidate_run_id)
+                telemetry = getattr(self, "_verification_telemetry", None)
+                if telemetry is not None:
+                    telemetry.record(
+                        "search_evidence_irrelevant",
+                        tool="web_search",
+                        reason=f"Search tool failed: {exc}",
+                        metadata={"query": candidate_query},
+                    )
+                return ""
+
+        grounded = grounder.ground(
+            original_request=orig,
+            resolved_request=q,
+            current_subject=current_subject,
+            execute=execute_candidate,
+            fetch_url=self._fetch_search_result_page_text,
+        )
+        try:
+            self._last_grounded_search_result = grounded.as_dict()
+        except Exception:
+            self._last_grounded_search_result = {
+                "chosen_query": grounded.chosen_query,
+                "accepted": grounded.accepted,
+                "condensed_evidence": grounded.condensed_evidence,
+            }
+
+        telemetry = getattr(self, "_verification_telemetry", None)
+        if telemetry is not None:
+            for rejected in grounded.rejected_candidates:
+                telemetry.record(
+                    "search_query_rejected",
+                    tool="web_search",
+                    reason=str(rejected.get("reason") or "Search candidate rejected."),
+                    metadata={
+                        "query": rejected.get("query"),
+                        "score": rejected.get("score"),
+                        "original_request": orig,
+                    },
+                )
+            if not grounded.accepted:
+                telemetry.record(
+                    "search_evidence_insufficient",
+                    tool="web_search",
+                    reason="No grounded search candidate reached the relevance threshold.",
+                    metadata={"chosen_query": grounded.chosen_query, "original_request": orig},
+                )
+        try:
+            status = "accepted" if grounded.accepted else "insufficient"
+            self._emit_thinking_step(
+                "search",
+                f"Search grounding {status}: {grounded.chosen_query}",
+                "done",
+            )
+        except Exception:
+            pass
+
+        return format_grounded_tool_output(grounded)
+
     def _invoke_web_research_query(self, query_text: str, callbacks: Optional[list], time_context: str = "", apply_reflection: bool = True) -> tuple[str, str, str]:
         tool = self._preferred_web_research_tool()
         if tool is None:
@@ -4229,65 +4494,19 @@ class EchoSpeakAgent:
         ensured_time_context = self._ensure_time_context_for_query(query_text, callbacks, time_context)
         final_query = self._build_time_aware_web_query(query_text, ensured_time_context)
 
-        if (
-            bool(getattr(config, "search_grounding_enabled", True))
-            and getattr(tool, "name", "") == "web_search"
-        ):
-            grounder = SearchGrounder(max_candidates=int(getattr(config, "search_grounding_max_candidates", 3) or 3))
-            current_subject = str(getattr(self, "_current_subject_text", "") or getattr(self, "_last_web_query_context", "") or "")
-
-            def execute_candidate(candidate_query: str) -> str:
-                candidate_run_id = str(uuid.uuid4())
-                self._emit_tool_start(callbacks, tool.name, candidate_query, candidate_run_id)
-                try:
-                    candidate_output = str(tool.invoke(q=candidate_query) or "")
-                    self._emit_tool_end(callbacks, candidate_output, candidate_run_id)
-                    return candidate_output
-                except Exception as exc:
-                    self._emit_tool_error(callbacks, exc, candidate_run_id)
-                    telemetry = getattr(self, "_verification_telemetry", None)
-                    if telemetry is not None:
-                        telemetry.record(
-                            "search_evidence_irrelevant",
-                            tool=tool.name,
-                            reason=f"Search tool failed: {exc}",
-                            metadata={"query": candidate_query},
-                        )
-                    return ""
-
-            grounded = grounder.ground(
+        if getattr(tool, "name", "") == "web_search":
+            # Stage 3 + any shortcut path: always use the shared grounder.
+            tool_output = self._grounded_web_search(
+                final_query,
                 original_request=query_text,
-                resolved_request=final_query,
-                current_subject=current_subject,
-                execute=execute_candidate,
-                fetch_url=self._fetch_search_result_page_text,
+                callbacks=callbacks,
+                emit_tool_events=True,
             )
-            self._last_grounded_search_result = grounded.as_dict()
-            telemetry = getattr(self, "_verification_telemetry", None)
-            if telemetry is not None:
-                for rejected in grounded.rejected_candidates:
-                    telemetry.record(
-                        "search_query_rejected",
-                        tool=tool.name,
-                        reason=str(rejected.get("reason") or "Search candidate rejected."),
-                        metadata={
-                            "query": rejected.get("query"),
-                            "score": rejected.get("score"),
-                            "original_request": query_text,
-                        },
-                    )
-                if not grounded.accepted:
-                    telemetry.record(
-                        "search_evidence_insufficient",
-                        tool=tool.name,
-                        reason="No grounded search candidate reached the relevance threshold.",
-                        metadata={"chosen_query": grounded.chosen_query, "original_request": query_text},
-                    )
-            try:
-                self._emit_thinking_step("search", f"Search grounding chose: {grounded.chosen_query}", "done")
-            except Exception:
-                pass
-            return str(grounded.condensed_evidence or grounded.raw_output or ""), grounded.chosen_query, ensured_time_context
+            chosen = final_query
+            last = getattr(self, "_last_grounded_search_result", None) or {}
+            if isinstance(last, dict) and last.get("chosen_query"):
+                chosen = str(last.get("chosen_query") or final_query)
+            return str(tool_output or ""), chosen, ensured_time_context
 
         run_id = str(uuid.uuid4())
         self._emit_tool_start(callbacks, tool.name, final_query, run_id)
@@ -4330,19 +4549,57 @@ class EchoSpeakAgent:
         except Exception:
             return ""
 
+    def _make_context_budget_manager(self) -> ContextBudgetManager:
+        local_cfg = getattr(config, "local", None)
+        configured_window = int(getattr(config, "llm_trim_max_tokens", 0) or 0)
+        if configured_window <= 0:
+            configured_window = int(getattr(local_cfg, "context_length", 0) or 0)
+        if configured_window <= 0:
+            configured_window = 8192
+        return ContextBudgetManager(
+            context_window=configured_window,
+            reserve_tokens=int(getattr(config, "llm_trim_reserve_tokens", 1200) or 1200),
+            enabled=bool(getattr(config, "context_budget_enabled", True)),
+        )
+
+    def _budget_large_text(self, text: str, *, label: str = "blob", overhead_tokens: int = 0) -> str:
+        """Apply Stage 5 / reinjection budget so large tool dumps shrink under pressure."""
+        raw = str(text or "")
+        if not raw.strip():
+            return raw
+        try:
+            manager = self._make_context_budget_manager()
+            fitted, report = manager.fit_text(raw, overhead_tokens=overhead_tokens, label=label)
+            try:
+                self._last_context_budget_report = {
+                    **(self._last_context_budget_report if isinstance(self._last_context_budget_report, dict) else {}),
+                    **asdict(report),
+                    "budget_source": label,
+                }
+            except Exception:
+                self._last_context_budget_report = asdict(report)
+            return fitted
+        except Exception:
+            return raw
+
     def _check_context_budget_mid_task(self, phase: str, task: Dict[str, Any], output_text: str = "") -> None:
         try:
-            local_cfg = getattr(config, "local", None)
-            configured_window = int(getattr(config, "llm_trim_max_tokens", 0) or 0)
-            if configured_window <= 0:
-                configured_window = int(getattr(local_cfg, "context_length", 0) or 0)
-            if configured_window <= 0:
-                configured_window = 8192
-            manager = ContextBudgetManager(
-                context_window=configured_window,
-                reserve_tokens=int(getattr(config, "llm_trim_reserve_tokens", 1200) or 1200),
-                enabled=bool(getattr(config, "context_budget_enabled", True)),
+            manager = self._make_context_budget_manager()
+            # Actually compress large tool outputs under pressure instead of only logging.
+            raw_output = str(output_text or "")
+            tool_name = str(task.get("tool") or "tool")
+            compressed_output, out_report = manager.fit_text(
+                raw_output,
+                overhead_tokens=estimate_tokens(self._compose_system_prompt()) + 512,
+                label=f"tool_output:{tool_name}",
             )
+            if compressed_output != raw_output and self._partial_tool_results:
+                # Replace the latest matching tool result with the compressed form.
+                for tr in reversed(self._partial_tool_results):
+                    if str(tr.get("tool") or "") == tool_name or str(tr.get("output") or "")[:200] == raw_output[:200]:
+                        tr["output"] = compressed_output[:4000]
+                        break
+
             task_text = json.dumps(
                 {
                     "phase": phase,
@@ -4352,7 +4609,7 @@ class EchoSpeakAgent:
                         "status": task.get("status"),
                         "description": task.get("description"),
                     },
-                    "output_preview": str(output_text or "")[:4000],
+                    "output_preview": compressed_output[:2000],
                 },
                 ensure_ascii=False,
             )
@@ -4360,15 +4617,19 @@ class EchoSpeakAgent:
                 ContextBlock("active_task_plan", task_text, 1, "Active task plan", protected=True),
                 ContextBlock("pending_action", str(getattr(self, "_pending_action", "") or ""), 2, "Pending action", protected=True),
                 ContextBlock("current_subject", str(getattr(self, "_current_subject_text", "") or ""), 3, "Current subject", protected=True),
+                ContextBlock("tool_output", compressed_output, 8, "Latest tool output", min_chars=200, protected=False),
             ]
             overhead = estimate_tokens(self._compose_system_prompt()) + 256
-            stage = manager.pressure_stage(blocks, overhead_tokens=overhead)
+            _, fitted_report = manager.fit_blocks(blocks, overhead_tokens=overhead)
             previous = self._last_context_budget_report if isinstance(self._last_context_budget_report, dict) else {}
             self._last_context_budget_report = {
                 **previous,
+                **asdict(fitted_report),
                 "mid_task_phase": phase,
-                "mid_task_stage": stage,
-                "mid_task_tool": str(task.get("tool") or ""),
+                "mid_task_stage": fitted_report.stage,
+                "mid_task_tool": tool_name,
+                "tool_output_stage": out_report.stage,
+                "tool_output_compressed": bool(out_report.compressed_blocks),
             }
         except Exception:
             pass
@@ -5742,6 +6003,77 @@ class EchoSpeakAgent:
             return f"{preview_block}Reply 'confirm' to proceed or 'cancel' to abort."
         return f"{preview_block}{plan_block}I can do this: {display}. Reply 'confirm' to proceed or 'cancel' to abort."
     
+
+    def _harvest_tool_results_from_graph(self, result: Any) -> None:
+        """Collect ToolMessage outputs from a LangGraph result into partial-tool state."""
+        if not isinstance(result, dict):
+            return
+        messages = result.get("messages") or []
+        if not isinstance(messages, list):
+            return
+        seen = {(tr.get("tool"), tr.get("output")) for tr in (self._partial_tool_results or [])}
+        for msg in messages:
+            type_name = type(msg).__name__
+            name = str(getattr(msg, "name", "") or "").strip()
+            content = getattr(msg, "content", None)
+            if content is None:
+                continue
+            text = str(content)
+            if not text.strip():
+                continue
+            is_tool_msg = (
+                "ToolMessage" in type_name
+                or type_name == "ToolMessage"
+                or (name and type_name not in {"AIMessage", "HumanMessage", "SystemMessage"} and getattr(msg, "tool_call_id", None))
+            )
+            if not is_tool_msg and not name:
+                continue
+            tool_name = name or "tool"
+            key = (tool_name, text[:4000])
+            if key in seen:
+                continue
+            seen.add(key)
+            self._partial_tool_results.append({"tool": tool_name, "output": text[:4000]})
+
+    def _format_partial_tool_context(self, limit: int = 8) -> str:
+        parts: List[str] = []
+        for tr in (self._partial_tool_results or [])[:limit]:
+            tool = str(tr.get("tool") or "tool")
+            output = str(tr.get("output") or "")
+            parts.append(f"Tool '{tool}' returned:\n{output}")
+        return "\n\n".join(parts).strip()
+
+    def _synthesize_from_partial_tools(
+        self,
+        user_input: str,
+        context: str = "",
+    ) -> str:
+        """Turn completed tool results into an answer when Stage 4 agent loops fail."""
+        tool_context = self._format_partial_tool_context()
+        if not tool_context:
+            return ""
+        prompt = (
+            "You are Echo Speak. Tool calls already completed successfully, but the agent loop "
+            "failed before producing a final answer. Use ONLY the tool results below to answer "
+            "the user. Do not claim you cannot access tools or data that appears below. "
+            "If the tool results are insufficient, say what is still missing clearly.\n\n"
+        )
+        if context:
+            prompt += f"Context (memory + docs, may be empty):\n{context}\n\n"
+        prompt += (
+            f"Tool results:\n{tool_context}\n\n"
+            f"User request: {user_input}\n\n"
+            "Answer:"
+        )
+        try:
+            return self._clamp_tts_text(self._invoke_visible_llm(prompt))
+        except Exception as exc:
+            logger.warning(f"Partial-tool synthesis failed: {exc}")
+            tool_names = ", ".join(sorted({str(tr.get("tool") or "tool") for tr in self._partial_tool_results}))
+            return (
+                f"I completed tool work ({tool_names}) but could not finish composing the answer "
+                f"after an agent error. Partial results:\n\n{tool_context[:2500]}"
+            )
 
     def _extract_graph_response(self, result: Any) -> str:
         if isinstance(result, dict):
@@ -8587,6 +8919,12 @@ class EchoSpeakAgent:
                     else:
                         messages = [*base, *chat_history, HumanMessage(content=extracted_input)]
                 result = self._invoke_langgraph(graph, messages, callbacks, thread_id=graph_thread_id)
+                # Always harvest tool outputs so Stage 4 recovery can synthesize if the
+                # final AI message is empty or the graph later fails mid-loop.
+                try:
+                    self._harvest_tool_results_from_graph(result)
+                except Exception:
+                    pass
                 if isinstance(result, dict) and "messages" in result:
                     ai_messages_with_reasoning = []
                     for i, msg in enumerate(result["messages"]):
@@ -8610,6 +8948,11 @@ class EchoSpeakAgent:
                 response_text = self._extract_graph_response(result)
                 if response_text:
                     self._last_stage4_branch = "langgraph"
+                elif self._partial_tool_results:
+                    # Graph returned no final text but tools completed — synthesize now.
+                    response_text = self._synthesize_from_partial_tools(extracted_input, context)
+                    if response_text:
+                        self._last_stage4_branch = "langgraph_partial_tool_synthesis"
             except Exception as exc:
                 msg = str(exc)
                 if "ResourceExhausted" in msg or "quota" in msg.lower() or "429" in msg:
@@ -8618,13 +8961,10 @@ class EchoSpeakAgent:
                     response_text = "I'm temporarily rate-limited by the model provider right now. Please wait a minute and try again."
                 else:
                     self._last_stage4_branch = "langgraph_failed"
-                    logger.warning(f"LangGraph agent failed; falling back to AgentExecutor: {exc}")
+                    logger.warning(f"LangGraph agent failed; recovering partial tools if any: {exc}")
                     # Preserve any tool results that were captured before the crash
                     if self._partial_tool_results:
-                        parts = []
-                        for tr in self._partial_tool_results:
-                            parts.append(f"Tool '{tr['tool']}' returned:\n{tr['output']}")
-                        _fallback_tool_context = "\n\n".join(parts)
+                        _fallback_tool_context = self._format_partial_tool_context()
                         logger.info(f"Preserved {len(self._partial_tool_results)} tool result(s) for fallback")
 
         if not response_text and allowed_tool_names and self.agent_executor is not None:
@@ -8680,6 +9020,19 @@ class EchoSpeakAgent:
                     self._last_stage4_branch = "fallback_executor_failed"
                     logger.warning(f"Fallback agent executor failed; falling back to direct LLM: {exc}")
 
+        # v7.4 Workstream C: never lose completed tool work when executors are absent/failed.
+        if not response_text and self._partial_tool_results:
+            response_text = self._synthesize_from_partial_tools(extracted_input, context)
+            if response_text:
+                self._last_stage4_branch = "partial_tool_synthesis"
+            else:
+                tool_names = ", ".join(sorted({str(tr.get("tool") or "tool") for tr in self._partial_tool_results}))
+                response_text = (
+                    f"I completed tool work ({tool_names}) but could not produce a final answer. "
+                    "Please retry the request or rephrase it."
+                )
+                self._last_stage4_branch = "partial_tool_blocker"
+
         if not response_text and self._last_stage4_branch in {
             "not_started",
             "langgraph_failed",
@@ -8705,9 +9058,9 @@ class EchoSpeakAgent:
 
         if not response_text:
             system_prompt = self._compose_system_prompt()
-            prompt_parts: list[str] = [system_prompt]
-            if context:
-                prompt_parts.append(f"Context (memory + docs, may be empty):\n{context}")
+            # v7.4 Workstream D: Stage 5 uses the same budget manager as Stage 2.
+            partial_ctx = self._format_partial_tool_context()
+            history_text = ""
             raw_input = str(user_input or "").strip()
             raw_low = raw_input.lower()
             has_wrapped_followup = bool(
@@ -8717,15 +9070,86 @@ class EchoSpeakAgent:
             )
             if not has_wrapped_followup:
                 history_text = self._history_as_text(ctx.chat_history)
+            current_turn = raw_input if has_wrapped_followup else f"Human: {extracted_input}"
+            try:
+                manager = self._make_context_budget_manager()
+                overhead = (
+                    estimate_tokens(system_prompt)
+                    + estimate_tokens(current_turn)
+                    + 256
+                )
+                fitted_variable, budget_report = manager.fit_blocks(
+                    [
+                        ContextBlock(
+                            "partial_tools",
+                            partial_ctx,
+                            2,
+                            "Tool results already retrieved this turn (use these; do not claim you lack access)",
+                            min_chars=200,
+                            protected=True,
+                        ),
+                        ContextBlock(
+                            "memory_context",
+                            context or "",
+                            5,
+                            "Context (memory + docs, may be empty)",
+                            min_chars=200,
+                            protected=False,
+                        ),
+                        ContextBlock(
+                            "chat_history",
+                            history_text or "",
+                            8,
+                            "Recent chat history",
+                            min_chars=120,
+                            protected=False,
+                        ),
+                    ],
+                    overhead_tokens=overhead,
+                )
+                try:
+                    self._last_context_budget_report = {
+                        **(self._last_context_budget_report if isinstance(self._last_context_budget_report, dict) else {}),
+                        **asdict(budget_report),
+                        "budget_source": "stage5_finalize",
+                    }
+                except Exception:
+                    pass
+                prompt = f"{system_prompt}\n\n"
+                if fitted_variable:
+                    prompt += f"{fitted_variable}\n\n"
+                prompt += f"Current conversation:\n{current_turn}\nAI:"
+                if partial_ctx:
+                    self._last_stage4_branch = self._last_stage4_branch or "stage5_with_partial_tools"
+            except Exception:
+                prompt_parts: list[str] = [system_prompt]
+                if context:
+                    prompt_parts.append(f"Context (memory + docs, may be empty):\n{context}")
+                if partial_ctx:
+                    prompt_parts.append(
+                        "Tool results already retrieved this turn (use these; do not claim you lack access):\n"
+                        f"{partial_ctx}"
+                    )
+                    self._last_stage4_branch = self._last_stage4_branch or "stage5_with_partial_tools"
                 if history_text:
                     prompt_parts.append(f"Recent chat history:\n{history_text}")
-            current_turn = raw_input if has_wrapped_followup else f"Human: {extracted_input}"
-            prompt_parts.append(f"Current conversation:\n{current_turn}\nAI:")
-            response_text = self._invoke_visible_llm("\n\n".join([p for p in prompt_parts if p.strip()]))
+                prompt_parts.append(f"Current conversation:\n{current_turn}\nAI:")
+                prompt = "\n\n".join([p for p in prompt_parts if p.strip()])
+            response_text = self._invoke_visible_llm(prompt)
 
         printed_tool_response = self._handle_printed_tool_directive(response_text, extracted_input)
         if printed_tool_response is not None:
             response_text = printed_tool_response
+        elif self._looks_like_raw_tool_syntax(response_text):
+            # Last-line defense: never show raw tool markup in chat.
+            self._record_tool_syntax_telemetry(
+                "Raw tool syntax survived finalize after parse; stripped from chat.",
+                str(response_text or ""),
+            )
+            response_text = (
+                "I generated tool-call syntax instead of a normal reply, and could not safely "
+                "convert it into an action. Please restate what you want me to do in plain language."
+            )
 
         response_text = self._sanitize_response_text(response_text)
         response_text = self._maybe_correct_past_schedule_answer(user_input, response_text, time_context, callbacks)
