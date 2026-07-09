@@ -179,6 +179,48 @@ def test_weather_place_structural_not_city_list():
     assert "weather" in bare.lower()
 
 
+def test_search_query_quality_gate_rejects_fragments():
+    """Utterance fragments must not become searches; multi keeps entity-rich queries only."""
+    from agent.research import (
+        is_viable_search_query,
+        quality_gate_search_queries,
+        resolve_web_search_queries,
+    )
+
+    parent = "what time does the fifa game with france and maracoo start today? pelsae check"
+    assert is_viable_search_query("pelsae check", parent=parent) is False
+    assert is_viable_search_query("please check", parent=parent) is False
+    assert is_viable_search_query("maracoo start today", parent=parent) is False
+    good = "FIFA World Cup france maracoo kickoff time ET today"
+    assert is_viable_search_query(good, parent=parent) is True
+
+    gated = quality_gate_search_queries(
+        [
+            "FIFA World Cup match list kickoff times ET each game schedule fixtures",
+            "maracoo start today",
+            "pelsae check",
+        ],
+        parent,
+    )
+    assert len(gated) >= 1
+    assert not any("pelsae" in g.lower() for g in gated)
+    assert not any(g.lower() == "maracoo start today" for g in gated)
+    # Prefer queries that keep the matchup when present
+    rjoin = " ".join(gated).lower()
+    assert "fifa" in rjoin or "world cup" in rjoin or "france" in rjoin
+
+    # Real multi still fans out cleanly
+    multi = (
+        "weather in Osaka tomorrow and what matches are happening for the world cup tomorrow"
+    )
+    resolved = resolve_web_search_queries(multi, multi, use_decomposition=True)
+    assert len(resolved) >= 2
+    rjoin2 = " ".join(resolved).lower()
+    assert "osaka" in rjoin2 or "weather" in rjoin2
+    assert "fifa" in rjoin2 or "world cup" in rjoin2 or "match" in rjoin2
+    assert not any("please" in x.lower() and len(x.split()) <= 3 for x in resolved)
+
+
 def test_fifa_matchup_single_query_not_junk_split():
     """Live: France/maracoo + 'pelsae check' must be ONE sports query, not 3 junk ones."""
     from agent.research import (

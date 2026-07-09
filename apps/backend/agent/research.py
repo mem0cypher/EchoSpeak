@@ -1551,12 +1551,21 @@ def decompose_search_intents(text: str, llm_invoke=None) -> list[str]:
 
     if callable(llm_invoke):
         prompt = (
-            "Break the user message into the minimum independent web-search sub-questions "
-            "needed to answer it fully (2-5 max). Preserve key nouns, places, names, dates.\n"
-            "Return ONLY a JSON array of short search strings, e.g. "
-            '["tallest building in Dubai", "CEO of Tesla 2026"].\n'
-            "If there is only ONE ask, return a one-element array.\n"
-            "Do not answer the questions. Do not add commentary.\n\n"
+            "You convert chat into web SEARCH QUERIES (not answers).\n"
+            "Rules:\n"
+            "1) ONE independent fact ask → ONE query. Do NOT split politeness "
+            "('please check'), STT noise, or matchup names joined by 'and' "
+            "(France and Morocco = one match).\n"
+            "2) Multiple DIFFERENT fact domains (e.g. weather + sports, release + price) "
+            "→ separate queries (2-5 max).\n"
+            "3) Each query must be a compact search string with the specific anchors: "
+            "who/what/where (names, places, products), when (today/tomorrow/dates), "
+            "and the fact type (kickoff time, high/low, price, release date).\n"
+            "4) Never emit fragments like 'please check', 'start today', or bare 'and X'.\n"
+            "5) Return ONLY a JSON array of strings.\n"
+            'Example one-ask: ["FIFA World Cup France Morocco kickoff time today"]\n'
+            'Example multi: ["Osaka weather tomorrow high low", '
+            '"FIFA World Cup match list kickoff tomorrow"]\n\n'
             f"User: {work[:500]}\n"
         )
         try:
@@ -1633,6 +1642,133 @@ def enrich_sports_query_with_subject(query: str, subject: str) -> str:
     return q
 
 
+def _search_content_anchors(text: str) -> set[str]:
+    """
+    Tokens that make a search *specific*: places, names, numbers, domain keywords.
+
+    Fragment queries like \"maracoo start today\" or \"pelsae check\" fail this bar
+    when the parent utterance had richer anchors they dropped.
+    """
+    low = (text or "").lower()
+    anchors: set[str] = set()
+    # Numbers / clock / dates
+    for m in re.finditer(r"\b(\d{1,4}(?::\d{2})?|\d{4})\b", low):
+        anchors.add(m.group(1))
+    # Domain keywords (category, not entity hardcode)
+    for tok in (
+        "weather", "forecast", "temperature", "fifa", "world", "cup", "nhl", "nba",
+        "nfl", "mlb", "kickoff", "schedule", "fixture", "score", "odds", "price",
+        "cost", "release", "trailer", "bitcoin", "stock", "news", "tomorrow", "today",
+        "tonight",
+    ):
+        if re.search(rf"\b{re.escape(tok)}\b", low):
+            anchors.add(tok)
+    # Content words: length >= 4, not stopwords
+    stop = {
+        "what", "when", "where", "which", "with", "from", "that", "this", "they",
+        "them", "have", "does", "will", "would", "could", "should", "please", "check",
+        "start", "starts", "starting", "about", "into", "just", "also", "then",
+        "there", "here", "your", "you", "for", "the", "and", "are", "was", "were",
+        "how", "who", "why", "can", "need", "want", "tell", "find", "look", "search",
+        "game", "games", "match", "matches", "time", "times",
+    }
+    for w in re.findall(r"(?u)[\w']+", low):
+        if len(w) >= 4 and w not in stop and not w.isdigit():
+            anchors.add(w)
+    return anchors
+
+
+def is_viable_search_query(q: str, *, parent: str = "") -> bool:
+    """
+    True only for search strings that look like *reframed factual asks*.
+
+    Rejects: politeness fragments, mid-sentence debris, empty chat crumbs.
+    Keeps: entity+intent compact queries (place, teams, titles, numbers).
+    """
+    s = _normalize_text(q)
+    if not s or len(s) < 4:
+        return False
+    if _is_smalltalk_clause(s) or _is_hollow_secondary_clause(s):
+        return False
+    low = s.lower()
+    # Pure politeness / meta
+    if re.fullmatch(
+        r"(?:please|pls|plz|pelsae|check|look|confirm|verify|thanks|thank you|"
+        r"can you|could you)(?:\s+\w+){0,2}",
+        low,
+    ):
+        return False
+    words = low.split()
+    if len(words) < 2:
+        return False
+    anchors = _search_content_anchors(s)
+    if not anchors:
+        return False
+
+    has_domain = bool(
+        re.search(
+            r"(?i)\b(weather|forecast|fifa|world cup|nhl|nba|nfl|mlb|kickoff|schedule|"
+            r"fixture|score|odds|price|cost|release|trailer|bitcoin|stock|news|"
+            r"temperature|high|low|capital|population|ceo|founded|invented|"
+            r"tallest|longest|who|what|when|where)\b",
+            low,
+        )
+    )
+    if parent:
+        parent_anchors = _search_content_anchors(parent)
+        parent_has_domain = bool(
+            re.search(
+                r"(?i)\b(weather|forecast|fifa|world cup|nhl|nba|nfl|mlb|kickoff|"
+                r"price|cost|release|trailer|bitcoin|stock|news|capital|score)\b",
+                parent,
+            )
+        )
+        distinctive = parent_anchors - {
+            "today", "tomorrow", "tonight", "start", "time", "game", "check",
+            "please", "pelsae", "starts", "starting",
+        }
+        kept = anchors & distinctive
+        # Short debris with no domain keyword while parent was a domain ask
+        if parent_has_domain and not has_domain and len(words) <= 5:
+            return False
+        # Kept almost none of parent's distinctive anchors and is short
+        if distinctive and len(distinctive) >= 2 and len(kept) <= 1 and len(words) <= 4 and not has_domain:
+            return False
+    # Short queries without a domain keyword are almost always fragments
+    if not has_domain and len(words) <= 4:
+        return False
+    return True
+
+
+def quality_gate_search_queries(queries: list[str], parent: str) -> list[str]:
+    """
+    Final filter: only ship entity-rich, intent-clear queries to the web.
+
+    If multi-split produced junk fragments, drop them. If nothing survives,
+    fall back to one compact query from the full parent utterance.
+    """
+    parent_n = _prep_search_work_text(parent) or _normalize_text(parent)
+    cleaned: list[str] = []
+    for q in queries or []:
+        n = _normalize_text(q)
+        if not n:
+            continue
+        # Prefer already-viable candidates AS-IS. Re-normalizing a compact sports
+        # string (\"FIFA … france maracoo kickoff\") used to wipe free-form sides.
+        if is_viable_search_query(n, parent=parent_n):
+            cleaned.append(n)
+            continue
+        compact = normalize_web_search_query_single(n) or n
+        if compact != n and is_viable_search_query(compact, parent=parent_n):
+            cleaned.append(compact)
+    cleaned = _dedupe_queries(cleaned)
+    if cleaned:
+        return cleaned[:5]
+    # Fallback: one well-formed query from the whole user turn
+    one = normalize_web_search_query_single(parent_n) or parent_n
+    return [one] if one else []
+
+
 def resolve_web_search_queries(
     user_text: str,
     model_query: str = "",
@@ -1643,23 +1779,24 @@ def resolve_web_search_queries(
     """
     Full query resolution for grounded search.
 
-    Order:
-      1) Recipe multi-split (free, instant) when it returns 2+ queries
-      2) If multi-intent suspected and no recipe: general decomposition
-         (domain diversity + also/and splits + optional LLM)
-      3) Single compact query from user text
-      4) Never silently replace a real multi-split with the model's single tool arg
+    Architecture (intent → reframed search strings, not utterance fragments):
+      1) Prep: strip social/politeness fluff (please check, greetings)
+      2) Detect domains / multi-intent (2+ distinct fact domains only)
+      3) Recipe multi-split OR domain carve OR single compact normalize
+      4) Quality gate: drop fragment/filler queries; require content anchors
+         (places, names, numbers, domain keywords)
 
-    Critical: model tool args are often single-intent. User text is authoritative
-    for multi detection — never collapse multi user text to the model arg alone.
+    Critical: model tool args are often single-intent or chatty. User text is
+    authoritative for multi detection — never ship raw chat crumbs to Tavily.
     """
     user = _normalize_text(user_text)
     model_q = _normalize_text(model_query)
+    user_prep = _prep_search_work_text(user) or user
 
     # Prefer user text for multi detection — model tool args are often single-intent.
-    multi_src = user or model_q
-    if user and (len(intent_domains(user)) >= 2 or looks_like_multi_intent(user)):
-        multi_src = user
+    multi_src = user_prep or model_q
+    if user_prep and (len(intent_domains(user_prep)) >= 2 or looks_like_multi_intent(user_prep)):
+        multi_src = user_prep
     elif model_q and len(intent_domains(model_q)) >= 2:
         multi_src = model_q
 
@@ -1681,11 +1818,15 @@ def resolve_web_search_queries(
                 decomp = _force_domain_decompose(multi_src) or decomp
             if len(decomp) >= 2:
                 multi = decomp
-        # 3) Single-intent compact
+        # 3) Single-intent compact — full utterance, not a clause fragment
         if not multi:
-            one = normalize_web_search_query_single(user) or normalize_web_search_query_single(model_q)
+            one = (
+                normalize_web_search_query_single(user_prep)
+                or normalize_web_search_query_single(user)
+                or normalize_web_search_query_single(model_q)
+            )
             if not one:
-                one = model_q or user
+                one = model_q or user_prep or user
             multi = [one] if one else []
 
     # Optionally append distinct model tool arg if useful and not already covered.
@@ -1705,6 +1846,7 @@ def resolve_web_search_queries(
             and model_c.lower() not in keys
             and len(model_c.split()) <= 14
             and not same_domain
+            and is_viable_search_query(model_c, parent=multi_src)
             and not re.match(r"(?i)^(i |can you|please|find out|what |when )", model_c)
         ):
             multi.append(model_c)
@@ -1722,7 +1864,8 @@ def resolve_web_search_queries(
         if not any(re.search(r"(?i)\b(price|cost|pre-?order)\b", q) for q in multi):
             multi = _dedupe_queries(list(multi) + [_normalize_product_price_query(multi_src)])
 
-    return _dedupe_queries(multi)[:5]
+    # 4) Quality gate — never ship utterance fragments as searches
+    return quality_gate_search_queries(multi, multi_src)[:5]
 
 
 def split_web_search_queries(text: str) -> list[str]:
