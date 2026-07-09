@@ -921,9 +921,16 @@ class _StreamingHandler(BaseCallbackHandler):
         # Save previous loop's reasoning before starting a new one
         if self._current_reasoning.strip():
             loop_idx = len(self._loop_blocks) + 1
-            header = f"### 💭 Model Thoughts (Loop {loop_idx})"
+            header = f"### Model Thoughts (Loop {loop_idx})"
             self._loop_blocks.append(f"{header}\n{self._current_reasoning.strip()}")
         self._current_reasoning = ""
+        # Reliable phase signal for avatar/chat (was only set on tool_start before).
+        self._q.put({
+            "type": "status",
+            "agent_mode": "thinking",
+            "at": time.time(),
+            "request_id": self._request_id,
+        })
 
     def on_llm_start(self, serialized: dict, prompts: Any, run_id: str, parent_run_id: Optional[str] = None, **kwargs):
         self._start_new_generation()
@@ -933,19 +940,23 @@ class _StreamingHandler(BaseCallbackHandler):
 
     def _process_token_or_reasoning(self, token: str, reasoning: str):
         # 1. Extract inline <think> tags from main content stream if no native reasoning is provided
+        visible_token = token
         if not reasoning and token:
             t_low = token.lower()
             if "<think>" in t_low:
                 self._in_think_block = True
                 parts = token.split("<think>", 1)
+                visible_token = parts[0]
                 if len(parts) > 1:
                     reasoning = parts[1]
             elif "</think>" in t_low:
                 self._in_think_block = False
                 parts = token.split("</think>", 1)
                 reasoning = parts[0]
+                visible_token = parts[1] if len(parts) > 1 else ""
             elif self._in_think_block:
                 reasoning = token
+                visible_token = ""
 
         # 2. Push accumulated loops + current reasoning to UI
         if reasoning:
@@ -953,9 +964,9 @@ class _StreamingHandler(BaseCallbackHandler):
             blocks = list(self._loop_blocks)
             loop_idx = len(self._loop_blocks) + 1
             if loop_idx > 1 or len(self._loop_blocks) > 0:
-                current_header = f"### 💭 Model Thoughts (Loop {loop_idx})"
+                current_header = f"### Model Thoughts (Loop {loop_idx})"
             else:
-                current_header = "### 💭 Model Thoughts"
+                current_header = "### Model Thoughts"
             blocks.append(f"{current_header}\n{self._current_reasoning}")
             
             self._q.put({
@@ -963,6 +974,16 @@ class _StreamingHandler(BaseCallbackHandler):
                 "content": "\n\n".join(blocks),
                 "at": time.time(),
                 "request_id": self._request_id
+            })
+
+        # 3. Stream non-reasoning answer tokens so the chat can show live text
+        # (final still sends the full response for correctness).
+        if visible_token and not self._in_think_block and not reasoning:
+            self._q.put({
+                "type": "agent_token",
+                "data": visible_token,
+                "at": time.time(),
+                "request_id": self._request_id,
             })
 
     def on_llm_new_token(self, token: str, **kwargs):
@@ -1053,6 +1074,13 @@ class _StreamingHandler(BaseCallbackHandler):
             event["research"] = research_run
             self._research_runs.append(research_run)
         self._q.put(event)
+        # After a tool completes, return to thinking so UI does not stick on last tool mode.
+        self._q.put({
+            "type": "status",
+            "agent_mode": "thinking",
+            "at": time.time(),
+            "request_id": self._request_id,
+        })
 
     def on_tool_error(self, error: BaseException, run_id: str, parent_run_id: Optional[str] = None, **kwargs):
         call_id = str(run_id)
@@ -1062,6 +1090,12 @@ class _StreamingHandler(BaseCallbackHandler):
             _record_tool_latency((time.perf_counter() - started) * 1000.0)
         tool_name = self._tool_run_map.get(call_id, "")
         self._q.put({"type": "tool_error", "id": call_id, "name": tool_name, "error": str(error), "at": time.time(), "request_id": self._request_id})
+        self._q.put({
+            "type": "status",
+            "agent_mode": "thinking",
+            "at": time.time(),
+            "request_id": self._request_id,
+        })
 
 
 def _start_agent_thread(
