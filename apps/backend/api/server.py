@@ -916,6 +916,8 @@ class _StreamingHandler(BaseCallbackHandler):
         self.partial_replies: list[str] = []
         # One guaranteed preamble beat per LLM generation that invokes tools.
         self._preamble_done_this_gen = False
+        # One spoken pre-tool beat per *request* (ReAct loops reset gen flag; never double-greet).
+        self._preamble_done_this_request = False
         # Optional: agent generates free-form wording when the model produced none.
         self._preamble_fn = None  # type: ignore[assignment]
         self._on_partial = None  # type: ignore[assignment]
@@ -992,9 +994,13 @@ class _StreamingHandler(BaseCallbackHandler):
             return
         if self.partial_replies and self.partial_replies[-1].strip() == text:
             return
+        # Hard stop: never emit two spoken first-beats in one request.
+        if self._preamble_done_this_request:
+            return
         self._partial_count += 1
         self.partial_replies.append(text)
         self._preamble_done_this_gen = True
+        self._preamble_done_this_request = True
         # Keep agent state in sync so finalize can forbid re-greetings.
         try:
             if callable(self._on_partial):
@@ -1031,8 +1037,8 @@ class _StreamingHandler(BaseCallbackHandler):
 
         Decision to emit is never left to the model remembering a prompt.
         """
-        # Already sealed this generation (e.g. multi-tool burst) — one beat max per gen.
-        if self._preamble_done_this_gen:
+        # Already sealed this generation or this full request — never double first-beat.
+        if self._preamble_done_this_gen or self._preamble_done_this_request:
             self._visible_gen = ""
             return
 
@@ -1062,6 +1068,7 @@ class _StreamingHandler(BaseCallbackHandler):
 
         if not self._is_usable_preamble(text):
             # Last-resort variety — never say the raw tool id ("web search").
+            # Prefer agent social-aware fallback when the user opened socially.
             import random
             tool = re.sub(r"[_\-]+", " ", str(tool_name or "")).strip().lower()
             if tool in {"web search", "websearch", "search"}:
@@ -1070,14 +1077,26 @@ class _StreamingHandler(BaseCallbackHandler):
                 task = tool
             else:
                 task = "that"
-            options = [
-                f"On it — pulling {task} up.",
-                f"One sec, checking {task}.",
-                f"Alright, looking into {task}.",
-                "Checking that now.",
-                "Let me pull that up.",
-                "Hang on, grabbing it.",
-            ]
+            social_fallback = ""
+            try:
+                agent = getattr(self, "_agent_ref", None)
+                if agent is not None and hasattr(agent, "_user_has_social_open"):
+                    uq = str(getattr(agent, "_active_user_query", "") or "")
+                    if agent._user_has_social_open(uq) and hasattr(agent, "_social_task_preamble_fallback"):
+                        social_fallback = str(agent._social_task_preamble_fallback(task) or "").strip()
+            except Exception:
+                social_fallback = ""
+            if social_fallback:
+                options = [social_fallback]
+            else:
+                options = [
+                    f"On it — pulling {task} up.",
+                    f"One sec, checking {task}.",
+                    f"Alright, looking into {task}.",
+                    "Checking that now.",
+                    "Let me pull that up.",
+                    "Hang on, grabbing it.",
+                ]
             text = random.choice(options)
 
         self._emit_partial(text, reason)
@@ -1094,6 +1113,8 @@ class _StreamingHandler(BaseCallbackHandler):
         self._visible_gen = ""
         self._in_think_block = False
         self._preamble_done_this_gen = False
+        # NOTE: do NOT reset _preamble_done_this_request — second ReAct tool loops
+        # must not emit another "Doing good — checking…" spoken beat.
         # Reliable phase signal for avatar/chat (was only set on tool_start before).
         self._q.put({
             "type": "status",
@@ -1220,9 +1241,16 @@ class _StreamingHandler(BaseCallbackHandler):
             logger.warning("No-progress detected: tool '%s' called %d times with identical input", tool_name, repeat_count)
 
         inp = raw_input
-        inp = " ".join((inp or "").split())
-        if len(inp) > 600:
-            inp = inp[:600] + "…"
+        # Coding tools need full path/content for the Code visualizer — do not collapse to 600 chars.
+        tname = str(tool_name or "")
+        if tname in {"file_write", "file_read", "artifact_write", "notepad_write", "terminal_run"}:
+            # Keep structure; only hard-cap huge writes for stream safety
+            if len(inp) > 120_000:
+                inp = inp[:120_000] + "…"
+        else:
+            inp = " ".join((inp or "").split())
+            if len(inp) > 600:
+                inp = inp[:600] + "…"
         self._q.put(
             {
                 "type": "tool_start",
@@ -1242,7 +1270,13 @@ class _StreamingHandler(BaseCallbackHandler):
         out = output if isinstance(output, str) else str(output)
         tool_name = self._tool_run_map.get(call_id, "")
         raw_input = self._tool_input_map.pop(call_id, "")
-        max_len = 8000 if tool_name == "web_search" else 800
+        # File/terminal payloads must reach the Code visualizer intact
+        if tool_name in {"file_read", "file_write", "artifact_write", "notepad_write", "terminal_run"}:
+            max_len = 120_000
+        elif tool_name == "web_search":
+            max_len = 8000
+        else:
+            max_len = 800
         if len(out) > max_len:
             out = out[:max_len] + "…"
         started = self._tool_started_at.pop(call_id, None)
@@ -1291,10 +1325,12 @@ def _start_agent_thread(
     def run_agent():
         try:
             handler = _StreamingHandler(q, request_id)
+            handler._agent_ref = agent  # social-aware last-resort preambles
             # Decision = code (on tool_start). Wording = free model generation when needed.
             try:
                 # Fresh multi-beat state for this turn
                 agent._turn_partial_beats = []
+                agent._active_user_query = message
                 handler.set_preamble_fn(
                     lambda tool_name, tool_input, model_text="": agent.generate_tool_preamble_beat(
                         tool_name=tool_name,
@@ -1630,29 +1666,61 @@ def _mcp_trust_summary(
     mcp_servers: Any,
     mcp_client_present: bool,
     mcp_tool_count: int,
+    manager_status: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Summarize MCP availability without overstating configured-only capability."""
+    """Summarize MCP availability without overstating configured-only capability.
+
+    Configured ≠ available. Loaded tools come from a live tools/list, not from
+    merely having MCP_SERVERS set. Optional manager_status adds per-server errors.
+    """
     configured_count = len(mcp_servers) if isinstance(mcp_servers, dict) else 0
+    if isinstance(manager_status, dict) and manager_status.get("configured_count") is not None:
+        # Prefer live manager count (includes disabled/failed rows from init)
+        try:
+            configured_count = max(configured_count, int(manager_status.get("configured_count") or 0))
+        except Exception:
+            pass
     loaded_tools = int(mcp_tool_count or 0)
+    if isinstance(manager_status, dict) and manager_status.get("loaded_tool_count") is not None:
+        try:
+            loaded_tools = max(loaded_tools, int(manager_status.get("loaded_tool_count") or 0))
+        except Exception:
+            pass
     mcp_available = bool(configured_count and mcp_client_present and loaded_tools > 0)
+    warnings: List[str] = []
     if mcp_available:
         status = "available"
-        warning = ""
     elif configured_count and mcp_client_present and loaded_tools <= 0:
         status = "configured_no_tools"
-        warning = "MCP servers are configured and the MCP bridge is present, but no MCP tools are loaded yet."
+        warnings.append(
+            "MCP servers are configured and the MCP bridge is present, but no MCP tools are loaded yet."
+        )
     elif configured_count and not mcp_client_present:
         status = "client_missing"
-        warning = "MCP servers are configured, but agent.mcp_client.py is missing, so MCP tools cannot load."
+        warnings.append(
+            "MCP servers are configured, but agent.mcp_client.py is missing, so MCP tools cannot load."
+        )
     elif mcp_client_present:
         status = "not_configured"
-        warning = ""
     else:
         status = "not_configured"
-        warning = ""
 
-    warnings = [warning] if warning else []
-    return {
+    # Surface loud start failures (config ≠ available)
+    if isinstance(manager_status, dict):
+        for row in manager_status.get("servers") or []:
+            if not isinstance(row, dict):
+                continue
+            err = str(row.get("last_error") or "").strip()
+            running = bool(row.get("running"))
+            if err and not running:
+                name = str(row.get("name") or "server")
+                warnings.append(f"MCP server '{name}' failed to load: {err}")
+        if manager_status.get("last_error") and loaded_tools <= 0:
+            le = str(manager_status.get("last_error") or "").strip()
+            if le and not any(le in w for w in warnings):
+                warnings.append(f"MCP last error: {le}")
+
+    out: Dict[str, Any] = {
         "mcp_configured_count": configured_count,
         "mcp_tool_count": loaded_tools,
         "mcp_available_tool_count": loaded_tools if mcp_available else 0,
@@ -1660,7 +1728,12 @@ def _mcp_trust_summary(
         "mcp_available": mcp_available,
         "mcp_status": status,
         "warnings": warnings,
+        "client_version": "7.6.0" if mcp_client_present else "",
     }
+    if isinstance(manager_status, dict):
+        out["mcp_running_count"] = int(manager_status.get("running_count") or 0)
+        out["mcp_servers_detail"] = manager_status.get("servers") or []
+    return out
 
 
 @app.middleware("http")
@@ -2393,6 +2466,10 @@ class CodingReadinessResponse(BaseModel):
     recommended_loop: List[str]
     warnings: List[str]
     recommendations: List[str]
+    # v7.5.0: terminal sandbox status (host vs docker; never implies available if probe fails)
+    sandbox: Dict[str, Any] = Field(default_factory=dict)
+    # v7.5.2: live coding-loop state machine snapshot
+    coding_loop: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PendingActionResponse(BaseModel):
@@ -2593,12 +2670,31 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
         mcp_tool_count = 0
         mcp_servers = getattr(config, "mcp_servers", None) or {}
         mcp_client_present = bool((BASE_DIR / "agent" / "mcp_client.py").exists())
+        manager_status: Dict[str, Any] = {}
+        try:
+            from agent.mcp_client import get_mcp_manager, is_mcp_client_present as _mcp_present
+
+            mcp_client_present = bool(_mcp_present())
+            manager_status = get_mcp_manager().status()
+            mcp_tool_count = max(mcp_tool_count, int(manager_status.get("loaded_tool_count") or 0))
+        except Exception:
+            manager_status = {}
+
+        # Union agent.tools + registry MCP entries (agent may not have merged yet)
+        seen_tool_names: set = set()
+        tool_objs = list(getattr(agent, "tools", []) or [])
+        for name, entry in ToolRegistry._entries.items():
+            if getattr(entry, "category", "") == "mcp" or str(name).startswith("mcp__"):
+                if not any(str(getattr(t, "name", "") or "") == name for t in tool_objs):
+                    tool_objs.append(entry.func if hasattr(entry.func, "name") else entry)
+
         # NOTE: `lc_tools` intentionally excludes many action/system tools.
         # For the Capabilities & Permissions UI, we want to show the full registered tool set.
-        for t in (getattr(agent, "tools", []) or []):
+        for t in tool_objs:
             name = str(getattr(t, "name", "") or "").strip()
-            if not name:
+            if not name or name in seen_tool_names:
                 continue
+            seen_tool_names.add(name)
             allowed_by_workspace = True
             if allowset is not None:
                 allowed_by_workspace = name in allowset
@@ -2628,6 +2724,12 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
             requires_confirmation = meta.get("requires_confirmation", False)
             policy_flags = meta.get("policy_flags", [])
             entry = ToolRegistry.get(name)
+            if entry is not None:
+                if not meta.get("risk_level"):
+                    risk_level = getattr(entry, "risk_level", None) or risk_level
+                if getattr(entry, "is_action", False):
+                    is_action = True
+                    requires_confirmation = True
             category = str(getattr(entry, "category", "") or "")
             origin = "mcp" if category == "mcp" or name.startswith("mcp__") else "local"
             mcp_server = ""
@@ -2637,13 +2739,26 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
                 if len(parts) >= 3:
                     mcp_server = parts[1]
             if origin == "mcp":
-                server_cfg = mcp_servers.get(mcp_server) if isinstance(mcp_servers, dict) else None
+                # Resolve config by sanitized or raw server key
+                server_cfg = None
+                if isinstance(mcp_servers, dict):
+                    server_cfg = mcp_servers.get(mcp_server)
+                    if server_cfg is None:
+                        for sk, sv in mcp_servers.items():
+                            safe = "".join(c if c.isalnum() or c == "_" else "_" for c in str(sk)).strip("_")
+                            if safe == mcp_server:
+                                server_cfg = sv
+                                break
                 if isinstance(server_cfg, dict):
                     trust_state = str(server_cfg.get("trust") or server_cfg.get("trust_state") or "configured").strip() or "configured"
                     transport = str(server_cfg.get("transport") or "stdio")
                 else:
-                    trust_state = "unconfigured"
-                    transport = ""
+                    # Loaded tool without matching config key — infer from registry risk
+                    if entry is not None and not entry.is_action:
+                        trust_state = "trusted"
+                    else:
+                        trust_state = "configured"
+                    transport = "stdio"
                 if not mcp_client_present:
                     allowed_by_policy = False
                     trust_state = "client_missing"
@@ -2686,6 +2801,16 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
                 }
             )
 
+        # Prefer live manager count over double-count from list walk
+        if isinstance(manager_status, dict) and manager_status.get("loaded_tool_count") is not None:
+            try:
+                mcp_tool_count = max(
+                    int(manager_status.get("loaded_tool_count") or 0),
+                    sum(1 for it in items if it.get("origin") == "mcp"),
+                )
+            except Exception:
+                pass
+
         ws = (report.get("workspace") or {}) if isinstance(report.get("workspace"), dict) else {}
         tools = (report.get("tools") or {}) if isinstance(report.get("tools"), dict) else {}
         features = (report.get("features") or {}) if isinstance(report.get("features"), dict) else {}
@@ -2706,7 +2831,12 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
                 "has_plugin": (skill_path / "plugin.py").exists() if skill_path.exists() else False,
             })
 
-        mcp_summary = _mcp_trust_summary(mcp_servers, mcp_client_present, mcp_tool_count)
+        mcp_summary = _mcp_trust_summary(
+            mcp_servers,
+            mcp_client_present,
+            mcp_tool_count,
+            manager_status=manager_status or None,
+        )
 
         return CapabilitiesResponse(
             ok=bool(report.get("ok", True)),
@@ -2793,11 +2923,45 @@ async def coding_readiness(thread_id: Optional[str] = Query(default=None)):
         if not str(getattr(config, "file_tool_root", "") or "").strip():
             warnings.append("FILE_TOOL_ROOT is empty.")
             recommendations.append("Set FILE_TOOL_ROOT to the folder where Echo should create and inspect project files.")
+
+        sandbox_info: Dict[str, Any] = {}
+        try:
+            from agent.sandbox import get_sandbox_status, normalize_execution_mode
+
+            sandbox_info = get_sandbox_status().as_dict()
+            mode = normalize_execution_mode(getattr(config, "terminal_execution_mode", "host"))
+            if mode == "docker" and not sandbox_info.get("ready"):
+                warnings.append("Terminal sandbox mode is docker/sandbox but Docker is not ready.")
+                recommendations.append(
+                    "Start Docker Engine/Desktop, or set TERMINAL_EXECUTION_MODE=host (unsandboxed). "
+                    "Echo will not silently fall back to host execution."
+                )
+            elif mode == "host":
+                recommendations.append(
+                    "Terminal runs on the host (default). Set TERMINAL_EXECUTION_MODE=docker for isolated runs."
+                )
+        except Exception as sandbox_exc:
+            sandbox_info = {
+                "mode": str(getattr(config, "terminal_execution_mode", "host") or "host"),
+                "ready": False,
+                "message": f"Sandbox status unavailable: {sandbox_exc}",
+            }
+
         if not warnings:
             recommendations.append("Coding lifecycle is ready: inspect, plan, implement, verify, summarize.")
 
         report = agent.get_doctor_report() or {}
         workspace = report.get("workspace") if isinstance(report.get("workspace"), dict) else {}
+        coding_loop_state: Dict[str, Any] = {}
+        try:
+            coding_loop_state = agent.get_coding_loop_state() if hasattr(agent, "get_coding_loop_state") else {}
+        except Exception:
+            coding_loop_state = {"active": False}
+        if coding_loop_state.get("active"):
+            recommendations.append(
+                f"Coding loop phase: {coding_loop_state.get('phase')} "
+                f"(exit={coding_loop_state.get('exit_status')}, verify={coding_loop_state.get('verify_status')})."
+            )
         return CodingReadinessResponse(
             ok=provider_ready and not missing and not blocked,
             provider={
@@ -2816,9 +2980,11 @@ async def coding_readiness(thread_id: Optional[str] = Query(default=None)):
             tools=tool_rows,
             blocked_tools=blocked,
             missing_tools=missing,
-            recommended_loop=["inspect", "plan", "implement", "verify", "summarize"],
+            recommended_loop=["inspect", "plan", "implement", "verify", "confirm", "summarize"],
             warnings=warnings,
             recommendations=recommendations,
+            sandbox=sandbox_info,
+            coding_loop=coding_loop_state,
         )
     except Exception as e:
         logger.error(f"Coding readiness error: {e}")

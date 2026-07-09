@@ -462,7 +462,237 @@ class TestDiscordHardening:
         assert is_followup is True
         assert subject == "Canada vs Morocco World Cup score"
         assert "Canada vs Morocco World Cup score" in resolved
-        assert "do a deeper search" in resolved
+        # Deeper-search rewrites to subject + analysis terms (not the meta phrase itself)
+        assert "detailed" in resolved.lower() or "sources" in resolved.lower() or "analysis" in resolved.lower()
+        assert "do a deeper search" not in resolved.lower()
+
+    def test_desktop_project_inspect_not_web_search(self, tmp_path):
+        """Local desktop/file inspect must use file tools, not Stage 3 web (no project-name whitelist)."""
+        from agent.core import EchoSpeakAgent, ContextBundle
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        q = (
+            "can you look on my desktop and lets start on my-app "
+            "read the files and understand the project"
+        )
+        assert agent._is_local_filesystem_intent(q) is True
+        assert agent._is_coding_project_intent(q) is True
+        tools = agent._allowed_lc_tool_names(q)
+        assert "file_list" in tools or "file_read" in tools
+        assert "web_search" not in tools
+        ctx = ContextBundle(
+            context="",
+            chat_history=[],
+            graph_thread_id=None,
+            extracted_input=q,
+            resolved_input=q,
+            current_subject="",
+            referential_followup=False,
+            allowed_tool_names=tools,
+            time_context="",
+        )
+        out = agent._pq_shortcut_queries(q, ctx, callbacks=None)
+        assert out is None
+
+    def test_coding_path_pin_and_stub_rejection(self, tmp_path, monkeypatch):
+        """Bare relative paths resolve under active project root (discovery-based pin)."""
+        from agent import tools as tools_mod
+        from agent.tools import (
+            set_active_project_root,
+            _safe_file_path,
+            _looks_like_code_stub,
+            get_active_project_root,
+            _file_tool_root,
+        )
+
+        # Use a temp "desktop" project — not a hard-coded product name
+        proj = tmp_path / "any-project-xyz"
+        proj.mkdir()
+        set_active_project_root(str(proj))
+        pinned = get_active_project_root()
+        assert pinned is not None
+        assert pinned.resolve() == proj.resolve()
+        resolved = _safe_file_path("index.html")
+        assert resolved is not None
+        assert resolved == (proj / "index.html").resolve()
+        # Must not land in EchoSpeak repo root
+        assert resolved.resolve() != (_file_tool_root() / "index.html").resolve()
+        # Stub rejection (generic code quality gate)
+        assert _looks_like_code_stub("game.js", "// Implement collision detection…") is True
+        assert _looks_like_code_stub("game.js", "x=1") is True
+        big = "function loop(){ requestAnimationFrame(loop); }\n" * 20
+        assert _looks_like_code_stub("game.js", big) is False
+        set_active_project_root(None)
+
+    def test_desktop_project_pin_discovers_existing_folder(self, tmp_path, monkeypatch):
+        """Pin by matching user tokens to real Desktop folders — no name whitelist."""
+        from agent.core import EchoSpeakAgent
+        from agent import tools as tools_mod
+
+        desk = tmp_path / "FakeDesktop"
+        desk.mkdir()
+        (desk / "cool-app-v2").mkdir()
+        monkeypatch.setattr(tools_mod, "_desktop_root", lambda: desk.resolve())
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path / "mem"))
+        pinned = agent._try_pin_desktop_project_from_user(
+            "look on my desktop and start on cool-app read the files"
+        )
+        assert pinned is not None
+        assert "cool-app-v2" in pinned.replace("\\", "/")
+        tools_mod.set_active_project_root(None)
+
+    def test_web_answer_abdication_detected_and_evidence_gate(self, tmp_path):
+        """System-wide keep-trying: abdication drafts are weak even with evidence present."""
+        from agent.core import EchoSpeakAgent, WebTaskReflector
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        give_up = (
+            "I do not have the specific kickoff time for the FIFA World Cup on July 9, 2026, "
+            "nor do I have the conversion to Mountain Time."
+        )
+        assert agent._answer_is_abdication(give_up) is True
+        assert agent._web_answer_is_weak(
+            "what mnt time?",
+            give_up,
+            "France vs Morocco 4 p.m. ET",
+        ) is True
+        ok = "France vs Morocco kicks off at 4 p.m. ET, which is 2 p.m. Mountain Time (MNT)."
+        assert agent._answer_is_abdication(ok) is False
+        assert agent._web_answer_is_weak("what mnt time?", ok, "France vs Morocco 4pm ET") is False
+
+        fluff = (
+            "The 2026 FIFA World Cup continues today with six matchups. "
+            "You can find the full schedule for all 104 games online."
+        )
+        assert agent._answer_is_abdication(fluff) is True
+
+        # Grounded packet quality gate: fluff without times is not acceptable
+        ref = WebTaskReflector(agent)
+        weak_packet = (
+            "[GROUNDED_SEARCH] accepted=true\n"
+            "The World Cup has 104 games. Full schedule available online."
+        )
+        assert ref._is_grounded_packet_acceptable(
+            "FIFA World Cup matches today kickoff",
+            weak_packet,
+        ) is False
+        strong_packet = (
+            "[GROUNDED_SEARCH] accepted=true\n"
+            "France vs Morocco kickoff 4:00 p.m. ET on July 9, 2026."
+        )
+        assert ref._is_grounded_packet_acceptable(
+            "FIFA World Cup matches today kickoff",
+            strong_packet,
+        ) is True
+
+    def test_clarifier_followups_bind_timezone_and_currency_to_subject(self, tmp_path):
+        """
+        Live: FIFA kickoff '4pm' then '4pm my time? MNT time or when?' must NOT
+        search bare 'MNT time zone' — keep match context. Same for BTC → 'in cad?'.
+        """
+        from agent.core import EchoSpeakAgent
+
+        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+
+        # --- Timezone clarifier on sports subject ---
+        agent._current_subject_text = (
+            "FIFA World Cup France vs Morocco Thursday July 9 2026 4pm"
+        )
+        agent._last_web_query_context = (
+            "FIFA World Cup matchups teams kickoff schedule fixtures today"
+        )
+        for q in (
+            "4pm my time? MNT time or when?",
+            "is that mountain time?",
+            "what timezone is that?",
+            "4pm my time?",
+        ):
+            assert agent._is_timezone_followup_text(q), q
+            assert agent._is_referential_followup_text(q), q
+            resolved, is_fu, subj = agent._resolve_referential_followup(q)
+            assert is_fu is True, (q, resolved)
+            assert "france" in resolved.lower() or "morocco" in resolved.lower() or "fifa" in resolved.lower(), (
+                q,
+                resolved,
+            )
+            assert "kickoff" in resolved.lower() or "timezone" in resolved.lower() or "time" in resolved.lower()
+            # Must not collapse to bare TZ definition search
+            assert resolved.lower().strip() not in {
+                "mnt time or when",
+                "mnt time zone offset",
+                "m nt time or when",
+            }
+            assert "mnt time zone offset" not in resolved.lower()
+            # Subject preserved (not replaced by MNT)
+            assert "fifa" in subj.lower() or "france" in subj.lower() or "morocco" in subj.lower()
+
+        # --- Currency clarifier on finance subject (not location swap) ---
+        agent._current_subject_text = "current bitcoin price"
+        agent._last_web_query_context = "the current bitcoin price"
+        for q in ("in cad?", "whats the in cad?", "how much in CAD?"):
+            assert agent._is_currency_followup_text(q), q
+            assert not agent._is_location_swap_followup(q), q
+            resolved, is_fu, subj = agent._resolve_referential_followup(q)
+            assert is_fu is True, (q, resolved)
+            assert "bitcoin" in resolved.lower() or "btc" in resolved.lower()
+            assert "cad" in resolved.lower()
+            assert "fifa" not in resolved.lower()
+            # Subject stays bitcoin, not "bitcoin in cad" as a city swap
+            assert "bitcoin" in subj.lower()
+
+        # Hollow clarifiers must not wipe subject on next turn
+        agent._current_subject_text = "FIFA World Cup France vs Morocco 4pm"
+        assert agent._subject_candidate_from_turn("4pm my time? MNT time or when?", "x") == ""
+        assert agent._subject_candidate_from_turn("in cad?", "x") == ""
+
+        # Live: answer anchors (France / 4pm) must stick; MNT follow-up must convert, not re-slate
+        agent._current_subject_text = "what fifa matches are happening today"
+        agent._update_current_subject(
+            "what fifa matches are happening today",
+            "Today there is one match: France vs. Morocco, kicking off at 4 p.m.",
+        )
+        subj = (agent._current_subject_text or "").lower()
+        assert "france" in subj and "morocco" in subj, agent._current_subject_text
+        assert "4" in subj and "p" in subj, agent._current_subject_text
+
+        resolved_mnt, is_mnt, _ = agent._resolve_referential_followup("what time MNT time?")
+        assert is_mnt is True
+        rlow = resolved_mnt.lower()
+        assert "france" in rlow or "morocco" in rlow or "fifa" in rlow
+        assert "mnt" in rlow or "mountain" in rlow
+        assert "convert" in rlow or "timezone" in rlow or "what time" in rlow
+        # Must not be the same bare slate query as the first search
+        assert rlow.strip() != (
+            "fifa world cup matchups teams kickoff schedule fixtures today thursday july 09 2026"
+        )
+
+        import re as _re
+        from agent.research import _normalize_sports_query
+
+        sports_q = _normalize_sports_query(resolved_mnt)
+        assert "convert" in sports_q.lower() or "mountain" in sports_q.lower() or "mnt" in sports_q.lower()
+        assert "france" in sports_q.lower() or "morocco" in sports_q.lower()
+        # Not a pure "today's full slate" rewrite
+        assert not _re.fullmatch(
+            r"fifa world cup matchups teams kickoff schedule fixtures( today.*)?",
+            sports_q.lower().strip(),
+        )
+
+        # Live phrasing: vague first answer → MNT follow-up must demand full kickoff list
+        agent._current_subject_text = "what fifa matches are happening today"
+        agent._last_search_facts = ""
+        r_vague, ok_vague, _ = agent._resolve_referential_followup(
+            "what mnt time? check that for me so its the right time for me."
+        )
+        assert ok_vague is True
+        assert agent._is_timezone_followup_text(
+            "what mnt time? check that for me so its the right time for me."
+        )
+        nv = _normalize_sports_query(r_vague).lower()
+        assert "mountain" in nv or "mnt" in nv
+        assert "kickoff" in nv or "time" in nv
+        assert "list" in nv or "each" in nv or "schedule" in nv
 
     def test_printed_tool_directive_becomes_pending_terminal_action(self, tmp_path, monkeypatch):
         from agent.core import EchoSpeakAgent

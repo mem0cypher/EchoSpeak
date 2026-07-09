@@ -382,7 +382,7 @@ def test_coding_readiness_response_shape(monkeypatch):
     assert "file_roots" in payload
     assert "terminal_denylist" in payload["file_roots"]
     assert "rm" in payload["file_roots"]["terminal_denylist"]
-    assert payload["recommended_loop"] == ["inspect", "plan", "implement", "verify", "summarize"]
+    assert payload["recommended_loop"] == ["inspect", "plan", "implement", "verify", "confirm", "summarize"]
 
 
 def test_memory_compact_accepts_query_params(monkeypatch):

@@ -101,7 +101,7 @@ class IntentRouter:
     ]
 
     LIVE_WEB_TRIGGERS: List[str] = [
-        "right now", "currently", "today", "live",
+        "right now", "currently", "today", "tonight", "tomorrow", "live",
         "score", "scores", "weather", "forecast",
         "price", "stock", "stocks", "bitcoin", "btc",
         "ethereum", "eth", "exchange rate",
@@ -112,6 +112,8 @@ class IntentRouter:
         "won", "lost", "beat", "defeated",
         "standings", "playoff", "playoffs",
         "odds", "betting odds", "sports odds",
+        "who is playing", "who's playing", "what games",
+        "deeper search", "dig deeper",
     ]
 
     DIRECT_TIME_PHRASES: List[str] = [
@@ -409,12 +411,20 @@ class IntentRouter:
         if self.is_small_talk(q):
             return False
         has_question_signal = any(w in q for w in self.QUESTION_SIGNAL_WORDS)
+        # Explicit search / deeper-search imperatives count as question signals
+        if re.search(r"\b(search|deeper|research|look up|dig deeper)\b", q):
+            has_question_signal = True
         if not has_question_signal:
             return False
         triggers = [t for t in self.LIVE_WEB_TRIGGERS if t != "today"]
         if any(t in q for t in triggers):
             return True
         if "today" in q and self.has_live_info_subject(q):
+            return True
+        if re.search(r"\b(tomorrow|tonight)\b", q) and (
+            self.has_live_info_subject(q)
+            or any(t in q for t in ("game", "match", "play", "world cup", "fifa", "nhl", "schedule"))
+        ):
             return True
         if "latest" in q or "breaking" in q:
             return True

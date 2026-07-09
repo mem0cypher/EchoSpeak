@@ -411,13 +411,43 @@ class WebTaskReflector:
 
     def _is_live_score_query(self, q: str) -> bool:
         low = (q or "").lower()
-        if not any(t in low for t in ["score", "scores", "result", "results", "who won", "winning", "live"]):
+        # Product/commerce "live price" is NOT a sports score (live bug: Silksong price →
+        # "live price today live score result").
+        if re.search(
+            r"\b(price|cost|msrp|pre-?order|stock|bitcoin|btc|crypto|usd|release|trailer|"
+            r"steam|editions?)\b",
+            low,
+        ) and not re.search(r"\b(game score|match score|final score|who won|winning)\b", low):
+            return False
+        # Bare "live" alone is too weak (matches "live price"); need real score language
+        has_score_lang = any(
+            t in low
+            for t in ("score", "scores", "who won", "winning", "live score", "current score")
+        )
+        if not has_score_lang and "result" not in low and "results" not in low:
+            return False
+        if has_score_lang:
+            pass
+        elif re.search(r"\b(result|results)\b", low) and not re.search(
+            r"\b(game|match|fixture|vs\.?|versus|nhl|nba|nfl|mlb|fifa)\b", low
+        ):
+            # "search result" / "price result" without sports → not live score
             return False
         sport_terms = [
             "game", "match", "fixture", "fifa", "world cup", "soccer", "football",
-            "nhl", "nba", "nfl", "mlb", "wnba", "canada", "morocco",
+            "nhl", "nba", "nfl", "mlb", "wnba", "hockey", "basketball", "vs", "versus",
         ]
-        return any(t in low for t in sport_terms)
+        if any(t in low for t in sport_terms):
+            return True
+        # Free-form team phrase only when score/result language is already present
+        if has_score_lang or re.search(r"\b(score|scores)\b", low):
+            try:
+                from agent.research import _extract_teamish_phrase, _extract_vs_sides
+                if _extract_vs_sides(low) or _extract_teamish_phrase(low):
+                    return True
+            except Exception:
+                pass
+        return False
 
     def _live_score_result_looks_relevant(self, q: str, result: str) -> bool:
         low_result = (result or "").lower()
@@ -534,7 +564,23 @@ class WebTaskReflector:
             elif attempt == 2:
                 return f"{cleaned} current score live updates"
         
-        # Strategy 4: Generic refinement - add date context
+        # Strategy 4: Schedule / fixtures need concrete kickoff list, not overview fluff
+        if self._is_schedule_or_fixture_query(q):
+            if attempt == 1:
+                return f"{q} match list kickoff times ET each game today {today}"
+            elif attempt == 2:
+                if re.search(r"(?i)\b(fifa|world cup)\b", q):
+                    return f"{q} site:fifa.com OR site:espn.com kickoff times schedule {today}"
+                return f"{q} site:espn.com OR site:cbssports.com kickoff times schedule {today}"
+
+        # Strategy 5: Timezone conversion — demand each match time in target zone
+        if self._is_timezone_query(q):
+            if attempt == 1:
+                return f"{q} each match kickoff time ET Mountain Time convert list {today}"
+            elif attempt == 2:
+                return f"{q} kickoff times MNT MST convert from ET site:espn.com {today}"
+
+        # Strategy 6: Generic refinement - add date context
         if attempt == 1:
             return f"{q} {today[:7]}"  # Add YYYY-MM
         elif attempt == 2:
@@ -565,6 +611,62 @@ class WebTaskReflector:
         
         # Accept if result has substantial content
         return len(result) > 200
+
+    def _is_schedule_or_fixture_query(self, q: str) -> bool:
+        low = (q or "").lower()
+        return bool(
+            re.search(
+                r"\b(schedule|fixture|fixtures|matchups?|kickoff|who(?:'s| is)? playing|"
+                r"games? today|matches? today|world cup|fifa)\b",
+                low,
+            )
+        )
+
+    def _is_timezone_query(self, q: str) -> bool:
+        low = (q or "").lower()
+        return bool(
+            re.search(
+                r"\b(timezone|time zone|mnt|mst|mdt|mountain|my time|local time|convert)\b",
+                low,
+            )
+        )
+
+    def _is_grounded_packet_acceptable(self, q: str, result: str) -> bool:
+        """Quality gate for already-grounded search packets (must not no-op)."""
+        low = (result or "").lower()
+        if not low or len(low) < 40:
+            return False
+        if "search_evidence_insufficient" in low or "accepted=false" in low:
+            # Soft-accept packets still may carry usable snippets — only reject hard insufficient
+            if "search_evidence_insufficient" in low and len(low) < 280:
+                return False
+        if self._is_live_score_query(q):
+            return self._live_score_result_looks_relevant(q, result)
+        if self._is_schedule_or_fixture_query(q):
+            # Structural matchup detection (A vs B) — not a team-name whitelist
+            has_sides = bool(re.search(r"\bvs\.?\b", low)) or bool(
+                re.search(r"\b\w{3,}\s+versus\s+\w{3,}\b", low)
+            )
+            has_clock = bool(
+                re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|am|pm)", low)
+                or re.search(r"\b\d{1,2}:\d{2}\b", low)
+            )
+            # Concrete matchup +/or kickoff is enough even if packet is short
+            if has_sides or has_clock:
+                return True
+            # Tournament fluff ("104 games", "full schedule") without names is a miss
+            if re.search(r"\b(104 games|full schedule|across canada|you can find)\b", low):
+                return False
+            if len(low) < 400:
+                return False
+        if self._is_timezone_query(q):
+            # Need a time or an explicit conversion mention with numbers
+            if not re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|am|pm)", low):
+                if not re.search(r"\b\d{1,2}:\d{2}\b", low):
+                    return False
+        if self._has_stale_date(result) and self._is_next_upcoming_query(q):
+            return False
+        return len(result) > 120
     
     def reflect_and_retry(self, task: Dict, tool_name: str, original_result: str, 
                           tools: List, callbacks: Optional[List] = None) -> str:
@@ -583,25 +685,27 @@ class WebTaskReflector:
         
         q = str(task.get("params", {}).get("q") or task.get("params", {}).get("query") or "")
 
-        # v7.4: single grounding path. Tool wrappers already ground native/TaskPlanner
-        # web_search results; never double-ground condensed packets.
+        # Grounded path: still quality-gate (was a hard no-op — Stage 3 "gave up" after one search)
         if is_grounded_search_output(original_result):
-            return str(original_result or "")
+            if self._is_grounded_packet_acceptable(q, original_result):
+                return str(original_result or "")
+            # Fall through to retry with refined grounded search
 
-        if bool(getattr(config, "search_grounding_enabled", True)) and hasattr(self.agent, "_grounded_web_search"):
-            if q:
-                return self.agent._grounded_web_search(
-                    q,
-                    original_request=q,
-                    callbacks=callbacks,
-                    emit_tool_events=True,
-                )
-            return str(original_result or "")
+        if not is_grounded_search_output(original_result):
+            if bool(getattr(config, "search_grounding_enabled", True)) and hasattr(self.agent, "_grounded_web_search"):
+                if q:
+                    return self.agent._grounded_web_search(
+                        q,
+                        original_request=q,
+                        callbacks=callbacks,
+                        emit_tool_events=True,
+                    )
+                return str(original_result or "")
 
-        # If result is already good, return it
-        if self._is_result_acceptable(q, original_result):
-            logger.info(f"WebTaskReflector: original result accepted for query: {q[:80]}")
-            return original_result
+            # If result is already good, return it
+            if self._is_result_acceptable(q, original_result):
+                logger.info(f"WebTaskReflector: original result accepted for query: {q[:80]}")
+                return original_result
         
         # Track attempts
         self._attempt_count[task_id] = self._attempt_count.get(task_id, 0) + 1
@@ -625,6 +729,33 @@ class WebTaskReflector:
                 self.agent._emit_thinking_step("thought", reason, "done")
         except Exception:
             pass
+
+        # Prefer grounded re-search when available (Stage 3 / tool wrappers)
+        if hasattr(self.agent, "_grounded_web_search"):
+            try:
+                result = self.agent._grounded_web_search(
+                    refined_q,
+                    original_request=str(
+                        task.get("params", {}).get("original_request") or q or refined_q
+                    ),
+                    callbacks=callbacks,
+                    emit_tool_events=True,
+                )
+                result = str(result or "")
+                logger.info(
+                    f"WebTaskReflector: grounded retry attempt {attempt} returned {len(result)} chars"
+                )
+                if is_grounded_search_output(result):
+                    if self._is_grounded_packet_acceptable(q, result) or attempt >= self.MAX_RETRIES:
+                        return result
+                    return self.reflect_and_retry(task, tool_name, result, tools, callbacks)
+                if self._is_result_acceptable(q, result):
+                    return result
+                if attempt < self.MAX_RETRIES:
+                    return self.reflect_and_retry(task, tool_name, result, tools, callbacks)
+                return result
+            except Exception as e:
+                logger.warning(f"WebTaskReflector: grounded retry failed: {e}")
         
         # Find the tool
         target_tool = next((t for t in tools if t.name == tool_name), None)
@@ -1157,6 +1288,18 @@ Return ONLY the JSON array, no explanation:
             result = tool.invoke(**params)
             if hasattr(self.agent, "_check_context_budget_mid_task"):
                 self.agent._check_context_budget_mid_task("after_tool_output", task, str(result or ""))
+            # v7.5.2 coding loop (TaskPlanner path)
+            if hasattr(self.agent, "_coding_loop_note_tool"):
+                try:
+                    pending = bool(task.get("status") == "pending_confirmation") or str(tool_name) == "file_write"
+                    self.agent._coding_loop_note_tool(
+                        str(tool_name or ""),
+                        str(params),
+                        str(result or ""),
+                        pending_write=pending,
+                    )
+                except Exception:
+                    pass
             
             # Apply reflection and retry for web search tasks (legacy fast-path)
             if tool_name == "web_search":
@@ -1692,9 +1835,12 @@ class EchoSpeakAgent:
         self._skills_prompt: str = ""
         self._tool_allowlist_override: Optional[set[str]] = None
         self._action_parser_enabled = bool(getattr(config, "action_parser_enabled", True))
+        # v7.5.2: code-enforced coding lifecycle (inspect→…→summarize)
+        self._coding_loop = None  # Optional[CodingLoop]
         # Track tool outputs so LangGraph fallback can preserve partial results
         self._partial_tool_results: List[Dict[str, str]] = []
         self._partial_tool_names: Dict[str, str] = {}  # run_id → tool_name
+        self._partial_tool_inputs: Dict[str, str] = {}  # run_id → tool input
         # Cross-source activity tracking
         self._last_activity: Dict[str, Any] = {"source": None, "summary": "", "thread_id": None, "at": 0.0}
         # Discord user identity & role (set per-request in process_query)
@@ -1706,10 +1852,13 @@ class EchoSpeakAgent:
         # Populate the global tool registry from the legacy lists (migration bridge)
         ToolRegistry.register_from_metadata(get_available_tools(), TOOL_METADATA)
 
-        # Load MCP dynamic tools
+        # Load MCP dynamic tools via process-wide singleton (Trust Center + agent share state)
+        self._mcp_manager = None
         try:
-            from agent.mcp_client import MCPManager
-            mcp_mgr = MCPManager()
+            from agent.mcp_client import get_mcp_manager
+
+            mcp_mgr = get_mcp_manager()
+            self._mcp_manager = mcp_mgr
             if getattr(config, "mcp_servers", None):
                 mcp_mgr.initialize_servers(config.mcp_servers)
         except Exception as e:
@@ -1720,12 +1869,27 @@ class EchoSpeakAgent:
         self.lc_tools = self._apply_search_grounding_to_lc_tools(ToolRegistry.get_config_filtered_funcs(config))
         self.tools = self._create_tools()
 
-        # Merge MCP tools into self.tools
+        # Merge MCP tools into self.tools (StructuredTool or shim already registered)
         for name, entry in ToolRegistry._entries.items():
             if entry.category == "mcp" and not any(t.name == name for t in self.tools):
-                def make_wrapper(t_func=entry.func):
-                    return lambda **kwargs: t_func.invoke(kwargs)
-                self.tools.append(Tool(name, make_wrapper(entry.func), entry.description))
+                func = entry.func
+                if hasattr(func, "invoke") or hasattr(func, "name"):
+                    # Prefer the LangChain tool object directly when possible
+                    try:
+                        self.tools.append(func)
+                        continue
+                    except Exception:
+                        pass
+
+                def make_wrapper(t_func=func):
+                    def _wrapped(**kwargs):
+                        if hasattr(t_func, "invoke"):
+                            return t_func.invoke(kwargs)
+                        return t_func(**kwargs)
+
+                    return _wrapped
+
+                self.tools.append(Tool(name, make_wrapper(func), entry.description))
         self.graph_agent = self._create_langgraph_agent()
         if self.graph_agent is None:
             self.agent_executor = self._create_agent_executor()
@@ -1877,54 +2041,90 @@ class EchoSpeakAgent:
 
         Called by the RoutineManager scheduler when a cron/webhook routine fires.
         Output is routed to the routine's delivery_channels (discord, telegram, etc.).
+
+        Isolation rules:
+          - dedicated thread_id so chat subject/history is not polluted
+          - source=routine suppresses interactive stream callbacks
+          - snapshot/restore current_subject + last web context for the interactive agent
         """
         try:
             action_type = getattr(routine, "action_type", "query")
             action_config = getattr(routine, "action_config", {}) or {}
             routine_name = getattr(routine, "name", "unknown")
+            routine_id = str(getattr(routine, "id", "") or routine_name).strip() or "anon"
             delivery_channels = getattr(routine, "delivery_channels", None) or ["web"]
+            isolated_thread = f"routine_{routine_id}"
+
+            # Snapshot interactive continuity so a "daily news briefing" never
+            # overwrites the user's current subject after the lock is released.
+            snap_subject = str(getattr(self, "_current_subject_text", "") or "")
+            snap_web = str(getattr(self, "_last_web_query_context", "") or "")
+            snap_partial = list(getattr(self, "_partial_tool_results", []) or [])
 
             response = None
 
-            if action_type == "query":
-                message = action_config.get("message", "").strip()
-                if not message:
-                    logger.warning(f"Routine '{routine_name}' has no message configured")
+            try:
+                if action_type == "query":
+                    message = action_config.get("message", "").strip()
+                    if not message:
+                        logger.warning(f"Routine '{routine_name}' has no message configured")
+                        return
+                    logger.info(f"Routine '{routine_name}' firing query: {message[:80]}...")
+                    response, success = self.process_query(
+                        message,
+                        include_memory=False,
+                        source="routine",
+                        thread_id=isolated_thread,
+                        callbacks=[],
+                    )
+                    logger.info(
+                        f"Routine '{routine_name}' completed (success={success}): "
+                        f"{str(response)[:120]}..."
+                    )
+
+                elif action_type == "tool":
+                    tool_name = action_config.get("tool_name", "").strip()
+                    tool_args = action_config.get("args", {})
+                    if not tool_name:
+                        logger.warning(f"Routine '{routine_name}' has no tool_name configured")
+                        return
+                    synthetic_query = f"Run the {tool_name} tool"
+                    if tool_args:
+                        args_str = ", ".join(f"{k}={v}" for k, v in tool_args.items())
+                        synthetic_query += f" with {args_str}"
+                    logger.info(f"Routine '{routine_name}' firing tool: {tool_name}")
+                    response, _ = self.process_query(
+                        synthetic_query,
+                        include_memory=False,
+                        source="routine",
+                        thread_id=isolated_thread,
+                        callbacks=[],
+                    )
+
+                elif action_type == "skill":
+                    skill_name = action_config.get("skill_name", "").strip()
+                    message = action_config.get("message", "").strip()
+                    if message:
+                        logger.info(f"Routine '{routine_name}' firing skill '{skill_name}': {message[:80]}")
+                        response, _ = self.process_query(
+                            message,
+                            include_memory=False,
+                            source="routine",
+                            thread_id=isolated_thread,
+                            callbacks=[],
+                        )
+
+                else:
+                    logger.warning(f"Routine '{routine_name}' has unknown action_type: {action_type}")
                     return
-                logger.info(f"Routine '{routine_name}' firing query: {message[:80]}...")
-                response, success = self.process_query(
-                    message,
-                    include_memory=True,
-                    source="routine",
-                )
-                logger.info(
-                    f"Routine '{routine_name}' completed (success={success}): "
-                    f"{str(response)[:120]}..."
-                )
-
-            elif action_type == "tool":
-                tool_name = action_config.get("tool_name", "").strip()
-                tool_args = action_config.get("args", {})
-                if not tool_name:
-                    logger.warning(f"Routine '{routine_name}' has no tool_name configured")
-                    return
-                synthetic_query = f"Run the {tool_name} tool"
-                if tool_args:
-                    args_str = ", ".join(f"{k}={v}" for k, v in tool_args.items())
-                    synthetic_query += f" with {args_str}"
-                logger.info(f"Routine '{routine_name}' firing tool: {tool_name}")
-                response, _ = self.process_query(synthetic_query, include_memory=False, source="routine")
-
-            elif action_type == "skill":
-                skill_name = action_config.get("skill_name", "").strip()
-                message = action_config.get("message", "").strip()
-                if message:
-                    logger.info(f"Routine '{routine_name}' firing skill '{skill_name}': {message[:80]}")
-                    response, _ = self.process_query(message, include_memory=True, source="routine")
-
-            else:
-                logger.warning(f"Routine '{routine_name}' has unknown action_type: {action_type}")
-                return
+            finally:
+                # Always restore interactive chat continuity
+                try:
+                    self._current_subject_text = snap_subject
+                    self._last_web_query_context = snap_web
+                    self._partial_tool_results = snap_partial
+                except Exception:
+                    pass
 
             # Route the response to the routine's delivery channels
             if response and str(response).strip():
@@ -2266,23 +2466,538 @@ class EchoSpeakAgent:
         )
 
     def _is_coding_project_intent(self, user_input: str) -> bool:
+        """Structural coding intent — works for any genre/project type, not a noun whitelist.
+
+        \"build me a rhythm game\" and \"create a tower defense prototype\" must match
+        the same mechanism as any other create+artifact request.
+        """
         text = self._extract_user_request_text(self._strip_live_desktop_context(user_input or ""))
         low = (text or "").lower().strip()
         if not low:
             return False
-        coding_nouns = [
-            "website", "web site", "html", "css", "javascript", "js", "typescript",
-            "python", "app", "project", "game", "script", "program", "codebase",
-            "repo", "repository", "frontend", "backend", "api", "component",
-        ]
-        build_verbs = [
-            "code", "build", "create", "make", "start", "setup", "set up",
-            "scaffold", "implement", "develop", "write", "fix", "patch",
-            "edit", "modify", "inspect", "search", "list", "read",
-        ]
-        if any(noun in low for noun in coding_nouns) and any(verb in low for verb in build_verbs):
+        if self._is_local_filesystem_intent(user_input):
             return True
-        return bool(re.search(r"\b(?:let'?s|get|start|begin)\s+(?:coding|building|developing)\b", low))
+        # Explicit code-work framing
+        if re.search(
+            r"\b(?:let'?s|let us|we should|i want to|i need to|can we|can you)\s+"
+            r"(?:code|build|make|create|scaffold|implement|develop|write)\b",
+            low,
+        ):
+            return True
+        # \"build/create/make/code (me) a|an <anything>\" — free-form object, no genre list
+        if re.search(
+            r"\b(build|create|make|code|implement|scaffold|develop|write)\b"
+            r".{0,30}\b(me|us|a|an|the|my|our)\b.{0,60}",
+            low,
+        ) and not re.search(r"\b(search|look up|google|weather|news|price of)\b", low):
+            return True
+        # File/code artifact extensions or source-tree language
+        if re.search(r"\b\w+\.(html|css|js|jsx|ts|tsx|py|go|rs|java|vue|svelte)\b", low):
+            return True
+        if re.search(
+            r"\b(file|folder|directory|repo|codebase|project|workspace)\b", low
+        ) and re.search(r"\b(create|write|edit|read|fix|open|list|mkdir|scaffold)\b", low):
+            return True
+        if re.search(r"\b(?:let'?s|get|start|begin)\s+(?:coding|building|developing)\b", low):
+            return True
+        return False
+
+    def _is_local_filesystem_intent(self, user_input: str) -> bool:
+        """User wants local Desktop/files/project inspection — NEVER web_search.
+
+        Structural signals only (no hard-coded project names). Covers:
+        scan/list/read/open folder, desktop paths, local project work.
+        """
+        text = self._extract_user_request_text(user_input or "")
+        low = re.sub(r"\s+", " ", (text or "").lower().strip())
+        if not low:
+            return False
+        # Explicit local filesystem signals
+        if re.search(
+            r"\b("
+            r"on my desktop|my desktop|look on (?:my )?desktop|list (?:my )?desktop|"
+            r"from (?:my )?desktop|on the desktop|desktop[/\\]|search (?:my )?desktop|"
+            r"read the files?|read (?:the )?project|open (?:the )?(?:project|folder|files?)|"
+            r"list (?:the )?files?|inspect (?:the )?(?:project|folder|code|files?)|"
+            r"look at (?:the )?(?:files?|code|project|folder)|"
+            r"scan (?:the )?(?:folder|project|files?|directory|code)|"
+            r"go into (?:the )?(?:folder|project|directory)|"
+            r"understand (?:the )?project|go through (?:the )?files?|"
+            r"start (?:on )?(?:the )?(?:project|folder)|"
+            r"file://|~/desktop"
+            r")\b",
+            low,
+        ):
+            return True
+        # Desktop + any inspect/work verb
+        if re.search(r"\bdesktop\b", low) and re.search(
+            r"\b(scan|list|read|open|folder|project|files?|code|inspect|check|"
+            r"look|start|work|together)\b",
+            low,
+        ):
+            return True
+        # "start on <slug>" / "project <slug>" with file-ish verbs → local, not web
+        if re.search(
+            r"\b(?:start on|open|continue on|work on|start the|scan)\s+[a-z0-9][\w.-]{1,40}\b",
+            low,
+        ) and re.search(r"\b(desktop|files?|folder|project|code|read|look|scan)\b", low):
+            return True
+        return False
+
+    def _try_pin_desktop_project_from_user(self, user_input: str) -> Optional[str]:
+        """Match user tokens to real Desktop folders — discovery, not a name whitelist."""
+        try:
+            from agent.tools import set_active_project_root, _desktop_root
+        except Exception:
+            return None
+        try:
+            desk = _desktop_root()
+            if not desk.is_dir():
+                return None
+            folders = {p.name.lower(): p for p in desk.iterdir() if p.is_dir()}
+            if not folders:
+                return None
+        except Exception:
+            return None
+
+        text = self._extract_user_request_text(user_input or "")
+        low = re.sub(r"\s+", " ", (text or "").lower())
+        # Candidate slugs from phrasing + kebab/snake tokens (generic)
+        candidates: list[str] = []
+        for m in re.finditer(
+            r"(?:start on|open|project|folder|called|named|thats called|that's called|"
+            r"that is called|in|on)\s+([a-z0-9][\w.-]{1,48})",
+            low,
+        ):
+            candidates.append(m.group(1).strip(".,!?"))
+        for m in re.finditer(r"\b([a-z0-9]+(?:[-_][a-z0-9]+)+)\b", low):
+            candidates.append(m.group(1))
+        # Also try contiguous words as a slug: "2d shooter" → "2d-shooter"
+        for m in re.finditer(r"\b([a-z0-9]{1,12})\s+([a-z0-9]{2,20})(?:\s+([a-z0-9]{2,20}))?\b", low):
+            candidates.append(f"{m.group(1)}-{m.group(2)}")
+            if m.group(3):
+                candidates.append(f"{m.group(1)}-{m.group(2)}-{m.group(3)}")
+
+        seen: set[str] = set()
+        for c in candidates:
+            key = c.lower().replace("_", "-")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            # Exact folder name
+            if key in folders:
+                path = folders[key]
+                set_active_project_root(str(path))
+                return str(path)
+            # Contains / contained-by match (e.g. user "2d-shooter" → folder "2d-shooter-game")
+            for name, path in folders.items():
+                if key == name or key in name or name in key:
+                    set_active_project_root(str(path))
+                    return str(path)
+        return None
+
+    def _desktop_folder_names(self) -> dict:
+        """Map lower-name → absolute path for Desktop child folders."""
+        try:
+            from agent.tools import _desktop_root
+
+            desk = _desktop_root()
+            if not desk.is_dir():
+                return {}
+            return {p.name.lower(): p for p in desk.iterdir() if p.is_dir()}
+        except Exception:
+            return {}
+
+    def _match_project_from_listing_text(self, user_input: str, listing: str) -> Optional[str]:
+        """If a Desktop listing shows candidate folders, pick the one matching user tokens."""
+        folders = self._desktop_folder_names()
+        if not folders:
+            return None
+        listed = set()
+        for line in str(listing or "").splitlines():
+            name = line.strip().rstrip("/\\").split("/")[-1].split("\\")[-1].strip()
+            if name:
+                listed.add(name.lower())
+        # Prefer intersection of listed Desktop dirs + user slug match
+        text = self._extract_user_request_text(user_input or "")
+        low = re.sub(r"\s+", " ", (text or "").lower())
+        candidates: list[str] = []
+        for m in re.finditer(r"\b([a-z0-9]+(?:[-_][a-z0-9]+)+)\b", low):
+            candidates.append(m.group(1).replace("_", "-"))
+        for m in re.finditer(
+            r"\b([a-z0-9]{1,12})\s+([a-z0-9]{2,20})(?:\s+([a-z0-9]{2,20}))?\b",
+            low,
+        ):
+            candidates.append(f"{m.group(1)}-{m.group(2)}")
+            if m.group(3):
+                candidates.append(f"{m.group(1)}-{m.group(2)}-{m.group(3)}")
+        for m in re.finditer(
+            r"(?:called|named|folder|project|game)\s+([a-z0-9][\w.-]{1,48})",
+            low,
+        ):
+            candidates.append(m.group(1).replace("_", "-").strip(".,!?"))
+
+        seen: set[str] = set()
+        for c in candidates:
+            key = c.lower().replace("_", "-")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            for name, path in folders.items():
+                if name not in listed and listed:
+                    # Listing may be partial; still allow full desktop match
+                    pass
+                if key == name or key in name or name in key:
+                    try:
+                        from agent.tools import set_active_project_root
+
+                        set_active_project_root(str(path))
+                    except Exception:
+                        pass
+                    return str(path)
+        # Single strong project-like folder on desktop when user said "the game/project"
+        if re.search(r"\b(game|project|folder|shooter)\b", low):
+            for name, path in folders.items():
+                if re.search(r"(game|shooter|project)", name) and (not listed or name in listed):
+                    try:
+                        from agent.tools import set_active_project_root
+
+                        set_active_project_root(str(path))
+                    except Exception:
+                        pass
+                    return str(path)
+        return None
+
+    def _run_local_project_deep_scan(self, user_input: str) -> dict:
+        """
+        Full local reloop:
+          1) pin project from user tokens (or Desktop list → match)
+          2) list *inside* the project (not just Desktop root)
+          3) sample-read entry files for real context
+
+        Returns {path, listing, samples}. Always prefers interior over Desktop root.
+        """
+        result: dict = {"path": "", "listing": "", "samples": ""}
+        try:
+            from agent.tools import _desktop_root, set_active_project_root
+        except Exception:
+            return result
+
+        pinned = self._try_pin_desktop_project_from_user(user_input)
+        # If pin failed or only Desktop was listed earlier, list Desktop then re-match
+        if not pinned:
+            try:
+                desk = str(_desktop_root())
+                desk_listing = self._preflight_list_local_project(desk)
+                pinned = self._match_project_from_listing_text(user_input, desk_listing)
+                if not pinned:
+                    pinned = self._try_pin_desktop_project_from_user(user_input)
+            except Exception as exc:
+                logger.debug("Desktop list for pin failed: {}", exc)
+
+        if not pinned:
+            # Last resort: any Desktop folder matching "shooter|game" tokens from utterance
+            pinned = self._match_project_from_listing_text(
+                user_input, "\n".join(self._desktop_folder_names().keys())
+            )
+
+        if not pinned:
+            return result
+
+        try:
+            set_active_project_root(str(pinned))
+        except Exception:
+            pass
+        try:
+            loop = getattr(self, "_coding_loop", None)
+            if loop is not None and hasattr(loop, "state"):
+                loop.state.project_folder = pinned
+        except Exception:
+            pass
+
+        listing = self._preflight_list_local_project(pinned)
+        # If listing looks like Desktop root (many sibling projects), re-enter target
+        if listing and re.search(r"(?im)^(echospeak|win11debloat|antigravity)", listing):
+            rematch = self._match_project_from_listing_text(user_input, listing)
+            if rematch and rematch != pinned:
+                pinned = rematch
+                try:
+                    set_active_project_root(str(pinned))
+                except Exception:
+                    pass
+                listing = self._preflight_list_local_project(pinned)
+
+        samples = self._preflight_sample_read_local_project(pinned, max_files=6)
+        result = {"path": pinned, "listing": listing or "", "samples": samples or ""}
+        try:
+            self._last_local_project_path = pinned
+            self._last_local_project_listing = listing or ""
+            self._last_local_project_samples = samples or ""
+        except Exception:
+            pass
+        return result
+
+    def _local_scan_answer_is_hollow(self, user_input: str, answer: str) -> bool:
+        """True when the model found the folder but stopped instead of reading into it."""
+        low = re.sub(r"\s+", " ", str(answer or "").lower())
+        if not low:
+            return True
+        # Classic stall: "what's first / what do you want to look at"
+        if re.search(
+            r"\b("
+            r"what(?:'s| is) the first thing|"
+            r"what do you want|"
+            r"which file|"
+            r"where (?:do|should) we start|"
+            r"what should we (?:look at|open|start)|"
+            r"ready when you are|"
+            r"let me know what"
+            r")\b",
+            low,
+        ):
+            return True
+        # User asked to scan/understand but answer has no file-level substance
+        u = (user_input or "").lower()
+        if re.search(r"\b(scan|understand|look into|read the|go through|inspect)\b", u):
+            has_file_signal = bool(
+                re.search(
+                    r"\b(readme|index\.html|main\.|package\.json|\.js|\.py|\.css|\.html|"
+                    r"entry|script|canvas|player|enemy|collision)\b",
+                    low,
+                )
+            )
+            samples = str(getattr(self, "_last_local_project_samples", "") or "")
+            if samples and len(samples) > 80 and not has_file_signal:
+                return True
+            # Only mentioned desktop siblings, never interior
+            if re.search(r"\b(i see|found).{0,40}folder\b", low) and not has_file_signal:
+                return True
+        return False
+
+    def _synthesize_local_project_brief(self, user_input: str) -> str:
+        """Concrete project brief from deep-scan tool results — never ask what to open first."""
+        path = str(getattr(self, "_last_local_project_path", "") or "")
+        listing = str(getattr(self, "_last_local_project_listing", "") or "")
+        samples = str(getattr(self, "_last_local_project_samples", "") or "")
+        tool_context = self._format_partial_tool_context(limit=12)
+        if not (listing or samples or tool_context):
+            return ""
+        prompt = (
+            "You are Echo Speak pair-programming. Local file tools already finished.\n"
+            "RULES (mandatory):\n"
+            "- Summarize the project from the file contents below.\n"
+            "- Cover: project path, structure (key files/folders), tech stack, entry points, "
+            "what the code already does, and 2–4 concrete next steps to work on together.\n"
+            "- Quote real filenames and short concrete details from the files.\n"
+            "- Do NOT ask \"what's the first thing you want to look at?\" or wait for the user "
+            "to pick a file — YOU already scanned. Lead with understanding.\n"
+            "- Do NOT claim you cannot open folders. Do NOT suggest web search.\n"
+            "- Be concise (about 8–14 sentences or short bullets). No markdown links.\n\n"
+            f"User request: {user_input}\n"
+            f"Project path: {path}\n\n"
+            f"Interior listing:\n{listing[:2500]}\n\n"
+            f"File samples:\n{samples[:6000]}\n\n"
+            f"Other tool results:\n{tool_context[:3000]}\n\n"
+            "Project brief:"
+        )
+        try:
+            return self._clamp_tts_text(self._invoke_visible_llm(prompt))
+        except Exception as exc:
+            logger.warning("Local project brief synthesis failed: {}", exc)
+            # Deterministic fallback without LLM
+            names = [ln.strip() for ln in listing.splitlines() if ln.strip()][:12]
+            return (
+                f"I scanned {path or 'the project'}.\n"
+                f"Top-level: {', '.join(names) if names else '(empty or unreadable)'}.\n"
+                f"{'I also read entry files for context.' if samples else 'Could not sample-read files.'}\n"
+                "Say what you want to change next and we can edit the code directly."
+            )
+
+    def _ensure_local_project_deep_scan(
+        self,
+        user_input: str,
+        response_text: str,
+        callbacks: Optional[list] = None,
+    ) -> str:
+        """
+        After Stage 4: if user asked to scan a Desktop project, make sure we actually
+        entered the folder, read files, and returned a brief — not a stall question.
+        """
+        if not self._is_local_filesystem_intent(user_input):
+            return response_text
+
+        samples = str(getattr(self, "_last_local_project_samples", "") or "")
+        path = str(getattr(self, "_last_local_project_path", "") or "")
+        hollow = self._local_scan_answer_is_hollow(user_input, response_text)
+
+        # Need deep scan if we never got interior samples, or answer is a stall
+        needs_scan = hollow or not samples or not path
+        # Also if path is Desktop root itself
+        try:
+            from agent.tools import _desktop_root
+
+            if path and Path(path).resolve() == _desktop_root().resolve():
+                needs_scan = True
+        except Exception:
+            pass
+
+        if needs_scan:
+            try:
+                if hasattr(self, "_emit_thinking_step"):
+                    self._emit_thinking_step(
+                        "thought",
+                        "Entering the project folder and reading key files…",
+                        "done",
+                    )
+            except Exception:
+                pass
+            try:
+                self._run_local_project_deep_scan(user_input)
+            except Exception as exc:
+                logger.warning("Local deep scan failed: {}", exc)
+
+        samples = str(getattr(self, "_last_local_project_samples", "") or "")
+        hollow = self._local_scan_answer_is_hollow(user_input, response_text)
+        thin = not (response_text or "").strip() or len((response_text or "").split()) < 25
+
+        # Prefer a real project brief whenever scan intent + file context exists
+        # and the model stalled, was thin, or never used the samples.
+        if samples and len(samples) > 80 and (hollow or thin):
+            brief = self._synthesize_local_project_brief(user_input)
+            if brief and len(brief.strip()) > 40:
+                return brief
+        if hollow:
+            brief = self._synthesize_local_project_brief(user_input)
+            if brief and len(brief.strip()) > 40:
+                return brief
+        return response_text
+
+    def _preflight_list_local_project(self, project_path: str) -> str:
+        """List a directory (Desktop or project interior). Emits file_list tool events."""
+        path = str(project_path or "").strip()
+        if not path:
+            return ""
+        try:
+            from agent.tools import file_list
+        except Exception:
+            return ""
+        run_id = f"preflight-list-{abs(hash(path)) % 10**8}"
+        try:
+            self._emit_tool_start(None, "file_list", path, run_id)
+        except Exception:
+            pass
+        try:
+            out = str(file_list.invoke({"path": path}) or "")
+        except Exception as exc:
+            out = f"File list failed: {exc}"
+            try:
+                self._emit_tool_error(None, RuntimeError(str(exc)), run_id)
+            except Exception:
+                pass
+            return out
+        try:
+            # _emit_tool_end also appends to _partial_tool_results
+            self._emit_tool_end(None, out[:4000], run_id)
+        except Exception:
+            try:
+                if not hasattr(self, "_partial_tool_results") or self._partial_tool_results is None:
+                    self._partial_tool_results = []
+                self._partial_tool_results.append({"tool": "file_list", "output": out[:4000]})
+            except Exception:
+                pass
+        try:
+            # Only treat as project listing if not Desktop root
+            from agent.tools import _desktop_root
+
+            if Path(path).resolve() != _desktop_root().resolve():
+                self._last_local_project_listing = out
+                self._last_local_project_path = path
+            else:
+                self._last_desktop_listing = out
+        except Exception:
+            self._last_local_project_listing = out
+            self._last_local_project_path = path
+        return out
+
+    def _preflight_sample_read_local_project(self, project_path: str, *, max_files: int = 5) -> str:
+        """Read a few entry-point files so the model can *understand* the project, not only list names.
+
+        Priority: README, package/manifest, main/index/app entry sources.
+        """
+        import os
+        from pathlib import Path
+
+        root = Path(str(project_path or "").strip())
+        if not root.is_dir():
+            return ""
+        try:
+            from agent.tools import file_read
+        except Exception:
+            return ""
+
+        preferred_names = (
+            "readme.md", "readme.txt", "readme", "package.json", "pyproject.toml",
+            "cargo.toml", "go.mod", "index.html", "main.py", "app.py", "main.js",
+            "main.ts", "index.js", "index.ts", "game.js", "game.py", "app.js",
+        )
+        candidates: list[Path] = []
+        try:
+            for p in root.rglob("*"):
+                if not p.is_file():
+                    continue
+                if any(part.startswith(".") for part in p.parts):
+                    continue
+                if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".mp3", ".wav", ".ogg", ".bin"}:
+                    continue
+                rel = p.relative_to(root).as_posix().lower()
+                name = p.name.lower()
+                score = 0
+                if name in preferred_names:
+                    score += 50
+                if name.startswith("readme"):
+                    score += 40
+                if p.suffix.lower() in {".md", ".txt", ".html", ".js", ".ts", ".py", ".css", ".json"}:
+                    score += 5
+                if "node_modules" in rel or "dist" in rel or "__pycache__" in rel:
+                    continue
+                # Prefer shallow files
+                score -= rel.count("/") * 3
+                if score > 0 or p.suffix.lower() in {".html", ".js", ".py", ".ts", ".css", ".md"}:
+                    candidates.append(p)
+        except Exception:
+            return ""
+
+        def _key(p: Path) -> tuple:
+            name = p.name.lower()
+            pref = preferred_names.index(name) if name in preferred_names else 99
+            return (pref, len(p.parts), str(p))
+
+        candidates = sorted(set(candidates), key=_key)[: max(1, int(max_files))]
+        blobs: list[str] = []
+        for p in candidates:
+            run_id = f"preflight-read-{abs(hash(str(p))) % 10**8}"
+            path_str = str(p)
+            try:
+                self._emit_tool_start(None, "file_read", path_str, run_id)
+            except Exception:
+                pass
+            try:
+                out = str(file_read.invoke({"path": path_str}) or "")
+            except Exception as exc:
+                out = f"File read failed: {exc}"
+            # Cap each sample so we don't blow context
+            sample = out[:3500]
+            try:
+                self._emit_tool_end(None, sample, run_id)
+            except Exception:
+                pass
+            blobs.append(f"### {p.name}\n{sample}")
+        joined = "\n\n".join(blobs)
+        try:
+            self._last_local_project_samples = joined
+        except Exception:
+            pass
+        return joined
 
     def _is_desktop_target_followup(self, user_input: str) -> bool:
         text = self._extract_user_request_text(self._strip_live_desktop_context(user_input or ""))
@@ -2291,6 +3006,8 @@ class EchoSpeakAgent:
             return False
         if not re.search(r"\b(?:desktop|on my desktop|to my desktop|there)\b", low):
             return False
+        if self._is_local_filesystem_intent(user_input) or self._is_coding_project_intent(user_input):
+            return True
         try:
             recent = " ".join(str(m.get("content", "")) for m in self.conversation_memory.messages[-6:])
         except Exception:
@@ -2302,6 +3019,122 @@ class EchoSpeakAgent:
             if str(self._workspace_id or "").strip().lower() != "coding":
                 self.configure_workspace("coding")
                 logger.info("[Workspace Auto-Detect] Promoted to coding workspace from project/file intent.")
+
+    def _coding_workspace_active(self) -> bool:
+        return str(getattr(self, "_workspace_id", "") or "").strip().lower() == "coding"
+
+    def _ensure_coding_loop(self, user_input: str = "") -> None:
+        """Start or resume a coding loop when in coding workspace / coding intent."""
+        if not (self._coding_workspace_active() or self._is_coding_project_intent(user_input)):
+            return
+        try:
+            from agent.coding_loop import CodingLoop, CodingPhase, project_folder_for_name
+        except Exception as exc:
+            logger.debug("coding_loop unavailable: {}", exc)
+            return
+        loop = getattr(self, "_coding_loop", None)
+        terminal = False
+        if loop is not None:
+            try:
+                terminal = loop.phase in (CodingPhase.DONE, CodingPhase.FAILED)
+            except Exception:
+                terminal = False
+        if loop is None or terminal:
+            folder = ""
+            try:
+                root = str(getattr(config, "file_tool_root", "") or ".")
+                # Prefer a stable session folder name from first words of the request
+                label = re.sub(r"\s+", " ", (user_input or "project").strip())[:40] or "project"
+                folder = project_folder_for_name(label, root)
+            except Exception:
+                folder = ""
+            self._coding_loop = CodingLoop(project_folder=folder)
+            try:
+                self._coding_loop.start(project_folder=folder, note="coding turn start")
+            except Exception as exc:
+                logger.debug("coding loop start: {}", exc)
+        elif loop.phase == CodingPhase.IDLE:
+            try:
+                loop.start(note="coding turn resume")
+            except Exception:
+                pass
+
+    def _coding_loop_note_tool(
+        self,
+        tool_name: str,
+        tool_input: str = "",
+        tool_output: str = "",
+        *,
+        pending_write: bool = False,
+    ) -> None:
+        """Advance coding loop from an observed tool call (TaskPlanner or LC tools)."""
+        if not self._coding_workspace_active() and getattr(self, "_coding_loop", None) is None:
+            return
+        self._ensure_coding_loop()
+        loop = getattr(self, "_coding_loop", None)
+        if loop is None:
+            return
+        try:
+            from agent.coding_loop import parse_terminal_status_block
+        except Exception:
+            parse_terminal_status_block = None  # type: ignore
+
+        path = ""
+        term_status = ""
+        name = str(tool_name or "").strip().lower()
+        raw_in = str(tool_input or "")
+        # Extract path from common tool input shapes
+        m = re.search(r"['\"]?path['\"]?\s*[:=]\s*['\"]([^'\"]+)['\"]", raw_in, flags=re.I)
+        if m:
+            path = m.group(1).strip()
+        elif name.startswith("file_") and raw_in and len(raw_in) < 260 and "\n" not in raw_in:
+            path = raw_in.strip().strip("'\"")
+        # Pin project root when mkdir / write hits Desktop/<project>
+        if path and name in {"file_mkdir", "file_write", "file_read", "file_list"}:
+            try:
+                from agent.tools import set_active_project_root
+
+                norm = path.replace("\\", "/")
+                mproj = re.search(r"(?i)(desktop/[^/]+)", norm)
+                if mproj:
+                    proj = mproj.group(1)
+                    set_active_project_root(proj)
+                    try:
+                        loop.state.project_folder = proj
+                    except Exception:
+                        pass
+                elif name == "file_mkdir" and "desktop" in norm.lower():
+                    set_active_project_root(norm)
+                    try:
+                        loop.state.project_folder = norm
+                    except Exception:
+                        pass
+                elif loop and str(getattr(loop.state, "project_folder", "") or "").strip():
+                    set_active_project_root(str(loop.state.project_folder))
+            except Exception as exc:
+                logger.debug("set_active_project_root: {}", exc)
+        if name == "terminal_run" and callable(parse_terminal_status_block):
+            term_status = parse_terminal_status_block(str(tool_output or ""))
+        try:
+            loop.note_tool(
+                name,
+                path=path,
+                terminal_status=term_status,
+                pending_write=bool(pending_write) or name == "file_write",
+            )
+        except Exception as exc:
+            logger.debug("coding_loop note_tool: {}", exc)
+
+    def get_coding_loop_state(self) -> Dict[str, Any]:
+        loop = getattr(self, "_coding_loop", None)
+        if loop is None:
+            return {"active": False, "phase": "idle"}
+        try:
+            d = loop.as_dict()
+            d["active"] = True
+            return d
+        except Exception:
+            return {"active": False, "phase": "idle"}
 
     def _is_capability_question_text(self, query_lower: str) -> bool:
         q = (query_lower or "").strip().lower()
@@ -2659,7 +3492,13 @@ class EchoSpeakAgent:
             "If no system action is required, return JSON: {\"action\": \"none\", \"confidence\": 1.0}.\n\n"
             "Hard rules:\n"
             "- Return ONLY JSON (no markdown, no commentary, no explanation).\n"
-            "- Allowed actions: none, file_write, terminal_run, file_read, file_list, file_mkdir, file_move, file_copy, file_delete, web_search.\n"
+            "- Allowed actions: none, file_write, terminal_run, file_read, file_list, file_mkdir, file_move, file_copy, file_delete"
+            + (
+                ".\n"  # no web_search for local filesystem turns
+                if self._is_local_filesystem_intent(user_input)
+                else ", web_search.\n"
+            )
+            + "- If the user mentions Desktop / folder / project / scan files, prefer file_list then file_read — NEVER web_search.\n"
             "- Single action only. If user requests multiple actions, pick the single best next action and set needs_followup=true.\n"
             "- For file_write: include path (relative to file_root unless the user gave an absolute path under an allowed root), content, append (bool).\n"
             "- If the user says Desktop as the destination, use a path beginning with Desktop/.\n"
@@ -3058,6 +3897,13 @@ class EchoSpeakAgent:
                 q = str(normalized.get("query") or normalized.get("q") or "").strip()
                 if not q:
                     q = str(user_input or "").strip()
+                # Prefer extracted compact query over raw multi-intent chat.
+                try:
+                    compact = self._extract_search_query(user_input or q)
+                    if compact and len(compact) < len(q):
+                        q = compact
+                except Exception:
+                    pass
                 grounded = self._grounded_web_search(q, original_request=user_input or q, emit_tool_events=True)
                 if is_grounded_search_output(grounded) and "SEARCH_EVIDENCE_INSUFFICIENT" in grounded:
                     return (
@@ -3438,6 +4284,7 @@ class EchoSpeakAgent:
             },
             "session_memory": session_memory_diag,
             "verification": self._verification_telemetry.report() if getattr(self, "_verification_telemetry", None) is not None else {},
+            "coding_loop": self.get_coding_loop_state(),
         }
 
         return {
@@ -3472,6 +4319,7 @@ class EchoSpeakAgent:
             "discord": discord_diag,
             "integrations": integrations_diag,
             "reliability": reliability_diag,
+            "coding_loop": self.get_coding_loop_state(),
             "features": {
                 "action_parser_enabled": bool(getattr(config, "action_parser_enabled", True)),
                 "system_actions": bool(getattr(config, "enable_system_actions", False)),
@@ -3833,38 +4681,38 @@ class EchoSpeakAgent:
         return any(re.fullmatch(pattern, q) is not None for pattern in patterns)
 
     def _has_live_info_subject(self, query_lower: str) -> bool:
+        """True for web-fresh topics. Word-boundary only — never 'eth' inside 'together'."""
         q = re.sub(r"\s+", " ", str(query_lower or "").strip().lower())
         if not q:
             return False
-        return any(term in q for term in [
-            "weather",
-            "forecast",
-            "score",
-            "scores",
-            "price",
-            "stock",
-            "stocks",
-            "bitcoin",
-            "btc",
-            "ethereum",
-            "eth",
-            "exchange rate",
-            "flight status",
-            "traffic",
-            "availability",
-            "released",
-            "is it open",
-            "news",
-            "headlines",
-            "current events",
-            "top stories",
-            "breaking news",
-            "latest news",
-            "recent news",
-            "odds",
-            "sports odds",
-            "betting odds",
-        ])
+        # Multi-word phrases first
+        if any(
+            p in q
+            for p in (
+                "exchange rate",
+                "flight status",
+                "is it open",
+                "current events",
+                "top stories",
+                "breaking news",
+                "latest news",
+                "recent news",
+                "sports odds",
+                "betting odds",
+            )
+        ):
+            return True
+        # Short tokens MUST use word boundaries (eth⊂together was forcing web search on desktop turns)
+        return bool(
+            re.search(
+                r"\b("
+                r"weather|forecast|score|scores|price|stock|stocks|"
+                r"bitcoin|btc|ethereum|eth|traffic|availability|released|"
+                r"news|headlines|odds"
+                r")\b",
+                q,
+            )
+        )
 
     def _is_brief_conversational_query(self, query_lower: str) -> bool:
         q = re.sub(r"\s+", " ", str(query_lower or "").strip().lower())
@@ -3935,83 +4783,151 @@ class EchoSpeakAgent:
             "?", "what", "how", "when", "where", "who", "which",
             "is there", "show me", "tell me", "find", "search",
             "look up", "check", "get me", "give me", "research",
+            "i wonder", "wondering", "come out", "coming out", "release",
         ])
         if not has_question_signal:
             return False
 
-        triggers = [
+        # Phrase triggers (safe as substring)
+        phrase_triggers = [
             "right now",
             "currently",
-            "live",
-            "score",
-            "scores",
-            "weather",
-            "forecast",
-            "price",
-            "stock",
-            "stocks",
-            "bitcoin",
-            "btc",
-            "ethereum",
-            "eth",
+            "live score",
             "exchange rate",
             "flight status",
-            "traffic",
             "is it open",
-            "availability",
-            "released",
-            # Sports results / recency triggers
             "last night",
-            "yesterday",
             "last game",
-            "won",
-            "lost",
-            "beat",
-            "defeated",
-            "standings",
-            "playoff",
-            "playoffs",
-            "odds",
             "sports odds",
             "betting odds",
+            "come out",
+            "coming out",
+            "release date",
         ]
-        if any(t in q for t in triggers):
+        if any(t in q for t in phrase_triggers):
             return True
-        if "today" in q and self._has_live_info_subject(q):
+
+        # Word-boundary triggers — avoid "won" matching "wonder", "live" in unrelated words, etc.
+        word_triggers = (
+            r"\blive\b",
+            r"\bscore\b",
+            r"\bscores\b",
+            r"\bweather\b",
+            r"\bforecast\b",
+            r"\bprice\b",
+            r"\bstock\b",
+            r"\bstocks\b",
+            r"\bbitcoin\b",
+            r"\bbtc\b",
+            r"\bethereum\b",
+            r"\beth\b",
+            r"\btraffic\b",
+            r"\bavailability\b",
+            r"\breleased\b",
+            r"\brelease\b",
+            r"\byesterday\b",
+            r"\bwon\b",
+            r"\blost\b",
+            r"\bbeat\b",
+            r"\bdefeated\b",
+            r"\bstandings\b",
+            r"\bplayoff\b",
+            r"\bplayoffs\b",
+            r"\bodds\b",
+            r"\btrailer\b",
+        )
+        if any(re.search(p, q) for p in word_triggers):
             return True
-        if "latest" in q or "breaking" in q:
+        if re.search(r"\btoday\b", q) and self._has_live_info_subject(q):
+            return True
+        # Near-future sports slates (tomorrow used to fall through as non-live)
+        if re.search(r"\b(today|tonight|tomorrow|this weekend)\b", q) and (
+            self._has_schedule_terms(q)
+            or re.search(r"\bwho(?:'s| is)?\s+playing\b", q)
+            or re.search(r"\b(world cup|fifa|nhl|nba|nfl|mlb|match|fixture)\b", q)
+        ):
+            return True
+        if re.search(r"\blatest\b", q) or re.search(r"\bbreaking\b", q):
+            return True
+        # Subject-anchored clarifiers already rewritten (kickoff timezone, price in CAD, …)
+        if re.search(r"\b(timezone|time zone|kickoff|convert local|price in cad|price in usd)\b", q):
+            return True
+        if self._is_deeper_search_followup(q):
             return True
         return False
 
     def _is_explicit_web_query(self, query_lower: str) -> bool:
-        q = (query_lower or "").strip()
+        """True only when the user is asking for *internet* search/research.
+
+        Local desktop/file 'search' language must NOT count (e.g. 'search my
+        desktop folder'). Prefer structural web markers over bare 'search'.
+        """
+        q = re.sub(r"\s+", " ", (query_lower or "").strip().lower())
         if not q:
             return False
+        # Local filesystem / project work is never an explicit web query
+        try:
+            if self._is_local_filesystem_intent(q):
+                return False
+        except Exception:
+            pass
         if self._is_live_web_intent(q):
             return True
-        explicit_terms = [
-            "search",
-            "deep search",
-            "research",
-            "research deeply",
-            "look up",
-            "find out",
-            "news",
-            "headlines",
-            "current events",
-            "top stories",
-            "breaking news",
-            "latest news",
-            "recent news",
-            "updates on",
-            "update on",
-        ]
-        return any(term in q for term in explicit_terms)
+        if self._is_deeper_search_followup(q):
+            return True
+        # Clear internet / research phrasing
+        if re.search(
+            r"\b("
+            r"search the web|web search|google|look up online|look online|"
+            r"deep(?:er)? search|research(?: deeply)?|dig deeper|search again|"
+            r"find out online|browse the web"
+            r")\b",
+            q,
+        ):
+            return True
+        # Bare "search/look up/find out" only when NOT about local files/folders
+        if re.search(r"\b(search|look up|find out|research)\b", q):
+            if re.search(
+                r"\b(desktop|folder|directory|files?|project|codebase|disk|drive|"
+                r"my computer|local|scan the|go into)\b",
+                q,
+            ):
+                return False
+            return True
+        if re.search(
+            r"\b(news|headlines|current events|top stories|breaking news|"
+            r"latest news|recent news|updates on|update on)\b",
+            q,
+        ):
+            return True
+        return False
+
+    def _is_currency_code_token(self, text: str) -> bool:
+        """CAD/USD etc. — must not be treated as a city location swap."""
+        t = re.sub(r"[^a-z]", "", str(text or "").lower())
+        return t in {
+            "cad", "usd", "eur", "gbp", "jpy", "aud", "nzd", "chf", "cny", "inr",
+            "mxn", "krw", "brl", "sek", "nok", "dkk", "hkd", "sgd", "zar", "rub",
+            "btc", "eth", "usdt", "dollars", "dollar", "euros", "pounds", "yen",
+            "canadian", "american",
+        }
+
+    def _is_timezone_code_token(self, text: str) -> bool:
+        t = re.sub(r"[^a-z]", "", str(text or "").lower())
+        return t in {
+            "mnt", "mst", "mdt", "mt", "est", "edt", "et", "pst", "pdt", "pt",
+            "cst", "cdt", "ct", "utc", "gmt", "cet", "cest", "bst", "aest",
+            "akst", "hst", "ist", "jst", "kst", "nzst", "mountain", "pacific",
+            "eastern", "central", "atlantic",
+        }
 
     def _is_location_swap_followup(self, query_text: str) -> bool:
         """'what about in Calgary?' / 'and Vancouver?' style follow-ups."""
         q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
         if not q:
+            return False
+        # Currency / timezone units are clarifiers, not places
+        if self._is_currency_followup_text(q) or self._is_timezone_followup_text(q):
             return False
         patterns = (
             r"^(?:and\s+)?(?:what|how)\s+about\s+(?:in\s+|for\s+)?(.+?)\??$",
@@ -4028,8 +4944,109 @@ class EchoSpeakAgent:
             # Reject if the "place" is already a full self-contained question
             if any(w in place for w in ("weather", "score", "news", "search", "price", "stock")):
                 return False
+            # "in cad" / "in usd" / "in mnt" are unit clarifiers, not cities
+            if self._is_currency_code_token(place) or self._is_timezone_code_token(place):
+                return False
             if len(place.split()) <= 5 and len(place) >= 2:
                 return True
+        return False
+
+    def _is_timezone_followup_text(self, query_text: str) -> bool:
+        """Clarifiers about when a prior time applies (my time, MNT, timezone)."""
+        q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+        q = q.replace("\u2019", "'").replace("\u2018", "'")
+        if not q or len(q) > 120:
+            return False
+        # Explicit timezone / local-time questions
+        if re.search(
+            r"\b("
+            r"my\s+time|local\s+time|your\s+time|right\s+time\s+for\s+me|"
+            r"time\s*zone|timezone|which\s+time\s*zone|what\s+time\s*zone|"
+            r"is\s+that\s+(?:in\s+)?(?:my\s+)?time|"
+            r"\d{1,2}\s*(?::\d{2})?\s*(?:am|pm)?\s*(?:my\s+time|local)|"
+            r"(?:am|pm)\s+my\s+time|"
+            r"or\s+when|what\s+time\s+(?:is\s+)?that|"
+            r"what\s+mnt\s+time|what\s+mst\s+time|what\s+mountain\s+time|"
+            r"convert(?:ed)?\s+to\s+my\s+time|"
+            r"in\s+my\s+time\s*zone"
+            r")\b",
+            q,
+        ):
+            return True
+        # Named TZ abbreviations often alone or with "time/or when"
+        if re.search(
+            r"\b(mnt|mst|mdt|est|edt|pst|pdt|cst|cdt|utc|gmt|cet|mt|et|pt|ct)\b",
+            q,
+        ) and (
+            len(q.split()) <= 18
+            or re.search(r"\b(time|zone|or when|my time|is that|right time|check)\b", q)
+        ):
+            return True
+        if re.search(
+            r"\b(is that|was that)\s+(mountain|pacific|eastern|central|utc|gmt)\b",
+            q,
+        ):
+            return True
+        return False
+
+    def _is_currency_followup_text(self, query_text: str) -> bool:
+        """'in CAD?' / 'whats that in USD?' — unit conversion on prior price subject."""
+        q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+        q = q.replace("\u2019", "'").replace("\u2018", "'")
+        if not q or len(q) > 80:
+            return False
+        # "in cad?" / "in usd please"
+        if re.fullmatch(
+            r"(?:what(?:'s| is|s)?\s+(?:the\s+)?(?:price\s+)?(?:in\s+)?)?"
+            r"(?:in\s+)?(cad|usd|eur|gbp|jpy|aud|nzd|chf|cny|canadian|dollars?|euros?|pounds?)\??",
+            q,
+        ):
+            return True
+        if re.search(
+            r"\b(?:in|to|into)\s+(cad|usd|eur|gbp|jpy|aud|canadian\s+dollars?|us\s+dollars?)\b",
+            q,
+        ) and len(q.split()) <= 10:
+            return True
+        if re.search(
+            r"\b(?:convert|conversion|how much)\b.+\b(cad|usd|eur|gbp|canadian)\b",
+            q,
+        ) and len(q.split()) <= 12:
+            return True
+        if re.search(r"\bwhat(?:'s| is|s)?\s+the\s+in\s+(cad|usd|eur|gbp)\b", q):
+            return True
+        return False
+
+    def _is_general_clarifier_followup_text(self, query_text: str) -> bool:
+        """Short deictic clarifiers that only make sense with current_subject.
+
+        Covers: 'is that official?', 'for PS5?', 'how much is that?', 'when is that?'
+        without stealing full self-contained questions.
+        """
+        q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+        q = q.replace("\u2019", "'").replace("\u2018", "'")
+        if not q or len(q.split()) > 14:
+            return False
+        if self._is_timezone_followup_text(q) or self._is_currency_followup_text(q):
+            return True
+        # "is that …" / "was that …" / "does that …"
+        if re.match(r"^(?:so\s+)?(?:is|was|does|did|will|would|can|could)\s+that\b", q):
+            return True
+        # Hollow "what about that/it" already partially covered; add unit/platform
+        if re.fullmatch(
+            r"(?:and\s+)?(?:for|on)\s+(ps5|xbox|pc|switch|steam|mobile|ios|android)\??",
+            q,
+        ):
+            return True
+        if re.fullmatch(
+            r"(?:and\s+)?(?:how much|when|where|which|who)(?:\s+is\s+that|\s+was\s+that|\s+for\s+that)?\??",
+            q,
+        ):
+            return True
+        if re.fullmatch(r"(?:and\s+)?(?:the\s+)?(?:price|cost|date|time|score)\??", q):
+            return True
+        # "or when?" / "or what time?"
+        if re.fullmatch(r"or\s+(?:when|what\s+time|which|where)\??", q):
+            return True
         return False
 
     def _extract_followup_location(self, query_text: str) -> str:
@@ -4055,6 +5072,9 @@ class EchoSpeakAgent:
             return False
         if self._is_location_swap_followup(q):
             return True
+        # Timezone / currency / short deictic clarifiers on current subject
+        if self._is_general_clarifier_followup_text(q):
+            return True
         exact = {
             "do a deeper search",
             "deeper search",
@@ -4071,12 +5091,44 @@ class EchoSpeakAgent:
             "explain more",
             "expand on that",
             "look into it more",
+            "look into that",
             "check more",
             "same for that",
             "same there",
             "and there",
+            "what do you think",
+            "what do you think?",
+            "what do you think about it",
+            "what do you think about it?",
+            "what do you think about that",
+            "what do you think about that?",
+            "thoughts",
+            "thoughts?",
+            "your thoughts",
+            "your thoughts?",
+            "interesting",
+            "interesting.",
+            "cool",
+            "nice",
+            "yeah",
+            "yep",
+            "ok",
+            "okay",
         }
         if q in exact:
+            return True
+        # Hollow opinion / pronoun follow-ups that depend on current_subject
+        if re.fullmatch(
+            r"(?:so\s+)?(?:i'?ll|i will)?\s*look into (?:it|that)(?:\s+for you)?(?:\s+right now)?\??",
+            q,
+        ):
+            return True
+        if re.fullmatch(
+            r"what do you think(?: about (?:it|that|this))?\??",
+            q,
+        ):
+            return True
+        if re.fullmatch(r"(?:your )?thoughts(?: on (?:it|that|this))?\??", q):
             return True
         prefixes = (
             "do a deeper search",
@@ -4098,6 +5150,8 @@ class EchoSpeakAgent:
             "and how about",
             "and in ",
             "same for ",
+            "what do you think about",
+            "thoughts on ",
         )
         if any(q.startswith(prefix) for prefix in prefixes):
             # Full self-contained questions should not be rewritten away.
@@ -4115,11 +5169,107 @@ class EchoSpeakAgent:
         # Prefer weather skeleton so location swaps stay on-topic
         if any(w in low for w in ("weather", "forecast", "temperature", "temp")):
             return "weather"
-        if any(w in low for w in ("score", "match", "game", "fifa", "nhl", "nba", "nfl")):
+        if any(w in low for w in ("score", "match", "game", "fifa", "nhl", "nba", "nfl", "kickoff", "fixture")):
             return "sports"
+        if any(w in low for w in ("bitcoin", "btc", "price", "stock", "crypto", "ethereum", "usd", "cad")):
+            return "finance"
+        if any(w in low for w in ("trailer", "pre-order", "preorder", "box office", "dlc", "release date")):
+            return "entertainment"
         if any(w in low for w in ("news", "headline", "breaking")):
             return "news"
         return "general"
+
+    def _extract_currency_code(self, query_text: str) -> str:
+        q = str(query_text or "").lower()
+        m = re.search(
+            r"\b(cad|usd|eur|gbp|jpy|aud|nzd|chf|cny|inr|mxn|btc|eth|"
+            r"canadian\s+dollars?|us\s+dollars?|euros?|pounds?)\b",
+            q,
+        )
+        if not m:
+            return ""
+        raw = re.sub(r"\s+", " ", m.group(1)).strip()
+        aliases = {
+            "canadian dollar": "CAD",
+            "canadian dollars": "CAD",
+            "us dollar": "USD",
+            "us dollars": "USD",
+            "dollar": "USD",
+            "dollars": "USD",
+            "euro": "EUR",
+            "euros": "EUR",
+            "pound": "GBP",
+            "pounds": "GBP",
+        }
+        if raw in aliases:
+            return aliases[raw]
+        return raw.upper() if len(raw) <= 4 else raw
+
+    def _bind_clarifier_to_subject(self, query_text: str, subject: str) -> str:
+        """Rewrite hollow clarifiers into a subject-anchored search/answer string."""
+        q = re.sub(r"\s+", " ", str(query_text or "").strip())
+        sub = re.sub(r"\s+", " ", str(subject or "").strip())
+        if not q or not sub:
+            return q or sub
+        low = q.lower()
+        topic = self._topic_template_from_subject(sub)
+
+        if self._is_timezone_followup_text(q):
+            # Keep match/event subject; ask for kickoff timezone, not "MNT definition"
+            tz_hint = ""
+            m = re.search(
+                r"\b(mnt|mst|mdt|est|edt|pst|pdt|cst|cdt|utc|gmt|cet|mt|et|pt|ct|"
+                r"mountain|pacific|eastern|central)\b",
+                low,
+            )
+            if m:
+                raw_tz = m.group(1)
+                tz_hint = raw_tz.upper() if len(raw_tz) <= 4 else raw_tz
+                if tz_hint in {"MNT", "MST", "MDT", "MT"} or "mountain" in raw_tz.lower():
+                    tz_hint = "Mountain Time MNT"
+            # Prefer search-extracted anchors (teams/times) over vague user ask subject
+            facts = str(getattr(self, "_last_search_facts", "") or "").strip()
+            if facts and not re.search(r"(?i)\bvs\.?\b", sub):
+                sub = f"{sub} {facts}".strip()
+            has_sides = bool(re.search(r"(?i)\bvs\.?\b", sub)) or bool(
+                re.search(r"(?i)\b\w{3,}\s+versus\s+\w{3,}\b", sub)
+            )
+            # Prefer concrete sides + clock already in subject; else re-query same subject with times
+            if topic == "sports" or re.search(
+                r"(?i)\b(match|game|kickoff|fixture|schedule|vs\.?|\d\s*p\.?m|am|pm)\b",
+                sub,
+            ):
+                if has_sides:
+                    base = f"{sub} kickoff convert timezone"
+                else:
+                    base = (
+                        f"{sub} match list each kickoff time "
+                        f"convert to {tz_hint or 'local timezone'} full schedule"
+                    )
+            else:
+                base = f"{sub} convert timezone"
+            if has_sides:
+                if tz_hint:
+                    base = f"{base} what time in {tz_hint}"
+                else:
+                    base = f"{base} what time local my time"
+            return base.strip()
+
+        if self._is_currency_followup_text(q):
+            code = self._extract_currency_code(q) or "CAD"
+            if topic == "finance" or re.search(r"(?i)\b(bitcoin|btc|price|stock|crypto)\b", sub):
+                return f"{sub} price in {code} convert"
+            if topic == "entertainment" or re.search(r"(?i)\b(price|cost|edition|pre-?order)\b", sub):
+                return f"{sub} price cost in {code}"
+            return f"{sub} in {code} convert price"
+
+        # Platform / edition
+        plat = re.search(r"\b(ps5|xbox|pc|switch|steam)\b", low)
+        if plat:
+            return f"{sub} {plat.group(1)} price edition details"
+
+        # Generic deictic: keep subject first
+        return f"{sub} — {q}".strip()
 
     def _swap_location_into_subject(self, subject: str, place: str) -> str:
         """Build 'weather in Vancouver' from subject 'weather in Edmonton' + place Vancouver."""
@@ -4153,6 +5303,41 @@ class EchoSpeakAgent:
             return subject
         return f"{subject} in {place}".strip()
 
+    def _is_deeper_search_followup(self, query_text: str) -> bool:
+        """User wants another / deeper web pass on the current subject."""
+        q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+        q = q.replace("\u2019", "'").replace("\u2018", "'")
+        if not q:
+            return False
+        exact = {
+            "do a deeper search",
+            "deeper search",
+            "search deeper",
+            "research deeper",
+            "go deeper",
+            "go further",
+            "dig deeper",
+            "look into it more",
+            "look into that",
+            "check more",
+            "search more",
+            "more search",
+            "do another search",
+            "search again",
+        }
+        if q in exact or q.rstrip("?.!") in exact:
+            return True
+        if re.search(
+            r"\b(?:do\s+a\s+)?(?:deep(?:er)?|another)\s+(?:web\s+)?search\b",
+            q,
+        ):
+            return True
+        if re.search(r"\b(?:dig|go)\s+deeper\b", q) and len(q.split()) <= 8:
+            return True
+        if re.search(r"\b(?:search|research)\s+deeper\b", q):
+            return True
+        return False
+
     def _resolve_referential_followup(self, query_text: str) -> tuple[str, bool, str]:
         q = (query_text or "").strip()
         subject = str(
@@ -4163,10 +5348,12 @@ class EchoSpeakAgent:
         if not q:
             return q, False, subject
 
-        # Prefer dedicated expansion for "what about in X?"
+        # Prefer dedicated expansion for "what about in X?" (not CAD/MNT units)
         if subject and self._is_location_swap_followup(q):
             place = self._extract_followup_location(q)
-            if place:
+            if place and not (
+                self._is_currency_code_token(place) or self._is_timezone_code_token(place)
+            ):
                 resolved = self._swap_location_into_subject(subject, place)
                 # Also keep last web context aligned for search expansion
                 try:
@@ -4177,6 +5364,24 @@ class EchoSpeakAgent:
                     pass
                 return resolved, True, resolved
 
+        # "do a deeper search" → search the SUBJECT itself, not meta-phrase "deeper search about X"
+        # (meta-phrase caused weak Tavily queries + model claiming tools can't search).
+        if subject and self._is_deeper_search_followup(q):
+            resolved = f"{subject} latest detailed sources analysis"
+            return resolved.strip(), True, subject
+
+        # Timezone / currency / platform clarifiers: always anchor to subject
+        if subject and self._is_general_clarifier_followup_text(q):
+            resolved = self._bind_clarifier_to_subject(q, subject)
+            try:
+                # Keep prior subject (don't replace FIFA with "MNT time zone")
+                if not self._is_timezone_followup_text(q) and not self._is_currency_followup_text(q):
+                    pass
+                self._last_web_query_context = resolved
+            except Exception:
+                pass
+            return resolved.strip(), True, subject
+
         if not subject or not self._is_referential_followup_text(q):
             # Still try web-query expander (handles what about + prev search context)
             expanded = self._expand_follow_up_web_query(q)
@@ -4186,9 +5391,13 @@ class EchoSpeakAgent:
 
         low = q.lower()
         if "search" in low or "research" in low or "look into" in low or "check" in low:
-            resolved = f"{q} about {subject}"
+            # Prefer subject-first queries when the user is asking to search more
+            if self._is_deeper_search_followup(q) or re.search(r"\b(deeper|more|again)\b", low):
+                resolved = f"{subject} latest detailed sources analysis"
+            else:
+                resolved = f"{subject} {q}".strip()
         elif "more" in low or "expand" in low or "deeper" in low or "further" in low:
-            resolved = f"{q} about {subject}"
+            resolved = f"{subject} more detail latest sources"
         else:
             resolved = f"{q} about {subject}"
         return resolved.strip(), True, subject
@@ -4199,8 +5408,35 @@ class EchoSpeakAgent:
             return ""
         low = user.lower()
         # Never let hollow follow-ups overwrite a good topic (this caused Vancouver to lose weather).
-        if self._is_small_talk_query(low) or self._is_referential_followup_text(user) or self._is_location_swap_followup(user):
+        if (
+            self._is_small_talk_query(low)
+            or self._is_referential_followup_text(user)
+            or self._is_location_swap_followup(user)
+            or self._is_general_clarifier_followup_text(user)
+            or self._is_timezone_followup_text(user)
+            or self._is_currency_followup_text(user)
+        ):
             return ""
+        # Explicit memory writes are durable facts, not a new discussion subject.
+        try:
+            if self.memory.extract_remember_payload(user):
+                return ""
+        except Exception:
+            pass
+        # Pronoun-heavy short questions ("when does it release?") should not replace a solid subject.
+        if str(getattr(self, "_current_subject_text", "") or "").strip() and re.search(
+            r"\b(it|that|this|them|they|those)\b", low
+        ):
+            content_words = re.findall(r"[a-z0-9]{4,}", low)
+            stop = {
+                "when", "does", "what", "about", "think", "tell", "more", "have", "with",
+                "from", "your", "you", "will", "would", "could", "should", "there", "here",
+                "show", "does", "into", "look", "right", "now", "please", "just", "like",
+                "think", "about", "that", "this", "them", "they", "those", "release",
+            }
+            content = [w for w in content_words if w not in stop]
+            if len(content) <= 1:
+                return ""
         candidate = user
         if self._is_explicit_web_query(low) or "weather" in low or "forecast" in low:
             try:
@@ -4221,14 +5457,97 @@ class EchoSpeakAgent:
             candidate = candidate[:220].rsplit(" ", 1)[0].strip()
         return candidate
 
+    def _extract_answer_anchor_facts(self, response_text: str) -> str:
+        """Pull matchups / kickoff times / prices from the answer into subject continuity.
+
+        Live: answer said 'France vs Morocco … 4 p.m.' but subject stayed the broad
+        FIFA slate query — timezone follow-ups then re-searched a different slate.
+        """
+        text = str(response_text or "")
+        if not text or len(text) < 8:
+            return ""
+        bits: list[str] = []
+        seen: set[str] = set()
+        for m in re.finditer(
+            r"\b([A-Z][a-zA-Z]{2,}(?:\s+[A-Z][a-zA-Z]{2,})?)\s+vs\.?\s+"
+            r"([A-Z][a-zA-Z]{2,}(?:\s+[A-Z][a-zA-Z]{2,})?)\b",
+            text,
+        ):
+            pair = f"{m.group(1)} vs {m.group(2)}"
+            key = pair.lower()
+            if key not in seen:
+                seen.add(key)
+                bits.append(pair)
+            if len(bits) >= 3:
+                break
+        for m in re.finditer(
+            r"\b(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|am|pm))\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            t = re.sub(r"\s+", "", m.group(1).lower()).replace("a.m.", "am").replace("p.m.", "pm")
+            # normalize display lightly
+            disp = m.group(1).strip()
+            if disp.lower() not in seen:
+                seen.add(disp.lower())
+                bits.append(disp)
+            break  # one kickoff clock is enough for follow-ups
+        # Stated price anchors (for currency follow-ups)
+        pm = re.search(r"\$\s?([\d,]+(?:\.\d{1,2})?)", text)
+        if pm and len(bits) < 4:
+            bits.append(f"${pm.group(1).replace(',', '')}")
+        return " ".join(bits[:4]).strip()
+
     def _update_current_subject(self, user_input: str, response_text: str) -> None:
         try:
             # Location-swap follow-ups already update subject in _resolve_referential_followup
             if self._is_location_swap_followup(self._extract_user_request_text(user_input)):
                 return
+            if self._is_general_clarifier_followup_text(
+                self._extract_user_request_text(user_input)
+            ):
+                # Clarifiers must not replace subject; still merge answer facts if missing teams/times
+                facts = self._extract_answer_anchor_facts(response_text)
+                cur = str(getattr(self, "_current_subject_text", "") or "").strip()
+                if facts and cur:
+                    low_cur = cur.lower()
+                    extra = " ".join(
+                        p for p in facts.split() if p.lower() not in low_cur and p.lower() not in {"vs", "vs."}
+                    )
+                    # Add full fact phrases that aren't already present
+                    for phrase in re.findall(
+                        r"[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?\s+vs\.?\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?|\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?|am|pm)|\$[\d.]+",
+                        facts,
+                        flags=re.IGNORECASE,
+                    ):
+                        if phrase.lower() not in low_cur:
+                            cur = f"{cur} {phrase}".strip()
+                            low_cur = cur.lower()
+                    self._current_subject_text = cur[:280]
+                return
             candidate = self._subject_candidate_from_turn(user_input, response_text)
-            if candidate:
-                self._current_subject_text = candidate
+            facts_answer = self._extract_answer_anchor_facts(response_text)
+            facts_search = str(getattr(self, "_last_search_facts", "") or "").strip()
+            # Prefer answer facts; fall back to evidence anchors if the model was vague
+            facts = facts_answer
+            if not facts or not re.search(r"(?i)\bvs\.?\b", facts):
+                if facts_search:
+                    facts = f"{facts} {facts_search}".strip() if facts else facts_search
+            if candidate and facts:
+                # Prefer concrete answer anchors on top of the user ask
+                merged = f"{candidate} {facts}".strip()
+                self._current_subject_text = merged[:280]
+            elif candidate:
+                # Keep any facts already merged from search during this turn
+                prev = str(getattr(self, "_current_subject_text", "") or "").strip()
+                if prev and re.search(r"(?i)\bvs\.?\b", prev) and candidate.lower() not in prev.lower():
+                    # Search already upgraded subject with matchups — don't downgrade
+                    pass
+                else:
+                    self._current_subject_text = candidate
+            elif facts:
+                prev = str(getattr(self, "_current_subject_text", "") or "").strip()
+                self._current_subject_text = f"{prev} {facts}".strip()[:280] if prev else facts
         except Exception:
             pass
 
@@ -4272,6 +5591,10 @@ class EchoSpeakAgent:
         if any(t in q for t in ["when is", "when's", "when does", "start time", "starts at", "kickoff", "tipoff"]):
             if self._has_schedule_terms(q):
                 return True
+
+        # Local/timezone clarifiers need system clock + offset for "my time" answers
+        if re.search(r"\b(timezone|time zone|my time|local time|mnt|mst|mdt|mountain time)\b", q):
+            return True
 
         return False
 
@@ -4401,9 +5724,16 @@ class EchoSpeakAgent:
             if place:
                 return self._swap_location_into_subject(prev, place)
 
+        if self._is_general_clarifier_followup_text(q):
+            return self._bind_clarifier_to_subject(q, prev)
+
         if self._is_referential_followup_text(q):
+            if self._is_deeper_search_followup(q):
+                return f"{prev} latest detailed sources analysis".strip()
             if "search" in low or "research" in low:
-                return f"{q} about {prev}".strip()
+                return f"{prev} latest detailed sources analysis".strip()
+            if self._is_general_clarifier_followup_text(q):
+                return self._bind_clarifier_to_subject(q, prev)
             return f"{q} about {prev}".strip()
 
         if low.startswith("and in "):
@@ -4424,6 +5754,9 @@ class EchoSpeakAgent:
             return prev
         if trimmed.lower() in prev.lower():
             return prev
+        # Currency codes after "and in " are not places
+        if self._is_currency_code_token(trimmed) or self._is_timezone_code_token(trimmed):
+            return self._bind_clarifier_to_subject(q, prev)
         # Prefer topic-preserving swap when previous subject is weather/scores
         if self._topic_template_from_subject(prev) in {"weather", "sports", "news"}:
             return self._swap_location_into_subject(prev, trimmed)
@@ -4438,24 +5771,32 @@ class EchoSpeakAgent:
         """Execute the underlying Tavily/web_search tool without grounding.
 
         Used only as the SearchGrounder execute callback so candidate loops never
-        re-enter _grounded_web_search.
+        re-enter _grounded_web_search. Request-scoped cache avoids re-hitting the
+        same query 3× for multi-candidate / multi-intent turns.
         """
         from agent.tools import web_search as raw_web_search
 
         q = str(query or "").strip()
         if not q:
             return ""
+        cache = getattr(self, "_request_search_cache", None)
+        cache_key = re.sub(r"\s+", " ", q).strip().lower()
+        if isinstance(cache, dict) and cache_key in cache:
+            return str(cache[cache_key] or "")
         try:
-            return str(raw_web_search.invoke({"query": q}) or "")
+            result = str(raw_web_search.invoke({"query": q}) or "")
         except TypeError:
             try:
-                return str(raw_web_search.invoke(q) or "")
+                result = str(raw_web_search.invoke(q) or "")
             except Exception as exc:
                 logger.warning(f"raw web_search failed: {exc}")
-                return ""
+                result = ""
         except Exception as exc:
             logger.warning(f"raw web_search failed: {exc}")
-            return ""
+            result = ""
+        if isinstance(cache, dict) and cache_key:
+            cache[cache_key] = result
+        return result
 
     def _apply_search_grounding_to_lc_tools(self, tools: Optional[list]) -> list:
         """Wrap web_search StructuredTools so native tool-calling hits grounding."""
@@ -4479,8 +5820,23 @@ class EchoSpeakAgent:
             description = description.rstrip(".") + " Results are evidence-grounded before return."
 
         def _run(query: str = "", **kwargs: Any) -> str:
+            from agent.research import looks_like_multi_intent, recipe_multi_search_queries, intent_domains
+
             q = str(query or kwargs.get("query") or kwargs.get("q") or "").strip()
-            return agent._grounded_web_search(q, original_request=q, emit_tool_events=False)
+            # Prefer the full user turn for multi-intent split (never trust model arg alone).
+            orig = str(
+                getattr(agent, "_active_user_query", None)
+                or getattr(agent, "_last_user_input_for_plan", None)
+                or q
+            ).strip()
+            # Full user turn is authoritative for multi-intent; always emit tool rows
+            # so each sub-search is visible in chat (weather + FIFA both show up).
+            return agent._grounded_web_search(
+                q,
+                original_request=orig or q,
+                callbacks=getattr(agent, "_current_callbacks", None),
+                emit_tool_events=True,
+            )
 
         try:
             from langchain_core.tools import StructuredTool
@@ -4534,38 +5890,216 @@ class EchoSpeakAgent:
         - TaskPlanner / WebTaskReflector (via tool wrappers + reflector delegate)
         - Native LangGraph/ReAct tool calls (lc_tools wrapper)
         """
-        q = str(query or "").strip()
-        if not q:
+        from agent.research import (
+            resolve_web_search_queries,
+            looks_like_multi_intent,
+            _infer_city_from_text,
+            _is_weather_clause,
+            _normalize_weather_query,
+            enrich_sports_query_with_subject,
+        )
+
+        raw_q = str(query or "").strip()
+        if not raw_q:
             return ""
 
-        if not bool(getattr(config, "search_grounding_enabled", True)):
-            run_id = str(uuid.uuid4())
-            if emit_tool_events:
-                self._emit_tool_start(callbacks, "web_search", q, run_id)
-            try:
-                raw = self._raw_web_search_execute(q)
-                if emit_tool_events:
-                    self._emit_tool_end(callbacks, raw, run_id)
-                return raw
-            except Exception as exc:
-                if emit_tool_events:
-                    self._emit_tool_error(callbacks, exc, run_id)
-                return ""
+        # Hard gate: local Desktop/project inspect must never become internet search
+        # (model may still emit web_search; Stage 4 recovery also used to force it).
+        hay = f"{original_request or ''} {raw_q}".strip()
+        if self._is_local_filesystem_intent(hay) or self._is_local_filesystem_intent(original_request or ""):
+            if not re.search(
+                r"(?i)\b(search the web|google|look up online|weather|forecast|"
+                r"stock price|bitcoin price|news headlines)\b",
+                hay,
+            ):
+                logger.info(
+                    "Blocked web_search for local filesystem intent: {!r}",
+                    (hay or "")[:100],
+                )
+                listing = str(getattr(self, "_last_local_project_listing", "") or "")
+                samples = str(getattr(self, "_last_local_project_samples", "") or "")
+                pin = str(getattr(self, "_last_local_project_path", "") or "")
+                return (
+                    "[LOCAL_FILESYSTEM — web_search blocked]\n"
+                    "This turn is local Desktop/project work. Use file_list / file_read, not the internet.\n"
+                    f"Pinned project: {pin or '(none yet)'}\n"
+                    f"Listing:\n{listing[:3000]}\n"
+                    f"Samples:\n{samples[:4000]}"
+                ).strip()
 
-        grounder = SearchGrounder(
-            max_candidates=int(getattr(config, "search_grounding_max_candidates", 3) or 3)
+        # --- Live sports structured path (default for scores/odds; not crawl search) ---
+        # Category mismatch: Tavily/etc. return crawled pages; live scores need APIs.
+        try:
+            from agent.sports_data import (
+                get_sports_data_client,
+                is_live_sports_data_intent,
+                live_sports_mode,
+            )
+            from config import config as _cfg
+
+            sports_src = str(
+                getattr(self, "_active_user_query", None)
+                or original_request
+                or raw_q
+                or ""
+            ).strip()
+            prefer_live = bool(getattr(_cfg, "sports_live_enabled", True)) and (
+                is_live_sports_data_intent(sports_src) or is_live_sports_data_intent(raw_q)
+            )
+            # Multi-intent: only use sports_live for sports-shaped sub-queries, not whole weather+score
+            domains_live = False
+            try:
+                from agent.research import intent_domains as _idom
+
+                d = _idom(sports_src)
+                domains_live = ("odds" in d) or (
+                    "sports" in d and is_live_sports_data_intent(sports_src)
+                )
+            except Exception:
+                domains_live = prefer_live
+            if prefer_live and domains_live:
+                # If multi-intent includes weather etc., only short-circuit pure live sports turns
+                multi_other = False
+                try:
+                    from agent.research import intent_domains as _idom2, looks_like_multi_intent
+
+                    doms = _idom2(sports_src)
+                    multi_other = looks_like_multi_intent(sports_src) and (
+                        "weather" in doms or "finance" in doms or "entertainment" in doms or "news" in doms
+                    )
+                except Exception:
+                    multi_other = False
+                if not multi_other:
+                    client = get_sports_data_client()
+                    live = client.query(sports_src or raw_q)
+                    if live.ok:
+                        ground_run_id = str(uuid.uuid4()) if emit_tool_events else ""
+                        if emit_tool_events:
+                            self._emit_tool_start(
+                                callbacks, "sports_live", sports_src or raw_q, ground_run_id
+                            )
+                        packet = live.as_tool_text()
+                        if emit_tool_events:
+                            self._emit_tool_end(callbacks, packet, ground_run_id)
+                        try:
+                            self._last_grounded_search_result = {
+                                "chosen_query": sports_src or raw_q,
+                                "accepted": True,
+                                "provider": "sports_live",
+                                "mode": live.mode,
+                                "condensed_evidence": live.summary,
+                            }
+                        except Exception:
+                            pass
+                        logger.info(
+                            "Sports live path ok mode={} sport={}",
+                            live.mode,
+                            live.sport_key,
+                        )
+                        return packet
+                    else:
+                        logger.info(
+                            "Sports live path miss ({}), falling back to web_search",
+                            live.error[:120] if live.error else "unknown",
+                        )
+        except Exception as _sports_exc:
+            logger.debug("Sports live path skipped: {}", _sports_exc)
+
+        # Prefer the richest multi-intent source: active user turn > original_request > tool arg.
+        # Stage 3 used to pass _extract_search_query() (single primary) as original_request,
+        # which wiped FIFA+weather down to one query — never do that again.
+        active = str(getattr(self, "_active_user_query", None) or "").strip()
+        orig_in = str(original_request or "").strip()
+        candidates_src = [active, orig_in, raw_q]
+        orig = raw_q
+        try:
+            from agent.research import intent_domains as _intent_domains
+
+            best_score = -1
+            for src in candidates_src:
+                if not src:
+                    continue
+                score = len(_intent_domains(src)) * 10 + (1 if looks_like_multi_intent(src) else 0) + min(len(src), 200) / 200.0
+                if score > best_score:
+                    best_score = score
+                    orig = src
+        except Exception:
+            orig = active or orig_in or raw_q
+        # Recipe fast path + general multi-intent decomposition fallback.
+        # Never silent-overwrite multi with the model's single tool arg.
+        llm_invoke = None
+        try:
+            wrap = getattr(self, "llm_wrapper", None)
+            if wrap is not None and hasattr(wrap, "invoke_fast"):
+                llm_invoke = lambda p, _w=wrap: _w.invoke_fast(p, max_tokens=180)
+            elif wrap is not None and hasattr(wrap, "invoke"):
+                llm_invoke = lambda p, _w=wrap: _w.invoke(p)
+        except Exception:
+            llm_invoke = None
+        multi = resolve_web_search_queries(
+            orig,
+            raw_q,
+            llm_invoke=llm_invoke,
+            use_decomposition=True,
         )
+        if not multi:
+            multi = resolve_web_search_queries(raw_q, raw_q, llm_invoke=None, use_decomposition=False)
+        if not multi:
+            multi = [raw_q]
+        # Bare "check the weather" with no city: prefer last subject / web context / profile location.
+        subject_city = self._resolve_weather_city_hint(orig)
+        if subject_city:
+            fixed: list[str] = []
+            for q in multi:
+                if _is_weather_clause(q) and not _infer_city_from_text(q):
+                    fixed.append(_normalize_weather_query(q, city_hint=subject_city))
+                else:
+                    fixed.append(q)
+            multi = fixed
+        # Schedule follow-ups ("july 9th what games?") inherit league from prior subject
+        subject_ctx = str(
+            getattr(self, "_current_subject_text", "")
+            or getattr(self, "_last_web_query_context", "")
+            or ""
+        ).strip()
+        if subject_ctx:
+            multi = [enrich_sports_query_with_subject(q, subject_ctx) for q in multi]
+        try:
+            logger.info(
+                "Search multi-intent resolved n={} queries={} orig={!r}",
+                len(multi),
+                multi,
+                (orig or "")[:120],
+            )
+        except Exception:
+            pass
+
+        if not bool(getattr(config, "search_grounding_enabled", True)):
+            chunks = []
+            for q in multi:
+                run_id = str(uuid.uuid4())
+                if emit_tool_events:
+                    self._emit_tool_start(callbacks, "web_search", q, run_id)
+                try:
+                    raw = self._raw_web_search_execute(q)
+                    if emit_tool_events:
+                        self._emit_tool_end(callbacks, raw, run_id)
+                    if raw:
+                        chunks.append(f"### Search: {q}\n{raw}")
+                except Exception as exc:
+                    if emit_tool_events:
+                        self._emit_tool_error(callbacks, exc, run_id)
+            return "\n\n".join(chunks)
+
+        # Default 2 candidates — enough retry without 3× waste per intent.
+        # Schedule gets a slightly higher budget inside SearchGrounder when needed.
+        max_cands = int(getattr(config, "search_grounding_max_candidates", 2) or 2)
+        grounder = SearchGrounder(max_candidates=max(1, min(max_cands, 4)))
         current_subject = str(
             getattr(self, "_current_subject_text", "")
             or getattr(self, "_last_web_query_context", "")
             or ""
         )
-        orig = str(original_request or q).strip() or q
-
-        # One outer tool event for the whole grounder loop (avoids "Search done" x N candidates).
-        ground_run_id = str(uuid.uuid4()) if emit_tool_events else ""
-        if emit_tool_events:
-            self._emit_tool_start(callbacks, "web_search", q, ground_run_id)
 
         def execute_candidate(candidate_query: str) -> str:
             try:
@@ -4582,84 +6116,169 @@ class EchoSpeakAgent:
                     )
                 return ""
 
-        try:
-            grounded = grounder.ground(
-                original_request=orig,
-                resolved_request=q,
-                current_subject=current_subject,
-                execute=execute_candidate,
-                fetch_url=self._fetch_search_result_page_text,
-            )
-        except Exception as exc:
+        formatted_parts: list[str] = []
+        last_grounded = None
+        any_accepted = False
+        for q in multi:
+            # One tool event per intent so chat shows each search (sports, then weather).
+            ground_run_id = str(uuid.uuid4()) if emit_tool_events else ""
             if emit_tool_events:
-                self._emit_tool_error(callbacks, exc, ground_run_id)
-            raise
-
-        try:
-            self._last_grounded_search_result = grounded.as_dict()
-        except Exception:
-            self._last_grounded_search_result = {
-                "chosen_query": grounded.chosen_query,
-                "accepted": grounded.accepted,
-                "condensed_evidence": grounded.condensed_evidence,
-            }
-
-        telemetry = getattr(self, "_verification_telemetry", None)
-        if telemetry is not None:
-            for rejected in grounded.rejected_candidates:
-                telemetry.record(
-                    "search_query_rejected",
-                    tool="web_search",
-                    reason=str(rejected.get("reason") or "Search candidate rejected."),
-                    metadata={
-                        "query": rejected.get("query"),
-                        "score": rejected.get("score"),
-                        "original_request": orig,
-                    },
+                self._emit_tool_start(callbacks, "web_search", q, ground_run_id)
+            try:
+                grounded = grounder.ground(
+                    original_request=orig,
+                    resolved_request=q,
+                    current_subject=current_subject,
+                    execute=execute_candidate,
+                    fetch_url=self._fetch_search_result_page_text,
                 )
-            if not grounded.accepted:
-                telemetry.record(
-                    "search_evidence_insufficient",
-                    tool="web_search",
-                    reason="No grounded search candidate reached the relevance threshold.",
-                    metadata={"chosen_query": grounded.chosen_query, "original_request": orig},
+            except Exception as exc:
+                if emit_tool_events:
+                    self._emit_tool_error(callbacks, exc, ground_run_id)
+                raise
+            last_grounded = grounded
+            any_accepted = any_accepted or bool(grounded.accepted)
+            part = format_grounded_tool_output(grounded)
+            if len(multi) > 1:
+                part = f"### Search: {q}\n{part}"
+            formatted_parts.append(part)
+            if emit_tool_events:
+                self._emit_tool_end(callbacks, part, ground_run_id)
+            try:
+                status = "accepted" if grounded.accepted else "insufficient"
+                # loguru uses {} formatting, not %-style
+                logger.info(
+                    "Search grounding {} query={!r} evidence={}",
+                    status,
+                    grounded.chosen_query,
+                    len(grounded.evidence or []),
                 )
+            except Exception:
+                pass
+            telemetry = getattr(self, "_verification_telemetry", None)
+            if telemetry is not None:
+                for rejected in grounded.rejected_candidates:
+                    telemetry.record(
+                        "search_query_rejected",
+                        tool="web_search",
+                        reason=str(rejected.get("reason") or "Search candidate rejected."),
+                        metadata={
+                            "query": rejected.get("query"),
+                            "score": rejected.get("score"),
+                            "original_request": orig,
+                        },
+                    )
+                if not grounded.accepted:
+                    telemetry.record(
+                        "search_evidence_insufficient",
+                        tool="web_search",
+                        reason="No grounded search candidate reached the relevance threshold.",
+                        metadata={"chosen_query": grounded.chosen_query, "original_request": orig},
+                    )
+
+        if last_grounded is not None:
+            try:
+                self._last_grounded_search_result = last_grounded.as_dict()
+                self._last_grounded_search_result["multi_queries"] = list(multi)
+                self._last_grounded_search_result["any_accepted"] = any_accepted
+            except Exception:
+                self._last_grounded_search_result = {
+                    "chosen_query": last_grounded.chosen_query,
+                    "accepted": last_grounded.accepted,
+                    "condensed_evidence": last_grounded.condensed_evidence,
+                    "multi_queries": list(multi),
+                }
+
+        joined = "\n\n".join(formatted_parts)
+        # Anchor teams/times from evidence even if the model later answers vaguely
         try:
-            status = "accepted" if grounded.accepted else "insufficient"
-            logger.info(
-                "Search grounding %s query=%r evidence=%d",
-                status,
-                grounded.chosen_query,
-                len(grounded.evidence or []),
-            )
+            evidence_blob = joined
+            if last_grounded is not None:
+                evidence_blob = f"{evidence_blob}\n{last_grounded.condensed_evidence or ''}\n{last_grounded.raw_output or ''}"
+            facts = self._extract_answer_anchor_facts(evidence_blob)
+            if facts:
+                self._last_search_facts = facts
+                cur = str(getattr(self, "_current_subject_text", "") or "").strip()
+                low_cur = cur.lower()
+                extra_bits = []
+                for phrase in re.findall(
+                    r"[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?\s+vs\.?\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?|"
+                    r"\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?|am|pm)|\$[\d.]+",
+                    facts,
+                    flags=re.IGNORECASE,
+                ):
+                    if phrase.lower() not in low_cur:
+                        extra_bits.append(phrase)
+                if extra_bits:
+                    merged = f"{cur} {' '.join(extra_bits)}".strip() if cur else " ".join(extra_bits)
+                    self._current_subject_text = merged[:280]
         except Exception:
             pass
 
-        formatted = format_grounded_tool_output(grounded)
-        if emit_tool_events:
-            self._emit_tool_end(callbacks, formatted, ground_run_id)
-        return formatted
+        return joined
 
-    def _invoke_web_research_query(self, query_text: str, callbacks: Optional[list], time_context: str = "", apply_reflection: bool = True) -> tuple[str, str, str]:
+    def _invoke_web_research_query(
+        self,
+        query_text: str,
+        callbacks: Optional[list],
+        time_context: str = "",
+        apply_reflection: bool = True,
+        *,
+        original_request: str = "",
+    ) -> tuple[str, str, str]:
         tool = self._preferred_web_research_tool()
         if tool is None:
             return "", "", time_context
 
-        ensured_time_context = self._ensure_time_context_for_query(query_text, callbacks, time_context)
-        final_query = self._build_time_aware_web_query(query_text, ensured_time_context)
+        # Prefer the full user turn for multi-intent — never collapse before grounder.
+        orig = str(
+            original_request
+            or getattr(self, "_active_user_query", None)
+            or query_text
+            or ""
+        ).strip()
+        ensured_time_context = self._ensure_time_context_for_query(query_text or orig, callbacks, time_context)
+        final_query = self._build_time_aware_web_query(query_text or orig, ensured_time_context)
 
         if getattr(tool, "name", "") == "web_search":
             # Stage 3 + any shortcut path: always use the shared grounder.
+            # original_request must stay the FULL user message for multi-intent fan-out.
             tool_output = self._grounded_web_search(
                 final_query,
-                original_request=query_text,
+                original_request=orig or query_text,
                 callbacks=callbacks,
                 emit_tool_events=True,
             )
+            # Evidence-level keep-trying (was skipped for grounded packets entirely)
+            if apply_reflection and hasattr(self, "_task_planner"):
+                try:
+                    retry_task = {
+                        "index": f"ground:{uuid.uuid4()}",
+                        "tool": "web_search",
+                        "params": {
+                            "q": final_query,
+                            "original_request": orig or query_text,
+                        },
+                    }
+                    tool_output = self._task_planner.web_reflector.reflect_and_retry(
+                        retry_task,
+                        "web_search",
+                        str(tool_output or ""),
+                        self.tools,
+                        callbacks,
+                    )
+                except Exception as exc:
+                    logger.debug("Grounded WebTaskReflector skipped: {}", exc)
             chosen = final_query
             last = getattr(self, "_last_grounded_search_result", None) or {}
             if isinstance(last, dict) and last.get("chosen_query"):
                 chosen = str(last.get("chosen_query") or final_query)
+            if isinstance(last, dict) and last.get("multi_queries"):
+                # Surface multi for logging / UI context
+                try:
+                    chosen = " | ".join(str(x) for x in (last.get("multi_queries") or [])[:4]) or chosen
+                except Exception:
+                    pass
             return str(tool_output or ""), chosen, ensured_time_context
 
         run_id = str(uuid.uuid4())
@@ -5033,10 +6652,16 @@ class EchoSpeakAgent:
             "kickoff",
             "tipoff",
         ]
-        if not any(t in q for t in time_ask):
-            return False
-
-        return self._has_schedule_terms(q)
+        if any(t in q for t in time_ask) and self._has_schedule_terms(q):
+            return True
+        # Near-future fixture slate: "who's playing tomorrow", "what games today"
+        if re.search(r"\b(today|tonight|tomorrow|this weekend)\b", q) and (
+            re.search(r"\bwho(?:'s| is)?\s+playing\b", q)
+            or re.search(r"\bwhat\s+(?:games?|matches?)\b", q)
+            or (self._has_schedule_terms(q) and re.search(r"\b(world cup|fifa|nhl|nba|nfl|mlb)\b", q))
+        ):
+            return True
+        return False
 
     def _is_hardware_capability_query(self, query_lower: str) -> bool:
         q = (query_lower or "").strip()
@@ -5120,6 +6745,29 @@ class EchoSpeakAgent:
             return self._filter_tool_names_for_current_context(
                 frozenset({"project_update_context"})
             )
+
+        # Local filesystem OR any create/code project intent → coding tools (never web-only)
+        if self._is_local_filesystem_intent(text) or self._is_coding_project_intent(text):
+            if not re.search(r"\b(search the web|google|look up online)\b", low):
+                try:
+                    self._ensure_workspace_for_intent(text)
+                except Exception:
+                    pass
+                return self._filter_tool_names_for_current_context(
+                    frozenset(
+                        {
+                            "file_list",
+                            "file_read",
+                            "file_write",
+                            "file_mkdir",
+                            "file_move",
+                            "file_copy",
+                            "file_delete",
+                            "terminal_run",
+                            "artifact_write",
+                        }
+                    )
+                )
 
         # Pure conversational messages should get NO tools - just natural chat.
         # Only route to tools if there's a clear intent that needs them.
@@ -5287,6 +6935,13 @@ class EchoSpeakAgent:
         wants_calc = bool(has_calc_keyword or has_math_operator)
 
         wants_search = any(x in low for x in ["search", "look up", "find out", "news", "headlines", "current events"]) or self._is_live_web_intent(low)
+        wants_sports_live = False
+        try:
+            from agent.sports_data import is_live_sports_data_intent
+
+            wants_sports_live = is_live_sports_data_intent(low)
+        except Exception:
+            wants_sports_live = False
         # Location follow-ups after a weather/live subject must keep web_search available.
         subject = str(getattr(self, "_current_subject_text", "") or getattr(self, "_last_web_query_context", "") or "").lower()
         if self._is_location_swap_followup(text) and (
@@ -5298,10 +6953,17 @@ class EchoSpeakAgent:
             wants_search = True
 
         if wants_calc and wants_search:
-            return frozenset({"calculate", "web_search"})
+            tools = {"calculate", "web_search"}
+            if wants_sports_live:
+                tools.add("sports_live")
+            return frozenset(tools)
 
         if wants_calc:
             return frozenset({"calculate"})
+
+        # Live scores/odds: prefer sports_live; keep web_search as fallback
+        if wants_sports_live:
+            return frozenset({"sports_live", "web_search"})
 
         if any(x in low for x in ["list files", "list folder", "show files", "show folder", "list directory", "browse files"]):
             return frozenset({"file_list"})
@@ -5877,7 +7539,13 @@ class EchoSpeakAgent:
             explicit_remember_payload = ""
 
         if not _is_public:
-            self.memory.add_conversation(clean_user_input, response_text, mode=mode_val, thread_id=thread_val)
+            # Raw turn → FAISS only when explicitly enabled. Default off so ordinary
+            # chatter does not inflate memory_count / "Memory saved" every turn.
+            # Durable path below (profile / curated / typed) is separate and gated.
+            if bool(getattr(config, "memory_auto_store_conversations", False)):
+                self.memory.add_conversation(
+                    clean_user_input, response_text, mode=mode_val, thread_id=thread_val
+                )
             # Deterministic regex-based profile extraction — captures facts like
             # "im memo not max" → user_name="memo", friend="max" immediately,
             # without needing an extra LLM call.
@@ -6476,9 +8144,54 @@ class EchoSpeakAgent:
                 return str(entry.risk_level or "safe"), list(entry.policy_flags or [])
         return str(meta.get("risk_level", "safe") or "safe"), list(meta.get("policy_flags", []) or [])
 
+    def _normalize_coding_file_path(self, path: str) -> str:
+        """Rewrite bare filenames to active Desktop project during coding turns."""
+        raw = str(path or "").strip()
+        if not raw:
+            return raw
+        low = raw.replace("\\", "/").lower()
+        if low.startswith("desktop/") or Path(raw).is_absolute():
+            return raw
+        # Prefer coding loop project folder
+        try:
+            loop = getattr(self, "_coding_loop", None)
+            proj = str(getattr(loop.state, "project_folder", "") or "").strip() if loop else ""
+            if proj:
+                base = proj.rstrip("/\\")
+                return f"{base}/{raw.lstrip('/\\')}"
+        except Exception:
+            pass
+        try:
+            from agent.tools import get_active_project_root
+
+            root = get_active_project_root()
+            if root is not None:
+                return str(root / raw)
+        except Exception:
+            pass
+        return raw
+
     def _set_pending_action(self, pending: Dict[str, Any], preview: str, user_input: str) -> Dict[str, Any]:
         pending_payload = dict(pending or {})
         tool_name = str(pending_payload.get("tool") or "").strip()
+        # Rewrite bare coding paths (index.html → Desktop/<project>/index.html)
+        try:
+            kw = dict(pending_payload.get("kwargs") or {})
+            if tool_name in {"file_write", "file_read", "file_mkdir", "file_delete", "file_list"}:
+                if kw.get("path"):
+                    kw["path"] = self._normalize_coding_file_path(str(kw.get("path")))
+            if tool_name in {"file_move", "file_copy"}:
+                if kw.get("src"):
+                    kw["src"] = self._normalize_coding_file_path(str(kw.get("src")))
+                if kw.get("dst"):
+                    kw["dst"] = self._normalize_coding_file_path(str(kw.get("dst")))
+            pending_payload["kwargs"] = kw
+            # Refresh preview if path was rewritten
+            if tool_name == "file_write" and kw.get("path"):
+                content = kw.get("content") or ""
+                preview = f"Write {len(str(content))} chars to file: {kw.get('path')}"
+        except Exception:
+            pass
         risk_level, policy_flags = self._approval_risk_metadata(tool_name)
         approval = self._state_store.create_approval(
             thread_id=self._thread_key(),
@@ -6500,6 +8213,17 @@ class EchoSpeakAgent:
         pending_payload["approval_id"] = approval.id
         pending_payload["preview"] = preview
         self._pending_action = pending_payload
+        # v7.5.2: pending write actions enter confirm phase of coding loop
+        try:
+            path = str((pending_payload.get("kwargs") or {}).get("path") or "")
+            self._coding_loop_note_tool(
+                tool_name,
+                path or str(pending_payload.get("kwargs") or ""),
+                "",
+                pending_write=True,
+            )
+        except Exception:
+            pass
         self._state_store.update_thread_state(
             self._thread_key(),
             pending_approval_id=approval.id,
@@ -7626,6 +9350,9 @@ class EchoSpeakAgent:
         self._tool_start_times[run_id] = time.time()
         # Map run_id → tool name for _emit_tool_end to look up
         self._partial_tool_names[run_id] = name
+        if not hasattr(self, "_partial_tool_inputs"):
+            self._partial_tool_inputs = {}
+        self._partial_tool_inputs[run_id] = str(input_str or "")
 
         # Stream event (fire-and-forget)
         if hasattr(self, '_stream_buffer') and self._stream_buffer:
@@ -7648,9 +9375,17 @@ class EchoSpeakAgent:
     def _emit_tool_end(self, callbacks: Optional[list], output: str, run_id: str) -> None:
         # Record observability metrics
         tool_name = self._partial_tool_names.pop(run_id, "unknown")
+        tool_input = ""
+        if hasattr(self, "_partial_tool_inputs"):
+            tool_input = self._partial_tool_inputs.pop(run_id, "")
         latency_ms = 0.0
         if hasattr(self, '_tool_start_times') and run_id in self._tool_start_times:
             latency_ms = (time.time() - self._tool_start_times.pop(run_id)) * 1000
+        # v7.5.2: drive coding loop from real tool completions
+        try:
+            self._coding_loop_note_tool(str(tool_name or ""), tool_input, str(output or ""))
+        except Exception:
+            pass
         # Capture result for LangGraph fallback preservation
         self._partial_tool_results.append({"tool": tool_name, "output": str(output)[:4000]})
         try:
@@ -7840,14 +9575,36 @@ class EchoSpeakAgent:
         }
 
     def _needs_live_web_fulfillment(self, user_input: str) -> bool:
-        """True when the user clearly needs fresh web facts (weather, scores, news…)."""
+        """True when the user clearly needs fresh web facts (weather, scores, news…).
+
+        Local Desktop / project / file inspect is NEVER live-web — eth⊂together and
+        bare 'search my files' used to force internet search incorrectly.
+        """
         q = self._extract_user_request_text(user_input or "")
         low = re.sub(r"\s+", " ", q.strip().lower())
         if not low:
             return False
-        if "weather" in low or "forecast" in low:
+        # Hard gate: local work wins over any accidental live-web signal
+        if self._is_local_filesystem_intent(user_input) or self._is_local_filesystem_intent(q):
+            # Allow only if they ALSO asked for pure web facts with clear online markers
+            if not re.search(
+                r"\b(search the web|google|look up online|weather|forecast|stock price|"
+                r"bitcoin|news headlines)\b",
+                low,
+            ):
+                return False
+        if re.search(r"\b(weather|forecast)\b", low):
             return True
         if self._has_live_info_subject(low) or self._is_live_web_intent(low):
+            return True
+        if self._is_explicit_web_query(low) or self._is_deeper_search_followup(low):
+            return True
+        # Near-future sports slate ("who's playing tomorrow")
+        if re.search(r"\b(today|tonight|tomorrow|this weekend)\b", low) and (
+            self._has_schedule_terms(low)
+            or re.search(r"\bwho(?:'s| is)?\s+playing\b", low)
+            or re.search(r"\b(world cup|fifa|nhl|nba|nfl)\b", low)
+        ):
             return True
         # "what about in Vancouver?" while current subject is weather/live facts
         subject = str(
@@ -7862,7 +9619,103 @@ class EchoSpeakAgent:
             or self._topic_template_from_subject(subject) in {"weather", "sports", "news"}
         ):
             return True
+        # Deeper search on an existing live subject
+        if self._is_deeper_search_followup(q) and subject and (
+            self._has_live_info_subject(subject)
+            or self._topic_template_from_subject(subject) in {"weather", "sports", "news"}
+            or any(w in subject for w in ("score", "game", "match", "weather", "odds", "world cup", "trailer", "release", "price"))
+        ):
+            return True
         return False
+
+    def _response_claims_search_unavailable(self, text: str) -> bool:
+        """Detect false 'I can't search' claims after tools were actually available."""
+        low = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        if not low:
+            return False
+        patterns = (
+            "don't let me search",
+            "do not let me search",
+            "doesn't let me search",
+            "can't search the web",
+            "cannot search the web",
+            "can't search online",
+            "cannot search online",
+            "don't have access to the web",
+            "do not have access to the web",
+            "don't have web search",
+            "no access to search",
+            "tools don't let me",
+            "tools do not let me",
+            "search is not available",
+            "search isn't available",
+            "unable to search the web",
+            "i can't look that up",
+            "i cannot look that up",
+            "my tools don't",
+            "my tools do not",
+            "i don't have a search",
+            "i do not have a search",
+            "web search is disabled",
+            "can't use web search",
+            "cannot use web search",
+        )
+        return any(p in low for p in patterns)
+
+    def _ensure_search_capability_honesty(
+        self,
+        user_input: str,
+        response_text: str,
+        callbacks: Optional[list] = None,
+    ) -> str:
+        """If the model falsely claims it cannot search, force a real search + rewrite."""
+        if not self._response_claims_search_unavailable(response_text):
+            return response_text
+        if not self._tool_available_in_current_context("web_search"):
+            return response_text
+        # Prefer expanded follow-up / deeper-search subject
+        display = self._extract_user_request_text(user_input)
+        resolved, is_fu, _subj = self._resolve_referential_followup(display)
+        search_q = resolved if is_fu and resolved else display
+        logger.warning(
+            "Search-capability honesty: model claimed search unavailable; forcing web_search for %r",
+            search_q[:80],
+        )
+        try:
+            tool_output = self._grounded_web_search(
+                search_q,
+                original_request=display,
+                callbacks=callbacks,
+                emit_tool_events=True,
+            )
+        except Exception as exc:
+            logger.warning("Search-capability honesty search failed: %s", exc)
+            return (
+                "I do have web search — something went wrong re-running it just now. "
+                "Please try again in a moment."
+            )
+        if not str(tool_output or "").strip():
+            return (
+                "I do have web search available. The last pass didn't return usable snippets — "
+                "try rephrasing the topic and I'll search again."
+            )
+        try:
+            return self._summarize_web_results(
+                user_input,
+                display,
+                str(tool_output),
+                search_q,
+                "",
+                is_schedule=bool(self._has_schedule_terms(search_q.lower())),
+                callbacks=callbacks,
+            )
+        except Exception as exc:
+            logger.warning("Search-capability honesty summarize failed: %s", exc)
+            # Never leave the false claim in place
+            return (
+                "I can search the web (and just did). Here's the best available evidence:\n\n"
+                + str(tool_output)[:2500]
+            )
 
     def _ensure_live_web_search(
         self,
@@ -7875,6 +9728,9 @@ class EchoSpeakAgent:
         (common with small models: they *say* they'll check and stop), force a search
         and rewrite the answer from results.
         """
+        # Never inject internet search into Desktop/project/file turns
+        if self._is_local_filesystem_intent(user_input):
+            return response_text
         if not self._needs_live_web_fulfillment(user_input):
             return response_text
         used = self._tools_used_this_turn()
@@ -7937,12 +9793,16 @@ class EchoSpeakAgent:
     def _user_has_social_open(self, user_input: str) -> bool:
         """True if the user greets or asks how Echo is (social first beat)."""
         low = re.sub(r"\s+", " ", str(user_input or "").strip().lower())
+        # Normalize curly apostrophes so how're / how's still match.
+        low = low.replace("\u2019", "'").replace("\u2018", "'")
         if not low:
             return False
         social = [
-            r"\bhow(?:'re| are) you\b",
+            r"\bhow(?:'re| are) you(?:\s+feeling)?\b",
             r"\bhow(?:'s| is) it going\b",
             r"\bhow you doing\b",
+            r"\bhow(?:'re| are) things\b",
+            r"\bhow(?:'s| is) everything\b",
             r"\bwhat(?:'s| is) up\b",
             r"\bwyd\b",
             r"\bhow(?:'s| is) your day\b",
@@ -7950,6 +9810,19 @@ class EchoSpeakAgent:
             r"\bgood (morning|afternoon|evening|night)\b",
         ]
         return any(re.search(p, low) for p in social)
+
+    def _social_task_preamble_fallback(self, task_hint: str = "that") -> str:
+        """Deterministic social-first line when the LLM preamble fails."""
+        import random
+        task = re.sub(r"\s+", " ", str(task_hint or "that")).strip() or "that"
+        options = [
+            f"Doing good — checking {task} now.",
+            f"I'm good — looking into {task}.",
+            f"Feeling solid — pulling {task} up.",
+            f"All good here — one sec on {task}.",
+            f"Pretty good — let me check {task}.",
+        ]
+        return random.choice(options)
 
     def _looks_like_social_reopen(self, text: str) -> bool:
         """Final answers that re-greet after a preamble already handled the vibe."""
@@ -8135,13 +10008,24 @@ class EchoSpeakAgent:
             if len(words) > 24:
                 text = " ".join(words[:24]).rstrip(",.;:") + "."
             if len(text) < 3:
-                return ""
+                # Never drop the social half on multi-intent turns.
+                if social:
+                    text = self._social_task_preamble_fallback(task_hint)
+                else:
+                    return ""
+            if social and not self._preamble_covers_social(text):
+                # Model returned task-only; force social-first shape.
+                text = self._social_task_preamble_fallback(task_hint)
             if len(text) > 180:
                 text = text[:177].rstrip() + "…"
             self.record_turn_partial_beat(text)
             return text
         except Exception as e:
             logger.warning("generate_tool_preamble_beat failed: %s", e)
+            if social:
+                text = self._social_task_preamble_fallback(task_hint)
+                self.record_turn_partial_beat(text)
+                return text
             return ""
 
     def _extract_calc_expression(self, user_input: str) -> str:
@@ -8268,6 +10152,8 @@ class EchoSpeakAgent:
         return ""
 
     def _extract_search_query(self, user_input: str) -> str:
+        from agent.research import normalize_web_search_query
+
         text = self._extract_user_request_text((user_input or "").strip())
         lower = text.lower()
         
@@ -8280,19 +10166,22 @@ class EchoSpeakAgent:
         for pattern in patterns:
             m = re.search(pattern, lower)
             if m:
-                return m.group(1).strip(" .,")
+                return normalize_web_search_query(m.group(1).strip(" .,")) or m.group(1).strip(" .,")
         
         # Handle "next game/match" patterns
         m = re.search(r"(?:next|upcoming)\s+(?:game|match|event|show)\s+(?:for\s+)?(.+?)(?:\s+also|\s+please|\s+and|$)", lower)
         if m:
-            return f"next game {m.group(1).strip(' .,')}"
+            return normalize_web_search_query(f"next game {m.group(1).strip(' .,')}") or f"next game {m.group(1).strip(' .,')}"
         
         # Standard prefix stripping
         for prefix in ("research deeply", "deep search", "research", "search", "look up", "find"):
             if lower.startswith(prefix):
                 text = text[len(prefix):].strip(" :,-")
                 break
-        return text
+        # Always compact chatty multi-intent prompts into a real search string
+        # (never "how're you feeling? and i wonder when…").
+        cleaned = normalize_web_search_query(text)
+        return cleaned or text
 
     # _split_multi_intent_web_queries was removed: it was dead code after
     # Stage 3 simplification (only fired on weather+schedule combos).
@@ -9134,6 +11023,13 @@ class EchoSpeakAgent:
         extracted_input = self._extract_user_request_text(user_input)
         resolved_input, referential_followup, current_subject = self._resolve_referential_followup(extracted_input)
         context_query = resolved_input or extracted_input or user_input
+        # Grounded search / multi-intent must use the subject-anchored rewrite, not
+        # hollow "MNT time or when" / "in cad?" alone (live FIFA timezone bug).
+        if referential_followup and resolved_input:
+            try:
+                self._active_user_query = resolved_input
+            except Exception:
+                pass
         memory_context = self.memory.get_conversation_context(
             context_query,
             thread_id=thread_id,
@@ -9285,45 +11181,118 @@ class EchoSpeakAgent:
         """
         self._add_pipeline_reasoning("⚙️ Stage 3: Shortcut Queries", "Checking for web search fast-path triggers.")
 
-        # When the model supports native tool calling (e.g. Gemma 4),
-        # skip heuristic shortcuts and let Stage 4's ReAct agent decide
-        # when to call tools — more reliable and uses the model's reasoning.
-        if self._allow_llm_tool_calling() and self.graph_agent is not None:
-            self._add_pipeline_reasoning("⚙️ Stage 3: Shortcut Queries", "Tool-calling model detected — deferring to ReAct agent in Stage 4.")
-            return None
-
         extracted_input = ctx.resolved_input or ctx.extracted_input
         time_context = ctx.time_context
+        raw_extracted = self._extract_user_request_text(user_input)
+
+        # Local Desktop / project inspect is NEVER a web search multi-intent fan-out
+        local_intent = self._is_local_filesystem_intent(user_input) or self._is_local_filesystem_intent(
+            extracted_input or ""
+        )
+        coding_local = (not local_intent) and self._is_coding_project_intent(user_input) and not self._is_explicit_web_query(
+            (extracted_input or user_input or "").lower()
+        )
+        if local_intent or coding_local:
+            self._add_pipeline_reasoning(
+                "⚙️ Stage 3: Shortcut Queries",
+                "Local filesystem / project intent — deep-scan: pin → list interior → read entry files.",
+            )
+            try:
+                self._ensure_workspace_for_intent(user_input)
+                self._run_local_project_deep_scan(user_input)
+            except Exception as exc:
+                logger.debug("Desktop project deep-scan failed: {}", exc)
+            return None
 
         # Detect query type with keyword heuristics (zero LLM cost)
         schedule_extracted = self._extract_user_request_text(self._strip_live_desktop_context(extracted_input or user_input))
         schedule_low = schedule_extracted.lower().strip()
-        is_schedule = self._is_schedule_time_query(schedule_low) or self._is_next_upcoming_schedule_query(schedule_low)
+        is_schedule = (
+            self._is_schedule_time_query(schedule_low)
+            or self._is_next_upcoming_schedule_query(schedule_low)
+            or bool(
+                re.search(r"\b(today|tonight|tomorrow|this weekend)\b", schedule_low)
+                and (
+                    self._has_schedule_terms(schedule_low)
+                    or re.search(r"\bwho(?:'s| is)?\s+playing\b", schedule_low)
+                    or re.search(r"\b(world cup|fifa|nhl|nba|nfl|mlb)\b", schedule_low)
+                )
+            )
+        )
 
         expanded = self._expand_follow_up_web_query(extracted_input)
         is_followup = expanded != extracted_input
+        is_deeper = self._is_deeper_search_followup(raw_extracted) and bool(
+            getattr(self, "_current_subject_text", "") or getattr(self, "_last_web_query_context", "")
+        )
 
-        low = extracted_input.lower().strip()
-        is_explicit = self._is_explicit_web_query(low)
+        low = (extracted_input or "").lower().strip()
+        is_explicit = self._is_explicit_web_query(low) or is_deeper
 
-        if not (is_schedule or is_explicit or is_followup):
+        # Multi-intent: weather+FIFA, stock+weather, etc. — never collapse before grounder.
+        full_user = str(user_input or schedule_extracted or extracted_input or "").strip()
+        is_multi = False
+        try:
+            from agent.research import looks_like_multi_intent, intent_domains
+
+            is_multi = looks_like_multi_intent(full_user) or len(intent_domains(full_user)) >= 2
+        except Exception:
+            is_multi = False
+
+        # When the model supports native tool calling (e.g. Gemma 4),
+        # normally defer to Stage 4 ReAct — EXCEPT deeper-search / schedule /
+        # multi-intent where small models drop half the question.
+        if self._allow_llm_tool_calling() and self.graph_agent is not None:
+            if not (is_deeper or is_schedule or is_multi or (is_followup and is_explicit)):
+                self._add_pipeline_reasoning(
+                    "⚙️ Stage 3: Shortcut Queries",
+                    "Tool-calling model detected — deferring to ReAct agent in Stage 4.",
+                )
+                return None
+            self._add_pipeline_reasoning(
+                "⚙️ Stage 3: Shortcut Queries",
+                "Forcing grounded search path (deeper/schedule/multi-intent) — full user turn preserved for fan-out.",
+            )
+
+        if not (is_schedule or is_explicit or is_followup or is_deeper or is_multi):
             return None  # Continue to Stage 4
 
-        # Build search query from the best source
-        search_input = schedule_extracted if is_schedule else (expanded if is_followup else extracted_input)
-        qtext = self._extract_search_query(search_input)
+        # Build search input. CRITICAL: for multi-intent never run through
+        # _extract_search_query — that collapses to a single primary query
+        # (e.g. FIFA only) and weather is never searched.
+        if is_multi:
+            search_input = full_user
+            qtext = full_user
+        else:
+            search_input = schedule_extracted if is_schedule else (expanded if is_followup else extracted_input)
+            if is_deeper and not is_schedule:
+                search_input = extracted_input or expanded
+            qtext = self._extract_search_query(search_input)
+
         tool_output, used_query, time_context = self._invoke_web_research_query(
-            qtext, callbacks, time_context=time_context, apply_reflection=True,
+            qtext,
+            callbacks,
+            time_context=time_context,
+            apply_reflection=True,
+            original_request=full_user,
         )
 
         if not used_query:
             return None  # Search failed or empty, let Stage 4 handle it
 
         self._remember_web_query_context(used_query)
-        display_question = schedule_extracted if is_schedule else extracted_input
-        response_text = self._summarize_web_results(
-            user_input, display_question, tool_output, used_query,
-            time_context, is_schedule, callbacks,
+        display_question = full_user if is_multi else (schedule_extracted if is_schedule else extracted_input)
+        # Multi-part answers need multi instructions, not schedule-only prompting
+        # System-wide keep-trying: evidence retry + answer abdication repair (not plan-only)
+        response_text = self._web_research_answer_with_retries(
+            user_input,
+            display_question,
+            tool_output,
+            used_query,
+            time_context,
+            is_schedule=bool(is_schedule and not is_multi),
+            callbacks=callbacks,
+            original_request=full_user,
         )
 
         self._pending_detail = None
@@ -9331,6 +11300,244 @@ class EchoSpeakAgent:
         self._record_turn(user_input, response_text)
         logger.info(f"Response generated: {response_text[:100]}...")
         return response_text, True
+
+    def _answer_is_abdication(self, text: str) -> bool:
+        """True when the model refuses / gives up instead of using evidence."""
+        low = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        if not low:
+            return True
+        phrases = (
+            "i do not have",
+            "i don't have",
+            "i do not know",
+            "i don't know",
+            "i cannot find",
+            "i can't find",
+            "i was unable",
+            "unable to determine",
+            "unable to find",
+            "no specific",
+            "not able to",
+            "do not have the specific",
+            "don't have the specific",
+            "nor do i have",
+            "cannot provide the exact",
+            "can't provide the exact",
+            "you can find the full schedule",
+            "check the official",
+            "visit the official",
+            "look up the schedule",
+            "search results provided general",
+            "i'm not sure",
+            "im not sure",
+        )
+        if any(p in low for p in phrases):
+            return True
+        # Fluffy non-answer for schedule asks
+        if re.search(r"\b(104 games|full schedule with dates)\b", low) and not re.search(
+            r"\bvs\.?\b|\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?|am|pm)\b", low
+        ):
+            return True
+        return False
+
+    def _answer_missing_live_facts(self, user_question: str, answer: str) -> bool:
+        """User asked for concrete live facts the answer failed to state."""
+        q = re.sub(r"\s+", " ", str(user_question or "").lower())
+        a = re.sub(r"\s+", " ", str(answer or "").lower())
+        if not q:
+            return False
+        wants_schedule = bool(
+            re.search(
+                r"\b(fifa|world cup|match(?:es)?|fixture|who(?:'s| is)? playing|games? today|schedule)\b",
+                q,
+            )
+        )
+        wants_tz = bool(
+            re.search(r"\b(mnt|mst|mdt|mountain|timezone|time zone|my time|local time)\b", q)
+        )
+        wants_price = bool(re.search(r"\b(price|cost|how much|bitcoin|btc|stock)\b", q))
+        if wants_schedule and not wants_tz:
+            # Structural: any "A vs B" or clock — not a country whitelist
+            has_match = bool(re.search(r"\bvs\.?\b", a)) or bool(
+                re.search(r"\b\w{3,}\s+versus\s+\w{3,}\b", a)
+            )
+            has_time = bool(re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|am|pm)\b", a))
+            if not has_match and not has_time:
+                return True
+        if wants_tz:
+            # Need a converted time or explicit MNT/Mountain statement with a clock
+            has_clock = bool(re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|am|pm)\b", a))
+            has_tz = bool(re.search(r"\b(mountain|mnt|mst|mdt|mt)\b", a))
+            if not (has_clock and has_tz) and not (has_clock and "convert" in a):
+                # Pure abdication already covered; missing conversion counts as weak
+                if not has_clock:
+                    return True
+        if wants_price and not re.search(r"\$|usd|cad|\d{2,}", a):
+            return True
+        return False
+
+    def _web_answer_is_weak(self, user_question: str, answer: str, evidence: str = "") -> bool:
+        if self._answer_is_abdication(answer):
+            return True
+        if self._answer_missing_live_facts(user_question, answer):
+            return True
+        return False
+
+    def _refine_query_after_weak_answer(
+        self, display_question: str, used_query: str, answer: str, attempt: int
+    ) -> str:
+        """Sharpen the next search when the spoken answer gave up or lacked facts.
+
+        Structural refinements only — never inject a hard-coded league/product name
+        that was not already in the user/query text.
+        """
+        q = (used_query or display_question or "").strip()
+        seed = (display_question or used_query or "").strip()
+        low = f"{display_question} {used_query} {answer}".lower()
+        today = datetime.now().strftime("%Y-%m-%d")
+        if re.search(r"\b(timezone|time zone|mnt|mst|mdt|mountain|my time|local time)\b", low):
+            if attempt == 1:
+                return f"{seed} each event kickoff time list convert local timezone {today}".strip()
+            return f"{q} kickoff times convert timezone detailed schedule {today}"
+        # Price/cost BEFORE schedule: product titles with "game" must not become kickoff lists
+        if re.search(r"\b(price|cost|msrp|pre-?order|stock|bitcoin|btc|crypto)\b", low):
+            # Prefer the compact product price query already used — not full multi-intent seed
+            base = q if re.search(r"(?i)\b(price|cost|msrp|pre-?order)\b", q) else seed
+            base = re.sub(
+                r"(?i)\b(live\s+score(?:\s+result)?|score\s+result|current\s+score|"
+                r"who\s+won|kickoff|fixture|match\s+list)\b",
+                " ",
+                base,
+            )
+            base = re.sub(r"\s+", " ", base).strip()
+            if attempt == 1:
+                return f"{base} MSRP USD pre-order official store".strip()
+            return f"{base} price USD buy".strip()
+        if re.search(r"\b(match|fixture|schedule|who(?:'s| is)? playing|games? today)\b", low):
+            if attempt == 1:
+                return f"{seed} match list kickoff times each game today {today}".strip()
+            return f"{q} kickoff schedule times detailed {today}"
+        return f"{q} detailed latest {today}"
+
+    def _force_evidence_bound_answer(
+        self,
+        display_question: str,
+        tool_output: str,
+        used_query: str,
+        time_context: str,
+        bad_draft: str,
+    ) -> str:
+        """Last resort: forbid abdication; extract whatever facts exist."""
+        time_note = f"Current system time: {time_context}\n\n" if time_context else ""
+        prompt = (
+            "You are Echo Speak. The previous draft ILLEGALLY gave up or skipped facts.\n"
+            "RULES (mandatory):\n"
+            "- Use ONLY the search evidence below.\n"
+            "- NEVER say you do not have the information if ANY match names, times, scores, "
+            "prices, or schedule rows appear in the evidence.\n"
+            "- List every concrete fact you can (teams, kickoff times, prices). "
+            "If a timezone conversion is requested and only ET times appear, convert roughly "
+            "to Mountain Time (ET is typically UTC-4 in summer / MT is UTC-6 — ET is 2 hours ahead of MT) "
+            "and state the assumption.\n"
+            "- If evidence is weak, say what you found and what is still uncertain — "
+            "do NOT refuse entirely or tell the user to look it up themselves.\n"
+            "- Be concise. No markdown links.\n\n"
+            f"{time_note}"
+            f"User question: {display_question}\n"
+            f"Search query: {used_query}\n\n"
+            f"Evidence:\n{tool_output}\n\n"
+            f"Bad draft to replace:\n{bad_draft}\n\n"
+            "Correct answer that uses the evidence:"
+        )
+        try:
+            return self._clamp_web_summary(self._invoke_visible_llm(prompt))
+        except Exception as exc:
+            logger.warning("Force evidence answer failed: {}", exc)
+            return bad_draft
+
+    def _web_research_answer_with_retries(
+        self,
+        user_input: str,
+        display_question: str,
+        tool_output: str,
+        used_query: str,
+        time_context: str,
+        *,
+        is_schedule: bool,
+        callbacks: Optional[list] = None,
+        original_request: str = "",
+        max_answer_retries: int = 2,
+    ) -> str:
+        """Summarize → if answer abdicates or lacks required facts, re-search and re-answer.
+
+        This is the system-wide keep-trying loop for web research (Stage 3 and any caller).
+        Plan reflection only covered multi-step TaskPlanner; weather had a one-off repair.
+        """
+        response = self._summarize_web_results(
+            user_input,
+            display_question,
+            tool_output,
+            used_query,
+            time_context,
+            is_schedule=is_schedule,
+            callbacks=callbacks,
+        )
+        for attempt in range(1, max_answer_retries + 1):
+            if not self._web_answer_is_weak(display_question, response, tool_output):
+                return response
+            logger.info(
+                "Web answer weak (attempt {}); re-searching. draft={!r}",
+                attempt,
+                (response or "")[:120],
+            )
+            try:
+                if hasattr(self, "_emit_thinking_step"):
+                    self._emit_thinking_step(
+                        "thought",
+                        "Answer incomplete — searching again for stronger evidence.",
+                        "done",
+                    )
+            except Exception:
+                pass
+            refined = self._refine_query_after_weak_answer(
+                display_question, used_query, response, attempt
+            )
+            new_out, new_q, time_context = self._invoke_web_research_query(
+                refined,
+                callbacks,
+                time_context=time_context,
+                apply_reflection=True,
+                original_request=original_request or display_question,
+            )
+            if new_out and len(str(new_out)) >= 40:
+                # Prefer richer evidence; merge if both useful
+                if len(str(new_out)) > len(str(tool_output or "")):
+                    tool_output = new_out
+                else:
+                    tool_output = f"{tool_output}\n\n### Retry search\n{new_out}"
+                used_query = new_q or refined
+                try:
+                    self._remember_web_query_context(used_query)
+                except Exception:
+                    pass
+            response = self._summarize_web_results(
+                user_input,
+                display_question,
+                tool_output,
+                used_query,
+                time_context,
+                is_schedule=is_schedule,
+                callbacks=callbacks,
+            )
+        if self._web_answer_is_weak(display_question, response, tool_output):
+            forced = self._force_evidence_bound_answer(
+                display_question, tool_output, used_query, time_context, response
+            )
+            if forced and not self._answer_is_abdication(forced):
+                return forced
+            if forced:
+                return forced
+        return response
 
     def _answer_has_weather_facts(self, text: str) -> bool:
         hay = str(text or "").lower()
@@ -9364,8 +11571,91 @@ class EchoSpeakAgent:
                 "i have access to hourly",
                 "pretty typical",
                 "looked it up",
+                "forecasts vary",
+                "vary depending on the location",
+                "varies depending on",
+                "specific forecasts vary",
+                "depending on the location",
             )
         )
+
+    def _resolve_weather_city_hint(self, text: str = "") -> str:
+        """Best-effort home/city for bare weather asks (subject, profile, config)."""
+        from agent.research import _infer_city_from_text
+
+        blobs: list[str] = [
+            str(text or ""),
+            str(getattr(self, "_current_subject_text", "") or ""),
+            str(getattr(self, "_last_web_query_context", "") or ""),
+            str(getattr(self, "_active_user_query", "") or ""),
+            str(getattr(config, "default_location", "") or ""),
+        ]
+        # Profile facts: location / city / home_city / hometown
+        try:
+            mem = getattr(self, "memory", None)
+            profile = getattr(mem, "_profile", None) if mem is not None else None
+            if isinstance(profile, dict):
+                for key in ("location", "city", "home_city", "hometown", "home_town"):
+                    val = profile.get(key)
+                    if val:
+                        blobs.append(str(val))
+                prefs = profile.get("preferences")
+                if isinstance(prefs, dict):
+                    for key in ("location", "city", "home_city"):
+                        if prefs.get(key):
+                            blobs.append(str(prefs.get(key)))
+        except Exception:
+            pass
+        # Recent tool evidence may name a city
+        try:
+            for tr in reversed(getattr(self, "_partial_tool_results", None) or []):
+                blobs.append(str(tr.get("output") or "")[:800])
+                if len(blobs) > 12:
+                    break
+        except Exception:
+            pass
+        for blob in blobs:
+            city = _infer_city_from_text(blob)
+            if city:
+                return city
+        # Bare profile strings that are just a city name
+        for blob in blobs:
+            s = re.sub(r"\s+", " ", str(blob or "").strip())
+            if s and 2 <= len(s) <= 40 and len(s.split()) <= 3:
+                if re.fullmatch(r"[A-Za-z][A-Za-z .'-]+", s):
+                    # Avoid non-places
+                    if s.lower() not in {"true", "false", "yes", "no", "owner", "user"}:
+                        return s.split(",")[0].strip()
+        return ""
+
+    def _answer_asks_city_despite_known_location(self, text: str, evidence: str = "") -> bool:
+        """True when the reply asks for a city even though evidence/context already has one."""
+        low = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        if not low:
+            return False
+        asks_city = bool(
+            re.search(
+                r"what city|which city|what location|which location|"
+                r"where (?:are you|do you)|location are you interested|"
+                r"city (?:are you|would you)|interested in for the weather",
+                low,
+            )
+        )
+        if not asks_city:
+            return False
+        from agent.research import _infer_city_from_text
+
+        hay = f"{evidence} {getattr(self, '_current_subject_text', '')} {getattr(self, '_last_web_query_context', '')}"
+        if _infer_city_from_text(hay) or _infer_city_from_text(evidence):
+            return True
+        # Evidence often names a place structurally ("Osaka high 24", "in Cape Town")
+        if re.search(
+            r"(?i)\b(?:in|for|near)\s+[a-z][a-z .'-]{2,40}\b|"
+            r"\b[a-z][a-z.'-]{2,}(?:\s+[a-z][a-z.'-]{2,}){0,2}\s+(?:high|low|°|degrees?|forecast)\b",
+            evidence or "",
+        ):
+            return True
+        return False
 
     def _latest_web_search_evidence(self) -> str:
         """Pull the most recent web_search tool blob from this turn (grounded preferred)."""
@@ -9413,6 +11703,35 @@ class EchoSpeakAgent:
             callbacks=None,
         )
 
+    def _ensure_web_answer_does_not_give_up(self, user_input: str, response_text: str) -> str:
+        """Stage 4 safety net: if tools already ran but the reply abdicates, force evidence use.
+
+        Complements Stage 3 `_web_research_answer_with_retries` so keep-trying is not plan-only.
+        """
+        display = self._extract_user_request_text(user_input)
+        evidence = self._latest_web_search_evidence()
+        if not evidence or len(evidence) < 40:
+            return response_text
+        if not self._web_answer_is_weak(display, response_text or "", evidence):
+            return response_text
+        logger.info(
+            "Web answer abdication repair (Stage4): re-binding to %d chars of evidence",
+            len(evidence),
+        )
+        forced = self._force_evidence_bound_answer(
+            display,
+            evidence,
+            display,
+            str(getattr(self, "_task_planner", None) and getattr(self._task_planner, "_cached_time_context", "") or ""),
+            response_text or "",
+        )
+        if forced and (
+            not self._answer_is_abdication(forced)
+            or len(forced) > len(response_text or "")
+        ):
+            return forced
+        return response_text
+
     def _summarize_web_results(
         self,
         user_input: str,
@@ -9442,9 +11761,14 @@ class EchoSpeakAgent:
             "(sunny/cloudy/rain/snow), and wind/humidity if present.\n"
             "- Prefer °C for Canadian cities when the evidence uses Celsius.\n"
             "- Do NOT say 'check AccuWeather/Environment Canada' or 'pretty typical' when numbers exist below.\n"
+            "- Do NOT say 'forecasts vary by location' or mix highs from different cities/days without naming each.\n"
             "- Do NOT offer a menu of what you *could* look up — give the forecast now.\n"
-            "- If the evidence truly has no numbers, say the sources didn't include temps and give only what is there.\n"
-            "- Keep it to 2–4 short spoken sentences. No markdown.\n\n"
+            "- If evidence names a city, state that city and its high/low. "
+            "NEVER ask 'what city?' when a place is already in the evidence.\n"
+            "- If evidence has numbers but no city and the user didn't name one, give the best single "
+            "high/low and name the city shown in the source, or say you need a city — not both hedges.\n"
+            "- Do not contradict yourself.\n"
+            "- Keep weather to 1–2 short sentences inside a multi-topic answer. No markdown.\n\n"
         ) if is_weather else ""
 
         had_partial = bool(getattr(self, "_turn_partial_beats", None))
@@ -9456,6 +11780,39 @@ class EchoSpeakAgent:
             "- Jump straight into the factual result.\n\n"
         ) if had_partial else ""
 
+        # Count either ### Search headers or multiple GROUNDED_SEARCH markers
+        multi_parts = max(
+            str(tool_output or "").count("### Search:"),
+            str(tool_output or "").lower().count("[grounded_search]"),
+        )
+        multi_part_instruction = ""
+        if multi_parts >= 2 or (
+            re.search(r"(?i)\balso\b", q_low)
+            and any(d in q_low for d in ("weather", "temp", "fifa", "match", "score", "stock", "news"))
+        ):
+            # Pin "tomorrow" to a real calendar day for schedule honesty
+            try:
+                from datetime import datetime, timedelta
+
+                _tm = (datetime.now() + timedelta(days=1)).strftime("%A, %B %d, %Y")
+                _td = datetime.now().strftime("%A, %B %d, %Y")
+            except Exception:
+                _tm, _td = "tomorrow", "today"
+            multi_part_instruction = (
+                "MULTI-QUESTION RULES (mandatory):\n"
+                "- The user asked more than one thing. Answer EVERY distinct ask in order.\n"
+                "- Each '### Search:' / grounded block is a separate topic — cover each.\n"
+                "- NEVER say you have no information about a topic that has its own search block below.\n"
+                "- NEVER drop half the question. If one block is weak, say so for THAT part only "
+                "and still answer the other part with its evidence.\n"
+                f"- If the user said 'tomorrow', that means {_tm} (today is {_td}). "
+                "For match schedules, only list games on that date. If sources only show other dates "
+                "(e.g. June fixtures when tomorrow is July), say there are no matches found for "
+                f"{_tm} and optionally mention the nearest slate without calling it 'tomorrow'.\n"
+                "- For weather: give one clear high/low with the city name from evidence; "
+                "do not mix unrelated cities.\n\n"
+            )
+
         prompt = (
             "You are Echo Speak, a conversational assistant. "
             "Use the following web search results to answer the user's question. "
@@ -9464,7 +11821,17 @@ class EchoSpeakAgent:
             f"{schedule_instruction}"
             f"{weather_instruction}"
             f"{multibeat_instruction}"
-            "If the search results are incomplete, say what is still missing and ask a clarifying question.\n\n"
+            f"{multi_part_instruction}"
+            "If the search results are incomplete for a sub-question, say what is still missing for that part only — "
+            "do not abandon other parts that have evidence.\n"
+            "ANTI-GIVE-UP RULES (mandatory):\n"
+            "- NEVER say you do not have the information, cannot find it, or tell the user to look it up "
+            "when the search results contain ANY usable facts (team names, times, scores, prices, temps).\n"
+            "- Extract and state the best available facts from the evidence. Partial answers beat refusals.\n"
+            "- If results look like a tournament overview without times, still list any matchups named; "
+            "do not invent — but do not refuse when names appear.\n"
+            "- For timezone questions, if only ET/local times appear, convert to the requested zone when "
+            "possible (Mountain Time is typically 2 hours behind Eastern in summer) and state the assumption.\n\n"
             f"{time_note}User question: {display_question}\n\n"
             f"Search query used: {used_query}\n\n"
             f"Search results:\n{tool_output}\n\n"
@@ -9473,14 +11840,17 @@ class EchoSpeakAgent:
         response_text = self._clamp_web_summary(self._invoke_visible_llm(prompt))
 
         # Repair weak weather answers that hand-wave despite evidence in tool_output.
-        if is_weather and (
+        weather_needs_repair = is_weather and (
             self._answer_defers_to_external_weather(response_text)
             or not self._answer_has_weather_facts(response_text)
-        ):
+            or self._answer_asks_city_despite_known_location(response_text, str(tool_output or ""))
+        )
+        if weather_needs_repair:
             repair = (
                 "Rewrite this as Echo. Use ONLY the evidence. "
                 "State high/low or current temperature and conditions if present. "
-                "Never tell the user to visit another weather site. "
+                "If the evidence names a city, use that city — never ask which city. "
+                "Never contradict yourself. Never tell the user to visit another weather site. "
                 "Max 3 short sentences. No markdown.\n\n"
                 f"User question: {display_question}\n\n"
                 f"Evidence:\n{tool_output}\n\n"
@@ -9489,11 +11859,14 @@ class EchoSpeakAgent:
             )
             try:
                 repaired = self._clamp_web_summary(self._invoke_visible_llm(repair))
-                if repaired and (
-                    self._answer_has_weather_facts(repaired)
-                    or not self._answer_defers_to_external_weather(repaired)
+                if repaired and not self._answer_asks_city_despite_known_location(
+                    repaired, str(tool_output or "")
                 ):
-                    response_text = repaired
+                    if (
+                        self._answer_has_weather_facts(repaired)
+                        or not self._answer_defers_to_external_weather(repaired)
+                    ):
+                        response_text = repaired
             except Exception as exc:
                 logger.warning("Weather answer repair failed: %s", exc)
 
@@ -9837,12 +12210,21 @@ class EchoSpeakAgent:
         self._current_thread_id = self._thread_key(thread_id)
         self._last_stage4_branch = ""
         self._last_tool_calling_mode = self._tool_calling_mode_label()
+        # Per-request web_search cache (dedupe multi-candidate / multi-intent rehits)
+        self._request_search_cache: Dict[str, str] = {}
         self._sync_thread_state(thread_id)
         self._hydrate_pending_action_from_state()
         self._ensure_workspace_for_intent(user_input)
+        # v7.5.2: open coding loop when coding workspace / coding intent
+        try:
+            self._ensure_coding_loop(user_input)
+        except Exception:
+            pass
 
+        # Background sources must never stream tool rows into an interactive chat.
+        bg_source = str(source or "").strip().lower() in {"routine", "heartbeat", "proactive", "cron"}
         trace: Optional[Dict[str, Any]] = None
-        callbacks_local = list(callbacks or [])
+        callbacks_local = [] if bg_source else list(callbacks or [])
         if self._trace_enabled:
             trace = {
                 "trace_id": str(uuid.uuid4()),
@@ -9875,10 +12257,14 @@ class EchoSpeakAgent:
         self._current_execution_id = execution.id
 
         # Attach a stream buffer for this request (stored in singleton dict for /stream/{id} lookup)
+        # Background jobs get a private buffer that no UI is watching — never reuse interactive buffer.
         try:
             from agent.stream_events import get_stream_buffer
-            self._stream_buffer = get_stream_buffer(_request_id)
-            self._stream_buffer.push_status("processing")
+            if bg_source:
+                self._stream_buffer = None
+            else:
+                self._stream_buffer = get_stream_buffer(_request_id)
+                self._stream_buffer.push_status("processing")
         except Exception:
             self._stream_buffer = None
 
@@ -9961,6 +12347,11 @@ class EchoSpeakAgent:
                 user_input, ctx, callbacks_local,
             )
 
+            # Local Desktop scan: reloop into the project, read files, brief the user
+            # (do not stall with "what do you want to look at?").
+            response_text = self._ensure_local_project_deep_scan(
+                user_input, response_text or "", callbacks_local,
+            )
             # Small models often say "I'll check the weather" after get_system_time and stop.
             # If live facts were required but web_search never ran, force it here.
             response_text = self._ensure_live_web_search(
@@ -9970,6 +12361,14 @@ class EchoSpeakAgent:
             # ("check AccuWeather"). Re-synthesize from grounded tool output.
             response_text = self._ensure_weather_answer_uses_evidence(
                 user_input, response_text or "",
+            )
+            # Don't let Stage 4 abdications slip through when web_search already ran
+            response_text = self._ensure_web_answer_does_not_give_up(
+                user_input, response_text or "",
+            )
+            # Worst bug class: model claims "tools don't let me search" after web_search works.
+            response_text = self._ensure_search_capability_honesty(
+                user_input, response_text or "", callbacks_local,
             )
             # Multi-beat: never re-greet in the post-tool answer if we already spoke a first beat.
             response_text = self._ensure_no_regreet_after_partials(

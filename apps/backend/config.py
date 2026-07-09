@@ -432,6 +432,17 @@ class Config:
         self.tavily_api_key = os.getenv("TAVILY_API_KEY", "").strip()
         self.tavily_search_depth = os.getenv("TAVILY_SEARCH_DEPTH", "advanced").strip().lower() or "advanced"
         self.tavily_max_results = int(os.getenv("TAVILY_MAX_RESULTS", "8") or 8)
+        # Secondary / future web search providers (optional; Tavily remains default crawl search)
+        self.brave_search_api_key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+        self.web_search_provider = (
+            os.getenv("WEB_SEARCH_PROVIDER", "auto").strip().lower() or "auto"
+        )  # auto | duckduckgo | tavily | brave
+        # Live sports structured data (The Odds API) — preferred over crawl for scores/odds
+        self.odds_api_key = (
+            os.getenv("ODDS_API_KEY", "").strip()
+            or os.getenv("THE_ODDS_API_KEY", "").strip()
+        )
+        self.sports_live_enabled = os.getenv("SPORTS_LIVE_ENABLED", "true").lower() == "true"
         raw_blocked = os.getenv("WEB_SEARCH_BLOCKED_DOMAINS", "")
         self.web_search_blocked_domains = [
             d.strip().lower().lstrip(".")
@@ -593,7 +604,13 @@ class Config:
                 self.mcp_servers = {}
         else:
             self.mcp_servers = {}
+        # host = legacy PowerShell/shell on the machine (default until sandbox is proven)
+        # docker|sandbox = isolated container (v7.5); never silent-fallback to host
         self.terminal_execution_mode = os.getenv("TERMINAL_EXECUTION_MODE", "host").strip().lower()
+        self.terminal_docker_image = os.getenv("TERMINAL_DOCKER_IMAGE", "python:3.12-slim").strip() or "python:3.12-slim"
+        self.terminal_docker_memory = os.getenv("TERMINAL_DOCKER_MEMORY", "512m").strip() or "512m"
+        self.terminal_docker_cpus = os.getenv("TERMINAL_DOCKER_CPUS", "1.0").strip() or "1.0"
+        self.terminal_docker_user = os.getenv("TERMINAL_DOCKER_USER", "65534:65534").strip() or "65534:65534"
         self.skill_curator_interval_minutes = int(os.getenv("SKILL_CURATOR_INTERVAL_MINUTES", "120") or 120)
         raw_notification_channels = os.getenv("NOTIFICATION_CHANNELS", "web")
         self.notification_channels = [
@@ -945,6 +962,10 @@ class Config:
             "tavily_api_key",
             "tavily_search_depth",
             "tavily_max_results",
+            "brave_search_api_key",
+            "web_search_provider",
+            "odds_api_key",
+            "sports_live_enabled",
             "tesseract_path",
             "web_search_blocked_domains",
             "enable_system_actions",
@@ -1078,6 +1099,10 @@ class Config:
             "twitter_autonomous_prompt",
             "mcp_servers",
             "terminal_execution_mode",
+            "terminal_docker_image",
+            "terminal_docker_memory",
+            "terminal_docker_cpus",
+            "terminal_docker_user",
             "skill_curator_interval_minutes",
         }
 

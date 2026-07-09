@@ -18,6 +18,9 @@ import { AvatarEditor } from "./components/AvatarEditor";
 import { buildResearchRunFromToolEvent, normalizeResearchRun } from "./features/research/buildResearchRun";
 import { useResearchStore } from "./features/research/store";
 import type { ResearchRun } from "./features/research/types";
+import { buildChatEmbeds } from "./features/embeds/buildChatEmbeds";
+import { ChatEmbeds, ChatEmbedFooter } from "./features/embeds/ChatEmbeds";
+import type { ChatEmbed } from "./features/embeds/types";
 import {
   agentActivityReducer,
   initialAgentActivity,
@@ -71,11 +74,166 @@ type Message = {
   usage?: MessageUsage;
   /** True when the reply was already shown live via stream tokens — skip typewriter re-reveal */
   skipTypewriter?: boolean;
+  /**
+   * Multi-beat: "partial" = first spoken mid-turn line (tools must render below it).
+   * "final" = post-tool answer. Used for timeline ordering only.
+   */
+  streamBeat?: "partial" | "final";
+  /**
+   * Rich embeds under the bubble (sources, weather stats, schedule, link cards).
+   * Derived from research + answer text — chat stays text-first.
+   */
+  embeds?: ChatEmbed[];
 };
 
 /** Rough client-side token estimate (chars / 3.5) — matches context meter */
 const estimateTokens = (text: string): number =>
   Math.max(0, Math.round(String(text || "").length / 3.5));
+
+/** Tools that fire every turn and would spam the chat activity list. */
+const SILENT_CHAT_TOOLS = new Set([
+  "get_system_time",
+  "project_update_context",
+]);
+
+/** Human label for any tool including MCP (`mcp__server__tool`). */
+const formatToolDisplayName = (rawName: string): string => {
+  const name = String(rawName || "").trim();
+  if (!name) return "tool";
+  if (name.startsWith("mcp__")) {
+    const parts = name.split("__").filter(Boolean);
+    // mcp, server, tool...
+    if (parts.length >= 3) {
+      const server = parts[1].replace(/_/g, " ");
+      const tool = parts.slice(2).join("__").replace(/_/g, " ");
+      return `MCP · ${server} · ${tool}`;
+    }
+    return `MCP · ${name.replace(/^mcp__/, "").replace(/__/g, " · ").replace(/_/g, " ")}`;
+  }
+  const known: Record<string, string> = {
+    web_search: "Web search",
+    sports_live: "Live sports",
+    file_read: "File read",
+    file_write: "File write",
+    file_list: "File list",
+    file_delete: "File delete",
+    file_move: "File move",
+    file_copy: "File copy",
+    file_mkdir: "Make folder",
+    terminal_run: "Terminal",
+    artifact_write: "Artifact write",
+    notepad_write: "Notepad",
+    browse_task: "Browse page",
+    youtube_transcript: "YouTube transcript",
+    vision_qa: "Vision",
+    analyze_screen: "Screen OCR",
+    take_screenshot: "Screenshot",
+    calculate: "Calculate",
+    system_info: "System info",
+    daily_briefing: "Daily briefing",
+    discord_read_channel: "Discord read",
+    discord_send_channel: "Discord send",
+  };
+  if (known[name]) return known[name];
+  return name.replace(/_/g, " ");
+};
+
+/** Pull a short human preview from tool input (JSON / query= / free text). */
+const previewToolInput = (rawName: string, rawInput: string, maxLen = 100): string => {
+  let inputPreview = String(rawInput || "").replace(/\s+/g, " ").trim();
+  if (!inputPreview) return "";
+  const m =
+    inputPreview.match(/['"]query['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]path['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]command['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]url['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]channel['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]text['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]input['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]name['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/\bquery\s*[:=]\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/\bpath\s*[:=]\s*['"]([^'"]+)['"]/i);
+  if (m && m[1]) inputPreview = m[1].trim().replace(/['"]$/g, "");
+  // Strip dict braces noise
+  if (inputPreview.startsWith("{") && inputPreview.length > 80) {
+    inputPreview = inputPreview.slice(0, 80);
+  }
+  if (inputPreview.length > maxLen) inputPreview = inputPreview.slice(0, maxLen) + "…";
+  if (/how(?:'re| are) you|look great|liking how you look/i.test(inputPreview) && inputPreview.length > 100) {
+    inputPreview = inputPreview.slice(0, 80) + "…";
+  }
+  return inputPreview;
+};
+
+const toolActivityStepType = (rawName: string): "search" | "read" | "tool" => {
+  const n = String(rawName || "").toLowerCase();
+  if (n === "web_search" || n === "sports_live") return "search";
+  if (n === "file_read" || n === "browse_task" || n === "youtube_transcript") return "read";
+  return "tool"; // includes MCP mcp__server__tool
+};
+
+/** Running / done labels for any tool (built-in + MCP). */
+const formatToolActivity = (
+  rawName: string,
+  phase: "start" | "done" | "failed",
+  opts?: { input?: string; output?: string; error?: string }
+): string => {
+  const name = String(rawName || "tool");
+  const low = name.toLowerCase();
+  const label = formatToolDisplayName(name);
+  const input = previewToolInput(name, opts?.input || "");
+  const out = String(opts?.output || "").replace(/\s+/g, " ").trim();
+  const err = String(opts?.error || "").replace(/\s+/g, " ").trim();
+
+  if (phase === "failed") {
+    return `Failed ${label}${err ? `: ${err.slice(0, 100)}` : ""}`;
+  }
+
+  // Specialized search copy
+  if (low === "web_search") {
+    if (phase === "start") return input ? `Searching: ${input}` : "Searching the web…";
+    const provM = out.match(/Search provider:\s*([a-z0-9_,]+)/i);
+    const via = provM?.[1] ? ` via ${provM[1].replace(/,/g, "+")}` : "";
+    const insufficient =
+      /search_evidence_insufficient|accepted=false/i.test(out) ||
+      (/insufficient/i.test(out) && !/\d+\.\s/.test(out));
+    const sources = (out.match(/^\s*\d+\.\s+/gm) || []).length;
+    if (insufficient) return input ? `Search done${via} (weak evidence): ${input}` : `Search finished${via} — weak evidence`;
+    if (sources > 0) return input ? `Search done${via} (${sources} sources): ${input}` : `Search done${via} (${sources} sources)`;
+    return input ? `Search done${via}: ${input}` : `Search done${via}`.trim();
+  }
+  if (low === "sports_live") {
+    if (phase === "start") return input ? `Live sports: ${input}` : "Live sports data…";
+    const ok = /ok\s*=\s*true/i.test(out);
+    if (ok) return input ? `Live sports done: ${input}` : "Live sports done";
+    return input ? `Live sports unavailable: ${input}` : "Live sports unavailable — may fall back to web";
+  }
+
+  if (phase === "start") {
+    if (low.startsWith("mcp__")) {
+      return input ? `${label}: ${input}` : `Using ${label}…`;
+    }
+    if (low === "file_read") return input ? `Reading: ${input}` : "Reading file…";
+    if (low === "file_write") return input ? `Writing: ${input}` : "Writing file…";
+    if (low === "terminal_run") return input ? `Running: ${input}` : "Running terminal…";
+    if (low === "browse_task") return input ? `Browsing: ${input}` : "Browsing page…";
+    return input ? `${label}: ${input}` : `Using ${label}…`;
+  }
+
+  // done
+  if (low.startsWith("mcp__")) {
+    const preview = out.slice(0, 80);
+    return preview ? `${label} done — ${preview}${out.length > 80 ? "…" : ""}` : `${label} done`;
+  }
+  if (low === "file_read") return input ? `Read ${input}` : "File read done";
+  if (low === "file_write") return input ? `Wrote ${input}` : "File write done";
+  if (low === "terminal_run") {
+    const code = out.match(/ExitCode\s*=\s*(-?\d+)/i)?.[1];
+    return code != null ? `Terminal done (exit ${code})` : "Terminal done";
+  }
+  const preview = out.slice(0, 90);
+  return preview ? `${label} done — ${preview}${out.length > 90 ? "…" : ""}` : `${label} done`;
+};
 
 const formatTokenCount = (n: number): string => {
   if (!Number.isFinite(n) || n < 0) return "0";
@@ -387,6 +545,86 @@ const replaceCodeSession = (sessions: CodeDiffSession[], nextSession: CodeDiffSe
 };
 
 const isFileWriteSummary = (value: string): boolean => /^(Wrote|Appended) \d+ chars to /.test(value);
+
+/** Parse <<<ECHO_FILE ...>>> ... <<<END_ECHO_FILE>>> blocks from tool output. */
+const parseEchoFileBlock = (
+  raw: string
+): { path: string; content: string; action: string; chars: number } | null => {
+  const text = String(raw || "");
+  const m = text.match(
+    /<<<ECHO_FILE\s+([^>]*?)>>>\r?\n?([\s\S]*?)\r?\n?<<<END_ECHO_FILE>>>/i
+  );
+  if (!m) return null;
+  const meta = m[1] || "";
+  const content = m[2] ?? "";
+  const pathM = meta.match(/\bpath=([^\s]+)/i);
+  const actionM = meta.match(/\baction=([^\s]+)/i);
+  const charsM = meta.match(/\bchars=(\d+)/i);
+  return {
+    path: (pathM?.[1] || "").replace(/^["']|["']$/g, ""),
+    content,
+    action: actionM?.[1] || "read",
+    chars: charsM ? Number(charsM[1]) : content.length,
+  };
+};
+
+/** Extract path + content from tool input (JSON / kwargs / free form). */
+const parseFileToolInput = (rawInput: string): { path: string; content: string } => {
+  const raw = String(rawInput || "");
+  let path = "";
+  let content = "";
+  try {
+    const j = JSON.parse(raw);
+    if (j && typeof j === "object") {
+      path = String(j.path || j.file_path || j.filepath || j.filename || "").trim();
+      content = typeof j.content === "string" ? j.content : typeof j.text === "string" ? j.text : "";
+      if (path || content) return { path, content };
+    }
+  } catch {
+    /* not JSON */
+  }
+  const pathM =
+    raw.match(/['"]path['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    raw.match(/\bpath\s*=\s*['"]([^'"]+)['"]/i) ||
+    raw.match(/\bpath\s*[:=]\s*([^\s,}\]]+)/i);
+  if (pathM) path = pathM[1].replace(/^['"]|['"]$/g, "");
+  // content after content= / "content": "
+  const contentKey = raw.search(/['"]content['"]\s*:/i);
+  if (contentKey >= 0) {
+    const after = raw.slice(contentKey);
+    const quoted = after.match(/['"]content['"]\s*:\s*(")([\s\S]*)$/i);
+    if (quoted) {
+      // naive unescape of JSON string remainder
+      let body = quoted[2];
+      // trim trailing ", append flags
+      const end = body.lastIndexOf('"');
+      if (end >= 0) body = body.slice(0, end);
+      content = body.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    }
+  }
+  if (!path) {
+    // first path-like token
+    const bare = raw.match(/(?:Desktop[/\\][^\s,'"]+\.\w{1,8}|[A-Za-z]:\\[^\s,'"]+|\/[^\s,'"]+\.\w{1,8}|[\w./\\-]+\.\w{1,8})/);
+    if (bare) path = bare[0];
+  }
+  return { path, content };
+};
+
+const basenamePath = (p: string): string => {
+  const s = String(p || "").replace(/\\/g, "/");
+  const parts = s.split("/").filter(Boolean);
+  return parts[parts.length - 1] || s || "file";
+};
+
+const langFromFilename = (filename: string, toolName: string): string => {
+  if (toolName === "terminal_run") return "bash";
+  const ext = (filename.split(".").pop() || "text").toLowerCase();
+  if (ext === "js" || ext === "mjs" || ext === "cjs") return "javascript";
+  if (ext === "ts" || ext === "tsx") return "typescript";
+  if (ext === "py") return "python";
+  if (ext === "htm") return "html";
+  return ext || "text";
+};
 
 const fallbackProviders: ProviderListItem[] = [
   { id: "openai", name: "OpenAI", local: false, description: "OpenAI GPT models" },
@@ -889,6 +1127,10 @@ const globalCss = `
            display: block;
            overflow: hidden;
            text-overflow: ellipsis;
+         }
+         .chat-embed-source-link:hover {
+           color: rgba(255,255,255,0.62) !important;
+           border-bottom-color: rgba(255,255,255,0.35) !important;
          }
          .research-source:hover {
            opacity: 1;
@@ -1920,6 +2162,11 @@ const ChatBubble: React.FC<{
           </div>
         )}
 
+        {/* Body embeds only (weather / fixtures) — sources live under time row */}
+        {!isUser && !stillTyping && msg.embeds && msg.embeds.length > 0 ? (
+          <ChatEmbeds embeds={msg.embeds} colors={colors} />
+        ) : null}
+
         {!isUser && isConfirmPrompt ? (
           <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
             <button
@@ -2059,6 +2306,11 @@ const ChatBubble: React.FC<{
             </div>
           );
         })()}
+
+        {/* sources · N · searched · M — below time/tokens, same meta style */}
+        {!isUser && !stillTyping && msg.embeds && msg.embeds.length > 0 ? (
+          <ChatEmbedFooter embeds={msg.embeds} colors={colors} />
+        ) : null}
       </div>
     </motion.div>
   );
@@ -2611,7 +2863,7 @@ export const Dashboard: React.FC = () => {
   const [monitorText, setMonitorText] = useState<string>("");
   const [monitorAt, setMonitorAt] = useState<number>(0);
   const [monitorError, setMonitorError] = useState<string | null>(null);
-  const toolInfoRef = useRef<Record<string, { name: string; input: string }>>({});
+  const toolInfoRef = useRef<Record<string, { name: string; input: string; requestId?: string }>>({});
   const latestCodeFilenameRef = useRef<string | null>(null);
   const [capabilitiesData, setCapabilitiesData] = useState<any>(null);
   const [codingReadiness, setCodingReadiness] = useState<CodingReadiness | null>(null);
@@ -3506,18 +3758,36 @@ export const Dashboard: React.FC = () => {
         })
       ),
     ];
-    // Chronological, but within the same turn: task plan sits above search/tool activity.
+    // Chronological with multi-beat contract:
+    //   user → first spoken assistant beat (partial) → tool/search rows → final answer
+    // Only *partial* assistant messages (skipTypewriter) force above tools — not finals.
     const kindRank = (k: TimelineItem["kind"]) =>
       k === "message" ? 0 : k === "task_plan" ? 1 : k === "activity" ? 2 : 3;
+    const isPartialBeat = (t: TimelineItem) => {
+      if (t.kind !== "message") return false;
+      const m = (t as Extract<TimelineItem, { kind: "message" }>).msg;
+      return m.role === "assistant" && m.streamBeat === "partial";
+    };
+    const isToolActivity = (t: TimelineItem) =>
+      t.kind === "activity" &&
+      ((t as Extract<TimelineItem, { kind: "activity" }>).item.kind === "thinking" ||
+        (t as Extract<TimelineItem, { kind: "activity" }>).item.kind === "tool");
+
     merged.sort((a, b) => {
       const dt = a.at - b.at;
-      // Same second / close events: tasks above search/tools.
-      if (Math.abs(dt) < 120_000 && a.kind !== "message" && b.kind !== "message") {
-        const ra = kindRank(a.kind);
-        const rb = kindRank(b.kind);
-        if (ra !== rb) return ra - rb;
+      // Close in time: partial spoken beat always above tool/search activity.
+      if (Math.abs(dt) < 180_000) {
+        if (isPartialBeat(a) && isToolActivity(b)) return -1;
+        if (isToolActivity(a) && isPartialBeat(b)) return 1;
+        if (a.kind !== "message" && b.kind !== "message") {
+          const ra = kindRank(a.kind);
+          const rb = kindRank(b.kind);
+          if (ra !== rb) return ra - rb;
+        }
       }
       if (dt !== 0) return dt;
+      if (isPartialBeat(a) && isToolActivity(b)) return -1;
+      if (isToolActivity(a) && isPartialBeat(b)) return 1;
       return kindRank(a.kind) - kindRank(b.kind);
     });
     return merged;
@@ -3621,6 +3891,9 @@ export const Dashboard: React.FC = () => {
     setLiveReplyDraft("");
     dispatchActivity({ type: "stream_start" });
     setStreaming(true);
+    // Drop prior-turn tool metadata so done-labels never inherit stale queries
+    // (e.g. Python search label leaking into a later GTA+FIFA turn).
+    toolInfoRef.current = {};
     // Seed a visible "working" step immediately so chat always shows progress
     // (avatar can animate before the first tool/thinking event arrives).
     const runRequestId = crypto.randomUUID();
@@ -3628,6 +3901,13 @@ export const Dashboard: React.FC = () => {
     let finalHandled = false;
     /** Mid-turn spoken beats already committed (so final doesn't re-add them). */
     const partialReplies: string[] = [];
+    /** True once the first spoken mid-turn beat is sealed — tools must sort after it. */
+    let sawPartialBeat = false;
+    /** Floor timestamp for tool/search activity after the first partial. */
+    let toolsAfterPartialAt = 0;
+    /** Research runs + queries this turn — feed chat embeds under the final bubble. */
+    const turnResearchRuns: ResearchRun[] = [];
+    const turnSearchQueries: string[] = [];
     setActivities((prev) => [
       ...prev,
       {
@@ -3718,7 +3998,10 @@ export const Dashboard: React.FC = () => {
                 matched = true;
               }
             }
-            return matched ? { ...p, steps } : p;
+            if (!matched) return p;
+            // Keep card under first partial beat if any.
+            const nextAt = sawPartialBeat ? Math.max(p.at, toolsAfterPartialAt) : p.at;
+            return { ...p, at: nextAt, steps };
           })
         );
       };
@@ -3751,6 +4034,8 @@ export const Dashboard: React.FC = () => {
             let prevSteps = (existing.steps || []).filter((s) =>
               step.id === bootstrapStepId ? true : s.id !== bootstrapStepId
             );
+            // Also drop post-partial placeholder once real tool/search steps land.
+            prevSteps = prevSteps.filter((s) => s.id !== `${reqId}:post-partial-working`);
             // Upsert by id so tool_end can complete the same row.
             const byId = prevSteps.findIndex((s) => s.id === step.id);
             let nextSteps: ThinkingStep[];
@@ -3766,9 +4051,14 @@ export const Dashboard: React.FC = () => {
             } else {
               nextSteps = [...prevSteps, step];
             }
+            // NEVER pull the card earlier (Math.min was pinning Search done above the first beat).
+            // After a partial beat, stay strictly after that spoken message.
+            const stepAt = step.at || Date.now();
+            const floor = sawPartialBeat ? Math.max(toolsAfterPartialAt, existing.at) : existing.at;
+            const nextAt = Math.max(floor, stepAt, sawPartialBeat ? toolsAfterPartialAt : 0);
             updated[existingIdx] = {
               ...existing,
-              at: Math.min(existing.at, step.at || Date.now()),
+              at: nextAt || stepAt,
               steps: nextSteps,
             };
             return updated;
@@ -3838,34 +4128,21 @@ export const Dashboard: React.FC = () => {
       };
       const upsertTool = (evt: AgentStreamEvent) => {
         if (evt.type === "tool_start") {
-          toolInfoRef.current[evt.id] = { name: evt.name, input: evt.input };
+          // Scope tool metadata to this stream turn (avoid stale labels from prior turns)
+          toolInfoRef.current[evt.id] = { name: evt.name, input: evt.input, requestId: runRequestId };
           dispatchActivity({ type: "tool_start", id: evt.id, name: evt.name });
-          const toolVerb =
-            evt.name === "web_search" ? "Searching" :
-            evt.name === "file_read" ? "Reading" :
-            evt.name === "file_write" ? "Writing" :
-            evt.name === "terminal_run" ? "Running" :
-            "Using";
-          const inputPreview = String(evt.input || "").replace(/\s+/g, " ").trim();
-          // Hide silent/internal tools from the chat step list (time inject, calc, …).
-          const silentTools = new Set([
-            "get_system_time",
-            "calculate",
-            "system_info",
-            "project_update_context",
-            "store_memory",
-            "save_memory",
-            "recall_memory",
-            "search_memory",
-            "query_memory",
-          ]);
-          if (!silentTools.has(String(evt.name || "").toLowerCase())) {
+          const toolNameStart = String(evt.name || "").toLowerCase();
+          // Only hide pure injects that fire almost every turn
+          if (!SILENT_CHAT_TOOLS.has(toolNameStart)) {
+            const stepAt = sawPartialBeat
+              ? Math.max(Date.now(), toolsAfterPartialAt)
+              : normalizeTimestampMs(evt.at || Date.now());
             appendThinkingStep(evt, {
               id: evt.id,
-              type: evt.name === "web_search" ? "search" : evt.name === "file_read" ? "read" : "tool",
-              content: inputPreview ? `${toolVerb} ${evt.name}: ${inputPreview}` : `${toolVerb} ${evt.name}`,
+              type: toolActivityStepType(evt.name || ""),
+              content: formatToolActivity(evt.name || "tool", "start", { input: evt.input }),
               status: "running",
-              at: normalizeTimestampMs(evt.at || Date.now()),
+              at: stepAt,
             });
           }
           return;
@@ -3874,115 +4151,127 @@ export const Dashboard: React.FC = () => {
         if (evt.type === "tool_end") {
           dispatchActivity({ type: "tool_end", id: evt.id });
           const info = toolInfoRef.current[evt.id];
-          const toolName = info?.name || evt.name || "tool";
-          const silentTools = new Set([
-            "get_system_time",
-            "calculate",
-            "system_info",
-            "project_update_context",
-            "store_memory",
-            "save_memory",
-            "recall_memory",
-            "search_memory",
-            "query_memory",
-          ]);
-          if (silentTools.has(String(toolName || "").toLowerCase())) {
+          // Ignore tool_end that belongs to another turn's metadata
+          if (info && (info as { requestId?: string }).requestId && (info as { requestId?: string }).requestId !== runRequestId) {
             return;
           }
-          if (toolName === "web_search") {
-            const normalized = normalizeResearchRun(evt.research) || buildResearchRunFromToolEvent(evt.id, toolName, info?.input || "", evt.output || "", evt.at || Date.now());
+          const toolName = info?.name || evt.name || "tool";
+          const toolNameLow = String(toolName || "").toLowerCase();
+          if (SILENT_CHAT_TOOLS.has(toolNameLow)) {
+            return;
+          }
+          // Research panel still fed by web_search
+          if (toolNameLow === "web_search") {
+            const normalized =
+              normalizeResearchRun(evt.research) ||
+              buildResearchRunFromToolEvent(
+                evt.id,
+                toolName,
+                info?.input || "",
+                evt.output || "",
+                evt.at || Date.now()
+              );
             if (normalized) {
               prependResearchRun(normalized);
+              turnResearchRuns.push(normalized);
+              if (normalized.query) turnSearchQueries.push(normalized.query);
+            } else if (info?.input) {
+              turnSearchQueries.push(String(info.input).replace(/\s+/g, " ").trim().slice(0, 120));
             }
-            const count = normalized?.evidence_count || 0;
-            const outLow = String(evt.output || "").toLowerCase();
-            const insufficient =
-              outLow.includes("search_evidence_insufficient") ||
-              outLow.includes("accepted=false") ||
-              (count === 0 && outLow.includes("insufficient"));
-            const summary = insufficient
-              ? "Search finished — evidence insufficient"
-              : count
-                ? `Search done (${count} sources)`
-                : "Search done";
-            markThinkingStep(
-              evt,
-              evt.id,
-              { status: "done", content: summary },
-              { toolName: "web_search", stepType: "search" },
-            );
-            return;
           }
-          // Capture code blocks for CodeVisualizer
+          // Capture code for Code visualizer (needs real file bodies, not "Wrote 15 chars")
           const codingTools = new Set(["file_write", "file_read", "artifact_write", "terminal_run", "notepad_write"]);
           if (codingTools.has(toolName)) {
             const rawInput = info?.input || "";
-            const filename = rawInput.split(/[\n,]/)[0]?.replace(/^.*?['"]([^'"]+)['"].*$/, "$1") || toolName || "output";
-            const lang = toolName === "terminal_run" ? "bash" : filename.split(".").pop() || "text";
-            const content = evt.output || "";
-            if (content.length > 0) {
-              latestCodeFilenameRef.current = filename;
-              setCodeSessions((prev) => {
-                const existing = prev.find((session) => session.filename === filename);
-                let nextSession: CodeDiffSession;
+            const rawOutput = String(evt.output || "");
+            const echo = parseEchoFileBlock(rawOutput);
+            const parsedIn = parseFileToolInput(rawInput);
+            const pathFromSummary = (rawOutput.match(/(?:Wrote|Appended|Read) \d+ chars (?:to|from) (.+?)(?:\n|$)/i) || [])[1]?.trim() || "";
+            const fullPath = echo?.path || parsedIn.path || pathFromSummary || "";
+            const filename = basenamePath(fullPath) || basenamePath(parsedIn.path) || toolName || "output";
+            const lang = langFromFilename(filename, toolName);
 
-                if (toolName === "file_read") {
-                  nextSession = {
-                    filename,
-                    language: lang,
-                    originalContent: content,
-                    currentContent: content,
-                    status: "read",
-                    summary: `Loaded ${content.length} chars`,
-                  };
-                } else if (toolName === "file_write") {
-                  if (isFileWriteSummary(content)) {
-                    nextSession = {
-                      filename,
-                      language: lang,
-                      originalContent: existing?.originalContent || existing?.currentContent || "",
-                      currentContent: existing?.currentContent || "",
-                      status: "saved",
-                      summary: content,
-                    };
-                  } else {
-                    nextSession = {
-                      filename,
-                      language: lang,
-                      originalContent: existing?.originalContent || existing?.currentContent || "",
-                      currentContent: content,
-                      status: "draft",
-                      summary: `Preview ${content.length} chars`,
-                    };
-                  }
-                } else {
-                  nextSession = {
-                    filename,
-                    language: lang,
-                    originalContent: content,
-                    currentContent: content,
-                    status: "output",
-                    summary: toolName === "terminal_run" ? "Terminal output" : undefined,
-                  };
-                }
-
-                const [nextSessions] = replaceCodeSession(prev, nextSession);
-                return nextSessions;
-              });
-              setVisualizerPin("coding");
+            let fileBody = "";
+            if (echo?.content != null && echo.content.length > 0) {
+              fileBody = echo.content;
+            } else if (toolName === "file_write" && parsedIn.content) {
+              fileBody = parsedIn.content;
+            } else if (toolName === "file_read" && rawOutput && !/^File not found|^Path not allowed|^Failed to read|^Path is a directory|^Binary file/i.test(rawOutput.trim())) {
+              // legacy: raw file body without ECHO_FILE wrapper
+              const stripped = rawOutput.replace(/^Read \d+ chars from .+\n?/i, "");
+              fileBody = stripped || rawOutput;
+            } else if (toolName === "terminal_run" || toolName === "notepad_write" || toolName === "artifact_write") {
+              fileBody = rawOutput;
             }
+
+            // Always open the coding pane on file ops (even errors — show the message)
+            const displayContent =
+              fileBody ||
+              (rawOutput.trim() ? rawOutput : `(no content returned for ${filename})`);
+            const isError =
+              /^(File not found|Path not allowed|Failed to |Path is a directory|Binary file|Rejected stub)/i.test(
+                rawOutput.trim()
+              );
+
+            latestCodeFilenameRef.current = filename;
+            setCodeSessions((prev) => {
+              const existing =
+                prev.find((session) => session.filename === filename) ||
+                prev.find((session) => fullPath && session.filename === fullPath);
+              let nextSession: CodeDiffSession;
+
+              if (toolName === "file_read") {
+                nextSession = {
+                  filename: fullPath || filename,
+                  language: lang,
+                  originalContent: isError ? "" : displayContent,
+                  currentContent: displayContent,
+                  status: isError ? "output" : "read",
+                  summary: isError
+                    ? rawOutput.slice(0, 120)
+                    : `Loaded ${displayContent.length.toLocaleString()} chars`,
+                };
+              } else if (toolName === "file_write") {
+                const hasBody = Boolean(fileBody);
+                nextSession = {
+                  filename: fullPath || filename,
+                  language: lang,
+                  originalContent: existing?.originalContent || existing?.currentContent || "",
+                  currentContent: hasBody ? fileBody : existing?.currentContent || displayContent,
+                  status: isFileWriteSummary(rawOutput.split("\n")[0] || "") || hasBody ? "saved" : "draft",
+                  summary: hasBody
+                    ? `Saved ${fileBody.length.toLocaleString()} chars → ${basenamePath(fullPath || filename)}`
+                    : (rawOutput.split("\n")[0] || `Write ${filename}`).slice(0, 160),
+                };
+              } else {
+                nextSession = {
+                  filename: fullPath || filename,
+                  language: lang,
+                  originalContent: displayContent,
+                  currentContent: displayContent,
+                  status: "output",
+                  summary: toolName === "terminal_run" ? "Terminal output" : undefined,
+                };
+              }
+
+              const [nextSessions] = replaceCodeSession(prev, nextSession);
+              return nextSessions;
+            });
+            setVisualizerPin("coding");
+            setAgentMode("coding");
           }
-          const isFileOp = codingTools.has(toolName);
-          const activityOutput = isFileOp && (evt.output || "").length > 200
-            ? `${toolName === "file_read" ? "Read" : "Wrote"} ${(evt.output || "").length} chars`
-            : (evt.output || "done").slice(0, 120);
-          const stepType: ThinkingStep["type"] =
-            toolName === "file_read" ? "read" : toolName === "web_search" ? "search" : "tool";
+          // Unified done label: built-in, sports, MCP (mcp__server__tool), skills, …
           markThinkingStep(
             evt,
             evt.id,
-            { status: "done", content: `${toolName}: ${activityOutput}` },
-            { toolName, stepType },
+            {
+              status: "done",
+              content: formatToolActivity(toolName, "done", {
+                input: info?.input || "",
+                output: evt.output || "",
+              }),
+            },
+            { toolName, stepType: toolActivityStepType(toolName) },
           );
           return;
         }
@@ -3991,14 +4280,20 @@ export const Dashboard: React.FC = () => {
           dispatchActivity({ type: "tool_error", id: evt.id, message: evt.error });
           const info = toolInfoRef.current[evt.id];
           const toolName = info?.name || "tool";
-          const stepType: ThinkingStep["type"] =
-            toolName === "web_search" ? "search" : toolName === "file_read" ? "read" : "tool";
-          markThinkingStep(
-            evt,
-            evt.id,
-            { status: "failed", content: `Failed ${toolName}: ${evt.error}` },
-            { toolName, stepType },
-          );
+          if (!SILENT_CHAT_TOOLS.has(String(toolName || "").toLowerCase())) {
+            markThinkingStep(
+              evt,
+              evt.id,
+              {
+                status: "failed",
+                content: formatToolActivity(toolName, "failed", {
+                  input: info?.input || "",
+                  error: evt.error,
+                }),
+              },
+              { toolName, stepType: toolActivityStepType(toolName) },
+            );
+          }
           setEchoReaction("error");
         }
       };
@@ -4070,12 +4365,17 @@ export const Dashboard: React.FC = () => {
             if (partialReplies.some((p) => p.trim() === text)) continue;
             partialReplies.push(text);
             const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
+            const beatAt = Date.now();
+            sawPartialBeat = true;
+            // Tools must render strictly below this spoken beat (across all multi-beat turns).
+            toolsAfterPartialAt = beatAt + 10;
             addMessage({
               id: crypto.randomUUID(),
               role: "assistant",
               text,
-              at: Date.now(),
+              at: beatAt,
               skipTypewriter: true,
+              streamBeat: "partial",
               usage: buildMessageUsage(text, useAppStore.getState().messages, ctxWindow, {
                 provider: providerInfo?.provider,
                 model: providerInfo?.model,
@@ -4087,6 +4387,41 @@ export const Dashboard: React.FC = () => {
             if (evt.speak !== false) {
               void speakText(text);
             }
+            // Move the thinking/tool card under this beat. Keep any tool rows already
+            // recorded (they may have finished before this event was painted).
+            const reqId = eventRequestId(evt);
+            setActivities((prev) =>
+              prev.map((p) => {
+                if (p.kind !== "thinking" || p.request_id !== reqId) return p;
+                const kept = (p.steps || []).filter(
+                  (s) =>
+                    s.id !== bootstrapStepId &&
+                    s.id !== `${reqId}:post-partial-working` &&
+                    (s.status === "done" || s.status === "failed" || s.status === "running") &&
+                    !/^(thinking|thinking…)$/i.test(String(s.content || "").trim())
+                );
+                const hasToolWork = kept.some(
+                  (s) => s.type === "search" || s.type === "tool" || s.type === "read"
+                );
+                return {
+                  ...p,
+                  at: toolsAfterPartialAt,
+                  content: "working",
+                  steps: hasToolWork
+                    ? kept
+                    : [
+                        ...kept,
+                        {
+                          id: `${reqId}:post-partial-working`,
+                          type: "tool" as const,
+                          content: "checking…",
+                          status: "running" as const,
+                          at: toolsAfterPartialAt,
+                        },
+                      ],
+                };
+              })
+            );
             dispatchActivity({ type: "thinking", content: "working" });
           } else if (evt.type === "thinking") {
             const content = (evt.content || "").trim();
@@ -4177,7 +4512,14 @@ export const Dashboard: React.FC = () => {
               if (evt.trace_id) setLatestTraceId(String(evt.trace_id));
             }
             if (Array.isArray(evt.research) && evt.research.length) {
-              replaceResearchRuns(evt.research.map((item) => normalizeResearchRun(item)).filter((item): item is ResearchRun => Boolean(item)));
+              const finals = evt.research
+                .map((item) => normalizeResearchRun(item))
+                .filter((item): item is ResearchRun => Boolean(item));
+              replaceResearchRuns(finals);
+              for (const r of finals) {
+                if (!turnResearchRuns.some((t) => t.id === r.id)) turnResearchRuns.push(r);
+                if (r.query) turnSearchQueries.push(r.query);
+              }
             }
 
             liveReplyDraftRef.current = "";
@@ -4188,12 +4530,21 @@ export const Dashboard: React.FC = () => {
             if (reply && !partialReplies.some((p) => p.trim() === reply)) {
               const alreadyStreamed = liveDraft.length > 0;
               const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
+              // Rich embeds under the answer (sources, weather, fixtures) — text stays primary.
+              const embeds = buildChatEmbeds({
+                answerText: reply,
+                researchRuns: turnResearchRuns,
+                searchQueries: turnSearchQueries,
+              });
               addMessage({
                 id: crypto.randomUUID(),
                 role: "assistant",
                 text: reply,
-                at: Date.now(),
+                // Always after tools: toolsAfterPartialAt is 0 when no partial.
+                at: Math.max(Date.now(), toolsAfterPartialAt + 1),
                 skipTypewriter: alreadyStreamed || partialReplies.length > 0,
+                streamBeat: "final",
+                embeds: embeds.length ? embeds : undefined,
                 usage: buildMessageUsage(reply, useAppStore.getState().messages, ctxWindow, {
                   provider: providerInfo?.provider,
                   model: providerInfo?.model,

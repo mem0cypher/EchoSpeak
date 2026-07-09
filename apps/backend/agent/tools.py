@@ -172,14 +172,61 @@ def _file_tool_extra_roots() -> list[Path]:
 
 def _file_tool_roots() -> list[Path]:
     roots = [_file_tool_root()]
+    # Always allow user Desktop (common coding destination)
+    try:
+        desk = _desktop_root()
+        if desk not in roots:
+            roots.append(desk)
+    except Exception:
+        pass
     for root in _file_tool_extra_roots():
         if root not in roots:
             roots.append(root)
+    # Active coding project (may be under Desktop or a discovered path)
+    try:
+        if _active_project_root is not None:
+            ap = _active_project_root.resolve()
+            # Allow the project dir itself and its parent (for relative resolves)
+            if ap not in roots:
+                roots.append(ap)
+            parent = ap.parent
+            if parent not in roots:
+                roots.append(parent)
+    except Exception:
+        pass
     return roots
 
 
 def _desktop_root() -> Path:
     return (Path.home() / "Desktop").expanduser().resolve()
+
+
+# Active coding project root — relative paths like "index.html" resolve here
+# instead of the EchoSpeak repo (live bug: white-screen write to EchoSpeak/index.html).
+_active_project_root: Optional[Path] = None
+
+
+def set_active_project_root(path: Optional[str]) -> None:
+    """Agent sets this when a coding project folder is known (e.g. Desktop/2d-shooter-game)."""
+    global _active_project_root
+    raw = str(path or "").strip()
+    if not raw:
+        _active_project_root = None
+        return
+    # Clear first so _candidate_file_path does not recurse into the old project root
+    _active_project_root = None
+    try:
+        p = _candidate_file_path(raw, _file_tool_root()).resolve()
+        _active_project_root = p
+    except Exception:
+        try:
+            _active_project_root = Path(raw).expanduser().resolve()
+        except Exception:
+            _active_project_root = None
+
+
+def get_active_project_root() -> Optional[Path]:
+    return _active_project_root
 
 
 def _candidate_file_path(path: str, root: Path) -> Path:
@@ -189,11 +236,20 @@ def _candidate_file_path(path: str, root: Path) -> Path:
         return _desktop_root()
     for prefix in ("desktop/", "~/desktop/", "%userprofile%/desktop/"):
         if low.startswith(prefix):
-            suffix = raw.replace("\\", "/")[len(prefix):]
+            suffix = raw.replace("\\", "/")[len(prefix) :]
             return _desktop_root() / suffix
     candidate = Path(raw).expanduser()
-    if not candidate.is_absolute():
-        candidate = root / candidate
+    if candidate.is_absolute():
+        return candidate
+    # Bare relative paths during coding → project folder, not EchoSpeak repo root
+    proj = _active_project_root
+    if proj is not None and not low.startswith(("desktop/", "apps/", "src/")):
+        try:
+            if proj.exists() or True:
+                return proj / raw
+        except Exception:
+            pass
+    candidate = root / raw
     return candidate
 
 
@@ -338,8 +394,12 @@ class FileListArgs(BaseModel):
 
 
 class FileReadArgs(BaseModel):
-    path: str = Field(..., validation_alias=AliasChoices("path", "file", "filepath", "filename"))
-    max_chars: int = Field(default=4000, ge=200, le=20000)
+    path: str = Field(
+        ...,
+        validation_alias=AliasChoices("path", "file", "filepath", "filename"),
+        description="Path to read; use Desktop/<project>/file for user projects",
+    )
+    max_chars: int = Field(default=100000, ge=200, le=200000)
 
 
 class FileWriteArgs(BaseModel):
@@ -473,25 +533,85 @@ def file_list(path: Optional[str] = ".", limit: int = 50) -> str:
         return f"Failed to list files: {str(e)}"
 
 
+def _echo_file_payload(path: Path | str, content: str, *, action: str = "read") -> str:
+    """Structured payload so the Code visualizer can show real file text (not just summaries)."""
+    p = str(path or "").replace("\\", "/")
+    body = content if content is not None else ""
+    # Cap stream payload size while keeping enough for real source files
+    max_body = 120_000
+    truncated = False
+    if len(body) > max_body:
+        body = body[:max_body]
+        truncated = True
+    header = f"<<<ECHO_FILE action={action} path={p} chars={len(content or '')}{' truncated=1' if truncated else ''}>>>"
+    return f"{header}\n{body}\n<<<END_ECHO_FILE>>>"
+
+
 @tool(args_schema=FileReadArgs, description="Read a text file from an allowed workspace directory.")
-def file_read(path: str, max_chars: int = 4000) -> str:
+def file_read(path: str, max_chars: int = 100000) -> str:
     target = _safe_file_path(path)
     if target is None:
-        return "Path not allowed."
+        roots = _format_file_tool_roots()
+        return (
+            f"Path not allowed: {path!r}. Allowed roots: {roots}. "
+            f"Use Desktop/<project>/filename or an absolute path under an allowed root."
+        )
     if not target.exists():
-        return "File not found."
+        # Helpful hint when relative path missed the active project
+        proj = get_active_project_root()
+        hint = f" Active project is {proj}." if proj else " No active project pin — pass Desktop/<project>/file."
+        return f"File not found: {target}.{hint}"
     if target.is_dir():
-        return "Path is a directory."
+        return f"Path is a directory: {target}. Use file_list to list children."
     try:
         data = target.read_bytes()
         if b"\x00" in data[:2000]:
             return "Binary file detected; text read skipped."
         text = data.decode("utf-8", errors="ignore")
-        if max_chars and len(text) > max_chars:
-            text = text[:max_chars].rstrip() + "…"
-        return text if text.strip() else "(empty file)"
+        limit = int(max_chars) if max_chars else 100000
+        if limit and len(text) > limit:
+            text = text[:limit].rstrip() + "\n…(truncated)"
+        if not text.strip():
+            return _echo_file_payload(target, "(empty file)", action="read")
+        # Lead with human line + structured body for UI + model
+        return f"Read {len(text)} chars from {target}\n{_echo_file_payload(target, text, action='read')}"
     except Exception as e:
         return f"Failed to read file: {str(e)}"
+
+
+def _looks_like_code_stub(path: str, content: str) -> bool:
+    """Reject comment-only / tiny placeholder writes that leave a white-screen game."""
+    p = str(path or "").lower().replace("\\", "/")
+    if not any(p.endswith(ext) for ext in (".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".html", ".htm", ".css", ".py")):
+        return False
+    c = str(content or "").strip()
+    if not c:
+        return True
+    # Tiny stubs (live: game.js became "// Implement collision…" only)
+    if len(c) < 100:
+        lines = [ln.strip() for ln in c.splitlines() if ln.strip()]
+        if not lines:
+            return True
+        commentish = all(
+            ln.startswith(("//", "/*", "*", "#", "<!--", "pass", "..."))
+            or ln in {"{}", "[]", ";"}
+            or re.match(r"^//.*", ln)
+            for ln in lines
+        )
+        if commentish or len(c) < 60:
+            return True
+    # Entire file is only comments / TODO placeholders
+    code_lines = [
+        ln
+        for ln in c.splitlines()
+        if ln.strip()
+        and not ln.strip().startswith(("//", "/*", "*", "#", "<!--"))
+        and "todo" not in ln.lower()
+        and "implement " not in ln.lower()
+    ]
+    if len(c) < 400 and not code_lines:
+        return True
+    return False
 
 
 @tool(args_schema=FileWriteArgs, description="Write text to a file (restricted; opt-in system action).")
@@ -500,14 +620,33 @@ def file_write(path: str, content: str, append: bool = False) -> str:
         return "File write is disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
     target = _safe_file_path(path)
     if target is None:
-        return "Path not allowed."
+        return f"Path not allowed. Allowed roots: {_format_file_tool_roots()}. Prefer Desktop/<project>/filename for user projects."
+    body = content or ""
+    if not append and _looks_like_code_stub(str(path), body):
+        return (
+            "Rejected stub write: content is too small or comment-only for a code file. "
+            "Write the FULL working file content (not '// Implement …' placeholders). "
+            f"Path was: {target}"
+        )
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
+        # If writing into a new project dir, pin active project for later relative paths
+        try:
+            if target.parent.is_dir() and target.parent.name and target.parent != _file_tool_root():
+                # Pin parent when it looks like a project folder under Desktop
+                desk = _desktop_root()
+                if str(target.parent).startswith(str(desk)) or (
+                    _active_project_root and str(target).startswith(str(_active_project_root))
+                ):
+                    set_active_project_root(str(target.parent))
+        except Exception:
+            pass
         mode = "a" if append else "w"
         with open(target, mode, encoding="utf-8") as f:
-            f.write(content or "")
+            f.write(body)
         action = "Appended" if append else "Wrote"
-        return f"{action} {len(content or '')} chars to {target}"
+        # Include file body so Code visualizer can show real source (not "Wrote N chars")
+        return f"{action} {len(body)} chars to {target}\n{_echo_file_payload(target, body, action='write')}"
     except Exception as e:
         return f"Failed to write file: {str(e)}"
 
@@ -592,9 +731,14 @@ def file_mkdir(path: str, parents: bool = True, exist_ok: bool = True) -> str:
         return "File operations are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
     target = _safe_file_path(path)
     if target is None:
-        return "Path not allowed."
+        return f"Path not allowed. Allowed roots: {_format_file_tool_roots()}"
     try:
         target.mkdir(parents=bool(parents), exist_ok=bool(exist_ok))
+        # Pin coding project so later bare "index.html" / "game.js" resolve here
+        try:
+            set_active_project_root(str(target))
+        except Exception:
+            pass
         return f"Created folder: {target}"
     except Exception as e:
         return f"Failed to create folder: {str(e)}"
@@ -695,20 +839,38 @@ def terminal_run(command: str, cwd: Optional[str] = ".", timeout: Optional[int] 
         timeout_s = default_timeout
     timeout_s = max(1, min(120, timeout_s))
 
-    if getattr(config, "terminal_execution_mode", "host") == "docker":
-        try:
-            from agent.sandbox import DockerSandbox
-            out = DockerSandbox.run_command(command, cwd=str(cwd_p), timeout=timeout_s)
-            try:
-                max_chars = int(getattr(config, "terminal_max_output_chars", 8000) or 8000)
-            except Exception:
-                max_chars = 8000
-            if max_chars > 0 and len(out) > max_chars:
-                out = out[:max_chars].rstrip() + "…"
-            return out
-        except Exception as e:
-            return f"Failed to run command in Docker sandbox: {str(e)}"
+    # v7.5.0: host (default) vs docker/sandbox — never silent-fallback from docker to host.
+    try:
+        from agent.sandbox import normalize_execution_mode, run_sandboxed_terminal
+    except Exception:
+        normalize_execution_mode = None  # type: ignore
+        run_sandboxed_terminal = None  # type: ignore
 
+    mode = "host"
+    if callable(normalize_execution_mode):
+        mode = normalize_execution_mode(getattr(config, "terminal_execution_mode", "host"))
+    else:
+        raw_mode = str(getattr(config, "terminal_execution_mode", "host") or "host").strip().lower()
+        mode = "docker" if raw_mode in {"docker", "sandbox", "container"} else "host"
+
+    if mode == "docker":
+        if not callable(run_sandboxed_terminal):
+            return (
+                "ExitCode=127\n"
+                "Status=sandbox_unavailable\n"
+                "Mode=docker\n"
+                "Reason=sandbox_unavailable: agent.sandbox module failed to import. "
+                "Fix the install or set TERMINAL_EXECUTION_MODE=host (unsandboxed)."
+            )
+        result = run_sandboxed_terminal(
+            command,
+            cwd=cwd_p,
+            timeout_s=timeout_s,
+            denylist_check=_terminal_command_denied,
+        )
+        return result.format()
+
+    # ---- host path (unchanged default behavior) ----
     cmd: list[str]
     if os.name == "nt":
         cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
@@ -739,14 +901,18 @@ def terminal_run(command: str, cwd: Optional[str] = ".", timeout: Optional[int] 
             max_chars = 8000
         if max_chars > 0 and len(out) > max_chars:
             out = out[:max_chars].rstrip() + "…"
-        header = f"ExitCode={proc.returncode}"
+        status = "pass" if int(proc.returncode) == 0 else "fail"
+        header = f"ExitCode={proc.returncode}\nStatus={status}\nMode=host"
         if out:
             return header + "\n" + out
         return header
     except subprocess.TimeoutExpired:
-        return f"Command timed out after {timeout_s}s."
+        return (
+            f"ExitCode=124\nStatus=timeout\nMode=host\n"
+            f"Reason=Command timed out after {timeout_s}s."
+        )
     except Exception as e:
-        return f"Failed to run command: {str(e)}"
+        return f"ExitCode=1\nStatus=fail\nMode=host\nReason=Failed to run command: {str(e)}"
 
 
 def _artifacts_root() -> Path:
@@ -1412,38 +1578,46 @@ def _encode_image_b64(img: "np.ndarray") -> str:
         return ""
 
 
+class SportsLiveArgs(BaseModel):
+    query: str = Field(description="Live score, odds, or standings request (e.g. 'team score right now', 'moneyline odds')")
+
+
+@tool(
+    args_schema=SportsLiveArgs,
+    description=(
+        "Live sports scores and betting odds from a structured sports-data API "
+        "(not web crawl). Prefer this over web_search for live scores, who won, "
+        "moneyline/spread odds. Falls back with an explicit error if not configured."
+    ),
+)
+def sports_live(query: str) -> str:
+    """Structured live sports data (The Odds API). Not a web search crawl."""
+    try:
+        from agent.sports_data import get_sports_data_client
+
+        client = get_sports_data_client()
+        result = client.query(query or "")
+        return result.as_tool_text()
+    except Exception as exc:
+        return f"[SPORTS_LIVE] ok=false ERROR: {exc}"
+
+
 @tool(args_schema=WebSearchArgs, description="Search the web for current information.")
 def web_search(query: str) -> str:
-    """
-    Search the web for current information using Tavily.
+    """Search the web via pluggable providers (DuckDuckGo default; optional Tavily/Brave).
 
-    Args:
-        query: The search query.
-
-    Returns:
-        Search results as a formatted string.
+    Free-path engineering: news channel, query variants, empty-result retry,
+    thin-snippet URL extract. Cascade controlled by WEB_SEARCH_PROVIDER.
     """
     try:
-        query_low = (query or "").lower()
+        from urllib.parse import urlparse
+        from agent.web_search_providers import (
+            SearchProviderResult,
+            format_hits_for_tool,
+            run_web_search,
+        )
 
-        # Detect news-related queries and add current date for better results
-        def _is_news_query(q: str) -> bool:
-            low = (q or "").lower().strip()
-            news_terms = ["news", "latest", "recent", "today", "update", "breaking", "headline", "war", "conflict", "crisis"]
-            return any(term in low for term in news_terms)
-
-        def _add_date_to_query(q: str) -> str:
-            if not _is_news_query(q):
-                return q
-            from datetime import datetime
-            now = datetime.now()
-            date_suffix = f" {now.strftime('%B %Y')}"  # e.g., "March 2026"
-            return f"{q}{date_suffix}"
-
-        # Enrich news queries with date
-        query = _add_date_to_query(query)
-
-        def _split_queries(q: str) -> list[str]:
+        def _split_queries(q: str) -> list:
             raw = (q or "").strip()
             if not raw:
                 return []
@@ -1455,8 +1629,7 @@ def web_search(query: str) -> str:
                     parts = [raw]
             else:
                 parts = [raw]
-            out = []
-            seen = set()
+            out, seen = [], set()
             for p in parts:
                 if p.lower() in seen:
                     continue
@@ -1466,279 +1639,10 @@ def web_search(query: str) -> str:
                     break
             return out
 
-        def _extract_keywords(q: str) -> list[str]:
-            text = re.sub(r"[^a-zA-Z0-9\s]", " ", (q or "").lower())
-            tokens = [t.strip() for t in text.split() if t.strip()]
-            stop = {
-                "a",
-                "an",
-                "and",
-                "are",
-                "as",
-                "at",
-                "be",
-                "by",
-                "for",
-                "from",
-                "how",
-                "i",
-                "in",
-                "is",
-                "it",
-                "of",
-                "on",
-                "or",
-                "that",
-                "the",
-                "this",
-                "to",
-                "what",
-                "when",
-                "where",
-                "who",
-                "why",
-                "with",
-                "you",
-                "your",
-            }
-            out = []
-            seen = set()
-            for t in tokens:
-                if len(t) < 3:
-                    continue
-                if t in stop:
-                    continue
-                if t in seen:
-                    continue
-                seen.add(t)
-                out.append(t)
-                if len(out) >= 8:
-                    break
-            # Weather fact boosters — keep temps/conditions even if not in query tokens
-            qlow = (q or "").lower()
-            if any(w in qlow for w in ("weather", "forecast", "temperature", "temp")):
-                for extra in ("temperature", "high", "low", "humidity", "wind", "celsius", "fahrenheit", "forecast"):
-                    if extra not in seen:
-                        out.append(extra)
-                        seen.add(extra)
-            return out
-
-        def _compress_extract(extract: str, q: str, max_chars: int = 900) -> str:
-            s = re.sub(r"\s+", " ", (extract or "")).strip()
-            if not s:
-                return ""
-            if len(s) <= max_chars:
-                return s
-            kws = _extract_keywords(q)
-            if not kws:
-                return s[:max_chars].rstrip() + "…"
-            sents = re.split(r"(?<=[\.!\?])\s+", s)
-            scored = []
-            for sent in sents:
-                low = sent.lower()
-                score = 0
-                for kw in kws:
-                    if kw in low:
-                        score += 1
-                # Prefer sentences that carry concrete weather numbers
-                if re.search(r"\d+\s*°|\bhigh\b.*\d|\blow\b.*\d|\d+\s*%", low):
-                    score += 3
-                if score > 0:
-                    scored.append((score, sent.strip()))
-            scored.sort(key=lambda x: (-x[0], len(x[1])))
-            picked = []
-            used = set()
-            total = 0
-            for _, sent in scored:
-                key = sent.lower()
-                if key in used:
-                    continue
-                used.add(key)
-                if not sent:
-                    continue
-                add_len = len(sent) + (1 if picked else 0)
-                if total+add_len > max_chars:
-                    continue
-                picked.append(sent)
-                total += add_len
-                if len(picked) >= 6:
-                    break
-            if not picked:
-                return s[:max_chars].rstrip() + "…"
-            out = " ".join(picked).strip()
-            if len(out) > max_chars:
-                out = out[:max_chars].rstrip() + "…"
-            return out
-
-        def _search_tavily(q: str) -> tuple[list[dict], str]:
-            api_key = str(getattr(config, "tavily_api_key", "") or "").strip()
-            if not api_key:
-                return [], "Tavily search is not available. Set TAVILY_API_KEY."
-            try:
-                import requests
-                from requests import exceptions as requests_exc
-
-                timeout_s = int(getattr(config, "web_search_timeout", 10) or 10)
-                max_results = int(getattr(config, "tavily_max_results", 8) or 8)
-                search_depth = str(getattr(config, "tavily_search_depth", "advanced") or "advanced").strip().lower() or "advanced"
-                resp = requests.post(
-                    "https://api.tavily.com/search",
-                    json={
-                        "api_key": api_key,
-                        "query": q,
-                        "search_depth": search_depth,
-                        "max_results": max(1, min(max_results, 10)),
-                        "include_answer": False,
-                        "include_raw_content": True,
-                    },
-                    timeout=timeout_s,
-                )
-                resp.raise_for_status()
-                data = resp.json() or {}
-                results = data.get("results") or []
-                items = []
-                for result in results[:10]:
-                    title = str(result.get("title") or "No title").strip()
-                    link = str(result.get("url") or "").strip()
-                    snippet = str(result.get("content") or "").strip()
-                    extract = str(result.get("raw_content") or "").strip()
-                    date = str(result.get("published_date") or result.get("published_at") or "").strip()
-                    items.append(
-                        {
-                            "title": title,
-                            "url": link,
-                            "snippet": snippet,
-                            "extract": extract,
-                            "date": date,
-                            "_query": q,
-                        }
-                    )
-                return items, ""
-            except requests_exc.Timeout:
-                msg = f"Tavily search timed out after {timeout_s}s."
-                logger.warning(msg)
-                return [], msg
-            except requests_exc.HTTPError as e:
-                status = getattr(getattr(e, "response", None), "status_code", None)
-                msg = f"Tavily search failed with HTTP {status}." if status else f"Tavily search failed: {e}"
-                logger.warning(msg)
-                return [], msg
-            except requests_exc.RequestException as e:
-                msg = f"Tavily search failed: {e}"
-                logger.warning(msg)
-                return [], msg
-            except Exception as e:
-                msg = f"Tavily search failed: {e}"
-                logger.warning(msg)
-                return [], msg
-
-        def _search_duckduckgo(q: str) -> tuple[list[dict], str]:
-            """Free web search using DuckDuckGo - no API key required."""
-            try:
-                try:
-                    from ddgs import DDGS  # New package name (2025+)
-                except ImportError:
-                    from duckduckgo_search import DDGS  # Legacy fallback
-                max_results = int(getattr(config, "tavily_max_results", 8) or 8)
-                
-                with DDGS() as ddgs:
-                    results = list(ddgs.text(q, max_results=max_results))
-                
-                items = []
-                for result in results:
-                    title = str(result.get("title") or "No title").strip()
-                    link = str(result.get("href") or result.get("url") or "").strip()
-                    snippet = str(result.get("body") or "").strip()
-                    items.append(
-                        {
-                            "title": title,
-                            "url": link,
-                            "snippet": snippet,
-                            "extract": snippet,
-                            "date": "",
-                            "_query": q,
-                        }
-                    )
-                return items, ""
-            except ImportError:
-                return [], "DuckDuckGo search not available. Install duckduckgo-search package."
-            except Exception as e:
-                msg = f"DuckDuckGo search failed: {e}"
-                logger.warning(msg)
-                return [], msg
-
-        queries = _split_queries(query)
-        if not queries:
-            return "No search results found."
-
-        def _score_item(item: dict, q: str) -> int:
-            blob = " ".join(
-                [
-                    str(item.get("title") or ""),
-                    str(item.get("snippet") or ""),
-                    str(item.get("page_title") or ""),
-                    str(item.get("extract") or ""),
-                ]
-            ).lower()
-            if not blob.strip():
-                return 0
-            score = 0
-            for kw in _extract_keywords(q):
-                if kw and kw in blob:
-                    score += 1
-            return score
-
-        def _parse_date_value(val: str) -> Optional[datetime]:
-            s = (val or "").strip()
-            if not s:
-                return None
-            low = s.lower()
-            m = re.match(r"^(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago\b", low)
-            if m:
-                n = int(m.group(1))
-                unit = m.group(2)
-                if unit == "minute":
-                    return datetime.now(timezone.utc) - timedelta(minutes=n)
-                if unit == "hour":
-                    return datetime.now(timezone.utc) - timedelta(hours=n)
-                if unit == "day":
-                    return datetime.now(timezone.utc) - timedelta(days=n)
-                if unit == "week":
-                    return datetime.now(timezone.utc) - timedelta(weeks=n)
-                if unit == "month":
-                    return datetime.now(timezone.utc) - timedelta(days=30 * n)
-                if unit == "year":
-                    return datetime.now(timezone.utc) - timedelta(days=365 * n)
-
-            iso = s.replace("Z", "+00:00")
-            try:
-                dt = datetime.fromisoformat(iso)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt
-            except Exception:
-                pass
-            try:
-                dt = datetime.strptime(s, "%Y-%m-%d")
-                return dt.replace(tzinfo=timezone.utc)
-            except Exception:
-                return None
-
-        def _recency_ts(item: dict) -> float:
-            dt = _parse_date_value(str(item.get("date") or ""))
-            if dt is None:
-                return 0.0
-            try:
-                return float(dt.timestamp())
-            except Exception:
-                return 0.0
-
         blocked_domains = set(
-            [
-                str(d).strip().lower().lstrip(".")
-                for d in (getattr(config, "web_search_blocked_domains", None) or [])
-                if str(d).strip()
-            ]
+            str(d).strip().lower().lstrip(".")
+            for d in (getattr(config, "web_search_blocked_domains", None) or [])
+            if str(d).strip()
         )
 
         def _url_is_blocked(url: str) -> bool:
@@ -1760,89 +1664,46 @@ def web_search(query: str) -> str:
                     return True
             return False
 
-        merged = []
-        seen_urls = set()
-        tavily_errors = []
-        ddg_errors = []
-        use_ddg_fallback = not str(getattr(config, "tavily_api_key", "") or "").strip()
-        
-        for q in queries:
-            # Try Tavily first if API key is available
-            if not use_ddg_fallback:
-                items, err = _search_tavily(q)
-                if err and err not in tavily_errors:
-                    tavily_errors.append(err)
-                # If Tavily fails, try DuckDuckGo fallback
-                if not items and err:
-                    logger.info(f"Tavily failed for '{q}', trying DuckDuckGo fallback")
-                    items, ddg_err = _search_duckduckgo(q)
-                    if ddg_err and ddg_err not in ddg_errors:
-                        ddg_errors.append(ddg_err)
-            else:
-                # Use DuckDuckGo directly if no Tavily API key
-                items, err = _search_duckduckgo(q)
-                if err and err not in ddg_errors:
-                    ddg_errors.append(err)
-            
-            for it in items:
-                url = (it.get("url") or "").strip()
-                if not url:
-                    continue
-                if _url_is_blocked(url):
-                    continue
-                if url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                merged.append(it)
-                if len(merged) >= 20:
-                    break
-            if len(merged) >= 20:
-                break
-
-        if not merged:
-            if tavily_errors:
-                return tavily_errors[0]
-            if ddg_errors:
-                return ddg_errors[0]
+        queries = _split_queries(query)
+        if not queries:
             return "No search results found."
 
-        base_q = " ".join(queries)
-        merged.sort(
-            key=lambda it: (
-                _score_item(it, f"{base_q} {str(it.get('_query') or '')}"),
-                _recency_ts(it),
-                len(str(it.get("extract") or "")),
-                len(str(it.get("snippet") or "")),
-            ),
-            reverse=True,
+        merged_hits = []
+        errors = []
+        providers_used = []
+        for q in queries:
+            res = run_web_search(q, config=config, enrich_extract=True, max_hits=10)
+            if res.provider:
+                providers_used.append(res.provider)
+            errors.extend(res.errors or [])
+            for h in res.hits:
+                if _url_is_blocked(h.url):
+                    continue
+                merged_hits.append(h)
+
+        seen = set()
+        deduped = []
+        for h in merged_hits:
+            key = (h.url or h.title).lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(h)
+            if len(deduped) >= 12:
+                break
+
+        if not deduped:
+            if errors:
+                return errors[0]
+            return "No search results found."
+
+        result = SearchProviderResult(
+            hits=deduped,
+            provider=",".join(dict.fromkeys(providers_used)) or "unknown",
+            errors=errors[:5],
+            queries_used=queries,
         )
-
-        formatted_results = []
-        multi = len(queries) > 1
-        for i, item in enumerate(merged[:10], 1):
-            title = (item.get("title") or "No title").strip()
-            link = (item.get("url") or "").strip()
-            snippet = (item.get("snippet") or "").strip()
-            date = (item.get("date") or "").strip()
-            page_title = (item.get("page_title") or "").strip()
-            raw_extract = (item.get("extract") or "").strip()
-            src_q = (item.get("_query") or "").strip()
-            extract = _compress_extract(raw_extract, src_q or query, max_chars=900)
-
-            block = [f"{i}. {title}", f"   URL: {link}"]
-            if multi and src_q:
-                block.append(f"   Query: {src_q}")
-            if date:
-                block.append(f"   Date: {date}")
-            if snippet:
-                block.append(f"   Snippet: {snippet[:200]}...")
-            if page_title and page_title != title:
-                block.append(f"   Page: {page_title}")
-            if extract:
-                block.append(f"   Extract: {extract}")
-            formatted_results.append("\n".join(block))
-
-        return "\n\n".join(formatted_results) if formatted_results else "No search results found."
+        return format_hits_for_tool(result, multi_query=len(queries) > 1)
     except Exception as e:
         logger.error(f"Web search failed: {e}")
         return f"Search failed: {str(e)}"
@@ -3933,6 +3794,7 @@ def todo_manage(action: str, title: str = "", description: str = "", todo_id: st
 TOOL_METADATA: Dict[str, Dict[str, Any]] = {
     # Read-only / safe tools
     "web_search": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "sports_live": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
     "get_system_time": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
     "calculate": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
     "project_update_context": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
@@ -4484,6 +4346,7 @@ def get_available_tools() -> list:
     """
     tools = [
         web_search,
+        sports_live,
         get_system_time,
         calculate,
         project_update_context,
