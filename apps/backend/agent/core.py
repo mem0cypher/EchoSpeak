@@ -4008,10 +4008,53 @@ class EchoSpeakAgent:
         ]
         return any(term in q for term in explicit_terms)
 
+    def _is_location_swap_followup(self, query_text: str) -> bool:
+        """'what about in Calgary?' / 'and Vancouver?' style follow-ups."""
+        q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
+        if not q:
+            return False
+        patterns = (
+            r"^(?:and\s+)?(?:what|how)\s+about\s+(?:in\s+|for\s+)?(.+?)\??$",
+            r"^(?:and\s+)?(?:in|for)\s+([a-z][a-z\s.'-]{1,40})\??$",
+            r"^what\s+about\s+([a-z][a-z\s.'-]{1,40})\??$",
+            # bare "and Vancouver?" / "Vancouver?" after a live topic
+            r"^and\s+([a-z][a-z\s.'-]{1,40})\??$",
+        )
+        for pat in patterns:
+            m = re.fullmatch(pat, q)
+            if not m:
+                continue
+            place = (m.group(1) or "").strip(" ?.!")
+            # Reject if the "place" is already a full self-contained question
+            if any(w in place for w in ("weather", "score", "news", "search", "price", "stock")):
+                return False
+            if len(place.split()) <= 5 and len(place) >= 2:
+                return True
+        return False
+
+    def _extract_followup_location(self, query_text: str) -> str:
+        q = re.sub(r"\s+", " ", str(query_text or "").strip())
+        patterns = (
+            r"(?i)^(?:and\s+)?(?:what|how)\s+about\s+(?:in\s+|for\s+)?(.+?)\??$",
+            r"(?i)^(?:and\s+)?(?:in|for)\s+(.+?)\??$",
+            r"(?i)^and\s+(.+?)\??$",
+        )
+        for pat in patterns:
+            m = re.fullmatch(pat, q)
+            if m:
+                place = (m.group(1) or "").strip(" ?.!")
+                # Drop leading "in/for" if capture still has it
+                place = re.sub(r"(?i)^(in|for)\s+", "", place).strip(" ?.!")
+                if place and not re.search(r"(?i)\b(weather|forecast|score|news)\b", place):
+                    return place
+        return ""
+
     def _is_referential_followup_text(self, query_text: str) -> bool:
         q = re.sub(r"\s+", " ", str(query_text or "").strip().lower())
         if not q:
             return False
+        if self._is_location_swap_followup(q):
+            return True
         exact = {
             "do a deeper search",
             "deeper search",
@@ -4029,6 +4072,9 @@ class EchoSpeakAgent:
             "expand on that",
             "look into it more",
             "check more",
+            "same for that",
+            "same there",
+            "and there",
         }
         if q in exact:
             return True
@@ -4046,17 +4092,98 @@ class EchoSpeakAgent:
             "expand on",
             "look into it more",
             "check more",
+            "what about",
+            "how about",
+            "and what about",
+            "and how about",
+            "and in ",
+            "same for ",
         )
         if any(q.startswith(prefix) for prefix in prefixes):
-            # If the user already supplied a concrete object, don't rewrite it.
-            return q.endswith(("that", "it", "this")) or len(q.split()) <= 5
+            # Full self-contained questions should not be rewritten away.
+            if len(q.split()) > 10 and not self._is_location_swap_followup(q):
+                return False
+            return True
         return False
+
+    def _topic_template_from_subject(self, subject: str) -> str:
+        """Normalize subject into a reusable topic skeleton (e.g. weather query)."""
+        s = re.sub(r"\s+", " ", str(subject or "").strip())
+        if not s:
+            return ""
+        low = s.lower()
+        # Prefer weather skeleton so location swaps stay on-topic
+        if any(w in low for w in ("weather", "forecast", "temperature", "temp")):
+            return "weather"
+        if any(w in low for w in ("score", "match", "game", "fifa", "nhl", "nba", "nfl")):
+            return "sports"
+        if any(w in low for w in ("news", "headline", "breaking")):
+            return "news"
+        return "general"
+
+    def _swap_location_into_subject(self, subject: str, place: str) -> str:
+        """Build 'weather in Vancouver' from subject 'weather in Edmonton' + place Vancouver."""
+        place = re.sub(r"\s+", " ", str(place or "").strip(" ?.!"))
+        subject = re.sub(r"\s+", " ", str(subject or "").strip())
+        if not place:
+            return subject
+        topic = self._topic_template_from_subject(subject)
+        low_s = subject.lower()
+
+        if topic == "weather":
+            # Strip prior locations / small-talk, keep weather intent
+            day = ""
+            if "tomorrow" in low_s:
+                day = " tomorrow"
+            elif "today" in low_s:
+                day = " today"
+            return f"weather in {place}{day}".strip()
+
+        # Generic: replace last "in <place>" or append
+        swapped = re.sub(
+            r"\bin\s+[A-Za-z][A-Za-z\s.'-]{1,40}\b",
+            f"in {place}",
+            subject,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if swapped.lower() != low_s:
+            return swapped
+        if place.lower() in low_s:
+            return subject
+        return f"{subject} in {place}".strip()
 
     def _resolve_referential_followup(self, query_text: str) -> tuple[str, bool, str]:
         q = (query_text or "").strip()
-        subject = str(getattr(self, "_current_subject_text", "") or getattr(self, "_last_web_query_context", "") or "").strip()
-        if not q or not subject or not self._is_referential_followup_text(q):
+        subject = str(
+            getattr(self, "_current_subject_text", "")
+            or getattr(self, "_last_web_query_context", "")
+            or ""
+        ).strip()
+        if not q:
             return q, False, subject
+
+        # Prefer dedicated expansion for "what about in X?"
+        if subject and self._is_location_swap_followup(q):
+            place = self._extract_followup_location(q)
+            if place:
+                resolved = self._swap_location_into_subject(subject, place)
+                # Also keep last web context aligned for search expansion
+                try:
+                    self._last_web_query_context = resolved
+                    # Update subject to the new city while keeping topic
+                    self._current_subject_text = resolved
+                except Exception:
+                    pass
+                return resolved, True, resolved
+
+        if not subject or not self._is_referential_followup_text(q):
+            # Still try web-query expander (handles what about + prev search context)
+            expanded = self._expand_follow_up_web_query(q)
+            if expanded and expanded != q:
+                return expanded, True, subject
+            return q, False, subject
+
         low = q.lower()
         if "search" in low or "research" in low or "look into" in low or "check" in low:
             resolved = f"{q} about {subject}"
@@ -4071,15 +4198,22 @@ class EchoSpeakAgent:
         if not user:
             return ""
         low = user.lower()
-        if self._is_small_talk_query(low) or self._is_referential_followup_text(user):
+        # Never let hollow follow-ups overwrite a good topic (this caused Vancouver to lose weather).
+        if self._is_small_talk_query(low) or self._is_referential_followup_text(user) or self._is_location_swap_followup(user):
             return ""
         candidate = user
-        if self._is_explicit_web_query(low):
+        if self._is_explicit_web_query(low) or "weather" in low or "forecast" in low:
             try:
                 candidate = self._extract_search_query(user) or user
             except Exception:
                 candidate = user
-        candidate = re.sub(r"^(?:can you|could you|please|pls|hey|okay|ok)\s+", "", candidate, flags=re.IGNORECASE).strip()
+        # Drop pure small-talk clauses from multi-intent turns so subject stays task-focused
+        candidate = re.sub(
+            r"(?i)\b(?:and\s+)?(?:how(?:'re| are) you(?: doing)?(?: today)?|how(?:'s| is) it going)\b[?.!]?",
+            " ",
+            candidate,
+        )
+        candidate = re.sub(r"^(?:can you|could you|please|pls|hey|okay|ok|echo)\s+", "", candidate, flags=re.IGNORECASE).strip()
         candidate = re.sub(r"\s+", " ", candidate).strip(" .?!")
         if len(candidate) < 4:
             return ""
@@ -4089,6 +4223,9 @@ class EchoSpeakAgent:
 
     def _update_current_subject(self, user_input: str, response_text: str) -> None:
         try:
+            # Location-swap follow-ups already update subject in _resolve_referential_followup
+            if self._is_location_swap_followup(self._extract_user_request_text(user_input)):
+                return
             candidate = self._subject_candidate_from_turn(user_input, response_text)
             if candidate:
                 self._current_subject_text = candidate
@@ -4258,6 +4395,12 @@ class EchoSpeakAgent:
             return q
 
         low = q.lower().strip()
+        # Location swap: "what about in Calgary?" → "weather in Calgary" (from weather subject)
+        if self._is_location_swap_followup(q):
+            place = self._extract_followup_location(q)
+            if place:
+                return self._swap_location_into_subject(prev, place)
+
         if self._is_referential_followup_text(q):
             if "search" in low or "research" in low:
                 return f"{q} about {prev}".strip()
@@ -4266,7 +4409,7 @@ class EchoSpeakAgent:
         if low.startswith("and in "):
             trimmed = q[7:].strip(" ?")
         else:
-            trimmed = re.sub(r"^(?:and\s+)?(?:what|how)\s+about\s+", "", q, flags=re.IGNORECASE).strip(" ?")
+            trimmed = re.sub(r"^(?:and\s+)?(?:what|how)\s+about\s+(?:in\s+|for\s+)?", "", q, flags=re.IGNORECASE).strip(" ?")
 
         follow_up_prefixes = (
             "what about",
@@ -4281,6 +4424,9 @@ class EchoSpeakAgent:
             return prev
         if trimmed.lower() in prev.lower():
             return prev
+        # Prefer topic-preserving swap when previous subject is weather/scores
+        if self._topic_template_from_subject(prev) in {"weather", "sports", "news"}:
+            return self._swap_location_into_subject(prev, trimmed)
         return f"{trimmed} {prev}".strip()
 
     def _remember_web_query_context(self, used_query: str) -> None:
@@ -4416,18 +4562,16 @@ class EchoSpeakAgent:
         )
         orig = str(original_request or q).strip() or q
 
+        # One outer tool event for the whole grounder loop (avoids "Search done" x N candidates).
+        ground_run_id = str(uuid.uuid4()) if emit_tool_events else ""
+        if emit_tool_events:
+            self._emit_tool_start(callbacks, "web_search", q, ground_run_id)
+
         def execute_candidate(candidate_query: str) -> str:
-            candidate_run_id = str(uuid.uuid4())
-            if emit_tool_events:
-                self._emit_tool_start(callbacks, "web_search", candidate_query, candidate_run_id)
             try:
-                candidate_output = self._raw_web_search_execute(candidate_query)
-                if emit_tool_events:
-                    self._emit_tool_end(callbacks, candidate_output, candidate_run_id)
-                return candidate_output
+                return self._raw_web_search_execute(candidate_query)
             except Exception as exc:
-                if emit_tool_events:
-                    self._emit_tool_error(callbacks, exc, candidate_run_id)
+                logger.warning("Search candidate failed for %r: %s", candidate_query[:80], exc)
                 telemetry = getattr(self, "_verification_telemetry", None)
                 if telemetry is not None:
                     telemetry.record(
@@ -4438,13 +4582,19 @@ class EchoSpeakAgent:
                     )
                 return ""
 
-        grounded = grounder.ground(
-            original_request=orig,
-            resolved_request=q,
-            current_subject=current_subject,
-            execute=execute_candidate,
-            fetch_url=self._fetch_search_result_page_text,
-        )
+        try:
+            grounded = grounder.ground(
+                original_request=orig,
+                resolved_request=q,
+                current_subject=current_subject,
+                execute=execute_candidate,
+                fetch_url=self._fetch_search_result_page_text,
+            )
+        except Exception as exc:
+            if emit_tool_events:
+                self._emit_tool_error(callbacks, exc, ground_run_id)
+            raise
+
         try:
             self._last_grounded_search_result = grounded.as_dict()
         except Exception:
@@ -4476,15 +4626,19 @@ class EchoSpeakAgent:
                 )
         try:
             status = "accepted" if grounded.accepted else "insufficient"
-            self._emit_thinking_step(
-                "search",
-                f"Search grounding {status}: {grounded.chosen_query}",
-                "done",
+            logger.info(
+                "Search grounding %s query=%r evidence=%d",
+                status,
+                grounded.chosen_query,
+                len(grounded.evidence or []),
             )
         except Exception:
             pass
 
-        return format_grounded_tool_output(grounded)
+        formatted = format_grounded_tool_output(grounded)
+        if emit_tool_events:
+            self._emit_tool_end(callbacks, formatted, ground_run_id)
+        return formatted
 
     def _invoke_web_research_query(self, query_text: str, callbacks: Optional[list], time_context: str = "", apply_reflection: bool = True) -> tuple[str, str, str]:
         tool = self._preferred_web_research_tool()
@@ -4526,7 +4680,11 @@ class EchoSpeakAgent:
             return "", final_query, ensured_time_context
 
     def _fetch_search_result_page_text(self, url: str, *, timeout: float = 6.0, max_chars: int = 12000) -> str:
-        """Read-only bounded page text extraction for search grounding fallbacks."""
+        """Read-only bounded page text extraction for search grounding fallbacks.
+
+        For weather pages, prefer windows of text that contain temperature numbers
+        so nav chrome / cookie banners don't drown out the forecast.
+        """
         raw_url = str(url or "").strip()
         if not re.match(r"^https?://", raw_url, flags=re.IGNORECASE):
             return ""
@@ -4534,7 +4692,15 @@ class EchoSpeakAgent:
             from html import unescape
             from urllib.request import Request, urlopen
 
-            req = Request(raw_url, headers={"User-Agent": "EchoSpeakSearchGrounder/1.0"})
+            req = Request(
+                raw_url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (compatible; EchoSpeakSearchGrounder/1.1; "
+                        "+https://github.com/echospeak)"
+                    )
+                },
+            )
             with urlopen(req, timeout=timeout) as resp:
                 content_type = str(resp.headers.get("content-type") or "").lower()
                 if content_type and "text/html" not in content_type and "text/plain" not in content_type:
@@ -4545,6 +4711,23 @@ class EchoSpeakAgent:
             text = re.sub(r"(?s)<[^>]+>", " ", text)
             text = unescape(text)
             text = re.sub(r"\s+", " ", text).strip()
+            if not text:
+                return ""
+            # Keep temperature-dense windows when present (weather deep-fetch).
+            windows: list[str] = []
+            for m in re.finditer(
+                r".{0,120}(?:\d+\s*°\s*[CFcf]|high\s+\d+|low\s+\d+|feels like\s+-?\d+).{0,160}",
+                text,
+                flags=re.IGNORECASE,
+            ):
+                chunk = m.group(0).strip()
+                if chunk and chunk not in windows:
+                    windows.append(chunk)
+                if len(windows) >= 8:
+                    break
+            if windows:
+                focused = " … ".join(windows)
+                return focused[:max_chars]
             return text[:max_chars]
         except Exception:
             return ""
@@ -4555,7 +4738,7 @@ class EchoSpeakAgent:
         if configured_window <= 0:
             configured_window = int(getattr(local_cfg, "context_length", 0) or 0)
         if configured_window <= 0:
-            configured_window = 8192
+            configured_window = 32768
         return ContextBudgetManager(
             context_window=configured_window,
             reserve_tokens=int(getattr(config, "llm_trim_reserve_tokens", 1200) or 1200),
@@ -5104,6 +5287,15 @@ class EchoSpeakAgent:
         wants_calc = bool(has_calc_keyword or has_math_operator)
 
         wants_search = any(x in low for x in ["search", "look up", "find out", "news", "headlines", "current events"]) or self._is_live_web_intent(low)
+        # Location follow-ups after a weather/live subject must keep web_search available.
+        subject = str(getattr(self, "_current_subject_text", "") or getattr(self, "_last_web_query_context", "") or "").lower()
+        if self._is_location_swap_followup(text) and (
+            "weather" in subject
+            or "forecast" in subject
+            or self._has_live_info_subject(subject)
+            or self._topic_template_from_subject(subject) in {"weather", "sports", "news"}
+        ):
+            wants_search = True
 
         if wants_calc and wants_search:
             return frozenset({"calculate", "web_search"})
@@ -7640,6 +7832,318 @@ class EchoSpeakAgent:
         self._emit_reasoning(reasoning)
         return self._sanitize_response_text(response_text)
 
+    def _tools_used_this_turn(self) -> set[str]:
+        return {
+            str(tr.get("tool") or "").strip()
+            for tr in (self._partial_tool_results or [])
+            if str(tr.get("tool") or "").strip()
+        }
+
+    def _needs_live_web_fulfillment(self, user_input: str) -> bool:
+        """True when the user clearly needs fresh web facts (weather, scores, news…)."""
+        q = self._extract_user_request_text(user_input or "")
+        low = re.sub(r"\s+", " ", q.strip().lower())
+        if not low:
+            return False
+        if "weather" in low or "forecast" in low:
+            return True
+        if self._has_live_info_subject(low) or self._is_live_web_intent(low):
+            return True
+        # "what about in Vancouver?" while current subject is weather/live facts
+        subject = str(
+            getattr(self, "_current_subject_text", "")
+            or getattr(self, "_last_web_query_context", "")
+            or ""
+        ).lower()
+        if self._is_location_swap_followup(q) and (
+            "weather" in subject
+            or "forecast" in subject
+            or self._has_live_info_subject(subject)
+            or self._topic_template_from_subject(subject) in {"weather", "sports", "news"}
+        ):
+            return True
+        return False
+
+    def _ensure_live_web_search(
+        self,
+        user_input: str,
+        response_text: str,
+        callbacks: Optional[list] = None,
+    ) -> str:
+        """
+        If the query needs live web facts but stage-4 never called web_search
+        (common with small models: they *say* they'll check and stop), force a search
+        and rewrite the answer from results.
+        """
+        if not self._needs_live_web_fulfillment(user_input):
+            return response_text
+        used = self._tools_used_this_turn()
+        if "web_search" in used:
+            return response_text
+        if not self._tool_available_in_current_context("web_search"):
+            return response_text
+
+        display = self._extract_user_request_text(user_input)
+        # Prefer expanded follow-up ("what about in Calgary?" → "weather in Calgary")
+        resolved, is_fu, _subj = self._resolve_referential_followup(display)
+        search_q = resolved if is_fu and resolved else display
+        low = search_q.lower()
+        for sep in (" and ", " also ", " plus ", "? ", ". ", "! "):
+            if "weather" in low and sep in low:
+                parts = re.split(re.escape(sep), search_q, maxsplit=1, flags=re.IGNORECASE)
+                for p in parts:
+                    if "weather" in p.lower() or "forecast" in p.lower():
+                        search_q = p.strip(" ?!.")
+                        break
+                break
+
+        logger.info("Live-web recovery: forcing web_search for %r (tools so far=%s)", search_q[:80], sorted(used))
+        try:
+            tool_output = self._grounded_web_search(
+                search_q,
+                original_request=display,
+                callbacks=callbacks,
+                emit_tool_events=True,
+            )
+        except Exception as exc:
+            logger.warning("Live-web recovery search failed: %s", exc)
+            return response_text
+
+        if not str(tool_output or "").strip():
+            return response_text
+
+        # Time context for summary (silent get_system_time may already be cached)
+        time_ctx = ""
+        try:
+            if getattr(self, "_task_planner", None) is not None:
+                time_ctx = self._task_planner._get_time_context(callbacks=None) or ""
+        except Exception:
+            time_ctx = ""
+
+        try:
+            return self._summarize_web_results(
+                user_input,
+                display,
+                str(tool_output),
+                search_q,
+                time_ctx,
+                is_schedule=bool(self._has_schedule_terms(low)),
+                callbacks=callbacks,
+            )
+        except Exception as exc:
+            logger.warning("Live-web recovery summarize failed: %s", exc)
+            return response_text
+
+    def _user_has_social_open(self, user_input: str) -> bool:
+        """True if the user greets or asks how Echo is (social first beat)."""
+        low = re.sub(r"\s+", " ", str(user_input or "").strip().lower())
+        if not low:
+            return False
+        social = [
+            r"\bhow(?:'re| are) you\b",
+            r"\bhow(?:'s| is) it going\b",
+            r"\bhow you doing\b",
+            r"\bwhat(?:'s| is) up\b",
+            r"\bwyd\b",
+            r"\bhow(?:'s| is) your day\b",
+            r"\b(hey|hi|hello|yo|sup)\b",
+            r"\bgood (morning|afternoon|evening|night)\b",
+        ]
+        return any(re.search(p, low) for p in social)
+
+    def _looks_like_social_reopen(self, text: str) -> bool:
+        """Final answers that re-greet after a preamble already handled the vibe."""
+        t = re.sub(r"\s+", " ", str(text or "").strip())
+        if not t:
+            return False
+        head = t[:120].lower()
+        reopen = [
+            r"^(hey|hi|hello|yo)\b",
+            r"^hey there\b",
+            r"^i(?:'m| am) doing (well|good|great|fine)",
+            r"^i(?:'m| am) (well|good|great|fine)\b",
+            r"^thanks for asking\b",
+            r"^thank you for asking\b",
+            r"^i am doing well\b",
+        ]
+        return any(re.search(p, head) for p in reopen)
+
+    def record_turn_partial_beat(self, text: str) -> None:
+        """Track mid-turn spoken beats so the final answer won't re-greet."""
+        t = re.sub(r"\s+", " ", str(text or "").strip())
+        if not t:
+            return
+        beats = getattr(self, "_turn_partial_beats", None)
+        if not isinstance(beats, list):
+            beats = []
+            self._turn_partial_beats = beats
+        if not beats or beats[-1] != t:
+            beats.append(t)
+
+    def _rewrite_task_only_answer(self, user_input: str, draft: str, beats: list[str]) -> str:
+        """Strip re-greetings from post-tool answer; keep only the factual beat."""
+        prior = " | ".join(beats[-3:])
+        prompt = (
+            "You are Echo. Rewrite the draft answer as the SECOND message in a multi-beat reply.\n"
+            f"User: {self._extract_user_request_text(user_input)[:300]}\n"
+            f"Already said out loud (first beat): {prior}\n"
+            f"Draft second message:\n{draft}\n\n"
+            "Rules:\n"
+            "- Do NOT greet again (no hey/hi/hello/hey there).\n"
+            "- Do NOT re-answer how you are / thanks for asking.\n"
+            "- Jump straight into the factual answer (weather numbers, scores, search result, etc.).\n"
+            "- Keep 2–4 short spoken sentences. No markdown, no URLs.\n"
+            "Output only the rewritten second message."
+        )
+        try:
+            if hasattr(self.llm_wrapper, "invoke_fast"):
+                raw = self.llm_wrapper.invoke_fast(prompt, max_tokens=180)
+            else:
+                raw = self._invoke_visible_llm(prompt)
+            text = self._sanitize_response_text(str(raw or ""))
+            text = re.sub(r"[\r\n]+", " ", text).strip().strip("\"'`")
+            if len(text) >= 8 and not self._looks_like_social_reopen(text):
+                return self._clamp_tts_text(text)
+        except Exception as exc:
+            logger.warning("task-only rewrite failed: %s", exc)
+        # Deterministic strip of common reopeners
+        t = str(draft or "").strip()
+        t = re.sub(
+            r"^(?:hey there!?|hey!?|hi!?|hello!?)\s*",
+            "",
+            t,
+            flags=re.IGNORECASE,
+        )
+        t = re.sub(
+            r"^i(?:'m| am) doing (?:well|good|great|fine)[,!.]?\s*(?:thank(?:s| you) for asking[,!.]?\s*)?",
+            "",
+            t,
+            flags=re.IGNORECASE,
+        )
+        t = re.sub(r"^thank(?:s| you) for asking[,!.]?\s*", "", t, flags=re.IGNORECASE)
+        return self._clamp_tts_text(t.strip() or draft)
+
+    def _ensure_no_regreet_after_partials(self, user_input: str, response_text: str) -> str:
+        """Across all answer paths: if we already spoke a first beat, final must not re-open socially."""
+        beats = list(getattr(self, "_turn_partial_beats", None) or [])
+        if not beats:
+            return response_text
+        if self._looks_like_social_reopen(response_text) or self._user_has_social_open(user_input):
+            # Always scrub final after a social-capable multi-intent turn once a preamble existed.
+            if self._looks_like_social_reopen(response_text):
+                return self._rewrite_task_only_answer(user_input, response_text, beats)
+        return response_text
+
+    def _preamble_covers_social(self, text: str) -> bool:
+        low = str(text or "").lower()
+        return any(
+            x in low
+            for x in (
+                "doing good",
+                "doing great",
+                "doing well",
+                "i'm good",
+                "im good",
+                "i'm great",
+                "i'm fine",
+                "chilling",
+                "all good",
+                "i'm solid",
+                "pretty good",
+            )
+        )
+
+    def generate_tool_preamble_beat(
+        self,
+        tool_name: str = "",
+        tool_input: str = "",
+        user_query: str = "",
+        model_text: str = "",
+    ) -> str:
+        """
+        Free-form short spoken line before a tool runs.
+
+        The *decision* to speak is made by the stream harness (on_tool_start).
+        This only supplies natural wording so small models don't have to remember
+        a SOUL rule about when to acknowledge.
+
+        Order is fixed in code: social vibe first (if any), then on-it for the task.
+        """
+        tool = re.sub(r"[_\-]+", " ", str(tool_name or "tool")).strip() or "tool"
+        # Prefer human-readable task, not raw tool id in speech
+        task_hint = tool
+        if tool in {"web search", "websearch"}:
+            task_hint = "that"
+        user_q = str(
+            user_query
+            or getattr(self, "_active_user_query", None)
+            or getattr(self, "_last_user_input_for_plan", None)
+            or ""
+        ).strip()
+        # Strip Discord / wrapper context if present
+        low_u = user_q.lower()
+        marker = "user request:"
+        idx = low_u.rfind(marker)
+        if idx >= 0:
+            user_q = user_q[idx + len(marker) :].strip()
+        user_q = user_q[:360]
+        tool_in = " ".join(str(tool_input or "").split())[:160]
+        social = self._user_has_social_open(user_q)
+        model_text = re.sub(r"\s+", " ", str(model_text or "").strip())
+
+        # Keep model text if it already has social-first shape; else regenerate.
+        if model_text and len(model_text) >= 8:
+            if not social or self._preamble_covers_social(model_text):
+                self.record_turn_partial_beat(model_text)
+                return model_text
+
+        if social:
+            prompt = (
+                "You are Echo. Write ONE short spoken line (max 20 words) BEFORE using a tool.\n"
+                f"User: {user_q or '(task)'}\n"
+                f"Next task/tool: {task_hint}"
+                + (f" ({tool_in})" if tool_in else "")
+                + "\n"
+                "Structure (required order):\n"
+                "1) Answer the greeting / how-are-you first (brief, natural).\n"
+                "2) Then say you're about to check/get the task (weather, scores, search, etc.).\n"
+                "Example shape: \"doing good — let me pull up those FIFA matchups.\"\n"
+                "Rules: no markdown, no quotes, no emoji; do NOT give the factual answer yet; "
+                "do NOT start with Hey/Hi/Hello if you can avoid it; vary wording.\n"
+                "Output only the spoken line."
+            )
+        else:
+            prompt = (
+                "You are Echo. Write ONE short spoken line (max 16 words) BEFORE using a tool.\n"
+                f"User: {user_q or '(task)'}\n"
+                f"Next task/tool: {task_hint}"
+                + (f" ({tool_in})" if tool_in else "")
+                + "\n"
+                "Just a natural on-it line (e.g. checking that now / pulling that up). "
+                "No greeting, no markdown, no quotes, no emoji. Do NOT answer the question yet.\n"
+                "Output only the spoken line."
+            )
+        try:
+            if hasattr(self.llm_wrapper, "invoke_fast"):
+                raw = self.llm_wrapper.invoke_fast(prompt, max_tokens=64)
+            else:
+                raw = self._invoke_visible_llm(prompt)
+            text = self._sanitize_response_text(str(raw or ""))
+            text = re.sub(r"[\r\n]+", " ", text).strip().strip("\"'`")
+            # Hard clamp for TTS / chat beat
+            words = text.split()
+            if len(words) > 24:
+                text = " ".join(words[:24]).rstrip(",.;:") + "."
+            if len(text) < 3:
+                return ""
+            if len(text) > 180:
+                text = text[:177].rstrip() + "…"
+            self.record_turn_partial_beat(text)
+            return text
+        except Exception as e:
+            logger.warning("generate_tool_preamble_beat failed: %s", e)
+            return ""
+
     def _extract_calc_expression(self, user_input: str) -> str:
         text = (user_input or "").strip()
         lower = text.lower()
@@ -7952,6 +8456,10 @@ class EchoSpeakAgent:
         self._maybe_reload_skills()
         current_source = str(source or "web").strip().lower()
         self._current_source = source
+        # Used by stream harness for free-form pre-tool spoken beats
+        self._active_user_query = user_input
+        # Reset multi-beat state each turn (also reset in stream thread, belt-and-suspenders)
+        self._turn_partial_beats = []
         if self._router is not None:
             self._router.source = source
             self._router.role_blocked_tools = self._get_blocked_tools_for_role()
@@ -8730,7 +9238,7 @@ class EchoSpeakAgent:
             if configured_window <= 0:
                 configured_window = int(getattr(local_cfg, "context_length", 0) or 0)
             if configured_window <= 0:
-                configured_window = 8192
+                configured_window = 32768
             reserve_tokens = int(getattr(config, "llm_trim_reserve_tokens", 1200) or 1200)
             overhead_tokens = estimate_tokens(self._compose_system_prompt()) + estimate_tokens(context_query) + 256
             manager = ContextBudgetManager(
@@ -8824,6 +9332,87 @@ class EchoSpeakAgent:
         logger.info(f"Response generated: {response_text[:100]}...")
         return response_text, True
 
+    def _answer_has_weather_facts(self, text: str) -> bool:
+        hay = str(text or "").lower()
+        if re.search(
+            r"\d+\s*°\s*[cf]\b|\d+\s*degrees|"
+            r"\bhigh(?:s)?\s*(?:near|around|of)?\s*-?\d+|"
+            r"\blow(?:s)?\s*(?:near|around|of)?\s*-?\d+|"
+            r"-?\d{1,2}\s*/\s*-?\d{1,2}",
+            hay,
+        ):
+            return True
+        # bare number + weather word (small models often drop the degree symbol)
+        if re.search(r"-?\d{1,3}\b", hay) and any(
+            w in hay for w in ("high", "low", "temp", "celsius", "fahrenheit", "humidity", "wind", "rain", "snow")
+        ):
+            return True
+        return False
+
+    def _answer_defers_to_external_weather(self, text: str) -> bool:
+        low = str(text or "").lower()
+        return any(
+            p in low
+            for p in (
+                "check accuweather",
+                "check environment canada",
+                "check the weather network",
+                "whatever the forecast says",
+                "i can certainly check",
+                "if you'd like a specific detail",
+                "just let me know",
+                "i have access to hourly",
+                "pretty typical",
+                "looked it up",
+            )
+        )
+
+    def _latest_web_search_evidence(self) -> str:
+        """Pull the most recent web_search tool blob from this turn (grounded preferred)."""
+        for tr in reversed(self._partial_tool_results or []):
+            if str(tr.get("tool") or "") != "web_search":
+                continue
+            out = str(tr.get("output") or "").strip()
+            if out:
+                return out
+        try:
+            grounded = getattr(self, "_last_grounded_search_result", None) or {}
+            condensed = str(grounded.get("condensed_evidence") or "").strip()
+            if condensed:
+                return condensed
+        except Exception:
+            pass
+        return ""
+
+    def _ensure_weather_answer_uses_evidence(self, user_input: str, response_text: str) -> str:
+        """If we have weather evidence but the reply has no temps, re-summarize strictly."""
+        q_low = str(user_input or "").lower()
+        if not any(t in q_low for t in ("weather", "forecast", "temperature", "humidity")):
+            return response_text
+        evidence = self._latest_web_search_evidence()
+        if not evidence or len(evidence) < 40:
+            return response_text
+        # Evidence should look weather-ish; skip if empty noise
+        if not re.search(r"\d", evidence) and "weather" not in evidence.lower():
+            return response_text
+        weak = (
+            self._answer_defers_to_external_weather(response_text)
+            or not self._answer_has_weather_facts(response_text)
+        )
+        if not weak:
+            return response_text
+        display = self._extract_user_request_text(user_input)
+        logger.info("Weather evidence repair: re-synthesizing from %d chars of tool output", len(evidence))
+        return self._summarize_web_results(
+            user_input,
+            display,
+            evidence,
+            display,
+            "",
+            is_schedule=False,
+            callbacks=None,
+        )
+
     def _summarize_web_results(
         self,
         user_input: str,
@@ -8836,6 +9425,8 @@ class EchoSpeakAgent:
     ) -> str:
         """Unified web-search → LLM summarisation with optional schedule-aware prompting."""
         time_note = f"Current system time: {time_context}\n\n" if time_context else ""
+        q_low = f"{display_question} {user_input}".lower()
+        is_weather = any(t in q_low for t in ("weather", "forecast", "temperature", "humidity"))
 
         schedule_instruction = (
             "IMPORTANT: For 'next'/'upcoming' schedule questions, choose the earliest event "
@@ -8845,12 +9436,34 @@ class EchoSpeakAgent:
             "If you can't confirm the next upcoming event, say so and ask a clarifying question.\n\n"
         ) if is_schedule else ""
 
+        weather_instruction = (
+            "WEATHER RULES (mandatory):\n"
+            "- Answer with concrete facts from the evidence: current temp and/or high/low, conditions "
+            "(sunny/cloudy/rain/snow), and wind/humidity if present.\n"
+            "- Prefer °C for Canadian cities when the evidence uses Celsius.\n"
+            "- Do NOT say 'check AccuWeather/Environment Canada' or 'pretty typical' when numbers exist below.\n"
+            "- Do NOT offer a menu of what you *could* look up — give the forecast now.\n"
+            "- If the evidence truly has no numbers, say the sources didn't include temps and give only what is there.\n"
+            "- Keep it to 2–4 short spoken sentences. No markdown.\n\n"
+        ) if is_weather else ""
+
+        had_partial = bool(getattr(self, "_turn_partial_beats", None))
+        multibeat_instruction = (
+            "MULTI-BEAT RULES (mandatory):\n"
+            "- A first spoken message already handled greetings / how-are-you.\n"
+            "- Do NOT start with hey/hi/hello/hey there.\n"
+            "- Do NOT re-answer how you are or say thanks for asking.\n"
+            "- Jump straight into the factual result.\n\n"
+        ) if had_partial else ""
+
         prompt = (
             "You are Echo Speak, a conversational assistant. "
             "Use the following web search results to answer the user's question. "
             "Be concise and conversational. Use bullets only if the user asked for a list or if a list is clearly the best format. "
             "Do NOT include URLs or markdown links. Do NOT cite sources in the chat reply. "
             f"{schedule_instruction}"
+            f"{weather_instruction}"
+            f"{multibeat_instruction}"
             "If the search results are incomplete, say what is still missing and ask a clarifying question.\n\n"
             f"{time_note}User question: {display_question}\n\n"
             f"Search query used: {used_query}\n\n"
@@ -8858,6 +9471,31 @@ class EchoSpeakAgent:
             "Answer:"
         )
         response_text = self._clamp_web_summary(self._invoke_visible_llm(prompt))
+
+        # Repair weak weather answers that hand-wave despite evidence in tool_output.
+        if is_weather and (
+            self._answer_defers_to_external_weather(response_text)
+            or not self._answer_has_weather_facts(response_text)
+        ):
+            repair = (
+                "Rewrite this as Echo. Use ONLY the evidence. "
+                "State high/low or current temperature and conditions if present. "
+                "Never tell the user to visit another weather site. "
+                "Max 3 short sentences. No markdown.\n\n"
+                f"User question: {display_question}\n\n"
+                f"Evidence:\n{tool_output}\n\n"
+                f"Bad draft to replace:\n{response_text}\n\n"
+                "Better answer:"
+            )
+            try:
+                repaired = self._clamp_web_summary(self._invoke_visible_llm(repair))
+                if repaired and (
+                    self._answer_has_weather_facts(repaired)
+                    or not self._answer_defers_to_external_weather(repaired)
+                ):
+                    response_text = repaired
+            except Exception as exc:
+                logger.warning("Weather answer repair failed: %s", exc)
 
         if is_schedule:
             response_text = self._maybe_correct_past_schedule_answer(
@@ -9152,10 +9790,12 @@ class EchoSpeakAgent:
             )
 
         response_text = self._sanitize_response_text(response_text)
+        response_text = self._ensure_no_regreet_after_partials(user_input, response_text)
         response_text = self._maybe_correct_past_schedule_answer(user_input, response_text, time_context, callbacks)
         from agent.adapters import get_adapter
         adapter = get_adapter(self._current_source)
         response_text = adapter.postprocess_response(self, user_input, response_text)
+        response_text = self._ensure_no_regreet_after_partials(user_input, response_text)
 
         full_response = response_text
         response_text = full_response
@@ -9321,10 +9961,28 @@ class EchoSpeakAgent:
                 user_input, ctx, callbacks_local,
             )
 
+            # Small models often say "I'll check the weather" after get_system_time and stop.
+            # If live facts were required but web_search never ran, force it here.
+            response_text = self._ensure_live_web_search(
+                user_input, response_text or "", callbacks_local,
+            )
+            # Even when search ran, the agent may ignore evidence and hand-wave
+            # ("check AccuWeather"). Re-synthesize from grounded tool output.
+            response_text = self._ensure_weather_answer_uses_evidence(
+                user_input, response_text or "",
+            )
+            # Multi-beat: never re-greet in the post-tool answer if we already spoke a first beat.
+            response_text = self._ensure_no_regreet_after_partials(
+                user_input, response_text or "",
+            )
+
             # Plugin hook: on_response (can transform the LLM response)
             if response_text:
                 response_text = PluginRegistry.dispatch_response(
                     user_input, response_text, ctx,
+                )
+                response_text = self._ensure_no_regreet_after_partials(
+                    user_input, response_text or "",
                 )
 
             # Stage 5: finalize (fallback, TTS, memory)

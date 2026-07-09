@@ -1514,6 +1514,13 @@ def web_search(query: str) -> str:
                 out.append(t)
                 if len(out) >= 8:
                     break
+            # Weather fact boosters — keep temps/conditions even if not in query tokens
+            qlow = (q or "").lower()
+            if any(w in qlow for w in ("weather", "forecast", "temperature", "temp")):
+                for extra in ("temperature", "high", "low", "humidity", "wind", "celsius", "fahrenheit", "forecast"):
+                    if extra not in seen:
+                        out.append(extra)
+                        seen.add(extra)
             return out
 
         def _compress_extract(extract: str, q: str, max_chars: int = 900) -> str:
@@ -1533,6 +1540,9 @@ def web_search(query: str) -> str:
                 for kw in kws:
                     if kw in low:
                         score += 1
+                # Prefer sentences that carry concrete weather numbers
+                if re.search(r"\d+\s*°|\bhigh\b.*\d|\blow\b.*\d|\d+\s*%", low):
+                    score += 3
                 if score > 0:
                     scored.append((score, sent.strip()))
             scored.sort(key=lambda x: (-x[0], len(x[1])))
@@ -1551,7 +1561,7 @@ def web_search(query: str) -> str:
                     continue
                 picked.append(sent)
                 total += add_len
-                if len(picked) >= 5:
+                if len(picked) >= 6:
                     break
             if not picked:
                 return s[:max_chars].rstrip() + "…"

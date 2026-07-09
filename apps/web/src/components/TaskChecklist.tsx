@@ -165,16 +165,16 @@ export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
   return (
     <div
       style={{
-        margin: "4px 0 8px",
-        padding: "4px 8px",
+        margin: "6px 0 10px",
+        padding: "2px 0",
         borderRadius: 0,
         background: "transparent",
         border: "none",
         boxShadow: "none",
-        fontFamily: "'Inter', 'SF Pro', system-ui, sans-serif",
+        fontFamily: "'JetBrains Mono', ui-monospace, monospace",
         fontSize: "12px",
-        maxWidth: "420px",
-        width: "fit-content",
+        maxWidth: "100%",
+        width: "100%",
       }}
     >
       {/* Header */}
@@ -184,21 +184,22 @@ export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
           alignItems: "center",
           justifyContent: "space-between",
           marginBottom: "8px",
-          paddingBottom: "7px",
-          borderBottom: "1px solid rgba(255,255,255,0.05)",
+          paddingBottom: "6px",
+          borderBottom: "1px solid rgba(255,255,255,0.06)",
         }}
       >
-        <span style={{ color: "#e2e8f0", fontWeight: 700, fontSize: "12px" }}>
-          Task Plan
+        <span style={{ color: "rgba(255,255,255,0.55)", fontWeight: 600, fontSize: "11px", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+          tasks
         </span>
         <span
           style={{
-            color: allDone ? "#4ade80" : hasFailed ? "#f87171" : "#94a3b8",
+            color: allDone ? "#4ade80" : hasFailed ? "#f87171" : "rgba(255,255,255,0.4)",
             fontSize: "11px",
-            fontWeight: 700,
+            fontWeight: 600,
+            letterSpacing: "0.04em",
           }}
         >
-          {completedCount}/{totalCount} {allDone ? "complete" : "in progress"}
+          {completedCount}/{totalCount}
         </span>
       </div>
 

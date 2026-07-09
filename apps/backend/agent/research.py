@@ -49,6 +49,23 @@ _SCHEDULE_TERMS = {
     "what matches",
 }
 
+_WEATHER_TERMS = {
+    "weather",
+    "forecast",
+    "temperature",
+    "temp",
+    "humidity",
+    "precipitation",
+    "rain",
+    "snow",
+    "wind chill",
+    "feels like",
+    "high of",
+    "low of",
+    "°c",
+    "°f",
+}
+
 
 @dataclass
 class SearchIntent:
@@ -59,6 +76,7 @@ class SearchIntent:
     recency_need: bool = False
     live_score_need: bool = False
     schedule_need: bool = False
+    weather_need: bool = False
     specific_answer_need: bool = False
     current_day_need: bool = False
     ambiguous: bool = False
@@ -213,10 +231,12 @@ def build_search_intent(original_request: str, resolved_request: str = "", curre
         for sport in ["game", "match", "fifa", "world cup", "soccer", "football", "nhl", "nba", "nfl", "mlb", "canada", "morocco"]
     )
     schedule = any(term in low for term in _SCHEDULE_TERMS)
-    current_day = any(term in low for term in ["today", "tonight", "right now", "currently", "current"])
+    weather = any(term in low for term in _WEATHER_TERMS)
+    current_day = any(term in low for term in ["today", "tonight", "right now", "currently", "current", "tomorrow"])
     specific_answer = bool(
         live_score
         or schedule
+        or weather  # always need concrete temps / conditions, not homepage nav text
         or (
             current_day
             and any(term in low for term in ["who plays", "what games", "what matches", "events", "available", "odds", "release", "released"])
@@ -225,7 +245,9 @@ def build_search_intent(original_request: str, resolved_request: str = "", curre
     )
     ambiguous = bool(current_subject and re.search(r"\b(deeper|more|again|that|this|it|continue|go further)\b", original.lower()))
     mode = "recent" if recency else "general"
-    if live_score:
+    if weather:
+        mode = "weather"
+    elif live_score:
         mode = "live_score"
     elif schedule:
         mode = "schedule"
@@ -234,9 +256,10 @@ def build_search_intent(original_request: str, resolved_request: str = "", curre
         resolved_request=resolved,
         current_subject=_normalize_text(current_subject),
         mode=mode,
-        recency_need=recency,
+        recency_need=recency or weather,
         live_score_need=live_score,
         schedule_need=schedule,
+        weather_need=weather,
         specific_answer_need=specific_answer,
         current_day_need=current_day,
         ambiguous=ambiguous,
@@ -257,7 +280,43 @@ class SearchGrounder:
         base = self._clean_query(base)
         candidates: list[SearchCandidate] = [SearchCandidate(base, "cleaned user intent", 0.72, ["base"])]
 
-        if intent.live_score_need:
+        if intent.weather_need:
+            # Prefer forecast-page queries that return °C/°F numbers, not homepage chrome.
+            day_hint = "tomorrow" if "tomorrow" in (intent.resolved_request or "").lower() else "today"
+            cleaned = re.sub(
+                r"\b(please|check|look up|what(?:'s| is)|how(?:'s| is)|"
+                r"how(?:'re| are) you(?: doing)?(?: today)?|"
+                r"and|also|plus|thanks|thank you|for me)\b",
+                " ",
+                base,
+                flags=re.IGNORECASE,
+            )
+            cleaned = self._clean_query(cleaned) or base
+            # Drop leftover small-talk crumbs
+            cleaned = re.sub(r"\b(doing|good|great|fine)\b", " ", cleaned, flags=re.IGNORECASE)
+            cleaned = self._clean_query(cleaned) or base
+            candidates = [
+                SearchCandidate(
+                    f"{cleaned} weather {day_hint} high low temperature forecast",
+                    "weather forecast numbers",
+                    0.96,
+                    ["weather", "forecast"],
+                ),
+                SearchCandidate(
+                    f"{cleaned} current weather temperature humidity wind",
+                    "weather current conditions",
+                    0.92,
+                    ["weather", "current"],
+                ),
+                SearchCandidate(
+                    f"{cleaned} weather Environment Canada OR AccuWeather forecast",
+                    "weather authority sources",
+                    0.88,
+                    ["weather", "source"],
+                ),
+                *candidates,
+            ]
+        elif intent.live_score_need:
             cleaned = re.sub(r"\b(date|schedule|start time|kickoff|kick-off)\b", "", base, flags=re.IGNORECASE)
             cleaned = self._clean_query(cleaned)
             candidates = [
@@ -385,10 +444,21 @@ class SearchGrounder:
         evidence: list[GroundedEvidence] = []
         terms = self._intent_terms(intent)
         for item in items:
+            content = str(item.get("content") or item.get("extract") or "")
+            summary = str(item.get("summary") or item.get("snippet") or "")
+            # Prefer the denser field for weather (raw extract often has °C/°F; titles are SEO fluff).
+            fact_blob = content if len(content) > len(summary) else summary
             hay = " ".join(str(item.get(k) or "") for k in ("title", "summary", "content", "page_title")).lower()
             matched = [t for t in terms if t in hay]
             score = min(1.0, 0.12 * len(matched))
-            if intent.live_score_need:
+            if intent.weather_need:
+                score += 0.55 if self._has_weather_signal(hay) else -0.3
+                # Prefer forecast domains / pages over generic "weather" landing pages
+                if any(d in hay for d in ("accuweather", "weather.com", "environment canada", "weather.gc.ca", "wunderground", "theweathernetwork")):
+                    score += 0.12
+                if any(noise in hay for noise in ("cookie", "sign in", "subscribe", "advertisement", "privacy policy")):
+                    score -= 0.15
+            elif intent.live_score_need:
                 score += 0.55 if self._has_score_signal(hay) else -0.25
                 if any(t in hay for t in ["schedule", "date", "kickoff", "start time"]) and not self._has_score_signal(hay):
                     score -= 0.25
@@ -400,11 +470,16 @@ class SearchGrounder:
                 score += 0.18
             if item.get("url"):
                 score += 0.05
+            # For weather, keep more of the fact-dense extract in the summary field
+            if intent.weather_need and self._has_weather_signal(fact_blob):
+                display_summary = _normalize_text(fact_blob)[:900]
+            else:
+                display_summary = str(item.get("summary") or item.get("content") or "")[:700]
             rejection = "" if score >= self.relevance_threshold else "Evidence did not strongly match the requested intent."
             evidence.append(GroundedEvidence(
                 title=str(item.get("title") or "Untitled source"),
                 url=str(item.get("url") or ""),
-                summary=str(item.get("summary") or item.get("content") or "")[:700],
+                summary=display_summary,
                 relevance_score=max(0.0, min(1.0, score)),
                 recency_bucket=str(item.get("recency_bucket") or "unknown"),
                 matched_terms=matched[:12],
@@ -417,8 +492,15 @@ class SearchGrounder:
         usable = [e for e in evidence if e.relevance_score >= 0.12]
         if not usable:
             return str(raw_output or "").strip()
+        # Prefer fact-bearing weather snippets first when mixed with nav noise
+        def _fact_rank(e: GroundedEvidence) -> tuple:
+            hay = f"{e.title} {e.summary}".lower()
+            has_wx = 1 if self._has_weather_signal(hay) else 0
+            return (has_wx, e.relevance_score)
+
+        usable = sorted(usable, key=_fact_rank, reverse=True)
         lines = []
-        for idx, item in enumerate(usable[:5], start=1):
+        for idx, item in enumerate(usable[:6], start=1):
             source = f" ({item.url})" if item.url else ""
             lines.append(
                 f"{idx}. {item.title}{source}\n"
@@ -431,6 +513,13 @@ class SearchGrounder:
         if not evidence:
             return False
         top = evidence[0]
+        if intent.weather_need:
+            # Accept if any of top results carry real weather numbers (not just page titles).
+            for e in evidence[:4]:
+                hay = f"{e.title} {e.summary}".lower()
+                if e.relevance_score >= max(0.28, self.relevance_threshold - 0.05) and self._has_weather_signal(hay):
+                    return True
+            return False
         if intent.live_score_need:
             return top.relevance_score >= self.relevance_threshold and self._has_score_signal(top.summary.lower() + " " + top.title.lower())
         if intent.specific_answer_need:
@@ -449,8 +538,10 @@ class SearchGrounder:
 
     def _intent_terms(self, intent: SearchIntent) -> list[str]:
         words = re.findall(r"[a-z0-9]{3,}", (intent.resolved_request + " " + intent.current_subject).lower())
-        stop = {"what", "when", "where", "which", "with", "about", "please", "search", "deeper", "right", "currently", "today"}
+        stop = {"what", "when", "where", "which", "with", "about", "please", "search", "deeper", "right", "currently", "today", "doing", "check"}
         terms = [w for w in words if w not in stop]
+        if intent.weather_need:
+            terms.extend(["weather", "forecast", "temperature", "high", "low", "°c", "humidity", "wind"])
         if intent.live_score_need:
             terms.extend(["score", "live", "result", "current"])
         if intent.recency_need:
@@ -465,8 +556,24 @@ class SearchGrounder:
             or re.search(r"\b\d{1,2}\s*[-:]\s*\d{1,2}\b", text)
         )
 
+    def _has_weather_signal(self, text: str) -> bool:
+        """Concrete forecast/condition facts — not marketing nav from weather sites."""
+        hay = str(text or "").lower()
+        if re.search(r"\d+\s*°\s*[cf]\b|\d+\s*degrees|\bhigh(?:s)?\s*(?:near|around|of)?\s*-?\d+|\blow(?:s)?\s*(?:near|around|of)?\s*-?\d+", hay):
+            return True
+        if re.search(r"-?\d{1,2}\s*/\s*-?\d{1,2}\s*°", hay):
+            return True
+        # temp + weather vocab together
+        if re.search(r"-?\d{1,3}\b", hay) and any(
+            w in hay for w in ("°", "celsius", "fahrenheit", "humidity", "wind", "km/h", "mph", "precip", "chance of rain", "feels like")
+        ):
+            return True
+        return False
+
     def _has_specific_answer_signal(self, text: str, intent: SearchIntent) -> bool:
         hay = str(text or "").lower()
+        if intent.weather_need:
+            return self._has_weather_signal(hay)
         if intent.live_score_need:
             return self._has_score_signal(hay)
         if "odds" in (intent.resolved_request or "").lower():
@@ -580,11 +687,13 @@ def format_grounded_tool_output(result: GroundedSearchResult) -> str:
     """
     chosen = _normalize_text(result.chosen_query)
     if result.accepted:
-        body = _normalize_text(result.condensed_evidence or result.raw_output)
+        body = (result.condensed_evidence or result.raw_output or "").strip()
         return (
             f"{GROUNDED_SEARCH_MARKER} accepted=true query={chosen}\n"
             "Use ONLY the evidence below. Prefer concrete facts from these sources. "
-            "Do not invent scores, times, or outcomes not present here.\n\n"
+            "Do not invent scores, times, temperatures, or outcomes not present here. "
+            "For weather: quote high/low/current temps and conditions when present; "
+            "never tell the user to 'check AccuWeather' if numbers are already below.\n\n"
             f"{body}"
         ).strip()
 

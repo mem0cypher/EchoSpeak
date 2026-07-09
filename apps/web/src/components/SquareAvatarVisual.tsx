@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence, Transition } from "framer-motion";
-import { type ToolCategory, type EchoReaction, getToolIcon, isNightTime } from "./echoAnimationUtils";
+import { type ToolCategory, type EchoReaction, isNightTime } from "./echoAnimationUtils";
 
 export type SquareAvatarVisualProps = {
   speaking: boolean;
@@ -24,7 +24,6 @@ export type SquareAvatarVisualProps = {
     breathing_speed?: number;
     eye_size?: number;
     body_roundness?: number;
-    enable_particles?: boolean;
     enable_glow?: boolean;
     enable_idle_activities?: boolean;
     custom_status_text?: string;
@@ -40,7 +39,6 @@ type AvatarVisualConfig = {
   breathing_speed: number;
   eye_size: number;
   body_roundness: number;
-  enable_particles: boolean;
   enable_glow: boolean;
   enable_idle_activities: boolean;
   custom_status_text: string;
@@ -55,7 +53,6 @@ const DEFAULT_AVATAR_CONFIG: AvatarVisualConfig = {
   breathing_speed: 1,
   eye_size: 1,
   body_roundness: 24,
-  enable_particles: true,
   enable_glow: true,
   enable_idle_activities: true,
   custom_status_text: "",
@@ -63,12 +60,8 @@ const DEFAULT_AVATAR_CONFIG: AvatarVisualConfig = {
 
 // ─── Animation Configs & Constants ──────────────────────────────────────────
 
-// Organic smooth spring for general movement
 const organicSpring: Transition = { type: "spring", stiffness: 120, damping: 20 };
-// Snappy spring for blinks and fast reactions
 const snappySpring: Transition = { type: "spring", stiffness: 400, damping: 25 };
-// Gentle ease for breathing
-const breathTransition: Transition = { duration: 3, repeat: Infinity, repeatType: "reverse", ease: "easeInOut" };
 
 type EyeAnimConfig = { x: number | number[]; y: number | number[]; durX: number; durY: number };
 
@@ -85,34 +78,116 @@ const TOOL_EYE_ANIMS: Record<ToolCategory, EyeAnimConfig> = {
   generic:       { x: [-8, 8, -8],            y: 0,                           durX: 1.2, durY: 0 },
 };
 
-type MicroBehavior = "look_left" | "look_right" | "look_up" | "look_down" | "curious_tilt" | "happy_bounce" | "spin_360" | "spin_dizzy" | "spin_shake" | "squint" | "wide_eyes" | "none";
-const MICRO_BEHAVIORS: MicroBehavior[] = ["look_left", "look_right", "look_up", "look_down", "curious_tilt", "happy_bounce", "spin_360", "squint", "wide_eyes"];
-const MICRO_BEHAVIOR_DURATIONS: Partial<Record<MicroBehavior, [number, number]>> = {
-  look_down: [1200, 1800],
-  curious_tilt: [1800, 2600],
-  happy_bounce: [1800, 2400],
-  squint: [1200, 1800],
-  wide_eyes: [1200, 1800],
+// Short glances & tiny habits — the main "alive" layer during chill
+type MicroBehavior =
+  | "none"
+  | "look_left"
+  | "look_right"
+  | "look_up"
+  | "look_down"
+  | "glance_around"
+  | "curious_tilt"
+  | "soft_sway"
+  | "shoulder_shift"
+  | "happy_soft"
+  | "squint"
+  | "wide_eyes";
+
+// Weighted: looking around should dominate
+const MICRO_POOL: MicroBehavior[] = [
+  "look_left", "look_left", "look_right", "look_right",
+  "look_up", "look_down", "look_down",
+  "glance_around", "glance_around",
+  "curious_tilt", "curious_tilt",
+  "soft_sway", "soft_sway",
+  "shoulder_shift",
+  "happy_soft",
+  "squint",
+  "wide_eyes",
+];
+
+const MICRO_DUR: Record<MicroBehavior, [number, number]> = {
+  none:            [0, 0],
+  look_left:       [1400, 2400],
+  look_right:      [1400, 2400],
+  look_up:         [1100, 1800],
+  look_down:       [1200, 2000],
+  glance_around:   [2200, 3200],
+  curious_tilt:    [1800, 2800],
+  soft_sway:       [2400, 3600],
+  shoulder_shift:  [1600, 2400],
+  happy_soft:      [1600, 2200],
+  squint:          [1100, 1700],
+  wide_eyes:       [1000, 1600],
 };
 
-type IdleActivity = "none" | "gaming" | "gaming_intense" | "floating" | "napping" | "waking_up" | "vibing" | "stretching";
-const ACTIVITY_POOL: IdleActivity[] = ["gaming","gaming","floating","napping","stretching"];
+// Longer moods — still casual, never gimmicky
+type IdleActivity =
+  | "none"
+  | "phone"        // scrolling on his phone
+  | "daydream"     // soft float / spaced out
+  | "napping"
+  | "waking_up"
+  | "vibing"       // Spotify only
+  | "stretching"
+  | "weight_shift" // lean one side, settle
+  | "fidget";      // tiny restless rock
+
+// Weighted toward chill moods; nap is rarer
+const ACTIVITY_POOL: IdleActivity[] = [
+  "phone", "phone",
+  "daydream", "daydream",
+  "weight_shift", "weight_shift", "weight_shift",
+  "fidget", "fidget",
+  "stretching",
+  "napping",
+];
+
 const ACT_DUR: Record<IdleActivity, [number, number]> = {
-  none:           [25000, 45000], // Huge idle times so he mostly just sits and blinks
-  gaming:         [12000, 20000],
-  gaming_intense: [8000,  15000],
-  floating:       [10000, 16000],
-  napping:        [45000, 90000], // He sleeps for a long time when he decides to nap
-  waking_up:      [1500,  1500],
-  vibing:         [10000, 18000],
-  stretching:     [4000,  6000],
+  none:         [8000, 14000],
+  phone:        [10000, 18000],
+  daydream:     [8000, 14000],
+  napping:      [22000, 40000],
+  waking_up:    [1600, 1600],
+  vibing:       [10000, 18000],
+  stretching:   [3500, 5500],
+  weight_shift: [5000, 9000],
+  fidget:       [4000, 7000],
 };
 
-function pickActivity(preferred?: string): IdleActivity {
-  if (preferred && preferred !== "auto") {
-    return (preferred === "none" ? "none" : preferred) as IdleActivity;
+// Editor / legacy aliases → internal activities
+const IDLE_ALIASES: Record<string, IdleActivity> = {
+  auto: "none",
+  none: "none",
+  phone: "phone",
+  gaming: "phone",
+  daydream: "daydream",
+  floating: "daydream",
+  napping: "napping",
+  vibing: "vibing",
+  stretching: "stretching",
+  weight_shift: "weight_shift",
+  fidget: "fidget",
+};
+
+function resolveIdle(preferred?: string): IdleActivity {
+  if (!preferred || preferred === "auto") {
+    return ACTIVITY_POOL[Math.floor(Math.random() * ACTIVITY_POOL.length)];
   }
-  return ACTIVITY_POOL[Math.floor(Math.random() * ACTIVITY_POOL.length)];
+  return IDLE_ALIASES[preferred] ?? "none";
+}
+
+// Moods that still allow soft micro glances (keeps him interconnected & alive)
+function allowsMicros(activity: IdleActivity): boolean {
+  return activity === "none" || activity === "daydream" || activity === "weight_shift" || activity === "fidget" || activity === "vibing";
+}
+
+// 1.5× original 140px body; face geometry authored at 140 and scaled via FACE
+const BODY_SIZE = 210;
+const FACE = BODY_SIZE / 140; // 1.5 — keep eyes/mouth proportional to body
+
+function faceDim(v: number | number[]): number | number[] {
+  return Array.isArray(v) ? v.map((n) => n * FACE) : v * FACE;
 }
 
 // ─── Main Component ─────────────────────────────────────────────────────────
@@ -144,46 +219,31 @@ export const SquareAvatarVisual = React.memo(function SquareAvatarVisual({
   const mergedAvatarConfig = { ...DEFAULT_AVATAR_CONFIG, ...(avatarConfig || {}) };
   const breathDuration = Math.max(0.9, 3 / Math.max(0.25, Number(mergedAvatarConfig.breathing_speed || 1)));
 
-  // ─── Spotify Vibing Override ─────────────────────────────────────────────
-  // Echo vibes whenever Spotify reports music is playing.
-  // When music stops (or spotifyPlaying becomes null), instantly go idle.
-  const spotifyTrackRef = useRef<string>("");
-  const spotifyVibingRef = useRef<boolean>(false);
+  // ─── Spotify: soft vibe while music plays ────────────────────────────────
+  const spotifyVibingRef = useRef(false);
 
   useEffect(() => {
-    const trackId = spotifyPlaying?.track_id || "";
     const isPlaying = !!spotifyPlaying?.is_playing;
-
     if (!isPlaying) {
-      // Music stopped or Spotify disconnected — release override immediately
       spotifyVibingRef.current = false;
-      spotifyTrackRef.current = "";
       if (idleActivity === "vibing") {
         if (activityTimerRef.current) clearTimeout(activityTimerRef.current);
-        if (microTimerRef.current) clearTimeout(microTimerRef.current);
-        setMicroBehavior("none");
         setIdleActivity("none");
       }
       return;
     }
-
-    // New track started — Echo decides if he vibes
-    if (trackId && trackId !== spotifyTrackRef.current) {
-      spotifyTrackRef.current = trackId;
-    }
-
     spotifyVibingRef.current = true;
-
-    // If Echo decided to vibe, override idle activity
-    if (spotifyVibingRef.current) {
-      if (idleActivity !== "vibing") {
-        if (activityTimerRef.current) clearTimeout(activityTimerRef.current);
-        if (microTimerRef.current) clearTimeout(microTimerRef.current);
-        setMicroBehavior("none");
-        setIdleActivity("vibing");
-      }
+    if (idleActivity !== "vibing") {
+      if (activityTimerRef.current) clearTimeout(activityTimerRef.current);
+      setMicroBehavior("none");
+      setIdleActivity("vibing");
     }
   }, [spotifyPlaying, idleActivity]);
+
+  // Forced idle mode from Avatar Editor (locks mood; still allows micros when chill)
+  const forcedIdle = mergedAvatarConfig.idle_activity && mergedAvatarConfig.idle_activity !== "auto"
+    ? resolveIdle(mergedAvatarConfig.idle_activity)
+    : null;
 
   useEffect(() => {
     if (!mergedAvatarConfig.enable_idle_activities) {
@@ -191,56 +251,52 @@ export const SquareAvatarVisual = React.memo(function SquareAvatarVisual({
       setIdleActivity("none");
       return;
     }
-    if (mergedAvatarConfig.idle_activity && mergedAvatarConfig.idle_activity !== "auto") {
+    if (forcedIdle && forcedIdle !== "none") {
       if (activityTimerRef.current) clearTimeout(activityTimerRef.current);
-      setIdleActivity(mergedAvatarConfig.idle_activity as IdleActivity);
+      setIdleActivity(forcedIdle);
     }
-  }, [mergedAvatarConfig.enable_idle_activities, mergedAvatarConfig.idle_activity]);
+  }, [mergedAvatarConfig.enable_idle_activities, forcedIdle]);
 
   // ─── Derived States ───────────────────────────────────────────────────────
-  // Sleep only when offline. Napping is the voluntary activity.
   const isSleeping = backendOnline === false;
   const isNapping = idleActivity === "napping";
   const isWakingUp = idleActivity === "waking_up";
-  const isGaming = idleActivity === "gaming" || idleActivity === "gaming_intense";
-  const isFloating = idleActivity === "floating";
+  const isOnPhone = idleActivity === "phone";
+  const isDaydream = idleActivity === "daydream";
   const isVibing = idleActivity === "vibing";
   const isStretching = idleActivity === "stretching";
+  const isWeightShift = idleActivity === "weight_shift";
+  const isFidget = idleActivity === "fidget";
   const isActive = speaking || isThinking || userIsTyping || pendingConfirmation || activeReaction !== null;
+  const microsOk = !isActive && !isSleeping && allowsMicros(idleActivity);
 
-  // ─── Idle Activity Engine ─────────────────────────────────────────────────
+  // ─── Mood engine: chill → mood → chill ────────────────────────────────────
   const cycleToNext = useCallback((prev: IdleActivity) => {
     if (activityTimerRef.current) clearTimeout(activityTimerRef.current);
-
-    // Don't cycle if Spotify vibing is active — let the override hold
     if (spotifyVibingRef.current) return;
+    if (forcedIdle && forcedIdle !== "none") return;
 
-    // If we just finished napping, we must wake up
     if (prev === "napping") {
       setIdleActivity("waking_up");
       activityTimerRef.current = window.setTimeout(() => cycleToNext("waking_up"), ACT_DUR.waking_up[0]);
       return;
     }
 
-    // ALTERNATING LOGIC:
-    // If we just finished an activity (or waking up), go into a long "none" phase (just blinking/breathing).
-    // If we just finished a long "none" phase, pick a short activity.
+    // Alternate: after any mood, return to chill; after chill, pick a mood
     if (prev !== "none" && prev !== "waking_up") {
       setIdleActivity("none");
       const [mn, mx] = ACT_DUR.none;
       activityTimerRef.current = window.setTimeout(() => cycleToNext("none"), mn + Math.random() * (mx - mn));
     } else {
-      const next = pickActivity(mergedAvatarConfig.idle_activity);
+      const next = resolveIdle("auto");
       setIdleActivity(next);
       const [mn, mx] = ACT_DUR[next];
       activityTimerRef.current = window.setTimeout(() => cycleToNext(next), mn + Math.random() * (mx - mn));
     }
-  }, [mergedAvatarConfig.idle_activity]);
+  }, [forcedIdle]);
 
-  // Main lifecycle for idle engine
   useEffect(() => {
     if (isActive) {
-      // Pause idle cycle while busy
       setIdleActivity("none");
       setMicroBehavior("none");
       if (activityTimerRef.current) clearTimeout(activityTimerRef.current);
@@ -251,59 +307,61 @@ export const SquareAvatarVisual = React.memo(function SquareAvatarVisual({
 
     if (!mergedAvatarConfig.enable_idle_activities) return;
     if (spotifyVibingRef.current) return;
+    if (forcedIdle && forcedIdle !== "none") {
+      setIdleActivity(forcedIdle);
+      return;
+    }
 
-    // Start purely idle
     setIdleActivity("none");
     setMicroBehavior("none");
-
-    // Initial delay before first random activity
     const [mn, mx] = ACT_DUR.none;
-    activityTimerRef.current = window.setTimeout(() => cycleToNext("none"), (mn + Math.random() * (mx - mn)) / 2); // start halfway through a none cycle
+    activityTimerRef.current = window.setTimeout(
+      () => cycleToNext("none"),
+      (mn + Math.random() * (mx - mn)) * 0.45
+    );
 
     return () => {
       if (microTimerRef.current) clearTimeout(microTimerRef.current);
       if (microPhaseTimerRef.current) clearTimeout(microPhaseTimerRef.current);
       if (activityTimerRef.current) clearTimeout(activityTimerRef.current);
     };
-  }, [isActive, cycleToNext, mergedAvatarConfig.enable_idle_activities]);
+  }, [isActive, cycleToNext, mergedAvatarConfig.enable_idle_activities, forcedIdle]);
 
+  // ─── Micro engine: frequent soft life while chill moods allow it ──────────
   useEffect(() => {
-    if (isActive || idleActivity !== "none" || isSleeping || isNapping) {
+    if (!microsOk) {
       if (microTimerRef.current) clearTimeout(microTimerRef.current);
       if (microBehavior !== "none") setMicroBehavior("none");
       return;
     }
     if (microBehavior !== "none") return;
 
-    const delay = 5000 + Math.random() * 10000;
+    // More frequent when fully chill; a bit slower during soft moods
+    const base = idleActivity === "none" ? 2200 : 4500;
+    const spread = idleActivity === "none" ? 4500 : 6000;
     microTimerRef.current = window.setTimeout(() => {
-      setMicroBehavior(MICRO_BEHAVIORS[Math.floor(Math.random() * MICRO_BEHAVIORS.length)]);
-    }, delay);
+      setMicroBehavior(MICRO_POOL[Math.floor(Math.random() * MICRO_POOL.length)]);
+    }, base + Math.random() * spread);
 
     return () => {
       if (microTimerRef.current) clearTimeout(microTimerRef.current);
     };
-  }, [isActive, idleActivity, microBehavior, isSleeping, isNapping]);
+  }, [microsOk, idleActivity, microBehavior]);
 
   useEffect(() => {
     if (microPhaseTimerRef.current) clearTimeout(microPhaseTimerRef.current);
-    if (isActive || idleActivity !== "none" || isSleeping || isNapping) return;
+    if (!microsOk || microBehavior === "none") return;
 
-    if (microBehavior === "spin_360") {
-      microPhaseTimerRef.current = window.setTimeout(() => setMicroBehavior("spin_dizzy"), 720);
-    } else if (microBehavior === "spin_dizzy") {
-      microPhaseTimerRef.current = window.setTimeout(() => setMicroBehavior("spin_shake"), 1350);
-    } else if (microBehavior === "spin_shake") {
-      microPhaseTimerRef.current = window.setTimeout(() => setMicroBehavior("none"), 650);
-    } else if (microBehavior !== "none") {
-      const [mn, mx] = MICRO_BEHAVIOR_DURATIONS[microBehavior] ?? [1400, 2100];
-      microPhaseTimerRef.current = window.setTimeout(() => setMicroBehavior("none"), mn + Math.random() * (mx - mn));
-    }
+    const [mn, mx] = MICRO_DUR[microBehavior];
+    microPhaseTimerRef.current = window.setTimeout(
+      () => setMicroBehavior("none"),
+      mn + Math.random() * (mx - mn)
+    );
 
     return () => {
       if (microPhaseTimerRef.current) clearTimeout(microPhaseTimerRef.current);
     };
-  }, [isActive, idleActivity, microBehavior]);
+  }, [microsOk, microBehavior]);
 
   // Night mode checker
   useEffect(() => {
@@ -324,110 +382,76 @@ export const SquareAvatarVisual = React.memo(function SquareAvatarVisual({
     }
   }, [reaction, activeReaction, onReactionDone]);
 
-  // ─── Blink Engine (Untouched rhythm, just decoupled from shapes) ────────
+  // ─── Blink ────────────────────────────────────────────────────────────────
   useEffect(() => {
     let timeout: number;
     const scheduleBlink = () => {
-      if (!isSleeping && !isNapping && !isThinking && activeReaction !== "error" && microBehavior !== "spin_360" && microBehavior !== "spin_dizzy" && microBehavior !== "spin_shake") {
+      if (!isSleeping && !isNapping && !isThinking && activeReaction !== "error" && !isOnPhone) {
         setBlink(true);
-        setTimeout(() => setBlink(false), 150);
+        setTimeout(() => setBlink(false), 140);
       }
-      timeout = window.setTimeout(scheduleBlink, 2000 + Math.random() * 4000);
+      timeout = window.setTimeout(scheduleBlink, 2200 + Math.random() * 3800);
     };
-    timeout = window.setTimeout(scheduleBlink, 1000);
+    timeout = window.setTimeout(scheduleBlink, 900);
     return () => window.clearTimeout(timeout);
-  }, [isSleeping, isNapping, isThinking, activeReaction, microBehavior]);
+  }, [isSleeping, isNapping, isThinking, activeReaction, isOnPhone]);
 
-  // ─── Animation Generators (Framer Motion Native) ──────────────────────────
+  // ─── Animation Generators ─────────────────────────────────────────────────
 
-  // 1. Eye Animation Props
   const getEyeProps = () => {
-    // Defaults: resting blinky state
     let w: number | number[] = 20, h: number | number[] = 24, r: number | number[] = 12;
     let x: number | number[] = 0, y: number | number[] = 0;
     let tX: Transition = organicSpring;
     let tY: Transition = organicSpring;
     let tShape: Transition = organicSpring;
 
-    // --- State Overrides (Hierarchy) ---
-
-    // Shape overrides
+    // Shape (priority high → low)
     if (isSleeping || isNapping) { h = 4; r = 4; w = 24; }
     else if (isWakingUp) { w = 26; h = 28; r = 14; }
     else if (activeReaction === "error") { w = 24; h = 28; r = 14; }
     else if (activeReaction === "success") { w = 22; h = 6; r = 6; }
     else if (activeReaction === "memory_saved") { w = 20; h = 8; r = 8; }
-    else if (userIsTyping) { w = 20; h = 20; r = 10; } // Focused eyes for listening
+    else if (userIsTyping) { w = 20; h = 20; r = 10; }
     else if (pendingConfirmation) { w = 20; h = 24; r = 12; }
-    else if (isVibing) { w = 22; h = 10; r = 6; }
+    else if (isOnPhone) { w = 18; h = 10; r = 6; }
+    else if (isVibing) { w = 22; h = 12; r = 7; }
     else if (isStretching) { w = 24; h = 14; r = 8; }
-    else if (isFloating) { w = 20; h = 22; r = 11; }
+    else if (isDaydream) { w = 20; h = 22; r = 11; }
     else if (microBehavior === "look_down") { w = 20; h = 20; r = 10; }
     else if (microBehavior === "curious_tilt") { w = 22; h = 22; r = 11; }
-    else if (microBehavior === "happy_bounce") { w = 22; h = 16; r = 8; }
-    else if (microBehavior === "spin_360") { w = 22; h = 22; r = 11; }
-    else if (microBehavior === "spin_dizzy") { w = 20; h = 20; r = 10; }
-    else if (microBehavior === "spin_shake") { w = 22; h = 22; r = 11; }
+    else if (microBehavior === "happy_soft") { w = 22; h = 16; r = 8; }
     else if (microBehavior === "squint") { w = 22; h = 10; r = 6; }
     else if (microBehavior === "wide_eyes") { w = 24; h = 28; r = 14; }
     else if (isThinking) {
       switch (toolCategory) {
-        case "search": w=20; h=22; r=11; break;
-        case "terminal": w=18; h=16; r=8; break;
-        case "browser": w=24; h=26; r=13; break;
-        case "memory_store": w=20; h=10; r=8; break;
-        case "memory_recall": w=22; h=26; r=13; break;
-        case "file_write": w=18; h=18; r=9; break;
-        case "discord_post": w=18; h=20; r=10; break;
+        case "search": w = 20; h = 22; r = 11; break;
+        case "terminal": w = 18; h = 16; r = 8; break;
+        case "browser": w = 24; h = 26; r = 13; break;
+        case "memory_store": w = 20; h = 10; r = 8; break;
+        case "memory_recall": w = 22; h = 26; r = 13; break;
+        case "file_write": w = 18; h = 18; r = 9; break;
+        case "discord_post": w = 18; h = 20; r = 10; break;
       }
     }
 
-    // ** CRITICAL: Blink overrides any active shape **
     if (blink && !isSleeping && !isNapping) {
       h = 3; r = 4;
-      tShape = snappySpring; // Fast snap shut and open
+      tShape = snappySpring;
     }
 
-    // Position overrides
+    // Position
     if (isSleeping || isNapping) { x = 0; y = 0; }
-    else if (isWakingUp) { y = [0, -3, 0]; tY = { duration: 0.4, ease: "easeOut" }; }
+    else if (isWakingUp) { y = [0, -3, 0]; tY = { duration: 0.45, ease: "easeOut" }; }
     else if (activeReaction === "error") { x = [0, -4, 4, -2, 0]; tX = { duration: 0.4 }; }
-    else if (userIsTyping) {
-      // Leaning forward to listen
-      x = 4; y = -2;
-    }
-    else if (microBehavior === "spin_dizzy") {
-      x = [0, 7, 0, -7, 0];
-      y = [0, -4, 0, 4, 0];
-      tX = { duration: 1.6, repeat: Infinity, ease: "easeInOut" };
-      tY = { duration: 0.8, repeat: Infinity, ease: "easeInOut" };
-    }
-    else if (microBehavior === "look_down") {
-      y = 6;
-    }
-    else if (microBehavior === "curious_tilt") {
-      x = 4;
-      y = -2;
-    }
-    else if (microBehavior === "happy_bounce") {
-      y = [0, -2, 0];
-      tY = { duration: 1.1, repeat: Infinity, ease: "easeInOut" };
-    }
-    else if (microBehavior === "spin_360" || microBehavior === "spin_shake") {
-      x = 0;
-      y = 0;
-    }
+    else if (userIsTyping) { x = 4; y = -2; }
     else if (isThinking) {
       if (toolCategory === "discord_post" || toolCategory === "file_write") {
-        // Typing squint
         w = 22; h = 8; r = 6;
       } else if (toolCategory === "search" || toolCategory === "browser" || toolCategory === "discord_read" || toolCategory === "file_read") {
-        // Reading/scanning eyes
         w = 22; h = 24; r = 12;
-        x = [-8, 8, -6, 6, -8]; 
+        x = [-8, 8, -6, 6, -8];
         tX = { duration: 1.5, repeat: Infinity, ease: "easeInOut" };
       } else if (toolCategory === "terminal") {
-        // Terminal focus
         w = 20; h = 18; r = 8;
         y = -2;
       } else {
@@ -437,25 +461,40 @@ export const SquareAvatarVisual = React.memo(function SquareAvatarVisual({
         if (cfg.durY > 0) tY = { duration: cfg.durY, repeat: Infinity, ease: "easeInOut" };
       }
     }
-    else if (isGaming && !speaking) {
-      w = 18; h = 8; r = 5;
-      y = [9, 10, 9]; x = [0, 1, 0, -1, 0];
-      tY = { duration: 2.4, repeat: Infinity, ease: "easeInOut" };
-      tX = { duration: 2.8, repeat: Infinity, ease: "easeInOut" };
+    else if (isOnPhone) {
+      // Eyes locked on the phone below
+      y = [7, 8, 7]; x = [0, 1.5, 0, -1, 0];
+      tY = { duration: 2.8, repeat: Infinity, ease: "easeInOut" };
+      tX = { duration: 3.2, repeat: Infinity, ease: "easeInOut" };
     }
-    else if (isFloating) { x = [-6, 0, 6, 0, -6]; tX = { duration: 3.0, repeat: Infinity, ease: "easeInOut" }; }
-    else if (isStretching) { y = [-4, 0]; tY = { duration: 0.8 }; }
+    // Micros sit above soft moods so glances still happen while daydreaming etc.
     else if (microBehavior === "look_left") { x = -8; }
     else if (microBehavior === "look_right") { x = 8; }
     else if (microBehavior === "look_up") { y = -6; }
+    else if (microBehavior === "look_down") { y = 6; }
+    else if (microBehavior === "glance_around") {
+      x = [0, -7, 7, -4, 0];
+      tX = { duration: 2.4, ease: "easeInOut" };
+    }
+    else if (microBehavior === "curious_tilt") { x = 4; y = -2; }
+    else if (microBehavior === "happy_soft") {
+      y = [0, -1.5, 0];
+      tY = { duration: 1.2, repeat: Infinity, ease: "easeInOut" };
+    }
+    else if (isDaydream) {
+      x = [-4, 0, 5, 0, -4];
+      tX = { duration: 5.5, repeat: Infinity, ease: "easeInOut" };
+      y = [0, -1, 0];
+      tY = { duration: 4, repeat: Infinity, ease: "easeInOut" };
+    }
+    else if (isStretching) { y = [-3, 0]; tY = { duration: 1.2, ease: "easeInOut" }; }
 
     return {
-      animate: { x, y, width: w, height: h, borderRadius: r },
-      transition: { x: tX, y: tY, width: tShape, height: tShape, borderRadius: tShape }
+      animate: { x: faceDim(x), y: faceDim(y), width: faceDim(w), height: faceDim(h), borderRadius: faceDim(r) },
+      transition: { x: tX, y: tY, width: tShape, height: tShape, borderRadius: tShape },
     };
   };
 
-  // 2. Mouth Animation Props
   const getMouthProps = () => {
     let w: number | number[] = 20, h: number | number[] = 6, r: number | number[] = 10;
     let t: Transition = organicSpring;
@@ -468,39 +507,33 @@ export const SquareAvatarVisual = React.memo(function SquareAvatarVisual({
       w = [20, 36, 24, 32, 22, 20]; h = [8, 26, 12, 22, 10, 8]; r = [10, 18, 12, 16, 10, 10];
       t = { duration: 0.6, repeat: Infinity };
     }
+    else if (isOnPhone) { w = 12; h = 5; r = 6; }
     else if (isVibing) {
-      w = [20, 24, 20]; h = [4, 6, 4]; t = { duration: 0.6, repeat: Infinity };
+      w = [20, 23, 20]; h = [5, 7, 5]; t = { duration: 0.9, repeat: Infinity, ease: "easeInOut" };
     }
     else if (isStretching) {
-      w = [24, 20]; h = [16, 6]; r = [14, 10]; t = { duration: 1.5 };
-    }
-    else if (isGaming && !speaking) {
-      w = 12; h = 8; r = 6; // Slack open mouth for brainrot scrolling
-    }
-    else if (microBehavior === "spin_dizzy") {
-      w = [14, 18, 14]; h = [4, 6, 4]; r = [8, 9, 8]; t = { duration: 1.2, repeat: Infinity, ease: "easeInOut" };
-    }
-    else if (microBehavior === "spin_shake") {
-      w = 14; h = 3; r = 6;
+      w = [24, 20]; h = [14, 6]; r = [12, 10]; t = { duration: 1.8, ease: "easeInOut" };
     }
     else if (isThinking) { w = 16; h = 4; }
-    else if (userIsTyping) {
-      // Small focused mouth
-      w = 12; h = 4; r = 6;
-    }
+    else if (userIsTyping) { w = 12; h = 4; r = 6; }
     else if (pendingConfirmation) { w = 14; h = 8; }
     else if (microBehavior === "curious_tilt") { w = 18; h = 5; }
-    else if (microBehavior === "happy_bounce") {
-      w = [20, 24, 20]; h = [5, 8, 5]; r = [10, 12, 10]; t = { duration: 1.1, repeat: Infinity, ease: "easeInOut" };
+    else if (microBehavior === "happy_soft") {
+      w = [20, 23, 20]; h = [5, 7, 5]; r = [10, 11, 10];
+      t = { duration: 1.2, repeat: Infinity, ease: "easeInOut" };
+    }
+    else if (isFidget) {
+      w = [18, 20, 18]; h = [5, 6, 5]; t = { duration: 1.6, repeat: Infinity, ease: "easeInOut" };
     }
 
-    return { animate: { width: w, height: h, borderRadius: r }, transition: t };
+    return { animate: { width: faceDim(w), height: faceDim(h), borderRadius: faceDim(r) }, transition: t };
   };
 
-  // 3. Body Animation Props
   const getBodyProps = () => {
     let x: number | number[] = 0, y: number | number[] = 0, rot: number | number[] = 0;
+    let scaleX: number | number[] = 1, scaleY: number | number[] = 1;
     let tX: Transition = organicSpring, tY: Transition = organicSpring, tR: Transition = organicSpring;
+    let tSX: Transition = organicSpring, tSY: Transition = organicSpring;
 
     if (activeReaction === "error") {
       y = [0, -4, 4, -2, 0]; rot = [0, -3, 3, -1, 0];
@@ -510,174 +543,178 @@ export const SquareAvatarVisual = React.memo(function SquareAvatarVisual({
       y = [0, -10, 0]; tY = { duration: 0.6 };
     }
     else if (isWakingUp) {
-      y = [0, -15, -5, 0]; tY = { duration: 0.6, ease: "easeOut" };
+      y = [0, -12, -4, 0]; tY = { duration: 0.7, ease: "easeOut" };
     }
     else if (speaking) {
-      y = [0, -8, 0]; tY = { duration: 0.8, repeat: Infinity, ease: "easeInOut" };
+      y = [0, -7, 0]; tY = { duration: 0.85, repeat: Infinity, ease: "easeInOut" };
     }
     else if (userIsTyping) {
-      // Listening lean
-      y = [0, -4, 0]; rot = -4; tY = { duration: 1.5, repeat: Infinity, ease: "easeInOut" };
+      y = [0, -3, 0]; rot = -3;
+      tY = { duration: 1.6, repeat: Infinity, ease: "easeInOut" };
     }
     else if (isThinking) {
       if (toolCategory === "discord_post" || toolCategory === "file_write") {
-        // Frantic typing bounce
-        y = [0, -4, 0, -2, 0];
+        y = [0, -3, 0, -2, 0];
         rot = [0, -1, 1, 0, 0];
-        tY = { duration: 0.6, repeat: Infinity, ease: "easeInOut" };
-        tR = { duration: 0.6, repeat: Infinity, ease: "easeInOut" };
+        tY = { duration: 0.7, repeat: Infinity, ease: "easeInOut" };
+        tR = { duration: 0.7, repeat: Infinity, ease: "easeInOut" };
       } else if (toolCategory === "search" || toolCategory === "browser") {
-        // Leaning in, focused
-        y = [0, -4, 0]; tY = { duration: 1.2, repeat: Infinity, ease: "easeInOut" };
+        y = [0, -3, 0]; tY = { duration: 1.3, repeat: Infinity, ease: "easeInOut" };
       } else {
-        // Generic thinking bounce
         y = [0, -2, 0]; tY = { duration: 1.5, repeat: Infinity, ease: "easeInOut" };
       }
     }
     else if (isNapping || isSleeping) {
-      y = [0, -4, 0]; rot = [1, -1, 1]; // Full loop back to start to prevent snapping
-      tY = { duration: 3, repeat: Infinity, ease: "easeInOut" };
-      tR = { duration: 4, repeat: Infinity, ease: "easeInOut" };
+      y = [0, -3, 0]; rot = [1.2, -1.2, 1.2];
+      tY = { duration: 3.2, repeat: Infinity, ease: "easeInOut" };
+      tR = { duration: 4.2, repeat: Infinity, ease: "easeInOut" };
     }
-    else if (isGaming) {
-      if (idleActivity === "gaming_intense") {
-        y = [0, -6, 0, -4, 0]; rot = [-2, 2, -1, 1, -2];
-        tY = { duration: 0.8, repeat: Infinity }; tR = { duration: 0.5, repeat: Infinity };
-      } else {
-        y = [6, 8, 6];
-        rot = [-2, 1, -2];
-        tY = { duration: 2.4, repeat: Infinity, ease: "easeInOut" };
-        tR = { duration: 2.8, repeat: Infinity, ease: "easeInOut" };
-      }
-    }
-    else if (isFloating) {
-      y = [0, -6, 0]; x = [-15, 15, -15]; rot = [-4, 4, -4];
-      tY = { duration: 4, repeat: Infinity, ease: "easeInOut" };
-      tX = { duration: 6, repeat: Infinity, ease: "easeInOut" };
-      tR = { duration: 5, repeat: Infinity, ease: "easeInOut" };
-    }
-    else if (isVibing) {
-      y = [0, -5, 0]; x = [-2, 2, -2]; rot = [-3, 3, -3];
-      tY = { duration: 0.7, repeat: Infinity, ease: "easeInOut" };
-      tX = { duration: 0.7, repeat: Infinity, ease: "easeInOut" };
-      tR = { duration: 0.7, repeat: Infinity, ease: "easeInOut" };
+    else if (isOnPhone) {
+      // Hunched over phone — small rock, not a dance
+      y = [4, 5.5, 4];
+      rot = [-2.5, -1, -2.5];
+      tY = { duration: 2.6, repeat: Infinity, ease: "easeInOut" };
+      tR = { duration: 3.0, repeat: Infinity, ease: "easeInOut" };
     }
     else if (isStretching) {
-      y = [0, -12, 0]; tY = { duration: 2, ease: "easeInOut" };
+      y = [0, -10, -10, 0]; scaleY = [1, 1.04, 1.04, 1]; scaleX = [1, 0.98, 0.98, 1];
+      tY = { duration: 2.8, ease: "easeInOut" };
+      tSY = { duration: 2.8, ease: "easeInOut" };
+      tSX = { duration: 2.8, ease: "easeInOut" };
     }
-    else if (microBehavior === "look_down") {
-      y = 1;
+    // Micros interrupt soft moods (daydream / fidget / vibe / weight shift)
+    else if (microBehavior === "look_down") { y = 1.5; }
+    else if (microBehavior === "curious_tilt") { x = 2; y = -1; rot = -5; }
+    else if (microBehavior === "soft_sway") {
+      x = [-3, 3, -3]; rot = [-2, 2, -2];
+      tX = { duration: 2.8, repeat: Infinity, ease: "easeInOut" };
+      tR = { duration: 2.8, repeat: Infinity, ease: "easeInOut" };
+      y = [0, -2, 0];
+      tY = { duration: breathDuration, repeat: Infinity, repeatType: "reverse", ease: "easeInOut" };
     }
-    else if (microBehavior === "curious_tilt") {
-      x = 3;
-      y = -1;
-      rot = -6;
+    else if (microBehavior === "shoulder_shift") {
+      x = [0, 3, 0]; rot = [0, 3.5, 0];
+      tX = { duration: 1.6, ease: "easeInOut" };
+      tR = { duration: 1.6, ease: "easeInOut" };
     }
-    else if (microBehavior === "happy_bounce") {
-      y = [0, -5, 0, -2, 0];
-      rot = [0, -1, 1, 0, 0];
-      tY = { duration: 1.1, repeat: Infinity, ease: "easeInOut" };
-      tR = { duration: 1.1, repeat: Infinity, ease: "easeInOut" };
-    }
-    else if (microBehavior === "spin_360") {
-      rot = [0, 120, 240, 360];
-      y = [0, -6, 0];
-      tR = { duration: 0.72, ease: "easeInOut" };
-      tY = { duration: 0.72, ease: "easeInOut" };
-    }
-    else if (microBehavior === "spin_dizzy") {
-      rot = [0, -4, 4, -3, 3, 0];
-      y = [0, -1, 0, 1, 0];
-      tR = { duration: 1.2, repeat: Infinity, ease: "easeInOut" };
+    else if (microBehavior === "happy_soft") {
+      y = [0, -3, 0];
       tY = { duration: 1.2, repeat: Infinity, ease: "easeInOut" };
     }
-    else if (microBehavior === "spin_shake") {
-      x = [0, -2, 2, -1, 1, 0];
-      rot = [0, -12, 12, -10, 10, -6, 6, 0];
-      y = [0, -1, 0];
-      tX = { duration: 0.8, ease: "easeInOut" };
-      tR = { duration: 0.8, ease: "easeInOut" };
-      tY = { duration: 0.8, ease: "easeInOut" };
+    else if (microBehavior === "glance_around") {
+      rot = [0, -2, 2, 0];
+      tR = { duration: 2.4, ease: "easeInOut" };
+      y = [0, -2, 0];
+      tY = { duration: breathDuration, repeat: Infinity, repeatType: "reverse", ease: "easeInOut" };
+    }
+    else if (isDaydream) {
+      y = [0, -4, 0]; x = [-6, 6, -6]; rot = [-2, 2, -2];
+      tY = { duration: 4.5, repeat: Infinity, ease: "easeInOut" };
+      tX = { duration: 7, repeat: Infinity, ease: "easeInOut" };
+      tR = { duration: 5.5, repeat: Infinity, ease: "easeInOut" };
+    }
+    else if (isVibing) {
+      y = [0, -3, 0]; x = [-1.5, 1.5, -1.5]; rot = [-2, 2, -2];
+      tY = { duration: 0.95, repeat: Infinity, ease: "easeInOut" };
+      tX = { duration: 0.95, repeat: Infinity, ease: "easeInOut" };
+      tR = { duration: 0.95, repeat: Infinity, ease: "easeInOut" };
+    }
+    else if (isWeightShift) {
+      x = [0, 5, 5, 0]; rot = [0, 4, 4, 0];
+      y = [0, -1, -1, 0];
+      tX = { duration: 3.5, ease: "easeInOut" };
+      tR = { duration: 3.5, ease: "easeInOut" };
+      tY = { duration: 3.5, ease: "easeInOut" };
+    }
+    else if (isFidget) {
+      y = [0, -2, 0, -1.5, 0]; rot = [0, -1.5, 1.5, -1, 0];
+      tY = { duration: 1.8, repeat: Infinity, ease: "easeInOut" };
+      tR = { duration: 1.8, repeat: Infinity, ease: "easeInOut" };
     }
     else {
-      // BASE IDLE BREATHING (The core "sitting there" loop)
-      y = [0, -3, 0]; tY = { duration: breathDuration, repeat: Infinity, repeatType: "reverse", ease: "easeInOut" };
+      // Base breathing — always the home pose
+      y = [0, -3, 0];
+      tY = { duration: breathDuration, repeat: Infinity, repeatType: "reverse", ease: "easeInOut" };
     }
 
     return {
-      animate: { x, y, rotate: rot },
-      transition: { x: tX, y: tY, rotate: tR }
+      animate: { x, y, rotate: rot, scaleX, scaleY },
+      transition: { x: tX, y: tY, rotate: tR, scaleX: tSX, scaleY: tSY },
     };
   };
 
-  // ─── Style Derivations ────────────────────────────────────────────────────
   const getBodyStyle = () => {
     const dimFactor = nightMode && !isActive ? 0.85 : 1;
     let bg = `linear-gradient(135deg, ${mergedAvatarConfig.body_color} 0%, ${mergedAvatarConfig.body_color}dd 100%)`;
     let shadow = `0 0 18px ${mergedAvatarConfig.glow_color}40, inset 0 0 20px rgba(0,0,0,0.05)`;
 
-    if (isSleeping || isNapping) { bg = "linear-gradient(135deg, #e2e8f0 0%, #cbd5e1 100%)"; shadow = "0 0 10px rgba(0,0,0,0.1), inset 0 0 20px rgba(0,0,0,0.05)"; }
-    else if (isWakingUp) { bg = "linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%)"; shadow = "0 0 20px rgba(251,191,36,0.25), inset 0 0 20px rgba(0,0,0,0.03)"; }
-    else if (speaking) { bg = "linear-gradient(135deg, #ffffff 0%, #e2e8f0 100%)"; shadow = "0 0 20px rgba(255,255,255,0.3), inset 0 0 20px rgba(0,0,0,0.05)"; }
-    else if (activeReaction === "success") { bg = "linear-gradient(135deg, #f0fdf4 0%, #bbf7d0 100%)"; shadow = "0 0 24px rgba(34,197,94,0.3), inset 0 0 20px rgba(0,0,0,0.03)"; }
-    else if (activeReaction === "error") { bg = "linear-gradient(135deg, #fef2f2 0%, #fecaca 100%)"; shadow = "0 0 24px rgba(239,68,68,0.3), inset 0 0 20px rgba(0,0,0,0.03)"; }
-    else if (activeReaction === "memory_saved") { bg = "linear-gradient(135deg, #eff6ff 0%, #bfdbfe 100%)"; shadow = "0 0 24px rgba(59,130,246,0.3), inset 0 0 20px rgba(0,0,0,0.03)"; }
-    else if (isVibing) { bg = "linear-gradient(135deg, #fdf4ff 0%, #e9d5ff 100%)"; shadow = "0 0 16px rgba(168,85,247,0.15), inset 0 0 20px rgba(0,0,0,0.03)"; }
-    else if (isThinking && toolCategory === "terminal") { bg = "linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%)"; shadow = "0 0 12px rgba(34,197,94,0.15), inset 0 0 20px rgba(0,0,0,0.05)"; }
-    else if (userIsTyping) { bg = "linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%)"; shadow = "inset 0 0 20px rgba(0,0,0,0.08)"; } // Neutral/listening color instead of yellow
+    if (isSleeping || isNapping) {
+      bg = "linear-gradient(135deg, #e2e8f0 0%, #cbd5e1 100%)";
+      shadow = "0 0 10px rgba(0,0,0,0.1), inset 0 0 20px rgba(0,0,0,0.05)";
+    } else if (isWakingUp) {
+      bg = "linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%)";
+      shadow = "0 0 20px rgba(251,191,36,0.22), inset 0 0 20px rgba(0,0,0,0.03)";
+    } else if (speaking) {
+      bg = "linear-gradient(135deg, #ffffff 0%, #e2e8f0 100%)";
+      shadow = "0 0 20px rgba(255,255,255,0.28), inset 0 0 20px rgba(0,0,0,0.05)";
+    } else if (activeReaction === "success") {
+      bg = "linear-gradient(135deg, #f0fdf4 0%, #bbf7d0 100%)";
+      shadow = "0 0 22px rgba(34,197,94,0.28), inset 0 0 20px rgba(0,0,0,0.03)";
+    } else if (activeReaction === "error") {
+      bg = "linear-gradient(135deg, #fef2f2 0%, #fecaca 100%)";
+      shadow = "0 0 22px rgba(239,68,68,0.28), inset 0 0 20px rgba(0,0,0,0.03)";
+    } else if (activeReaction === "memory_saved") {
+      bg = "linear-gradient(135deg, #eff6ff 0%, #bfdbfe 100%)";
+      shadow = "0 0 22px rgba(59,130,246,0.28), inset 0 0 20px rgba(0,0,0,0.03)";
+    } else if (isVibing) {
+      bg = "linear-gradient(135deg, #faf5ff 0%, #ede9fe 100%)";
+      shadow = "0 0 14px rgba(168,85,247,0.12), inset 0 0 20px rgba(0,0,0,0.03)";
+    } else if (isOnPhone) {
+      bg = "linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%)";
+      shadow = "inset 0 0 18px rgba(0,0,0,0.06)";
+    } else if (isThinking && toolCategory === "terminal") {
+      bg = "linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%)";
+      shadow = "0 0 12px rgba(34,197,94,0.12), inset 0 0 20px rgba(0,0,0,0.05)";
+    } else if (userIsTyping) {
+      bg = "linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%)";
+      shadow = "inset 0 0 20px rgba(0,0,0,0.08)";
+    }
 
-return { background: bg, boxShadow: mergedAvatarConfig.enable_glow ? shadow : "inset 0 0 20px rgba(0,0,0,0.05)", opacity: dimFactor };
-};
+    return {
+      background: bg,
+      boxShadow: mergedAvatarConfig.enable_glow ? shadow : "inset 0 0 20px rgba(0,0,0,0.05)",
+      opacity: dimFactor,
+    };
+  };
 
-const bodyStyle = getBodyStyle();
-const eyeProps = getEyeProps();
-const mouthProps = getMouthProps();
-const bodyProps = getBodyProps();
-const showEyebrow = pendingConfirmation && !isSleeping && !speaking;
+  const bodyStyle = getBodyStyle();
+  const eyeProps = getEyeProps();
+  const mouthProps = getMouthProps();
+  const bodyProps = getBodyProps();
+  const showEyebrow = pendingConfirmation && !isSleeping && !speaking;
+  const eyeScale = Math.max(1, Number(mergedAvatarConfig.eye_size || 1));
 
-return (
-<div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", position: "relative", background: `radial-gradient(circle at center, ${mergedAvatarConfig.bg_color} 0%, rgba(0,0,0,0) 72%)` }}>
-      
+  return (
+    <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", position: "relative", background: `radial-gradient(circle at center, ${mergedAvatarConfig.bg_color} 0%, rgba(0,0,0,0) 72%)` }}>
+
       {/* ── Effects Layers ────────────────────────────────────────────────── */}
       <AnimatePresence>
         {activeReaction === "success" && (
-          <motion.div initial={{ scale: 0.8, opacity: 0 }} animate={{ scale: 1.4, opacity: [0, 0.6, 0] }} exit={{ opacity: 0 }} transition={{ duration: 0.7 }} style={{ position: "absolute", width: 160, height: 160, borderRadius: 30, border: "3px solid rgba(34,197,94,0.5)", zIndex: 50, pointerEvents: "none" }} />
+          <motion.div initial={{ scale: 0.8, opacity: 0 }} animate={{ scale: 1.35, opacity: [0, 0.55, 0] }} exit={{ opacity: 0 }} transition={{ duration: 0.7 }} style={{ position: "absolute", width: BODY_SIZE + 48, height: BODY_SIZE + 48, borderRadius: 40, border: "3px solid rgba(34,197,94,0.45)", zIndex: 50, pointerEvents: "none" }} />
         )}
         {activeReaction === "error" && (
-          <motion.div initial={{ scale: 1, opacity: 0.5 }} animate={{ scale: [1, 1.1, 1], opacity: [0.5, 0.3, 0] }} exit={{ opacity: 0 }} transition={{ duration: 0.8 }} style={{ position: "absolute", width: 160, height: 160, borderRadius: 30, border: "3px solid rgba(239,68,68,0.4)", zIndex: 50, pointerEvents: "none" }} />
+          <motion.div initial={{ scale: 1, opacity: 0.45 }} animate={{ scale: [1, 1.08, 1], opacity: [0.45, 0.25, 0] }} exit={{ opacity: 0 }} transition={{ duration: 0.8 }} style={{ position: "absolute", width: BODY_SIZE + 48, height: BODY_SIZE + 48, borderRadius: 40, border: "3px solid rgba(239,68,68,0.35)", zIndex: 50, pointerEvents: "none" }} />
         )}
       </AnimatePresence>
-
-      {mergedAvatarConfig.enable_particles && !isThinking && !isSleeping && !isNapping && (
-        <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
-          {[0, 1, 2].map((i) => (
-            <motion.div
-              key={`particle-${i}`}
-              animate={{ y: [0, -18, 0], x: [0, i === 1 ? 10 : -10, 0], opacity: [0.18, 0.5, 0.18] }}
-              transition={{ duration: 3 + i, repeat: Infinity, ease: "easeInOut", delay: i * 0.35 }}
-              style={{
-                position: "absolute",
-                top: `${28 + i * 14}%`,
-                left: `${32 + i * 14}%`,
-                width: 8,
-                height: 8,
-                borderRadius: 999,
-                background: mergedAvatarConfig.glow_color,
-                filter: "blur(1px)",
-              }}
-            />
-          ))}
-        </div>
-      )}
 
       {/* ── Main Body ─────────────────────────────────────────────────────── */}
       <motion.div
         animate={bodyProps.animate}
         transition={bodyProps.transition}
         style={{
-          width: 140, height: 140,
-          borderRadius: mergedAvatarConfig.body_roundness,
-          border: mergedAvatarConfig.enable_glow ? `4px solid ${mergedAvatarConfig.glow_color}22` : "4px solid rgba(255,255,255,0.08)",
+          width: BODY_SIZE, height: BODY_SIZE,
+          borderRadius: Math.max(22, Number(mergedAvatarConfig.body_roundness || 24) * 1.35),
+          border: mergedAvatarConfig.enable_glow ? `6px solid ${mergedAvatarConfig.glow_color}22` : "6px solid rgba(255,255,255,0.08)",
           display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
           position: "relative",
           zIndex: 60,
@@ -687,22 +724,75 @@ return (
         <motion.div
           animate={{ background: bodyStyle.background, boxShadow: bodyStyle.boxShadow, opacity: bodyStyle.opacity }}
           transition={{ duration: 0.6 }}
-          style={{ position: "absolute", inset: -4, borderRadius: mergedAvatarConfig.body_roundness, zIndex: -1 }}
+          style={{ position: "absolute", inset: -5, borderRadius: Math.max(22, Number(mergedAvatarConfig.body_roundness || 24) * 1.35), zIndex: -1 }}
         />
 
         {/* ── Eyebrow ── */}
         {showEyebrow && (
-          <motion.div initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} style={{ position: "absolute", top: 22, left: 62, width: 16, height: 3, background: "#000", borderRadius: 2, transform: "rotate(-15deg)", zIndex: 10 }} />
+          <motion.div
+            initial={{ opacity: 0, y: 4 }}
+            animate={{ opacity: 1, y: 0 }}
+            style={{
+              position: "absolute",
+              top: 44 * FACE,
+              left: 62 * FACE,
+              width: 16 * FACE,
+              height: 3 * FACE,
+              background: "#000",
+              borderRadius: 2,
+              transform: "rotate(-15deg)",
+              zIndex: 10,
+            }}
+          />
         )}
 
         {/* ── Eyes ── */}
-        <div style={{ display: "flex", gap: Math.max(22, 28 + mergedAvatarConfig.eye_size * 6), marginTop: -20, zIndex: 2 }}>
-          <motion.div animate={eyeProps.animate} transition={eyeProps.transition} style={{ background: mergedAvatarConfig.eye_color, boxShadow: mergedAvatarConfig.enable_glow ? `0 0 12px ${mergedAvatarConfig.glow_color}35` : "0 4px 6px rgba(0,0,0,0.1)", scale: mergedAvatarConfig.eye_size }} />
-          <motion.div animate={eyeProps.animate} transition={eyeProps.transition} style={{ background: mergedAvatarConfig.eye_color, boxShadow: mergedAvatarConfig.enable_glow ? `0 0 12px ${mergedAvatarConfig.glow_color}35` : "0 4px 6px rgba(0,0,0,0.1)", scale: mergedAvatarConfig.eye_size }} />
+        <div
+          style={{
+            display: "flex",
+            gap: Math.max(22, 28 + mergedAvatarConfig.eye_size * 6) * FACE,
+            marginTop: -20 * FACE,
+            zIndex: 2,
+          }}
+        >
+          <motion.div
+            animate={eyeProps.animate}
+            transition={eyeProps.transition}
+            style={{
+              background: mergedAvatarConfig.eye_color,
+              boxShadow: mergedAvatarConfig.enable_glow
+                ? `0 0 ${12 * FACE}px ${mergedAvatarConfig.glow_color}35`
+                : `0 ${4 * FACE}px ${6 * FACE}px rgba(0,0,0,0.12)`,
+              scale: eyeScale,
+            }}
+          />
+          <motion.div
+            animate={eyeProps.animate}
+            transition={eyeProps.transition}
+            style={{
+              background: mergedAvatarConfig.eye_color,
+              boxShadow: mergedAvatarConfig.enable_glow
+                ? `0 0 ${12 * FACE}px ${mergedAvatarConfig.glow_color}35`
+                : `0 ${4 * FACE}px ${6 * FACE}px rgba(0,0,0,0.12)`,
+              scale: eyeScale,
+            }}
+          />
         </div>
 
         {/* ── Mouth ── */}
-        <motion.div animate={mouthProps.animate} transition={mouthProps.transition} style={{ marginTop: 24, background: mergedAvatarConfig.eye_color, boxShadow: mergedAvatarConfig.enable_glow ? `0 0 10px ${mergedAvatarConfig.glow_color}25` : "0 4px 6px rgba(0,0,0,0.1)", zIndex: 2, opacity: 0.92 }} />
+        <motion.div
+          animate={mouthProps.animate}
+          transition={mouthProps.transition}
+          style={{
+            marginTop: 24 * FACE,
+            background: mergedAvatarConfig.eye_color,
+            boxShadow: mergedAvatarConfig.enable_glow
+              ? `0 0 ${12 * FACE}px ${mergedAvatarConfig.glow_color}25`
+              : `0 ${4 * FACE}px ${6 * FACE}px rgba(0,0,0,0.12)`,
+            zIndex: 2,
+            opacity: 0.92,
+          }}
+        />
 
         {/* ── UI Bubbles ──────────────────────────────────────────────────── */}
         <AnimatePresence>
@@ -753,142 +843,145 @@ return (
           )}
         </AnimatePresence>
 
-        {/* ── Idle Activities Addons ──────────────────────────────────────── */}
+        {/* ── Idle mood props (subtle) ────────────────────────────────── */}
         <AnimatePresence>
-          {isGaming && (
+          {isOnPhone && (
             <motion.div
               initial={{ opacity: 0, y: 10, scale: 0.9 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: 10, scale: 0.9 }}
+              exit={{ opacity: 0, y: 8, scale: 0.92 }}
+              transition={{ duration: 0.35 }}
               style={{
                 position: "absolute",
                 left: "50%",
-                bottom: -16,
-                marginLeft: -44,
+                bottom: -20,
+                marginLeft: -30,
                 zIndex: 100,
-                pointerEvents: "none"
+                pointerEvents: "none",
               }}
             >
-              <div style={{ position: "absolute", left: 8, top: -26, width: 72, display: "flex", justifyContent: "center", gap: 6 }}>
-                {[
-                  { label: "•••", delay: 0, width: 18 },
-                  { label: "1", delay: 0.28, width: 14 },
-                  { label: "♥", delay: 0.56, width: 16 },
-                ].map((item) => (
-                  <motion.div
-                    key={`${item.label}-${item.delay}`}
-                    animate={{ y: [6, -3, -12], opacity: [0, 1, 0], scale: [0.85, 1, 0.92] }}
-                    transition={{ duration: 1.8, repeat: Infinity, delay: item.delay, ease: "easeOut" }}
-                    style={{
-                      minWidth: item.width,
-                      height: 16,
-                      padding: "0 6px",
-                      borderRadius: 999,
-                      background: "rgba(255,255,255,0.92)",
-                      boxShadow: "0 4px 12px rgba(0,0,0,0.12)",
-                      color: item.label === "♥" ? "#f43f5e" : "#0f172a",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      fontSize: 10,
-                      fontWeight: 800,
-                      letterSpacing: item.label === "•••" ? 0.5 : 0,
-                    }}
-                  >
-                    {item.label}
-                  </motion.div>
-                ))}
-              </div>
-               <motion.div
-                 animate={{ y: [0, -3, 0], rotate: [-2, 0, -2], scale: [1, 1.015, 1] }}
-                 transition={{ duration: 2.4, repeat: Infinity, ease: "easeInOut" }}
-                 style={{ width: 88, height: 104, position: "relative" }}
-               >
-                <motion.div
-                  animate={{ y: [0, -1.2, 0], rotate: [-8, -6, -8] }}
-                  transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
+              {/* Back of phone: body + camera island + center logo */}
+              <motion.div
+                animate={{ y: [0, -2.5, 0], rotate: [-8, -5, -8] }}
+                transition={{ duration: 2.4, repeat: Infinity, ease: "easeInOut" }}
+                style={{
+                  width: 60,
+                  height: 104,
+                  borderRadius: 14,
+                  background: "linear-gradient(145deg, #2a2d33 0%, #14161a 48%, #0a0b0d 100%)",
+                  boxShadow:
+                    "0 12px 24px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.12), inset 0 -2px 8px rgba(0,0,0,0.45)",
+                  border: "1px solid rgba(255,255,255,0.1)",
+                  position: "relative",
+                  overflow: "hidden",
+                }}
+              >
+                {/* soft side edge */}
+                <div
                   style={{
                     position: "absolute",
-                    left: 8,
-                    bottom: 14,
-                    width: 22,
-                    height: 38,
-                    borderRadius: 999,
-                    background: "linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%)",
-                    boxShadow: "inset -2px -3px 6px rgba(148,163,184,0.35)",
-                    transform: "rotate(-8deg)",
-                    zIndex: 1,
+                    inset: 0,
+                    borderRadius: 14,
+                    boxShadow: "inset 0 0 0 1.5px rgba(255,255,255,0.06)",
+                    pointerEvents: "none",
                   }}
                 />
-                <motion.div
-                  animate={{ y: [0, -1.4, 0], rotate: [8, 6, 8] }}
-                  transition={{ duration: 1.4, repeat: Infinity, ease: "easeInOut" }}
+
+                {/* Camera island (top-left) */}
+                <div
                   style={{
                     position: "absolute",
-                    right: 8,
-                    bottom: 14,
-                    width: 22,
-                    height: 38,
-                    borderRadius: 999,
-                    background: "linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%)",
-                    boxShadow: "inset -2px -3px 6px rgba(148,163,184,0.3)",
-                    transform: "rotate(8deg)",
-                    zIndex: 1,
-                  }}
-                />
-                <motion.div
-                  animate={{ y: [0, -2, 0], rotate: [-6, -3, -6] }}
-                  transition={{ duration: 1.15, repeat: Infinity, ease: "easeInOut" }}
-                  style={{
-                    position: "absolute",
-                    left: 18,
-                    top: 12,
-                    width: 52,
-                    height: 82,
-                    borderRadius: 16,
-                    background: "linear-gradient(145deg, #334155 0%, #1e293b 48%, #0f172a 100%)",
-                    boxShadow: "10px 12px 18px rgba(15,23,42,0.32), inset 1px 1px 0 rgba(255,255,255,0.16)",
-                    overflow: "hidden",
-                    transformStyle: "preserve-3d",
-                    zIndex: 3,
+                    top: 10,
+                    left: 10,
+                    width: 26,
+                    height: 26,
+                    borderRadius: 8,
+                    background: "linear-gradient(160deg, #3a3f48 0%, #1a1d24 100%)",
+                    boxShadow: "0 2px 6px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.1)",
+                    border: "1px solid rgba(255,255,255,0.08)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: 3,
                   }}
                 >
-                  <div style={{ position: "absolute", inset: 3, borderRadius: 13, background: "linear-gradient(160deg, #64748b 0%, #334155 30%, #1e293b 68%, #0f172a 100%)" }} />
-                  <div style={{ position: "absolute", top: 9, left: 8, width: 19, height: 19, borderRadius: 10, background: "rgba(15,23,42,0.72)", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.1)" }}>
-                    <div style={{ position: "absolute", top: 3, left: 3, width: 5, height: 5, borderRadius: 999, background: "#94a3b8", boxShadow: "0 0 0 2px rgba(15,23,42,0.45)" }} />
-                    <div style={{ position: "absolute", top: 3, right: 3, width: 5, height: 5, borderRadius: 999, background: "#cbd5e1", boxShadow: "0 0 0 2px rgba(15,23,42,0.45)" }} />
-                    <div style={{ position: "absolute", bottom: 3, left: 7, width: 5, height: 5, borderRadius: 999, background: "#e2e8f0", boxShadow: "0 0 0 2px rgba(15,23,42,0.45)" }} />
+                  {/* main lens */}
+                  <div
+                    style={{
+                      width: 11,
+                      height: 11,
+                      borderRadius: 999,
+                      background: "radial-gradient(circle at 35% 30%, #4b5568 0%, #1f2937 45%, #0b0f14 100%)",
+                      boxShadow: "inset 0 0 0 1.5px rgba(15,23,42,0.9), 0 0 0 1px rgba(255,255,255,0.06)",
+                      position: "relative",
+                    }}
+                  >
+                    <div
+                      style={{
+                        position: "absolute",
+                        top: 2,
+                        left: 2,
+                        width: 3,
+                        height: 3,
+                        borderRadius: 999,
+                        background: "rgba(147,197,253,0.45)",
+                      }}
+                    />
                   </div>
-                  <div style={{ position: "absolute", top: 15, left: 31, width: 5, height: 5, borderRadius: 999, background: "rgba(248,250,252,0.7)" }} />
-                  <motion.div
-                    animate={{ opacity: [0.14, 0.22, 0.14], x: [-2, 1, -2] }}
-                    transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+                  {/* flash / secondary */}
+                  <div
                     style={{
                       position: "absolute",
-                      top: -6,
-                      bottom: -6,
-                      left: 11,
-                      width: 16,
-                      background: "linear-gradient(180deg, rgba(255,255,255,0.28) 0%, rgba(255,255,255,0.03) 100%)",
-                      transform: "skewX(-12deg)",
+                      bottom: 4,
+                      right: 4,
+                      width: 5,
+                      height: 5,
+                      borderRadius: 999,
+                      background: "radial-gradient(circle at 40% 35%, #fef9c3 0%, #fde68a 40%, #a3a3a3 100%)",
+                      boxShadow: "0 0 3px rgba(253,224,71,0.35)",
                     }}
                   />
-                  <div style={{ position: "absolute", right: 0, top: 7, bottom: 7, width: 5, background: "linear-gradient(180deg, rgba(15,23,42,0.4) 0%, rgba(2,6,23,0.85) 100%)" }} />
-                  <div style={{ position: "absolute", left: 19, bottom: 14, width: 14, height: 14, borderRadius: 999, border: "1px solid rgba(255,255,255,0.12)", opacity: 0.5 }} />
-                  <div style={{ position: "absolute", bottom: 8, left: "50%", marginLeft: -8, width: 16, height: 2, borderRadius: 999, background: "rgba(255,255,255,0.09)" }} />
-                </motion.div>
+                </div>
+
+                {/* Center logo mark */}
+                <div
+                  style={{
+                    position: "absolute",
+                    left: "50%",
+                    top: "52%",
+                    transform: "translate(-50%, -50%)",
+                    width: 18,
+                    height: 18,
+                    borderRadius: 5,
+                    background: "linear-gradient(145deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.03) 100%)",
+                    boxShadow: "inset 0 1px 1px rgba(255,255,255,0.12)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  <div
+                    style={{
+                      width: 10,
+                      height: 10,
+                      borderRadius: 3,
+                      border: "1.5px solid rgba(255,255,255,0.28)",
+                      background: "rgba(255,255,255,0.06)",
+                    }}
+                  />
+                </div>
               </motion.div>
             </motion.div>
           )}
           {(isSleeping || isNapping) && (
             <div style={{ position: "absolute", top: -60, right: -20, pointerEvents: "none", zIndex: 100 }}>
               {[1, 2, 3].map((i) => (
-                <motion.div key={`z-${i}`} initial={{ opacity: 0, y: 0, x: 0, scale: 0.5 }} animate={{ opacity: [0, 1, 0, 0], y: [-10, -80], x: [0, i % 2 === 0 ? 30 : -30], scale: [0.8, 2.0] }} exit={{ opacity: 0 }} transition={{ duration: 3, repeat: Infinity, delay: (i - 1) * 1, ease: "easeOut" }} style={{ position: "absolute", fontWeight: "900", fontSize: 28, color: "#e2e8f0", fontFamily: '"Comic Sans MS", "Chalkboard SE", monospace', textShadow: "0 4px 12px rgba(255,255,255,0.4), 0 2px 4px rgba(0,0,0,0.8)" }}>Z</motion.div>
+                <motion.div key={`z-${i}`} initial={{ opacity: 0, y: 0, x: 0, scale: 0.5 }} animate={{ opacity: [0, 1, 0, 0], y: [-10, -70], x: [0, i % 2 === 0 ? 24 : -24], scale: [0.8, 1.7] }} exit={{ opacity: 0 }} transition={{ duration: 3, repeat: Infinity, delay: (i - 1) * 1, ease: "easeOut" }} style={{ position: "absolute", fontWeight: 900, fontSize: 24, color: "#e2e8f0", fontFamily: '"Comic Sans MS", "Chalkboard SE", monospace', textShadow: "0 2px 8px rgba(0,0,0,0.55)" }}>Z</motion.div>
               ))}
             </div>
           )}
           {isWakingUp && (
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: [0, 0.5, 0] }} exit={{ opacity: 0 }} transition={{ duration: 0.8 }} style={{ position: "absolute", inset: -8, borderRadius: 28, background: "radial-gradient(circle, rgba(251,191,36,0.3) 0%, transparent 70%)", pointerEvents: "none", zIndex: 50 }} />
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: [0, 0.4, 0] }} exit={{ opacity: 0 }} transition={{ duration: 0.85 }} style={{ position: "absolute", inset: -8, borderRadius: 28, background: "radial-gradient(circle, rgba(251,191,36,0.28) 0%, transparent 70%)", pointerEvents: "none", zIndex: 50 }} />
           )}
         </AnimatePresence>
 
