@@ -3731,7 +3731,32 @@ export const Dashboard: React.FC = () => {
     }
   };
 
+  /** Live plan for the current turn — sticky below tools, not buried in older messages. */
+  const liveTaskPlan = useMemo(() => {
+    if (!taskPlans.length) return null;
+    const isOpen = (entry: TaskPlanEntry) => {
+      if (!entry.plan.active || !entry.plan.tasks.length) return false;
+      return entry.plan.tasks.some((t) =>
+        ["pending", "running", "retrying", "awaiting_confirmation", "blocked"].includes(t.status)
+      );
+    };
+    // Prefer the open plan for this stream; else most recent open plan; else none (historical only).
+    const open = [...taskPlans].reverse().find(isOpen);
+    if (open) return open;
+    // While streaming, keep the latest plan visible at the bottom even if just completed.
+    if (streaming) {
+      return taskPlans[taskPlans.length - 1] || null;
+    }
+    return null;
+  }, [taskPlans, streaming]);
+
   const timeline = useMemo<TimelineItem[]>(() => {
+    const liveId = liveTaskPlan?.id;
+    const historicalPlans = taskPlans.filter((entry) => {
+      // Live plan is rendered sticky at bottom — exclude from chronological merge
+      if (liveId && entry.id === liveId) return false;
+      return entry.plan.active && entry.plan.tasks.length > 0;
+    });
     const merged: TimelineItem[] = [
       ...messages.map(
         (m): TimelineItem => ({
@@ -3749,7 +3774,7 @@ export const Dashboard: React.FC = () => {
           item: a,
         })
       ),
-      ...taskPlans.map(
+      ...historicalPlans.map(
         (entry): TimelineItem => ({
           kind: "task_plan",
           id: entry.id,
@@ -3759,10 +3784,11 @@ export const Dashboard: React.FC = () => {
       ),
     ];
     // Chronological with multi-beat contract:
-    //   user → first spoken assistant beat (partial) → tool/search rows → final answer
+    //   user → first spoken assistant beat (partial) → tool/search rows → plan → final answer
     // Only *partial* assistant messages (skipTypewriter) force above tools — not finals.
+    // task_plan ranks AFTER activity so checklists sit under tools, not above old chatter.
     const kindRank = (k: TimelineItem["kind"]) =>
-      k === "message" ? 0 : k === "task_plan" ? 1 : k === "activity" ? 2 : 3;
+      k === "message" ? 0 : k === "activity" ? 1 : k === "task_plan" ? 2 : 3;
     const isPartialBeat = (t: TimelineItem) => {
       if (t.kind !== "message") return false;
       const m = (t as Extract<TimelineItem, { kind: "message" }>).msg;
@@ -3791,7 +3817,7 @@ export const Dashboard: React.FC = () => {
       return kindRank(a.kind) - kindRank(b.kind);
     });
     return merged;
-  }, [messages, activities, taskPlans]);
+  }, [messages, activities, taskPlans, liveTaskPlan]);
 
   const lastMsgLen = messages.length ? (messages[messages.length - 1]?.text || "").length : 0;
   const activityLen = activities.length;
@@ -4098,7 +4124,9 @@ export const Dashboard: React.FC = () => {
       };
       const upsertTaskPlan = (evt: AgentStreamEvent) => {
         const reqId = eventRequestId(evt);
-        const eventAt = normalizeTimestampMs("at" in evt ? evt.at : Date.now());
+        // Always prefer "now" for plan placement so the checklist tracks the current turn
+        // (backend `at` can lag or collide with older messages and pin the plan high up).
+        const eventAt = Date.now();
         setTaskPlans((prev) => {
           if (evt.type === "task_plan") {
             const id = crypto.randomUUID();
@@ -4108,7 +4136,7 @@ export const Dashboard: React.FC = () => {
               {
                 id,
                 at: eventAt,
-                request_id: reqId,
+                request_id: reqId || runRequestId,
                 plan: taskPlanReducer(createEmptyTaskPlan(), evt),
               },
             ];
@@ -4116,12 +4144,18 @@ export const Dashboard: React.FC = () => {
 
           const activeId =
             activeTaskPlanIdRef.current ||
-            [...prev].reverse().find((entry) => entry.request_id === reqId)?.id;
+            [...prev].reverse().find((entry) => entry.request_id === reqId || entry.request_id === runRequestId)?.id ||
+            [...prev].reverse().find((entry) => entry.plan.active)?.id;
           if (!activeId) return prev;
 
           return prev.map((entry) =>
             entry.id === activeId
-              ? { ...entry, plan: taskPlanReducer(entry.plan, evt) }
+              ? {
+                  ...entry,
+                  // Bump timestamp on every step so historical placement follows the turn
+                  at: eventAt,
+                  plan: taskPlanReducer(entry.plan, evt),
+                }
               : entry
           );
         });
@@ -5581,6 +5615,15 @@ export const Dashboard: React.FC = () => {
                         )
                       )}
                     </AnimatePresence>
+                    {/* Live plan sticky under current turn (tools/thinking), not high in history */}
+                    {liveTaskPlan && liveTaskPlan.plan.active && liveTaskPlan.plan.tasks.length > 0 ? (
+                      <div
+                        key={`live-plan-${liveTaskPlan.id}`}
+                        style={{ width: "100%", padding: "4px 4px 8px", order: 9999 }}
+                      >
+                        <TaskChecklist plan={liveTaskPlan.plan} />
+                      </div>
+                    ) : null}
                     {streaming && liveReplyDraft ? (
                       <div style={{ display: "flex", justifyContent: "flex-start", padding: "10px 4px 8px", width: "100%" }}>
                         <div

@@ -281,6 +281,31 @@ def test_active_work_replan_on_incomplete_implement_goal():
     assert "active_work_restore" in tools
 
 
+def test_coding_implement_intent_uses_plan_state_hooks():
+    """Feature edits on Desktop game must be recognized as implement + plan-worthy."""
+    import tempfile
+    from pathlib import Path
+    from agent.core import EchoSpeakAgent
+
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    q = (
+        "lets work on 2d-shooter-game on my desktop and add a health bar "
+        "and scoreboard and a you died screen with restart"
+    )
+    assert agent._is_coding_implement_intent(q) is True
+    assert agent._task_planner.needs_planning(q) is True
+    desk = Path.home() / "Desktop" / "2d-shooter-game"
+    if not desk.is_dir():
+        return
+    path = agent._resolve_coding_project_path(q)
+    assert path and "2d-shooter" in path.lower().replace("_", "-")
+    files = agent._coding_project_source_files(path)
+    names = {Path(f).name for f in files}
+    assert "game.js" in names
+    # Scan/open-only should NOT be implement (brief path stays)
+    assert agent._is_coding_implement_intent("start 2d-shooter-game on my desktop") is False
+
+
 def test_active_work_store_disk_roundtrip():
     """ActiveWorkStore is the continuity layer independent of agent instance."""
     import tempfile

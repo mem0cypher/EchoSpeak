@@ -1016,11 +1016,24 @@ class TaskPlanner:
         
         low = text.lower()
 
-        # If in coding workspace, enable planning easily for code creation/modification requests
-        if getattr(self, "_workspace_id", None) == "coding":
-            coding_terms = ["code", "create", "make", "write", "build", "program", "develop", "implement", "change", "modify", "html", "css", "js", "javascript", "python", "game", "file", "folder", "script"]
-            if any(term in low for term in coding_terms):
-                return True
+        # Coding workspace lives on the AGENT, not TaskPlanner (was a dead check).
+        agent = getattr(self, "agent", None)
+        ws = str(getattr(agent, "_workspace_id", None) or "").strip().lower() if agent else ""
+        coding_terms = (
+            "code", "create", "make", "write", "build", "program", "develop",
+            "implement", "change", "modify", "add", "fix", "update", "edit",
+            "html", "css", "js", "javascript", "python", "game", "file", "folder",
+            "script", "health", "score", "scoreboard", "feature",
+        )
+        if ws == "coding" and any(term in low for term in coding_terms):
+            return True
+        # Coding project intent on agent (Desktop game / active work) → always plan
+        try:
+            if agent is not None and hasattr(agent, "_is_coding_implement_intent"):
+                if agent._is_coding_implement_intent(user_input):
+                    return True
+        except Exception:
+            pass
         
         # Count task indicators
         task_markers = [
@@ -1038,6 +1051,8 @@ class TaskPlanner:
             r"\bupdate\b", r"\bmessage\b", r"\bnotify\b", r"\brun\b",
             r"\bset\b", r"\bremove\b", r"\bmove\b", r"\bcopy\b",
             r"\bbrowse\b", r"\bemail\b", r"\btweet\b", r"\bannounce\b",
+            r"\badd\b", r"\bedit\b", r"\bfix\b", r"\bimplement\b", r"\bmake\b",
+            r"\bscan\b", r"\bapply\b",
         ]
         
         # Count distinct actions
@@ -1164,6 +1179,13 @@ Return ONLY the JSON array, no explanation:
     
     def execute_next_task(self, tools: List, callbacks: Optional[List] = None) -> Optional[Dict]:
         """Execute the next pending task."""
+        # Skip tasks already finished (e.g. no-op writes filled earlier)
+        while self.current_task_index < len(self.pending_tasks):
+            st = str(self.pending_tasks[self.current_task_index].get("status") or "").lower()
+            if st in {"completed", "failed", "done"}:
+                self.current_task_index += 1
+                continue
+            break
         if self.current_task_index >= len(self.pending_tasks):
             return None
         
@@ -3426,6 +3448,470 @@ class EchoSpeakAgent:
                 f"Continuing on {path}. Goal: {goal}. Next: {next_step or 'edit project files'}.\n"
                 f"Known files: {files or 'see project'}. I will edit under project_path — not re-list Desktop."
             )
+
+    def _is_coding_implement_intent(self, user_input: str) -> bool:
+        """User wants concrete code changes on a local/coding project — must use plan state."""
+        text = self._extract_user_request_text(self._strip_live_desktop_context(user_input or ""))
+        low = re.sub(r"\s+", " ", (text or "").lower().strip())
+        if not low:
+            return False
+        implement = bool(
+            re.search(
+                r"\b("
+                r"add|implement|update the code|update|change|edit|fix|write|"
+                r"make sure|apply|feature|health|hp|scoreboard|score bar|"
+                r"you died|game over|restart|new game|damage|hit points|"
+                r"please scan.{0,40}update|scan.{0,20}(?:and|&).{0,20}update"
+                r")\b",
+                low,
+            )
+        )
+        if not implement:
+            return False
+        if self._is_local_filesystem_intent(user_input) or self._is_coding_project_intent(user_input):
+            return True
+        try:
+            aw = self._load_active_work()
+            if aw and aw.is_active() and aw.project_path:
+                return True
+        except Exception:
+            pass
+        try:
+            from agent.tools import get_active_project_root
+
+            if get_active_project_root() is not None:
+                return True
+        except Exception:
+            pass
+        return bool(str(getattr(self, "_last_local_project_path", "") or "").strip())
+
+    def _resolve_coding_project_path(self, user_input: str = "") -> str:
+        """Best project root for coding implement plans."""
+        try:
+            aw = self._load_active_work()
+            if aw and getattr(aw, "project_path", ""):
+                p = Path(str(aw.project_path))
+                if p.is_dir():
+                    return str(p.resolve())
+        except Exception:
+            pass
+        try:
+            from agent.tools import get_active_project_root
+
+            root = get_active_project_root()
+            if root is not None and Path(str(root)).is_dir():
+                return str(Path(str(root)).resolve())
+        except Exception:
+            pass
+        pin = str(getattr(self, "_last_local_project_path", "") or "").strip()
+        if pin and Path(pin).is_dir():
+            return str(Path(pin).resolve())
+        try:
+            pinned = self._try_pin_desktop_project_from_user(user_input or "")
+            if pinned and Path(pinned).is_dir():
+                return str(Path(pinned).resolve())
+        except Exception:
+            pass
+        # Deep-scan if user named a Desktop project
+        try:
+            if self._is_local_filesystem_intent(user_input or ""):
+                scan = self._run_local_project_deep_scan(user_input or "")
+                path = str((scan or {}).get("path") or "")
+                if path and Path(path).is_dir():
+                    return str(Path(path).resolve())
+        except Exception:
+            pass
+        return ""
+
+    def _coding_project_source_files(self, project_path: str, *, max_files: int = 8) -> List[str]:
+        """Prefer entry sources for implement plans (html/js/css/py…)."""
+        root = Path(str(project_path or "").strip())
+        if not root.is_dir():
+            return []
+        preferred = (
+            "game.js", "index.html", "style.css", "main.js", "app.js", "main.py",
+            "app.py", "index.js", "script.js", "styles.css", "main.ts", "app.ts",
+        )
+        found: List[str] = []
+        for name in preferred:
+            p = root / name
+            if p.is_file():
+                found.append(str(p.resolve()))
+        if found:
+            return found[:max_files]
+        # Fallback: shallow source files
+        try:
+            for p in sorted(root.iterdir(), key=lambda x: x.name.lower()):
+                if p.is_file() and p.suffix.lower() in {
+                    ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".py", ".json",
+                }:
+                    if p.name.lower() in {"package-lock.json", "package.json"}:
+                        continue
+                    found.append(str(p.resolve()))
+                if len(found) >= max_files:
+                    break
+        except Exception:
+            pass
+        return found[:max_files]
+
+    def _emit_coding_plan_as_tasks(self, tasks: List[Dict[str, Any]]) -> None:
+        """Push plan into TaskPlanner and stream task_plan for the UI checklist."""
+        self._task_planner.reset()
+        self._task_planner.pending_tasks = list(tasks)
+        self._task_planner._user_goal = str(getattr(self, "_last_user_input_for_plan", "") or "")
+        try:
+            self._task_planner._emit_task_plan()
+        except Exception:
+            pass
+
+    def _try_coding_implement_plan(
+        self,
+        user_input: str,
+        callbacks: Optional[list] = None,
+    ) -> Optional[tuple]:
+        """Code-enforced coding plan: inspect → read → implement writes (uses plan state).
+
+        Industry pattern: explicit to-do / plan state drives tools; the model does not
+        only narrate steps. Emits task_plan/task_step so the UI checklist tracks work.
+        """
+        if not self._is_coding_implement_intent(user_input):
+            return None
+        if not bool(getattr(config, "multi_task_planner_enabled", True)):
+            return None
+
+        self._ensure_workspace_for_intent(user_input)
+        self._ensure_coding_loop(user_input)
+        project = self._resolve_coding_project_path(user_input)
+        if not project:
+            return None
+        files = self._coding_project_source_files(project)
+        if not files:
+            return None
+
+        try:
+            from agent.tools import set_active_project_root
+
+            set_active_project_root(project)
+        except Exception:
+            pass
+        self._update_active_work_goal(user_input)
+        try:
+            self._save_active_work_from_scan(
+                user_input,
+                path=project,
+                listing="\n".join(Path(f).name for f in files),
+                samples=str(getattr(self, "_last_local_project_samples", "") or "")[:8000],
+                phase="implement",
+            )
+        except Exception:
+            pass
+
+        # Build durable plan steps (inspect → read each → write each)
+        tasks: List[Dict[str, Any]] = []
+        idx = 0
+        tasks.append(
+            {
+                "index": idx,
+                "description": f"Inspect project {Path(project).name}",
+                "tool": "file_list",
+                "params": {"path": project},
+                "depends_on": -1,
+                "status": "pending",
+                "result": None,
+            }
+        )
+        idx += 1
+        read_indices: List[int] = []
+        for fp in files:
+            tasks.append(
+                {
+                    "index": idx,
+                    "description": f"Read {Path(fp).name}",
+                    "tool": "file_read",
+                    "params": {"path": fp},
+                    "depends_on": 0,
+                    "status": "pending",
+                    "result": None,
+                }
+            )
+            read_indices.append(idx)
+            idx += 1
+        write_start = idx
+        for fp in files:
+            tasks.append(
+                {
+                    "index": idx,
+                    "description": f"Apply edits to {Path(fp).name}",
+                    "tool": "file_write",
+                    "params": {"path": fp, "content": ""},
+                    "depends_on": read_indices[-1] if read_indices else 0,
+                    "status": "pending",
+                    "result": None,
+                }
+            )
+            idx += 1
+
+        self._last_user_input_for_plan = user_input
+        self._emit_coding_plan_as_tasks(tasks)
+        logger.info(
+            "Coding implement plan: project={} files={} steps={}",
+            project,
+            [Path(f).name for f in files],
+            len(tasks),
+        )
+
+        # Advance coding loop into implement
+        try:
+            from agent.coding_loop import CodingPhase
+
+            loop = getattr(self, "_coding_loop", None)
+            if loop is not None:
+                loop.fast_forward_to(CodingPhase.IMPLEMENT, note="coding implement plan")
+        except Exception:
+            pass
+
+        # Execute inspect + reads via planner (emits task_step running/done)
+        read_contents: Dict[str, str] = {}
+        while self._task_planner.current_task_index < write_start:
+            task = self._task_planner.execute_next_task(self.tools, callbacks)
+            if not task:
+                break
+            if task.get("status") == "completed" and task.get("tool") == "file_read":
+                path = str((task.get("params") or {}).get("path") or "")
+                read_contents[path] = str(task.get("result") or "")
+            if task.get("status") == "failed":
+                break
+
+        if not read_contents:
+            # Try direct reads if planner failed
+            try:
+                from agent.tools import file_read
+
+                for fp in files:
+                    try:
+                        read_contents[fp] = str(file_read.invoke({"path": fp}) or "")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        if not read_contents:
+            msg = f"I found {project} but could not read its source files to apply edits."
+            self._task_planner.reset()
+            self._last_tts_text = self._clamp_tts_text(msg)
+            self._record_turn(user_input, msg)
+            return msg, True
+
+        # LLM generates SEARCH/REPLACE or full content per file; fill write tasks
+        file_blobs = "\n\n".join(
+            f"### FILE: {Path(p).name}\n```\n{c[:12000]}\n```" for p, c in read_contents.items()
+        )
+        edit_prompt = (
+            "You are implementing features in an existing local project. "
+            "Apply the user's request to the files below.\n\n"
+            f"User request:\n{user_input}\n\n"
+            f"Project path: {project}\n\n"
+            f"{file_blobs}\n\n"
+            "For EACH file you change, output one or more SEARCH/REPLACE blocks labeled with the filename:\n\n"
+            "### FILE: name.ext\n"
+            "<<<<<<< SEARCH\n"
+            "[exact lines from that file]\n"
+            "=======\n"
+            "[replacement]\n"
+            ">>>>>>> REPLACE\n\n"
+            "Rules:\n"
+            "- Prefer SEARCH/REPLACE over full-file dumps.\n"
+            "- Only change what the user asked for.\n"
+            "- Keep the game/app playable.\n"
+            "- Output ONLY labeled blocks (and optional ### FILE headers). No prose plan.\n"
+        )
+
+        def _parse_search_replace_blocks(llm_output: str) -> list:
+            blocks = []
+            pattern = re.compile(
+                r"<<<<<<+\s*SEARCH\s*\n(.*?)\n?={5,}\s*\n(.*?)\n?>{5,}\s*REPLACE",
+                re.DOTALL,
+            )
+            for m in pattern.finditer(llm_output or ""):
+                blocks.append((m.group(1), m.group(2)))
+            return blocks
+
+        def _apply_search_replace(original: str, blocks: list) -> tuple:
+            content = original
+            applied = 0
+            skipped = 0
+            for search_text, replace_text in blocks:
+                if search_text in content:
+                    content = content.replace(search_text, replace_text, 1)
+                    applied += 1
+                    continue
+                def _normalize_ws(s):
+                    return "\n".join(line.rstrip() for line in s.split("\n"))
+                norm_content = _normalize_ws(content)
+                norm_search = _normalize_ws(search_text)
+                if norm_search in norm_content:
+                    idx0 = norm_content.index(norm_search)
+                    lines_before = norm_content[:idx0].count("\n")
+                    search_line_count = search_text.count("\n") + 1
+                    orig_lines = content.split("\n")
+                    before = "\n".join(orig_lines[:lines_before])
+                    after = "\n".join(orig_lines[lines_before + search_line_count :])
+                    content = before + ("\n" if before else "") + replace_text + ("\n" if after else "") + after
+                    applied += 1
+                else:
+                    skipped += 1
+            return content, applied, skipped
+
+        try:
+            if hasattr(self, "_emit_thinking_step"):
+                self._emit_thinking_step("thought", "Generating code edits from plan…", "running")
+            llm_out = self.llm_wrapper.invoke(edit_prompt)
+            if hasattr(self, "_emit_thinking_step"):
+                self._emit_thinking_step("thought", "Generating code edits from plan…", "done")
+        except Exception as exc:
+            msg = f"I scanned {project} and built a plan, but edit generation failed: {exc}"
+            self._task_planner.reset()
+            self._last_tts_text = self._clamp_tts_text(msg)
+            self._record_turn(user_input, msg)
+            return msg, True
+
+        # Split LLM output by ### FILE: headers
+        sections: Dict[str, str] = {}
+        current_name = ""
+        buf: List[str] = []
+        for line in (llm_out or "").splitlines():
+            m = re.match(r"^###\s*FILE:\s*(.+?)\s*$", line.strip(), flags=re.I)
+            if m:
+                if current_name:
+                    sections[current_name] = "\n".join(buf)
+                current_name = Path(m.group(1).strip().strip("`")).name
+                buf = []
+            else:
+                buf.append(line)
+        if current_name:
+            sections[current_name] = "\n".join(buf)
+        # If no headers, apply global blocks to primary game.js/html
+        if not sections:
+            sections = {Path(files[0]).name: llm_out or ""}
+
+        new_by_path: Dict[str, str] = {}
+        for fp, original in read_contents.items():
+            name = Path(fp).name
+            section = sections.get(name) or sections.get(name.lower()) or ""
+            if not section.strip():
+                # try fuzzy key
+                for k, v in sections.items():
+                    if k.lower() == name.lower() or name.lower() in k.lower():
+                        section = v
+                        break
+            if not section.strip():
+                continue
+            blocks = _parse_search_replace_blocks(section)
+            if blocks:
+                new_content, applied, _skipped = _apply_search_replace(original, blocks)
+                if applied > 0:
+                    new_by_path[fp] = new_content
+                    continue
+            # Whole-file fallback if section looks like full source
+            cleaned = re.sub(r"^```[\w]*\s*\n?", "", section.strip())
+            cleaned = re.sub(r"\n?```\s*$", "", cleaned.strip())
+            if len(cleaned) > 40 and cleaned != original:
+                new_by_path[fp] = cleaned
+
+        if not new_by_path:
+            # Last resort: one whole-file regenerate for the main logic file
+            primary = next((f for f in files if f.endswith(".js") or f.endswith(".py")), files[0])
+            try:
+                whole = self.llm_wrapper.invoke(
+                    f"User request: {user_input}\n\nCurrent {Path(primary).name}:\n```\n"
+                    f"{read_contents.get(primary, '')[:14000]}\n```\n\n"
+                    "Return COMPLETE updated file content only."
+                )
+                cleaned = re.sub(r"^```[\w]*\s*\n?", "", (whole or "").strip())
+                cleaned = re.sub(r"\n?```\s*$", "", cleaned.strip())
+                if cleaned:
+                    new_by_path[primary] = cleaned
+            except Exception:
+                pass
+
+        if not new_by_path:
+            brief = (
+                f"Plan for {Path(project).name} is ready (inspect + reads done), "
+                "but I could not produce valid file edits. Ask me to try again or specify the file."
+            )
+            # Mark remaining write tasks failed
+            for t in self._task_planner.pending_tasks:
+                if t.get("tool") == "file_write" and t.get("status") == "pending":
+                    t["status"] = "failed"
+                    t["result"] = "No edit produced"
+                    self._task_planner._emit_task_step(t, "failed", "No edit produced")
+            self._last_tts_text = self._clamp_tts_text(brief)
+            self._record_turn(user_input, brief)
+            return brief, True
+
+        # Fill write task contents; mark unchanged files done
+        for t in self._task_planner.pending_tasks:
+            if t.get("tool") != "file_write":
+                continue
+            path = str((t.get("params") or {}).get("path") or "")
+            if path in new_by_path:
+                t["params"]["content"] = new_by_path[path]
+                t["status"] = "pending"
+            else:
+                t["status"] = "completed"
+                t["result"] = "No changes needed"
+                self._task_planner._emit_task_step(t, "done", "No changes needed")
+                if t not in self._task_planner.completed_tasks:
+                    self._task_planner.completed_tasks.append(t)
+
+        # Position planner at first pending write (skip already-completed no-ops)
+        self._task_planner.current_task_index = write_start
+        while self._task_planner.current_task_index < len(self._task_planner.pending_tasks):
+            cur = self._task_planner.pending_tasks[self._task_planner.current_task_index]
+            if cur.get("status") in {"completed", "failed", "done"}:
+                self._task_planner.current_task_index += 1
+                continue
+            break
+
+        # Continue plan (will pause on first file_write for confirm on web)
+        results = self._task_planner.execute_all(self.tools, callbacks)
+
+        if self._pending_action is not None:
+            display = self._format_pending_action(self._pending_action)
+            response_text = (
+                f"Plan is running on {Path(project).name}. "
+                f"I've prepared the code changes — check the Code panel. "
+                f"Reply 'confirm' to save or 'cancel' to abort.\n\n{display}"
+            )
+            try:
+                self._note_active_work_after_turn(user_input, response_text)
+            except Exception:
+                pass
+            self._last_tts_text = self._clamp_tts_text(response_text)
+            self._record_turn(user_input, response_text)
+            return response_text, True
+
+        # All writes auto-completed (or failed)
+        parts = []
+        for task in list(self._task_planner.completed_tasks) + list(results or []):
+            desc = task.get("description", task.get("tool", "Task"))
+            status = task.get("status", "")
+            if status == "completed":
+                parts.append(f"**{desc}**: done")
+            elif status == "failed":
+                parts.append(f"**{desc}**: failed — {task.get('result', '')}")
+        summary = (
+            f"Finished plan for {Path(project).name}.\n"
+            + ("\n".join(parts) if parts else "No file writes completed.")
+        )
+        try:
+            self._note_active_work_after_turn(user_input, summary)
+        except Exception:
+            pass
+        self._task_planner.reset()
+        self._last_tts_text = self._clamp_tts_text(summary)
+        self._record_turn(user_input, summary)
+        return summary, True
 
     def _ensure_coding_loop(self, user_input: str = "") -> None:
         """Start or resume a coding loop when in coding workspace / coding intent."""
@@ -11018,6 +11504,16 @@ class EchoSpeakAgent:
                 logger.warning(f"Search/replace block skipped (no match): {search_text[:80]}...")
             return content, applied, skipped
 
+        # Coding implement plan (plan-state driven): multi-file Desktop/project edits
+        # MUST run before free ReAct so we don't only narrate steps. Emits task_plan.
+        if current_source not in _background_sources:
+            try:
+                coding_plan = self._try_coding_implement_plan(user_input, callbacks)
+                if coding_plan is not None:
+                    return coding_plan
+            except Exception as exc:
+                logger.warning("Coding implement plan failed: {}", exc)
+
         # Deterministic file-edit pipeline: bypasses broken AgentExecutor
         # by routing through the task planner (direct tool invocation).
         # Detects "edit soul.md" style queries and creates a read→edit→write plan.
@@ -11871,6 +12367,25 @@ class EchoSpeakAgent:
             (extracted_input or user_input or "").lower()
         )
         if local_intent:
+            # Implement asks must NOT stop at a brief — Stage 1 plan should have run;
+            # if we still get here, hydrate and fall through (or run plan now).
+            if self._is_coding_implement_intent(user_input):
+                self._add_pipeline_reasoning(
+                    "⚙️ Stage 3: Shortcut Queries",
+                    "Local project + implement intent — hydrate pin, prefer plan-state execution.",
+                )
+                try:
+                    self._ensure_workspace_for_intent(user_input)
+                    coding_plan = self._try_coding_implement_plan(user_input, callbacks)
+                    if coding_plan is not None:
+                        return coding_plan
+                    # Hydrate for Stage 4 if plan could not run
+                    self._run_local_project_deep_scan(user_input)
+                    self._update_active_work_goal(user_input)
+                except Exception as exc:
+                    logger.debug("Local implement plan/hydrate failed: {}", exc)
+                return None
+
             # Deep-scan + durable active-work + forced brief (skip Stage-4 "what game is it?")
             self._add_pipeline_reasoning(
                 "⚙️ Stage 3: Shortcut Queries",
