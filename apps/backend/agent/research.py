@@ -2572,13 +2572,23 @@ class SearchGrounder:
                 if hit is not None:
                     return hit
 
-        # Soft-accept: if best evidence still has schedule signals, treat as usable
-        # so the model is instructed to report best-available dates instead of giving up.
-        # Covers today/tomorrow/near-future fixture asks equally.
+        # Soft-accept schedule only with concrete matchups/times — never tournament fluff
+        # ("104 games", "where to watch Yamal") that used to accept then re-trigger retries.
         if (intent.schedule_need or intent.current_day_need) and best_evidence:
             for e in best_evidence[:5]:
                 hay = f"{e.title} {e.summary}".lower()
-                if self._has_schedule_signal(hay) and e.relevance_score >= 0.18:
+                if re.search(
+                    r"\b(104 games|full schedule available|where to watch|"
+                    r"lamine yamal|cristiano ronaldo playing)\b",
+                    hay,
+                ) and not re.search(r"\bvs\.?\b|\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?|am|pm)", hay):
+                    continue
+                has_sides = bool(re.search(r"\bvs\.?\b|\bversus\b|\b@\b", hay))
+                has_clock = bool(
+                    re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?|am|pm)\b", hay)
+                    or re.search(r"\b\d{1,2}:\d{2}\b", hay)
+                )
+                if has_sides and (has_clock or e.relevance_score >= 0.28):
                     return GroundedSearchResult(
                         chosen_query=best_query,
                         candidates=candidates,
@@ -2588,11 +2598,7 @@ class SearchGrounder:
                         raw_output=best_output,
                         accepted=True,
                     )
-                # Near-future slate: "tomorrow's fixtures" pages often list matchups without "next game"
-                if intent.current_day_need and e.relevance_score >= 0.22 and (
-                    re.search(r"\b(?:vs\.?|versus|@)\b", hay)
-                    or re.search(r"\b(?:group\s+[a-h]|round of|knockout|fixture|kickoff)\b", hay)
-                ):
+                if intent.current_day_need and has_sides and e.relevance_score >= 0.25:
                     return GroundedSearchResult(
                         chosen_query=best_query,
                         candidates=candidates,

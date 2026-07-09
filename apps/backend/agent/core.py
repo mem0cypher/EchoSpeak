@@ -690,36 +690,49 @@ class WebTaskReflector:
             return original_result
         
         q = str(task.get("params", {}).get("q") or task.get("params", {}).get("query") or "")
+        raw = str(original_result or "")
+        low_raw = raw.lower()
 
-        # Grounded path: still quality-gate (was a hard no-op — Stage 3 "gave up" after one search)
-        if is_grounded_search_output(original_result):
-            if self._is_grounded_packet_acceptable(q, original_result):
-                return str(original_result or "")
-            # Fall through to retry with refined grounded search
+        # Grounded path: NEVER re-orchestrate once SearchGrounder already returned.
+        # Live log: accepted=true → reflector still retried 2× → triple Search done.
+        if is_grounded_search_output(raw):
+            if "accepted=true" in low_raw:
+                logger.info(
+                    "WebTaskReflector: grounded packet already accepted — no retry ({})",
+                    (q or "")[:80],
+                )
+                return raw
+            if self._is_grounded_packet_acceptable(q, raw):
+                return raw
+            # Insufficient grounded packet: do NOT re-call _grounded_web_search
+            # (same fingerprint, same fluff). Let answer layer force-use evidence.
+            logger.info(
+                "WebTaskReflector: grounded insufficient — skip re-search, keep packet ({})",
+                (q or "")[:80],
+            )
+            return raw
 
         silent = bool(task.get("params", {}).get("silent"))
-        # Retries never spam the UI with more "Search done" rows
         emit_events = False if silent else True
 
-        if not is_grounded_search_output(original_result):
-            if bool(getattr(config, "search_grounding_enabled", True)) and hasattr(self.agent, "_grounded_web_search"):
-                if q:
-                    return self.agent._grounded_web_search(
-                        q,
-                        original_request=str(
-                            task.get("params", {}).get("original_request") or q
-                        ),
-                        callbacks=callbacks,
-                        emit_tool_events=emit_events,
-                    )
-                return str(original_result or "")
+        if bool(getattr(config, "search_grounding_enabled", True)) and hasattr(self.agent, "_grounded_web_search"):
+            if q:
+                return self.agent._grounded_web_search(
+                    q,
+                    original_request=str(
+                        task.get("params", {}).get("original_request") or q
+                    ),
+                    callbacks=callbacks,
+                    emit_tool_events=emit_events,
+                )
+            return raw
 
-            # If result is already good, return it
-            if self._is_result_acceptable(q, original_result):
-                logger.info(f"WebTaskReflector: original result accepted for query: {q[:80]}")
-                return original_result
+        # If result is already good, return it
+        if self._is_result_acceptable(q, original_result):
+            logger.info(f"WebTaskReflector: original result accepted for query: {q[:80]}")
+            return original_result
         
-        # Track attempts
+        # Track attempts (non-grounded legacy path only)
         self._attempt_count[task_id] = self._attempt_count.get(task_id, 0) + 1
         attempt = self._attempt_count[task_id]
         
@@ -758,9 +771,7 @@ class WebTaskReflector:
                     f"WebTaskReflector: grounded retry attempt {attempt} returned {len(result)} chars"
                 )
                 if is_grounded_search_output(result):
-                    if self._is_grounded_packet_acceptable(q, result) or attempt >= self.MAX_RETRIES:
-                        return result
-                    return self.reflect_and_retry(task, tool_name, result, tools, callbacks)
+                    return result  # never cascade reflect_and_retry on grounded
                 if self._is_result_acceptable(q, result):
                     return result
                 if attempt < self.MAX_RETRIES:
@@ -11398,12 +11409,16 @@ class EchoSpeakAgent:
                 search_input = extracted_input or expanded
             qtext = self._extract_search_query(search_input)
 
+        # Schedule/FIFA: one grounded search, no reflector re-orchestration
+        # (log: accepted=true → reflector still re-searched 2×).
+        apply_refl = not is_schedule
         tool_output, used_query, time_context = self._invoke_web_research_query(
             qtext,
             callbacks,
             time_context=time_context,
-            apply_reflection=True,
+            apply_reflection=apply_refl,
             original_request=full_user,
+            emit_tool_events=True,
         )
 
         if not used_query:

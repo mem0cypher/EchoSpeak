@@ -179,6 +179,41 @@ def test_weather_place_structural_not_city_list():
     assert "weather" in bare.lower()
 
 
+def test_reflector_does_not_retry_accepted_grounded_packet():
+    """Log bug: accepted=true still triggered reflector attempts 1 and 2."""
+    from agent.core import EchoSpeakAgent, WebTaskReflector
+    import tempfile
+
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    refl = WebTaskReflector(agent)
+    packet = (
+        "[GROUNDED_SEARCH] accepted=true query=FIFA World Cup matches today\n"
+        "France vs Morocco 4:00 PM ET\n"
+        "evidence ok"
+    )
+    calls = {"n": 0}
+    orig = agent._grounded_web_search
+
+    def _spy(*a, **k):
+        calls["n"] += 1
+        return packet
+
+    agent._grounded_web_search = _spy  # type: ignore
+    out = refl.reflect_and_retry(
+        {
+            "index": "t1",
+            "tool": "web_search",
+            "params": {"q": "FIFA World Cup matches today", "silent": True},
+        },
+        "web_search",
+        packet,
+        tools=[],
+        callbacks=None,
+    )
+    assert out == packet
+    assert calls["n"] == 0, "must not re-call grounded search after accepted=true"
+
+
 def test_search_fingerprint_dedupes_tz_word_order():
     from agent.core import EchoSpeakAgent
     import tempfile
