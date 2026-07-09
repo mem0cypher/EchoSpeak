@@ -82,6 +82,13 @@ _SPELLING_FIXES = {
     "argentia": "argentina",
     "wordlcup": "world cup",
     "worldcup": "world cup",
+    # Common speech/typo day words (must land before relative-day labels)
+    "tommrrow": "tomorrow",
+    "tommorow": "tomorrow",
+    "tommorrow": "tomorrow",
+    "tomorow": "tomorrow",
+    "tomorro": "tomorrow",
+    "todya": "today",
 }
 
 _WEATHER_TERMS = {
@@ -309,26 +316,142 @@ def _infer_city_from_text(text: str) -> str:
 
 def _is_weather_clause(text: str) -> bool:
     low = (text or "").lower()
-    return any(t in low for t in _WEATHER_TERMS)
+    if any(t in low for t in _WEATHER_TERMS):
+        return True
+    # Spoken shorthand: "what's the temp tomorrow"
+    if re.search(r"\btemp(?:s|erature|eratures)?\b", low):
+        return True
+    return False
 
 
 def _is_schedule_or_sports_clause(text: str) -> bool:
+    """True for schedules, fixtures, leagues — not only NHL team names."""
     low = (text or "").lower()
     if any(t in low for t in _SCHEDULE_TERMS):
         return True
-    if re.search(r"\b(next|upcoming)\s+(game|match|fixture)\b", low):
+    if re.search(r"\b(next|upcoming)\s+(game|match|matches|fixture|fixtures)\b", low):
+        return True
+    # Plural matches/games alone + competition or day
+    if re.search(r"\b(matches|games|fixtures)\b", low) and re.search(
+        r"\b(today|tonight|tomorrow|this week|weekend|schedule|happening|playing|fifa|world cup|"
+        r"nhl|nba|nfl|mlb|soccer|football|premier|uefa|mls)\b",
+        low,
+    ):
         return True
     if re.search(r"\b(game|match|schedule|fixture)\b", low) and (
         any(team in low for team in _TEAM_CITY)
-        or re.search(r"\b(nhl|nba|nfl|mlb|oilers?|flames|canucks|leafs)\b", low)
+        or re.search(
+            r"\b(nhl|nba|nfl|mlb|oilers?|flames|canucks|leafs|fifa|world cup|soccer|football)\b",
+            low,
+        )
+    ):
+        return True
+    # League + day/playing without the word "match"
+    if re.search(r"\b(fifa|world cup|uefa|premier league|champions league)\b", low) and re.search(
+        r"\b(today|tonight|tomorrow|schedule|playing|fixtures?|matches?|games?)\b",
+        low,
     ):
         return True
     return False
 
 
+def intent_domains(text: str) -> set[str]:
+    """
+    Lightweight domain tags for multi-intent detection.
+
+    General mechanism — not a per-combo recipe. Two or more distinct domains
+    in one utterance ⇒ multi-intent, regardless of whether we have a recipe.
+    """
+    low = (text or "").lower()
+    if not low:
+        return set()
+    domains: set[str] = set()
+    if _is_weather_clause(low):
+        domains.add("weather")
+    if _is_schedule_or_sports_clause(low) or re.search(
+        r"\b(fifa|world cup|nhl|nba|nfl|mlb|soccer|football|premier league|"
+        r"match(?:es)?|score(?:s)?|standings|playoff)\b",
+        low,
+    ):
+        domains.add("sports")
+    if re.search(
+        r"\b(stock|share price|nasdaq|s&p|dow jones|bitcoin|btc|ethereum|eth|crypto|ticker)\b",
+        low,
+    ):
+        domains.add("finance")
+    if re.search(
+        r"\b(movie|film|trailer|netflix|show|series|album|gta|rockstar|box office)\b",
+        low,
+    ) or _has_trailer_intent(low) or _has_character_cast_intent(low):
+        domains.add("entertainment")
+    if re.search(r"\b(news|headline|breaking|headlines)\b", low) and "weather" not in domains:
+        domains.add("news")
+    if re.search(
+        r"\b(capital of|who is the|ceo of|founded|invented|tallest|longest|population of)\b",
+        low,
+    ):
+        domains.add("fact")
+    if re.search(r"\b(odds|betting|moneyline|spread)\b", low):
+        domains.add("odds")
+    return domains
+
+
+def _relative_day_labels(text: str) -> tuple[str, str]:
+    """Return (day_word, calendar_label) e.g. ('tomorrow', 'Thursday July 9 2026')."""
+    low = (text or "").lower()
+    now = datetime.now()
+    if re.search(r"\btomorrow\b", low):
+        d = now + timedelta(days=1)
+        return "tomorrow", d.strftime("%A %B %d %Y")
+    if re.search(r"\btonight\b", low):
+        return "tonight", now.strftime("%A %B %d %Y")
+    if re.search(r"\btoday\b", low):
+        return "today", now.strftime("%A %B %d %Y")
+    return "", ""
+
+
+def _explicit_calendar_date_label(text: str) -> str:
+    """Pull 'July 9 2026' / 'July 9th' style dates into a compact calendar pin."""
+    low = (text or "").lower()
+    m = re.search(
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)"
+        r"\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(\d{4}))?\b",
+        low,
+    )
+    if not m:
+        return ""
+    month, day_n = m.group(1).title(), m.group(2)
+    year = m.group(3) or str(datetime.now().year)
+    return f"{month} {int(day_n)} {year}"
+
+
 def _normalize_sports_query(text: str) -> str:
-    q = _normalize_text(text)
+    q = _normalize_text(apply_spelling_fixes(text or ""))
     low = q.lower()
+    day, cal = _relative_day_labels(low)
+    explicit = _explicit_calendar_date_label(low)
+    # FIFA / World Cup fixtures (general league normalize — not multi-intent recipe)
+    if re.search(r"\b(fifa|world cup)\b", low):
+        # Keep named sides when present (morocco, portugal, …)
+        named = re.findall(
+            r"\b(morocco|portugal|spain|brazil|argentina|france|germany|england|"
+            r"canada|mexico|usa|japan|korea|croatia|netherlands|italy|belgium|"
+            r"uruguay|colombia|senegal|australia)\b",
+            low,
+        )
+        side = " ".join(dict.fromkeys(named))  # stable unique
+        # Ask for teams + kickoff so DDG/snippets surface concrete matchups, not tournament fluff
+        base = "FIFA World Cup matchups teams kickoff schedule fixtures"
+        if side:
+            base = f"FIFA World Cup {side} matchups teams kickoff schedule fixtures"
+        # Pin calendar date so Tavily doesn't return a random tournament month
+        if day and cal:
+            return f"{base} {day} {cal}"
+        if day:
+            return f"{base} {day}"
+        if explicit:
+            return f"{base} {explicit}"
+        return base
     # Edmonton Oilers / Oilers
     if re.search(r"\boilers?\b", low):
         if re.search(r"\b(next|upcoming|when)\b", low) or "schedule" in low or "game" in low:
@@ -347,6 +470,20 @@ def _normalize_sports_query(text: str) -> str:
         team = _normalize_text(team)
         if team:
             return f"{team} next game schedule"
+    # Generic "matches/games happening" + relative day or explicit calendar date
+    if re.search(r"\b(matches|games|fixtures|playing|matchup)\b", low) and (day or explicit):
+        cleaned = re.sub(
+            r"(?i)\b(what|which|are|is|happening|for|the|a|an|also|just|wondering|sorry|not|"
+            r"then|being|played|explain|me|who|when|next)\b",
+            " ",
+            q,
+        )
+        cleaned = _normalize_text(cleaned) or q
+        pin = f"{day} {cal}".strip() if day and cal else (day or explicit)
+        # Prefer league/context words if present; else compact "games schedule DATE"
+        if re.search(r"\b(fifa|world cup|nhl|nba|nfl|mlb|soccer|football)\b", cleaned.lower()):
+            return f"{cleaned} schedule fixtures {pin}".strip()
+        return f"sports games matches schedule fixtures {pin}".strip()
     return q
 
 
@@ -380,19 +517,28 @@ def _strip_weather_chat_filler(text: str) -> str:
 def _normalize_weather_query(text: str, *, city_hint: str = "") -> str:
     """Build a compact weather search string. Must not call normalize_web_search_query*."""
     city = (city_hint or "").strip() or _infer_city_from_text(text)
-    day = "tomorrow" if re.search(r"(?i)\btomorrow\b", text or "") else "today"
+    day, cal = _relative_day_labels(text or "")
+    if not day:
+        day = "today"
+        cal = datetime.now().strftime("%A %B %d %Y")
+    day_part = f"{day} {cal}".strip() if cal else day
     if city:
-        return f"{city} weather {day} high low temperature forecast"
+        return f"{city} weather {day_part} high low temperature forecast"
     # No city: strip chat filler only (never re-enter normalize_web_search_query_single —
     # that path used to recurse: weather → single → weather → …).
     cleaned = _strip_weather_chat_filler(text)
     cleaned = re.sub(r"(?i)\b(weather|forecast|temperature|temp)\b", " ", cleaned)
-    cleaned = re.sub(r"(?i)\b(the|a|an|for|me|my|you|your)\b", " ", cleaned)
+    cleaned = re.sub(r"(?i)\b(the|a|an|for|me|my|you|your|tomorrow|today|tonight)\b", " ", cleaned)
     cleaned = _normalize_text(cleaned)
-    # Only keep cleaned if it looks like a place name (short, no leftover chatter)
-    if cleaned and 2 <= len(cleaned) <= 40 and len(cleaned.split()) <= 4:
-        return f"{cleaned} weather {day} high low temperature forecast"
-    return f"weather {day} high low temperature forecast"
+    # Only keep cleaned if it looks like a place name (short, no leftover chatter/day words)
+    if (
+        cleaned
+        and 2 <= len(cleaned) <= 40
+        and len(cleaned.split()) <= 4
+        and not re.search(r"(?i)\b(high|low|going|be|what|matches|fifa)\b", cleaned)
+    ):
+        return f"{cleaned} weather {day_part} high low temperature forecast"
+    return f"weather {day_part} high low temperature forecast"
 
 
 def _has_gta_context(text: str) -> bool:
@@ -408,7 +554,36 @@ def _has_character_cast_intent(text: str) -> bool:
     return bool(
         re.search(r"\b(characters?|cast|protagonists?|playable)\b", low)
         or re.search(r"\bnames of the (?:characters?|cast)\b", low)
-        or re.search(r"\bwho (?:is|are) (?:in|the)\b", low)
+        # "who is in the cast" / "who are the characters" — not "who is the president"
+        or re.search(r"\bwho (?:is|are) (?:in|the) (?:cast|characters?|game|movie|film)\b", low)
+        or re.search(r"\bwho (?:is|are) (?:playable|protagonists?)\b", low)
+    )
+
+
+def _has_gta_release_intent(text: str) -> bool:
+    low = (text or "").lower()
+    if not _has_gta_context(low):
+        return False
+    return bool(
+        re.search(
+            r"\b(release(?:s|d)?|come\s+out|coming\s+out|launch(?:es|ing)?|drop(?:s|ping)?|"
+            r"when\s+(?:does|is|will)|out\s+on)\b",
+            low,
+        )
+    )
+
+
+def _has_gta_price_intent(text: str) -> bool:
+    low = (text or "").lower()
+    if not _has_gta_context(low) and not re.search(r"\b(it|game|edition)\b", low):
+        # Bare cost only counts when GTA is already in the full message context
+        return False
+    return bool(
+        re.search(
+            r"\b(how much|cost(?:s|ing)?|price|pricing|msrp|pre-?order|edition(?:s)?|"
+            r"money it costs|dollars?)\b",
+            low,
+        )
     )
 
 
@@ -428,12 +603,21 @@ def _normalize_gta_characters_query(text: str = "") -> str:
     return "GTA 6 characters cast Lucia Jason Duval known details plot"
 
 
+def _normalize_gta_release_query(text: str = "") -> str:
+    return "GTA 6 release date launch platforms Rockstar official"
+
+
+def _normalize_gta_price_query(text: str = "") -> str:
+    return "GTA 6 price cost pre-order editions PS5 Xbox"
+
+
 def _prep_search_work_text(text: str) -> str:
     """Strip social fluff before intent detection / split."""
     raw = _normalize_text(text)
     if not raw:
         return ""
     raw = raw.replace("\u2019", "'").replace("\u2018", "'")
+    raw = apply_spelling_fixes(raw)
     work = _SOCIAL_OPEN_RE.sub(" ", raw)
     work = re.sub(
         r"(?i)\b(you look(?:ing)? great|looking good|love (?:the|your) (?:look|design|avatar)|really liking how you look)[^.?!]*[.?!]?",
@@ -445,7 +629,7 @@ def _prep_search_work_text(text: str) -> str:
 
 def _is_smalltalk_clause(text: str) -> bool:
     """True for pure social/filler clauses that must not become search queries."""
-    low = _normalize_text(text).lower()
+    low = _normalize_text(apply_spelling_fixes(text or "")).lower()
     if not low:
         return True
     if _is_weather_clause(low) or _is_schedule_or_sports_clause(low):
@@ -455,9 +639,21 @@ def _is_smalltalk_clause(text: str) -> bool:
         for t in (
             "score", "odds", "price", "stock", "news", "headline", "trailer",
             "release", "gta", "forecast", "temperature", "schedule", "fixture",
+            "games", "matches", "fifa", "python", "bitcoin",
         )
     ):
         return False
+    # Apology / self-correction prefixes: "sorry not tomorrow today" (real ask follows)
+    if re.search(
+        r"(?i)^\s*(?:sorry|my bad|oops|actually|i meant|never ?mind|nvm)\b",
+        low,
+    ) and len(low.split()) <= 8:
+        if not re.search(
+            r"(?i)\b(what|when|where|who|which|how much|how many|find|check|search|"
+            r"look up|games?|matches?|weather|price|score)\b",
+            low,
+        ):
+            return True
     if re.search(
         r"(?i)\b(not much|just chilling|chilling|hope you(?:'re| are) well|"
         r"look(?:ing)? good|you look|sounds good|lol|haha|thanks|thank you|"
@@ -479,11 +675,18 @@ def looks_like_multi_intent(text: str) -> bool:
 
     Must stay false for simple single-fact questions so they never pay
     decomposition latency (no extra LLM call, no extra Tavily fan-out).
+
+    Primary general signal: **two or more intent domains** (weather+sports,
+    finance+weather, fact+entertainment, …) — not a list of hand-written combos.
     """
     t = _prep_search_work_text(text)
     if not t:
         return False
     words = t.split()
+    # Domain diversity is the real multi-intent signal (works on novel combos).
+    domains = intent_domains(t)
+    if len(domains) >= 2:
+        return True
     # Single-fact short asks never multi
     if len(words) < 10:
         return False
@@ -496,9 +699,14 @@ def looks_like_multi_intent(text: str) -> bool:
         r"(?i)\b(?:and also|also|plus|as well as|and then)\b",
         low,
     ):
-        parts = re.split(r"(?i)\b(?:and also|also|plus|as well as)\b", t)
-        parts = [p.strip() for p in parts if len(p.split()) >= 3]
+        parts = re.split(r"(?i)\b(?:and also|also|plus|as well as|and then)\b", t)
+        parts = [
+            p.strip(" ,;.")
+            for p in parts
+            if p and len(p.split()) >= 2 and not _is_smalltalk_clause(p)
+        ]
         if len(parts) >= 2:
+            # Two fact-bearing sides → multi even if domains only resolved on full text
             return True
     # Two interrogative heads in one message
     inters = re.findall(
@@ -514,6 +722,13 @@ def looks_like_multi_intent(text: str) -> bool:
         if c and len(c.split()) >= 3 and not _is_smalltalk_clause(c)
     ]
     if len(clauses) >= 2:
+        # Distinct domains across clauses
+        clause_domains = [intent_domains(c) for c in clauses]
+        union: set[str] = set()
+        for d in clause_domains:
+            union |= d
+        if len(union) >= 2:
+            return True
         qish = sum(
             1
             for c in clauses
@@ -587,24 +802,310 @@ def _dedupe_queries(queries: list[str]) -> list[str]:
     return deduped
 
 
+def _is_orphan_price_query(q: str) -> bool:
+    """True for bare 'how much will it cost' with no product/entity noun."""
+    low = _normalize_text(q).lower()
+    if not low:
+        return False
+    if not re.search(r"(?i)\b(how much|cost(?:s|ing)?|price|pricing|msrp|pre-?order)\b", low):
+        return False
+    # Already entity-grounded
+    if re.search(
+        r"(?i)\b(gta|grand theft auto|bitcoin|btc|ethereum|stock|iphone|ps5|xbox|"
+        r"rockstar|game|fifa|python|nvidia|tesla|apple|microsoft)\b",
+        low,
+    ):
+        return False
+    # Short cost-only / "will it cost" clauses
+    if len(low.split()) <= 8:
+        return True
+    return bool(re.search(r"(?i)\b(how much will it cost|how much does it cost|what does it cost)\b", low))
+
+
+def _rebind_orphan_queries(work: str, queries: list[str]) -> list[str]:
+    """Attach bare cost/price sub-queries to GTA (or other) entity from full message."""
+    work_n = _normalize_text(work)
+    if not work_n or not queries:
+        return queries
+    out: list[str] = []
+    for q in queries:
+        if _is_orphan_price_query(q) and _has_gta_context(work_n):
+            out.append(_normalize_gta_price_query(work_n))
+        elif _is_orphan_price_query(q) and re.search(r"(?i)\b(bitcoin|btc)\b", work_n):
+            out.append("current bitcoin price USD")
+        else:
+            out.append(q)
+    return _dedupe_queries(out)
+
+
+def _normalize_clause_for_search(part: str, *, full_context: str = "") -> str:
+    """Normalize one fact clause with domain-aware compactors."""
+    p = _normalize_text(apply_spelling_fixes(part or ""))
+    if not p or _is_smalltalk_clause(p):
+        return ""
+    ctx = _normalize_text(full_context or p)
+    if _is_weather_clause(p) and not _is_schedule_or_sports_clause(p):
+        return _normalize_weather_query(p, city_hint=_infer_city_from_text(p) or _infer_city_from_text(ctx))
+    if _is_schedule_or_sports_clause(p) and not _is_weather_clause(p):
+        return _normalize_sports_query(p)
+    if _has_trailer_intent(p) and (_has_gta_context(p) or _has_gta_context(ctx) or _has_trailer_intent(p)):
+        if _has_character_cast_intent(p):
+            # Both in one clause — leave to recipe; single side only here
+            pass
+        return _normalize_gta_trailer_query(p, full_context=ctx)
+    if (_has_gta_context(p) or _has_gta_context(ctx)) and _has_character_cast_intent(p):
+        return _normalize_gta_characters_query(p)
+    if (_has_gta_context(p) or _has_gta_context(ctx)) and (
+        _has_gta_release_intent(p) or _has_gta_release_intent(f"{p} {ctx}" if _has_gta_context(ctx) else p)
+    ):
+        # "when does gta 6 come out" on this clause, or release intent only on full text
+        if _has_gta_context(p) and _has_gta_release_intent(p):
+            return _normalize_gta_release_query(p)
+        if _has_gta_context(p) and re.search(r"(?i)\b(how much|cost|price|money)\b", p):
+            return _normalize_gta_price_query(p)
+        if _has_gta_release_intent(p) and _has_gta_context(ctx):
+            return _normalize_gta_release_query(ctx)
+    # Bare "how much will it cost" after a GTA clause in the same message
+    if _is_orphan_price_query(p) and _has_gta_context(ctx):
+        return _normalize_gta_price_query(ctx)
+    if _has_gta_context(p) and re.search(r"(?i)\b(how much|cost|price|money)\b", p):
+        return _normalize_gta_price_query(p)
+    n = normalize_web_search_query_single(p) or p
+    return _normalize_text(n)
+
+
+def _clip_span_to_clause(span: str) -> str:
+    """Stop a domain span at multi-intent joiners so domains don't bleed into each other."""
+    s = str(span or "")
+    s = re.split(r"(?i)\b(?:and also|also|plus|as well as|and then)\b", s)[0]
+    return _normalize_text(s)
+
+
+def _force_domain_decompose(text: str) -> list[str]:
+    """
+    When the full message has 2+ domains but clause split only yielded one query,
+    carve domain-specific compact queries from the whole text.
+
+    This is still *general* (domain tags), not a weather+FIFA special case.
+    """
+    work = _prep_search_work_text(text)
+    domains = intent_domains(work)
+    if len(domains) < 2:
+        return []
+    out: list[str] = []
+    city_hint = _infer_city_from_text(work)
+
+    if "weather" in domains:
+        m = re.search(
+            r"(?i)(?:what(?:'s| is)?\s+)?(?:the\s+)?(?:temp(?:erature)?s?|weather|forecast|high|low)"
+            r".{0,80}?(?:tomorrow|today|tonight|this week)?(?:\s+in\s+[A-Za-z .'-]+)?",
+            work,
+        )
+        span = _clip_span_to_clause(m.group(0) if m else "")
+        if not span or not _is_weather_clause(span):
+            # Recover from "… weather in Denver" style after a joiner
+            m2 = re.search(
+                r"(?i)\b(?:temp(?:erature)?s?|weather|forecast)\b.{0,60}",
+                work,
+            )
+            span = _clip_span_to_clause(m2.group(0) if m2 else "weather")
+        # Strip non-weather domains from span
+        span = re.sub(
+            r"(?i)\b(bitcoin|btc|stock|nasdaq|fifa|world cup|score|movie|trailer|news)\b",
+            " ",
+            span,
+        )
+        wq = _normalize_weather_query(span, city_hint=city_hint or _infer_city_from_text(work))
+        if wq:
+            out.append(wq)
+
+    if "sports" in domains:
+        # Start near sports keywords — NEVER from message start (GTA clause used to
+        # swallow the whole string, then _clip_span_to_clause dropped FIFA).
+        kw = re.search(
+            r"(?i)\b(?:fifa|world\s*cup|nhl|nba|nfl|mlb|uefa|premier\s*league|"
+            r"matches?|games?|fixtures?|matchup|score|playing|oilers?|flames|canucks|lakers)\b",
+            work,
+        )
+        if kw:
+            # Expand left only to last multi-intent joiner / punctuation
+            left = work[: kw.start()]
+            cut = 0
+            for mjoin in re.finditer(
+                r"(?i)(?:[?!.]+\s*|\b(?:and also|as well as|and then|also|plus)\b\s*)",
+                left,
+            ):
+                cut = mjoin.end()
+            span = work[cut : min(len(work), kw.end() + 90)]
+        else:
+            span = work
+        span = _clip_span_to_clause(span)
+        # If clip still landed on a non-sports half, take from keyword only
+        if kw and not _is_schedule_or_sports_clause(span) and not re.search(
+            r"(?i)\b(fifa|world cup|match|game|score|nhl|nba|nfl|mlb)\b", span
+        ):
+            span = work[kw.start() : min(len(work), kw.end() + 90)]
+        span = re.sub(r"(?i)\b(temp(?:erature)?s?|weather|forecast|humidity|bitcoin|stock|gta)\b", " ", span)
+        # Orphan "who is playing" alone → keep parent sports context
+        if re.search(r"(?i)^\s*who\s+is\s+playing\s*$", span.strip()) and kw:
+            span = work[max(0, kw.start() - 40) : min(len(work), kw.end() + 90)]
+        sq = _normalize_sports_query(span)
+        if sq and not _is_weather_clause(sq) and not _has_gta_context(sq):
+            out.append(sq)
+        elif re.search(r"(?i)\b(fifa|world cup)\b", work):
+            out.append(_normalize_sports_query("fifa world cup matches " + (span or "")))
+
+    if "finance" in domains:
+        m = re.search(
+            r"(?i)(?:what(?:'s| is)?\s+)?(?:the\s+)?(?:\w+\s+)?(?:stock|share)\s*price|"
+            r"(?:bitcoin|btc|ethereum|eth|nasdaq|crypto)\s*(?:price)?|"
+            r"price of \w+",
+            work,
+        )
+        span = _clip_span_to_clause(m.group(0) if m else "")
+        if not span:
+            m2 = re.search(r"(?i)\b(?:bitcoin|btc|ethereum|stock|nasdaq|crypto)\b.{0,40}", work)
+            span = _clip_span_to_clause(m2.group(0) if m2 else "")
+        span = re.sub(r"(?i)\b(weather|forecast|temp(?:erature)?s?|fifa|match(?:es)?)\b", " ", span)
+        span = _normalize_text(span)
+        if span:
+            fq = normalize_web_search_query_single(span) or span
+            # Keep finance-y; don't let weather normalizer swallow it
+            if fq and not _is_weather_clause(fq):
+                out.append(fq)
+            elif span:
+                out.append(span)
+
+    if "entertainment" in domains:
+        if _has_gta_context(work) or _has_trailer_intent(work):
+            if _has_trailer_intent(work):
+                out.append(_normalize_gta_trailer_query(work, full_context=work))
+            if _has_character_cast_intent(work):
+                out.append(_normalize_gta_characters_query(work))
+            # Release / launch (not trailer-only)
+            if _has_gta_release_intent(work) and not _has_trailer_intent(work):
+                out.append(_normalize_gta_release_query(work))
+            # Price / cost / editions — separate search so release evidence isn't the only hit
+            if _has_gta_price_intent(work) or (
+                _has_gta_context(work)
+                and re.search(r"(?i)\b(how much|cost|price|money it costs|pre-?order)\b", work)
+            ):
+                out.append(_normalize_gta_price_query(work))
+            # Bare GTA with no specific intent → release as default fact ask
+            if (
+                _has_gta_context(work)
+                and not _has_trailer_intent(work)
+                and not _has_character_cast_intent(work)
+                and not _has_gta_release_intent(work)
+                and not re.search(r"(?i)\b(how much|cost|price)\b", work)
+            ):
+                out.append(_normalize_gta_release_query(work))
+        else:
+            m = re.search(
+                r"(?i)(?:when|what).{0,40}\b(?:movie|film|trailer|release|netflix|show|dune)\b.{0,40}",
+                work,
+            )
+            if m:
+                span = _clip_span_to_clause(m.group(0))
+                out.append(normalize_web_search_query_single(span) or span)
+
+    if "news" in domains:
+        m = re.search(r"(?i)(?:local\s+)?news.{0,40}|headlines.{0,40}", work)
+        if m:
+            span = _clip_span_to_clause(m.group(0))
+            span = re.sub(r"(?i)\b(weather|stock|bitcoin|fifa)\b", " ", span)
+            nq = normalize_web_search_query_single(span) or span
+            if nq:
+                out.append(nq)
+
+    if "fact" in domains:
+        m = re.search(
+            r"(?i)(?:what(?:'s| is)|who is|tallest|capital of|ceo of).{0,60}",
+            work,
+        )
+        if m:
+            span = _clip_span_to_clause(m.group(0))
+            span = re.sub(r"(?i)\b(weather|stock|score|match(?:es)?)\b", " ", span)
+            fq = normalize_web_search_query_single(span) or span
+            if fq and not _is_weather_clause(fq) and not _is_schedule_or_sports_clause(fq):
+                out.append(fq)
+
+    if "odds" in domains and "sports" not in domains:
+        m = re.search(r"(?i)(?:odds|betting|moneyline).{0,40}", work)
+        if m:
+            out.append(normalize_web_search_query_single(_clip_span_to_clause(m.group(0))) or m.group(0))
+
+    return _dedupe_queries(out)[:5]
+
+
 def _heuristic_decompose(text: str) -> list[str]:
-    """No-LLM fallback: split on and/also/? into compact sub-queries."""
+    """No-LLM fallback: split on and/also/plus/? into compact sub-queries."""
     work = _prep_search_work_text(text)
     if not work:
         return []
     parts = [
         c.strip(" ,;:")
-        for c in re.split(r"[?!.]+|\band also\b|\balso\b|\band\b", work, flags=re.IGNORECASE)
-        if c and len(c.split()) >= 3 and not _is_smalltalk_clause(c)
+        for c in re.split(
+            r"[?!.]+|\band also\b|\bas well as\b|\band then\b|\balso\b|\bplus\b|\band\b",
+            work,
+            flags=re.IGNORECASE,
+        )
+        if c and len(c.split()) >= 2 and not _is_smalltalk_clause(c)
     ]
+    # Merge orphaned "who is playing" onto prior sports clause
+    merged_parts: list[str] = []
+    for p in parts:
+        if (
+            merged_parts
+            and re.search(r"(?i)^\s*who\s+(?:is|are)\s+playing\b", p)
+            and _is_schedule_or_sports_clause(merged_parts[-1])
+        ):
+            merged_parts[-1] = f"{merged_parts[-1]} {p}".strip()
+            continue
+        merged_parts.append(p)
+    parts = merged_parts
     out: list[str] = []
     for p in parts:
-        # Prefer specialized single normalize per clause
-        n = normalize_web_search_query_single(p) or p
-        n = _normalize_text(n)
+        # Prefer specialized single normalize per clause (full work rebinds bare "how much")
+        n = _normalize_clause_for_search(p, full_context=work)
         if n and len(n) >= 4 and not _is_smalltalk_clause(n):
             out.append(n)
-    return _dedupe_queries(out)[:5]
+    out = _rebind_orphan_queries(work, _dedupe_queries(out))
+    # Prefer force domain when multi domains and heuristic stayed chatty / incomplete
+    forced = _force_domain_decompose(work) if len(intent_domains(work)) >= 2 else []
+    if len(out) < 2 and forced:
+        if len(forced) >= 2:
+            return forced
+        out = _dedupe_queries(out + forced)
+    elif forced and len(forced) >= 2:
+        # Heuristic chatty residue: "i need you to search…", "explain to me…"
+        chatty = sum(
+            1
+            for q in out
+            if re.search(
+                r"(?i)\b(i need|can you|please|explain to me|search when|how much money it)\b",
+                q,
+            )
+            or len(q.split()) > 12
+        )
+        # "how much will it cost" alone still matches cost — require entity-grounded price
+        has_grounded_price = any(
+            re.search(r"(?i)\b(gta|price cost|pre-?order|bitcoin|msrp)\b", q)
+            and re.search(r"(?i)\b(price|cost|pre-?order|msrp)\b", q)
+            for q in out
+        ) or any(
+            re.search(r"(?i)\b(gta|grand theft auto).{0,40}\b(price|cost)\b", q)
+            or re.search(r"(?i)\b(price|cost).{0,40}\b(gta|grand theft auto)\b", q)
+            for q in out
+        )
+        missing_price = bool(re.search(r"(?i)\b(how much|cost|price)\b", work)) and not has_grounded_price
+        orphan_price = any(_is_orphan_price_query(q) for q in out)
+        missing_fifa = re.search(r"(?i)\b(fifa|world cup)\b", work) and not any(
+            re.search(r"(?i)\b(fifa|world cup)\b", q) for q in out
+        )
+        if chatty or missing_price or orphan_price or missing_fifa or len(forced) > len(out):
+            return forced[:5]
+    return out[:5]
 
 
 def decompose_search_intents(text: str, llm_invoke=None) -> list[str]:
@@ -655,6 +1156,43 @@ def decompose_search_intents(text: str, llm_invoke=None) -> list[str]:
     return _heuristic_decompose(work)
 
 
+def enrich_sports_query_with_subject(query: str, subject: str) -> str:
+    """Pin league/team from prior subject onto bare schedule follow-ups.
+
+    Live: \"july 9th what games?\" after a FIFA turn should not search generic \"sports games\".
+    """
+    q = _normalize_text(query)
+    sub = _normalize_text(subject)
+    if not q or not sub:
+        return q
+    # Already league-specific
+    if re.search(r"(?i)\b(fifa|world\s*cup|nhl|nba|nfl|mlb|uefa|premier\s*league|oilers|flames)\b", q):
+        return q
+    # Only enrich schedule / slate style asks
+    if not (
+        _is_schedule_or_sports_clause(q)
+        or re.search(r"(?i)\b(games?|matches?|fixtures?|playing|schedule)\b", q)
+    ):
+        return q
+    # Don't rewrite non-sports subjects
+    if not (
+        _is_schedule_or_sports_clause(sub)
+        or re.search(r"(?i)\b(fifa|world\s*cup|nhl|nba|nfl|mlb|match|score|oilers)\b", sub)
+    ):
+        return q
+    if re.search(r"(?i)\b(fifa|world\s*cup)\b", sub):
+        return _normalize_sports_query(f"FIFA World Cup {q}")
+    if re.search(r"(?i)\b(nhl|oilers|flames|canucks)\b", sub):
+        return _normalize_sports_query(f"NHL {q}")
+    if re.search(r"(?i)\bnba\b", sub):
+        return _normalize_sports_query(f"NBA {q}")
+    if re.search(r"(?i)\bnfl\b", sub):
+        return _normalize_sports_query(f"NFL {q}")
+    if re.search(r"(?i)\bmlb\b", sub):
+        return _normalize_sports_query(f"MLB {q}")
+    return q
+
+
 def resolve_web_search_queries(
     user_text: str,
     model_query: str = "",
@@ -668,21 +1206,39 @@ def resolve_web_search_queries(
     Order:
       1) Recipe multi-split (free, instant) when it returns 2+ queries
       2) If multi-intent suspected and no recipe: general decomposition
+         (domain diversity + also/and splits + optional LLM)
       3) Single compact query from user text
       4) Never silently replace a real multi-split with the model's single tool arg
+
+    Critical: model tool args are often single-intent. User text is authoritative
+    for multi detection — never collapse multi user text to the model arg alone.
     """
     user = _normalize_text(user_text)
     model_q = _normalize_text(model_query)
 
+    # Prefer user text for multi detection — model tool args are often single-intent.
+    multi_src = user or model_q
+    if user and (len(intent_domains(user)) >= 2 or looks_like_multi_intent(user)):
+        multi_src = user
+    elif model_q and len(intent_domains(model_q)) >= 2:
+        multi_src = model_q
+
     # 1) Fast recipes
-    recipes = recipe_multi_search_queries(user)
+    recipes = recipe_multi_search_queries(multi_src)
     if len(recipes) >= 2:
         multi = list(recipes)
     else:
         multi = []
         # 2) General decomposition fallback (only when multi-intent looks real)
-        if use_decomposition and looks_like_multi_intent(user):
-            decomp = decompose_search_intents(user, llm_invoke=llm_invoke)
+        multi_suspected = use_decomposition and (
+            looks_like_multi_intent(multi_src)
+            or len(intent_domains(multi_src)) >= 2
+        )
+        if multi_suspected:
+            decomp = decompose_search_intents(multi_src, llm_invoke=llm_invoke)
+            if len(decomp) < 2:
+                # Hard fail-safe: domain carve even if LLM returned one blob
+                decomp = _force_domain_decompose(multi_src) or decomp
             if len(decomp) >= 2:
                 multi = decomp
         # 3) Single-intent compact
@@ -692,21 +1248,42 @@ def resolve_web_search_queries(
                 one = model_q or user
             multi = [one] if one else []
 
-    # Optionally append distinct model tool arg if useful and not already covered
-    if model_q:
+    # Optionally append distinct model tool arg if useful and not already covered.
+    # Never add a same-domain duplicate (model often rephrases weather already in multi).
+    if model_q and len(multi) >= 2:
         keys = {m.lower() for m in multi}
         model_c = normalize_web_search_query_single(model_q) or model_q
+        model_dom = intent_domains(model_c)
+        covered_dom: set[str] = set()
+        for m in multi:
+            covered_dom |= intent_domains(m)
+        same_domain = bool(model_dom and model_dom.issubset(covered_dom))
         if (
             model_c
             and len(model_c) >= 8
             and len(model_c.split()) >= 2
             and model_c.lower() not in keys
             and len(model_c.split()) <= 14
+            and not same_domain
             and not re.match(r"(?i)^(i |can you|please|find out|what |when )", model_c)
-            # Only add as extra on multi; never replace multi with model alone
-            and len(multi) >= 2
         ):
             multi.append(model_c)
+
+    # Final guard: if user had 2+ domains but multi is still 1, force domain split
+    if use_decomposition and len(multi) < 2 and len(intent_domains(multi_src)) >= 2:
+        forced = _force_domain_decompose(multi_src)
+        if len(forced) >= 2:
+            multi = forced
+
+    # Rebind bare "how much will it cost" → GTA price when parent turn has GTA
+    multi = _rebind_orphan_queries(multi_src, multi)
+    # If GTA+price still missing grounded price query, inject it
+    if _has_gta_context(multi_src) and re.search(r"(?i)\b(how much|cost|price)\b", multi_src):
+        if not any(
+            re.search(r"(?i)\b(price|cost|pre-?order)\b", q) and re.search(r"(?i)\bgta\b", q)
+            for q in multi
+        ):
+            multi = _dedupe_queries(list(multi) + [_normalize_gta_price_query(multi_src)])
 
     return _dedupe_queries(multi)[:5]
 
@@ -814,12 +1391,43 @@ def normalize_web_search_query_single(query: str) -> str:
     q = re.sub(r"(?i)^(what(?:'s| is)|how(?:'s| is)|when(?:'s| is))\s+", "", q)
     q = _normalize_text(q)
 
+    # "release notes" is documentation — never rewrite into "release date"
+    if re.search(r"(?i)\brelease\s+notes\b", q):
+        q_notes = re.sub(
+            r"(?i)^(search(?:\s+for)?|look\s+up|find(?:\s+out)?|research|check|get)\s+",
+            "",
+            q,
+        )
+        q_notes = re.sub(r"(?i)\b(latest|new|official|current)\b", " ", q_notes)
+        q_notes = _normalize_text(q_notes)
+        # Prefer crisp doc query
+        if re.search(r"(?i)\bpython\b", q_notes):
+            return "Python latest release notes changelog official"
+        if q_notes:
+            return q_notes if "release notes" in q_notes.lower() else f"{q_notes} release notes"
+        return "release notes changelog official"
+
     # Known entity rewrite: GTA / Grand Theft Auto trailer N (and bare "trailer 3")
     if _has_trailer_intent(q) and (_has_gta_context(q) or _has_trailer_intent(q)):
         # Prefer GTA Trailer N when trailer number present (default franchise context)
         return _normalize_gta_trailer_query(q, full_context=q)
     if _has_gta_context(q) and _has_character_cast_intent(q):
         return _normalize_gta_characters_query(q)
+    # GTA release / price (single-intent compact — multi fans out elsewhere)
+    if _has_gta_context(q):
+        wants_price = bool(
+            re.search(r"(?i)\b(how much|cost|price|money it costs|pre-?order|editions?)\b", q)
+        )
+        wants_release = _has_gta_release_intent(q) or bool(
+            re.search(r"(?i)\b(when|release|launch|come out)\b", q)
+        )
+        if wants_price and not wants_release:
+            return _normalize_gta_price_query(q)
+        if wants_release:
+            # Prefer release for single-string path; multi-intent adds price separately
+            return _normalize_gta_release_query(q)
+        if wants_price:
+            return _normalize_gta_price_query(q)
     gta = re.search(
         r"(?i)\b(?:gta|grand theft auto)\s*(?:6|vi|six)?\b.*?\btrailer\s*(\d+)\b"
         r"|\btrailer\s*(\d+)\b.*?\b(?:gta|grand theft auto)\s*(?:6|vi|six)?\b",
@@ -851,22 +1459,29 @@ def normalize_web_search_query_single(query: str) -> str:
         return _normalize_weather_query(q, city_hint=_infer_city_from_text(q))
 
     # Generic: "when does X come out / release" → "X release date"
-    m = re.search(
-        r"(?i)(?:when\s+(?:does|is|will|do|did)\s+)?(.+?)\s+"
-        r"(?:come\s+out|coming\s+out|release(?:s|d)?|drop(?:s|ping)?|launch(?:es|ing)?)\b",
-        q,
-    )
-    if m:
-        subject = _normalize_text(m.group(1))
-        subject = re.sub(
-            r"(?i)^(when|that|the|a|an|new|latest|next)\s+",
-            "",
-            subject,
+    # Never treat "release notes" as a product launch date.
+    if not re.search(r"(?i)\brelease\s+notes\b", q):
+        m = re.search(
+            r"(?i)(?:when\s+(?:does|is|will|do|did)\s+)?(.+?)\s+"
+            r"(?:come\s+out|coming\s+out|release(?:s|d)?|drop(?:s|ping)?|launch(?:es|ing)?)\b",
+            q,
         )
-        subject = re.sub(r"(?i)\b(that|the|a|an|new|latest)\b", " ", subject)
-        subject = _normalize_text(subject)
-        if 2 <= len(subject) <= 80:
-            return f"{subject} release date"
+        if m:
+            subject = _normalize_text(m.group(1))
+            subject = re.sub(
+                r"(?i)^(when|that|the|a|an|new|latest|next|search for|look up)\s+",
+                "",
+                subject,
+            )
+            subject = re.sub(r"(?i)\b(that|the|a|an|new|latest|search|for)\b", " ", subject)
+            subject = _normalize_text(subject)
+            # Reject chatty leftovers ("i need you to search when gta 6 is")
+            if (
+                2 <= len(subject) <= 80
+                and not re.search(r"(?i)\b(i need|can you|please|explain|search when)\b", subject)
+                and len(subject.split()) <= 8
+            ):
+                return f"{subject} release date"
 
     # Strip leftover conversational glue / trailing greetings
     q = re.sub(
@@ -1137,7 +1752,9 @@ class SearchGrounder:
 
         if intent.weather_need:
             # Prefer forecast-page queries that return °C/°F numbers, not homepage chrome.
-            day_hint = "tomorrow" if "tomorrow" in (intent.resolved_request or "").lower() else "today"
+            day_word, cal = _relative_day_labels(intent.resolved_request or intent.original_request or "")
+            day_hint = day_word or "today"
+            day_part = f"{day_hint} {cal}".strip() if cal else day_hint
             cleaned = re.sub(
                 r"\b(please|check|look up|what(?:'s| is)|how(?:'s| is)|"
                 r"how(?:'re| are) you(?: doing)?(?: today)?|"
@@ -1150,24 +1767,24 @@ class SearchGrounder:
             # Drop leftover small-talk crumbs
             cleaned = re.sub(r"\b(doing|good|great|fine)\b", " ", cleaned, flags=re.IGNORECASE)
             cleaned = self._clean_query(cleaned) or base
+            # Avoid "weather weather tomorrow" duplication if base already is a weather query
+            if re.search(r"(?i)\bweather\b", cleaned) and re.search(r"(?i)\b(high|low|forecast|temperature)\b", cleaned):
+                primary = cleaned
+            else:
+                primary = f"{cleaned} weather {day_part} high low temperature forecast"
             candidates = [
+                SearchCandidate(primary, "weather forecast numbers", 0.96, ["weather", "forecast"]),
                 SearchCandidate(
-                    f"{cleaned} weather {day_hint} high low temperature forecast",
-                    "weather forecast numbers",
-                    0.96,
-                    ["weather", "forecast"],
+                    f"{cleaned} {day_part} high low temperature AccuWeather OR Environment Canada",
+                    "weather authority dated",
+                    0.93,
+                    ["weather", "source"],
                 ),
                 SearchCandidate(
                     f"{cleaned} current weather temperature humidity wind",
                     "weather current conditions",
-                    0.92,
+                    0.9,
                     ["weather", "current"],
-                ),
-                SearchCandidate(
-                    f"{cleaned} weather Environment Canada OR AccuWeather forecast",
-                    "weather authority sources",
-                    0.88,
-                    ["weather", "source"],
                 ),
                 *candidates,
             ]
@@ -1183,33 +1800,33 @@ class SearchGrounder:
             today = datetime.now().strftime("%Y-%m-%d")
             tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
             year = datetime.now().strftime("%Y")
-            day_word = "tomorrow" if re.search(r"(?i)\btomorrow\b", intent.resolved_request or "") else (
-                "tonight" if re.search(r"(?i)\btonight\b", intent.resolved_request or "") else "today"
-            )
+            day_word, cal = _relative_day_labels(intent.resolved_request or intent.original_request or "")
+            if not day_word:
+                day_word = "today"
+                cal = datetime.now().strftime("%A %B %d %Y")
             day_iso = tomorrow if day_word == "tomorrow" else today
             # Prefer authority schedule pages over vague "this year" recaps.
-            # Cover today/tonight/tomorrow — not just "today".
+            # Pin calendar label so "tomorrow" isn't a whole tournament month.
             candidates = [
                 SearchCandidate(f"{base}", "schedule base", 0.94, ["schedule"]),
                 SearchCandidate(
-                    f"{base} {day_word} schedule fixtures kickoff",
-                    f"schedule {day_word}",
+                    f"{base} {day_word} {cal} kickoff",
+                    f"schedule {day_word} calendar",
+                    0.95,
+                    ["schedule", day_word, "date"],
+                ),
+                SearchCandidate(
+                    f"{base} {day_iso}",
+                    "schedule iso date",
                     0.93,
-                    ["schedule", day_word],
+                    ["schedule", "date"],
                 ),
                 SearchCandidate(
-                    f"{base} next game date time",
-                    "schedule next game",
-                    0.91,
-                    ["schedule", "next"],
-                ),
-                SearchCandidate(
-                    f"{base} {year} ESPN OR FIFA OR NHL.com schedule",
+                    f"{base} fixtures {day_word} ESPN OR FIFA.com",
                     "schedule authority",
                     0.9,
                     ["schedule", "source"],
                 ),
-                SearchCandidate(f"{base} {day_iso}", "schedule dated", 0.86, ["schedule", "date"]),
             ]
         elif intent.recency_need:
             year = datetime.now().strftime("%Y")

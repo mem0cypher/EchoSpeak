@@ -4785,23 +4785,22 @@ class EchoSpeakAgent:
             description = description.rstrip(".") + " Results are evidence-grounded before return."
 
         def _run(query: str = "", **kwargs: Any) -> str:
-            from agent.research import looks_like_multi_intent, recipe_multi_search_queries
+            from agent.research import looks_like_multi_intent, recipe_multi_search_queries, intent_domains
 
             q = str(query or kwargs.get("query") or kwargs.get("q") or "").strip()
-            # Prefer the full user turn for multi-intent split (Oilers + weather).
+            # Prefer the full user turn for multi-intent split (never trust model arg alone).
             orig = str(
                 getattr(agent, "_active_user_query", None)
                 or getattr(agent, "_last_user_input_for_plan", None)
                 or q
             ).strip()
-            # Emit per-intent tool rows when recipe or cheap multi-intent detector fires
-            # (full decompose runs inside _grounded_web_search).
-            emit_extra = len(recipe_multi_search_queries(orig or q)) >= 2 or looks_like_multi_intent(orig or q)
+            # Full user turn is authoritative for multi-intent; always emit tool rows
+            # so each sub-search is visible in chat (weather + FIFA both show up).
             return agent._grounded_web_search(
                 q,
                 original_request=orig or q,
                 callbacks=getattr(agent, "_current_callbacks", None),
-                emit_tool_events=emit_extra,
+                emit_tool_events=True,
             )
 
         try:
@@ -4862,12 +4861,111 @@ class EchoSpeakAgent:
             _infer_city_from_text,
             _is_weather_clause,
             _normalize_weather_query,
+            enrich_sports_query_with_subject,
         )
 
         raw_q = str(query or "").strip()
         if not raw_q:
             return ""
-        orig = str(original_request or raw_q).strip() or raw_q
+
+        # --- Live sports structured path (default for scores/odds; not crawl search) ---
+        # Category mismatch: Tavily/etc. return crawled pages; live scores need APIs.
+        try:
+            from agent.sports_data import (
+                get_sports_data_client,
+                is_live_sports_data_intent,
+                live_sports_mode,
+            )
+            from config import config as _cfg
+
+            sports_src = str(
+                getattr(self, "_active_user_query", None)
+                or original_request
+                or raw_q
+                or ""
+            ).strip()
+            prefer_live = bool(getattr(_cfg, "sports_live_enabled", True)) and (
+                is_live_sports_data_intent(sports_src) or is_live_sports_data_intent(raw_q)
+            )
+            # Multi-intent: only use sports_live for sports-shaped sub-queries, not whole weather+score
+            domains_live = False
+            try:
+                from agent.research import intent_domains as _idom
+
+                d = _idom(sports_src)
+                domains_live = ("odds" in d) or (
+                    "sports" in d and is_live_sports_data_intent(sports_src)
+                )
+            except Exception:
+                domains_live = prefer_live
+            if prefer_live and domains_live:
+                # If multi-intent includes weather etc., only short-circuit pure live sports turns
+                multi_other = False
+                try:
+                    from agent.research import intent_domains as _idom2, looks_like_multi_intent
+
+                    doms = _idom2(sports_src)
+                    multi_other = looks_like_multi_intent(sports_src) and (
+                        "weather" in doms or "finance" in doms or "entertainment" in doms or "news" in doms
+                    )
+                except Exception:
+                    multi_other = False
+                if not multi_other:
+                    client = get_sports_data_client()
+                    live = client.query(sports_src or raw_q)
+                    if live.ok:
+                        ground_run_id = str(uuid.uuid4()) if emit_tool_events else ""
+                        if emit_tool_events:
+                            self._emit_tool_start(
+                                callbacks, "sports_live", sports_src or raw_q, ground_run_id
+                            )
+                        packet = live.as_tool_text()
+                        if emit_tool_events:
+                            self._emit_tool_end(callbacks, packet, ground_run_id)
+                        try:
+                            self._last_grounded_search_result = {
+                                "chosen_query": sports_src or raw_q,
+                                "accepted": True,
+                                "provider": "sports_live",
+                                "mode": live.mode,
+                                "condensed_evidence": live.summary,
+                            }
+                        except Exception:
+                            pass
+                        logger.info(
+                            "Sports live path ok mode={} sport={}",
+                            live.mode,
+                            live.sport_key,
+                        )
+                        return packet
+                    else:
+                        logger.info(
+                            "Sports live path miss ({}), falling back to web_search",
+                            live.error[:120] if live.error else "unknown",
+                        )
+        except Exception as _sports_exc:
+            logger.debug("Sports live path skipped: {}", _sports_exc)
+
+        # Prefer the richest multi-intent source: active user turn > original_request > tool arg.
+        # Stage 3 used to pass _extract_search_query() (single primary) as original_request,
+        # which wiped FIFA+weather down to one query — never do that again.
+        active = str(getattr(self, "_active_user_query", None) or "").strip()
+        orig_in = str(original_request or "").strip()
+        candidates_src = [active, orig_in, raw_q]
+        orig = raw_q
+        try:
+            from agent.research import intent_domains as _intent_domains
+
+            best_score = -1
+            for src in candidates_src:
+                if not src:
+                    continue
+                score = len(_intent_domains(src)) * 10 + (1 if looks_like_multi_intent(src) else 0) + min(len(src), 200) / 200.0
+                if score > best_score:
+                    best_score = score
+                    orig = src
+        except Exception:
+            orig = active or orig_in or raw_q
         # Recipe fast path + general multi-intent decomposition fallback.
         # Never silent-overwrite multi with the model's single tool arg.
         llm_invoke = None
@@ -4889,13 +4987,8 @@ class EchoSpeakAgent:
             multi = resolve_web_search_queries(raw_q, raw_q, llm_invoke=None, use_decomposition=False)
         if not multi:
             multi = [raw_q]
-        # Bare "check the weather" with no city: prefer last subject / web context location.
-        subject = str(
-            getattr(self, "_current_subject_text", "")
-            or getattr(self, "_last_web_query_context", "")
-            or ""
-        )
-        subject_city = _infer_city_from_text(subject) if subject else ""
+        # Bare "check the weather" with no city: prefer last subject / web context / profile location.
+        subject_city = self._resolve_weather_city_hint(orig)
         if subject_city:
             fixed: list[str] = []
             for q in multi:
@@ -4904,6 +4997,23 @@ class EchoSpeakAgent:
                 else:
                     fixed.append(q)
             multi = fixed
+        # Schedule follow-ups ("july 9th what games?") inherit league from prior subject
+        subject_ctx = str(
+            getattr(self, "_current_subject_text", "")
+            or getattr(self, "_last_web_query_context", "")
+            or ""
+        ).strip()
+        if subject_ctx:
+            multi = [enrich_sports_query_with_subject(q, subject_ctx) for q in multi]
+        try:
+            logger.info(
+                "Search multi-intent resolved n={} queries={} orig={!r}",
+                len(multi),
+                multi,
+                (orig or "")[:120],
+            )
+        except Exception:
+            pass
 
         if not bool(getattr(config, "search_grounding_enabled", True)):
             chunks = []
@@ -4977,8 +5087,9 @@ class EchoSpeakAgent:
                 self._emit_tool_end(callbacks, part, ground_run_id)
             try:
                 status = "accepted" if grounded.accepted else "insufficient"
+                # loguru uses {} formatting, not %-style
                 logger.info(
-                    "Search grounding %s query=%r evidence=%d",
+                    "Search grounding {} query={!r} evidence={}",
                     status,
                     grounded.chosen_query,
                     len(grounded.evidence or []),
@@ -5021,19 +5132,35 @@ class EchoSpeakAgent:
 
         return "\n\n".join(formatted_parts)
 
-    def _invoke_web_research_query(self, query_text: str, callbacks: Optional[list], time_context: str = "", apply_reflection: bool = True) -> tuple[str, str, str]:
+    def _invoke_web_research_query(
+        self,
+        query_text: str,
+        callbacks: Optional[list],
+        time_context: str = "",
+        apply_reflection: bool = True,
+        *,
+        original_request: str = "",
+    ) -> tuple[str, str, str]:
         tool = self._preferred_web_research_tool()
         if tool is None:
             return "", "", time_context
 
-        ensured_time_context = self._ensure_time_context_for_query(query_text, callbacks, time_context)
-        final_query = self._build_time_aware_web_query(query_text, ensured_time_context)
+        # Prefer the full user turn for multi-intent — never collapse before grounder.
+        orig = str(
+            original_request
+            or getattr(self, "_active_user_query", None)
+            or query_text
+            or ""
+        ).strip()
+        ensured_time_context = self._ensure_time_context_for_query(query_text or orig, callbacks, time_context)
+        final_query = self._build_time_aware_web_query(query_text or orig, ensured_time_context)
 
         if getattr(tool, "name", "") == "web_search":
             # Stage 3 + any shortcut path: always use the shared grounder.
+            # original_request must stay the FULL user message for multi-intent fan-out.
             tool_output = self._grounded_web_search(
                 final_query,
-                original_request=query_text,
+                original_request=orig or query_text,
                 callbacks=callbacks,
                 emit_tool_events=True,
             )
@@ -5041,6 +5168,12 @@ class EchoSpeakAgent:
             last = getattr(self, "_last_grounded_search_result", None) or {}
             if isinstance(last, dict) and last.get("chosen_query"):
                 chosen = str(last.get("chosen_query") or final_query)
+            if isinstance(last, dict) and last.get("multi_queries"):
+                # Surface multi for logging / UI context
+                try:
+                    chosen = " | ".join(str(x) for x in (last.get("multi_queries") or [])[:4]) or chosen
+                except Exception:
+                    pass
             return str(tool_output or ""), chosen, ensured_time_context
 
         run_id = str(uuid.uuid4())
@@ -5674,6 +5807,13 @@ class EchoSpeakAgent:
         wants_calc = bool(has_calc_keyword or has_math_operator)
 
         wants_search = any(x in low for x in ["search", "look up", "find out", "news", "headlines", "current events"]) or self._is_live_web_intent(low)
+        wants_sports_live = False
+        try:
+            from agent.sports_data import is_live_sports_data_intent
+
+            wants_sports_live = is_live_sports_data_intent(low)
+        except Exception:
+            wants_sports_live = False
         # Location follow-ups after a weather/live subject must keep web_search available.
         subject = str(getattr(self, "_current_subject_text", "") or getattr(self, "_last_web_query_context", "") or "").lower()
         if self._is_location_swap_followup(text) and (
@@ -5685,10 +5825,17 @@ class EchoSpeakAgent:
             wants_search = True
 
         if wants_calc and wants_search:
-            return frozenset({"calculate", "web_search"})
+            tools = {"calculate", "web_search"}
+            if wants_sports_live:
+                tools.add("sports_live")
+            return frozenset(tools)
 
         if wants_calc:
             return frozenset({"calculate"})
+
+        # Live scores/odds: prefer sports_live; keep web_search as fallback
+        if wants_sports_live:
+            return frozenset({"sports_live", "web_search"})
 
         if any(x in low for x in ["list files", "list folder", "show files", "show folder", "list directory", "browse files"]):
             return frozenset({"file_list"})
@@ -9867,11 +10014,21 @@ class EchoSpeakAgent:
         low = (extracted_input or "").lower().strip()
         is_explicit = self._is_explicit_web_query(low) or is_deeper
 
+        # Multi-intent: weather+FIFA, stock+weather, etc. — never collapse before grounder.
+        full_user = str(user_input or schedule_extracted or extracted_input or "").strip()
+        is_multi = False
+        try:
+            from agent.research import looks_like_multi_intent, intent_domains
+
+            is_multi = looks_like_multi_intent(full_user) or len(intent_domains(full_user)) >= 2
+        except Exception:
+            is_multi = False
+
         # When the model supports native tool calling (e.g. Gemma 4),
-        # normally defer to Stage 4 ReAct — EXCEPT deeper-search / schedule
-        # follow-ups where small models have lied about search being off.
+        # normally defer to Stage 4 ReAct — EXCEPT deeper-search / schedule /
+        # multi-intent where small models drop half the question.
         if self._allow_llm_tool_calling() and self.graph_agent is not None:
-            if not (is_deeper or is_schedule or (is_followup and is_explicit)):
+            if not (is_deeper or is_schedule or is_multi or (is_followup and is_explicit)):
                 self._add_pipeline_reasoning(
                     "⚙️ Stage 3: Shortcut Queries",
                     "Tool-calling model detected — deferring to ReAct agent in Stage 4.",
@@ -9879,29 +10036,46 @@ class EchoSpeakAgent:
                 return None
             self._add_pipeline_reasoning(
                 "⚙️ Stage 3: Shortcut Queries",
-                "Forcing grounded search path (deeper/schedule/follow-up) — do not trust model to self-report tools.",
+                "Forcing grounded search path (deeper/schedule/multi-intent) — full user turn preserved for fan-out.",
             )
 
-        if not (is_schedule or is_explicit or is_followup or is_deeper):
+        if not (is_schedule or is_explicit or is_followup or is_deeper or is_multi):
             return None  # Continue to Stage 4
 
-        # Build search query from the best source
-        search_input = schedule_extracted if is_schedule else (expanded if is_followup else extracted_input)
-        if is_deeper and not is_schedule:
-            search_input = extracted_input or expanded
-        qtext = self._extract_search_query(search_input)
+        # Build search input. CRITICAL: for multi-intent never run through
+        # _extract_search_query — that collapses to a single primary query
+        # (e.g. FIFA only) and weather is never searched.
+        if is_multi:
+            search_input = full_user
+            qtext = full_user
+        else:
+            search_input = schedule_extracted if is_schedule else (expanded if is_followup else extracted_input)
+            if is_deeper and not is_schedule:
+                search_input = extracted_input or expanded
+            qtext = self._extract_search_query(search_input)
+
         tool_output, used_query, time_context = self._invoke_web_research_query(
-            qtext, callbacks, time_context=time_context, apply_reflection=True,
+            qtext,
+            callbacks,
+            time_context=time_context,
+            apply_reflection=True,
+            original_request=full_user,
         )
 
         if not used_query:
             return None  # Search failed or empty, let Stage 4 handle it
 
         self._remember_web_query_context(used_query)
-        display_question = schedule_extracted if is_schedule else extracted_input
+        display_question = full_user if is_multi else (schedule_extracted if is_schedule else extracted_input)
+        # Multi-part answers need multi instructions, not schedule-only prompting
         response_text = self._summarize_web_results(
-            user_input, display_question, tool_output, used_query,
-            time_context, is_schedule, callbacks,
+            user_input,
+            display_question,
+            tool_output,
+            used_query,
+            time_context,
+            is_schedule=bool(is_schedule and not is_multi),
+            callbacks=callbacks,
         )
 
         self._pending_detail = None
@@ -9942,8 +10116,91 @@ class EchoSpeakAgent:
                 "i have access to hourly",
                 "pretty typical",
                 "looked it up",
+                "forecasts vary",
+                "vary depending on the location",
+                "varies depending on",
+                "specific forecasts vary",
+                "depending on the location",
             )
         )
+
+    def _resolve_weather_city_hint(self, text: str = "") -> str:
+        """Best-effort home/city for bare weather asks (subject, profile, config)."""
+        from agent.research import _infer_city_from_text
+
+        blobs: list[str] = [
+            str(text or ""),
+            str(getattr(self, "_current_subject_text", "") or ""),
+            str(getattr(self, "_last_web_query_context", "") or ""),
+            str(getattr(self, "_active_user_query", "") or ""),
+            str(getattr(config, "default_location", "") or ""),
+        ]
+        # Profile facts: location / city / home_city / hometown
+        try:
+            mem = getattr(self, "memory", None)
+            profile = getattr(mem, "_profile", None) if mem is not None else None
+            if isinstance(profile, dict):
+                for key in ("location", "city", "home_city", "hometown", "home_town"):
+                    val = profile.get(key)
+                    if val:
+                        blobs.append(str(val))
+                prefs = profile.get("preferences")
+                if isinstance(prefs, dict):
+                    for key in ("location", "city", "home_city"):
+                        if prefs.get(key):
+                            blobs.append(str(prefs.get(key)))
+        except Exception:
+            pass
+        # Recent tool evidence may name a city
+        try:
+            for tr in reversed(getattr(self, "_partial_tool_results", None) or []):
+                blobs.append(str(tr.get("output") or "")[:800])
+                if len(blobs) > 12:
+                    break
+        except Exception:
+            pass
+        for blob in blobs:
+            city = _infer_city_from_text(blob)
+            if city:
+                return city
+        # Bare profile strings that are just a city name
+        for blob in blobs:
+            s = re.sub(r"\s+", " ", str(blob or "").strip())
+            if s and 2 <= len(s) <= 40 and len(s.split()) <= 3:
+                if re.fullmatch(r"[A-Za-z][A-Za-z .'-]+", s):
+                    # Avoid non-places
+                    if s.lower() not in {"true", "false", "yes", "no", "owner", "user"}:
+                        return s.split(",")[0].strip()
+        return ""
+
+    def _answer_asks_city_despite_known_location(self, text: str, evidence: str = "") -> bool:
+        """True when the reply asks for a city even though evidence/context already has one."""
+        low = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        if not low:
+            return False
+        asks_city = bool(
+            re.search(
+                r"what city|which city|what location|which location|"
+                r"where (?:are you|do you)|location are you interested|"
+                r"city (?:are you|would you)|interested in for the weather",
+                low,
+            )
+        )
+        if not asks_city:
+            return False
+        from agent.research import _infer_city_from_text
+
+        hay = f"{evidence} {getattr(self, '_current_subject_text', '')} {getattr(self, '_last_web_query_context', '')}"
+        if _infer_city_from_text(hay) or _infer_city_from_text(evidence):
+            return True
+        # Evidence often names the place without our city list
+        if re.search(
+            r"\b(edmonton|calgary|vancouver|toronto|montreal|winnipeg|ottawa|seattle|"
+            r"denver|boston|chicago|dallas|alberta|bc|ontario)\b",
+            (evidence or "").lower(),
+        ):
+            return True
+        return False
 
     def _latest_web_search_evidence(self) -> str:
         """Pull the most recent web_search tool blob from this turn (grounded preferred)."""
@@ -10020,9 +10277,14 @@ class EchoSpeakAgent:
             "(sunny/cloudy/rain/snow), and wind/humidity if present.\n"
             "- Prefer °C for Canadian cities when the evidence uses Celsius.\n"
             "- Do NOT say 'check AccuWeather/Environment Canada' or 'pretty typical' when numbers exist below.\n"
+            "- Do NOT say 'forecasts vary by location' or mix highs from different cities/days without naming each.\n"
             "- Do NOT offer a menu of what you *could* look up — give the forecast now.\n"
-            "- If the evidence truly has no numbers, say the sources didn't include temps and give only what is there.\n"
-            "- Keep it to 2–4 short spoken sentences. No markdown.\n\n"
+            "- If evidence names a city, state that city and its high/low. "
+            "NEVER ask 'what city?' when a place is already in the evidence.\n"
+            "- If evidence has numbers but no city and the user didn't name one, give the best single "
+            "high/low and name the city shown in the source, or say you need a city — not both hedges.\n"
+            "- Do not contradict yourself.\n"
+            "- Keep weather to 1–2 short sentences inside a multi-topic answer. No markdown.\n\n"
         ) if is_weather else ""
 
         had_partial = bool(getattr(self, "_turn_partial_beats", None))
@@ -10034,6 +10296,39 @@ class EchoSpeakAgent:
             "- Jump straight into the factual result.\n\n"
         ) if had_partial else ""
 
+        # Count either ### Search headers or multiple GROUNDED_SEARCH markers
+        multi_parts = max(
+            str(tool_output or "").count("### Search:"),
+            str(tool_output or "").lower().count("[grounded_search]"),
+        )
+        multi_part_instruction = ""
+        if multi_parts >= 2 or (
+            re.search(r"(?i)\balso\b", q_low)
+            and any(d in q_low for d in ("weather", "temp", "fifa", "match", "score", "stock", "news"))
+        ):
+            # Pin "tomorrow" to a real calendar day for schedule honesty
+            try:
+                from datetime import datetime, timedelta
+
+                _tm = (datetime.now() + timedelta(days=1)).strftime("%A, %B %d, %Y")
+                _td = datetime.now().strftime("%A, %B %d, %Y")
+            except Exception:
+                _tm, _td = "tomorrow", "today"
+            multi_part_instruction = (
+                "MULTI-QUESTION RULES (mandatory):\n"
+                "- The user asked more than one thing. Answer EVERY distinct ask in order.\n"
+                "- Each '### Search:' / grounded block is a separate topic — cover each.\n"
+                "- NEVER say you have no information about a topic that has its own search block below.\n"
+                "- NEVER drop half the question. If one block is weak, say so for THAT part only "
+                "and still answer the other part with its evidence.\n"
+                f"- If the user said 'tomorrow', that means {_tm} (today is {_td}). "
+                "For match schedules, only list games on that date. If sources only show other dates "
+                "(e.g. June fixtures when tomorrow is July), say there are no matches found for "
+                f"{_tm} and optionally mention the nearest slate without calling it 'tomorrow'.\n"
+                "- For weather: give one clear high/low with the city name from evidence; "
+                "do not mix unrelated cities.\n\n"
+            )
+
         prompt = (
             "You are Echo Speak, a conversational assistant. "
             "Use the following web search results to answer the user's question. "
@@ -10042,7 +10337,9 @@ class EchoSpeakAgent:
             f"{schedule_instruction}"
             f"{weather_instruction}"
             f"{multibeat_instruction}"
-            "If the search results are incomplete, say what is still missing and ask a clarifying question.\n\n"
+            f"{multi_part_instruction}"
+            "If the search results are incomplete for a sub-question, say what is still missing for that part only — "
+            "do not abandon other parts that have evidence.\n\n"
             f"{time_note}User question: {display_question}\n\n"
             f"Search query used: {used_query}\n\n"
             f"Search results:\n{tool_output}\n\n"
@@ -10051,14 +10348,17 @@ class EchoSpeakAgent:
         response_text = self._clamp_web_summary(self._invoke_visible_llm(prompt))
 
         # Repair weak weather answers that hand-wave despite evidence in tool_output.
-        if is_weather and (
+        weather_needs_repair = is_weather and (
             self._answer_defers_to_external_weather(response_text)
             or not self._answer_has_weather_facts(response_text)
-        ):
+            or self._answer_asks_city_despite_known_location(response_text, str(tool_output or ""))
+        )
+        if weather_needs_repair:
             repair = (
                 "Rewrite this as Echo. Use ONLY the evidence. "
                 "State high/low or current temperature and conditions if present. "
-                "Never tell the user to visit another weather site. "
+                "If the evidence names a city, use that city — never ask which city. "
+                "Never contradict yourself. Never tell the user to visit another weather site. "
                 "Max 3 short sentences. No markdown.\n\n"
                 f"User question: {display_question}\n\n"
                 f"Evidence:\n{tool_output}\n\n"
@@ -10067,11 +10367,14 @@ class EchoSpeakAgent:
             )
             try:
                 repaired = self._clamp_web_summary(self._invoke_visible_llm(repair))
-                if repaired and (
-                    self._answer_has_weather_facts(repaired)
-                    or not self._answer_defers_to_external_weather(repaired)
+                if repaired and not self._answer_asks_city_despite_known_location(
+                    repaired, str(tool_output or "")
                 ):
-                    response_text = repaired
+                    if (
+                        self._answer_has_weather_facts(repaired)
+                        or not self._answer_defers_to_external_weather(repaired)
+                    ):
+                        response_text = repaired
             except Exception as exc:
                 logger.warning("Weather answer repair failed: %s", exc)
 

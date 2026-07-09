@@ -1,5 +1,115 @@
 # Changes
 
+## v7.6.4b - Orphan cost rebind + stale tool labels
+
+### Live retest (GTA come out + how much will it cost + FIFA today)
+- Python / Bitcoin / release notes: solid (official docs, BTC sources, tool rows)
+- Multi fan-out worked, but cost shipped as bare `how much will it cost` (no GTA noun)
+- Thinking strip sometimes showed prior-turn Python search on a later multi turn
+- FIFA query OK but answer still soft (DDG snippets) — query now asks matchups/teams/kickoff
+
+### Fixes
+- `_rebind_orphan_queries` / grounded price check: bare cost → `GTA 6 price cost pre-order…`
+- Clear `toolInfoRef` each stream; tag tool meta with `requestId` so done-labels don't inherit
+- FIFA sports normalize: `matchups teams kickoff` for denser snippets
+
+## v7.6.4 - Live transcript query quality (GTA+FIFA, release notes, July 9)
+
+### Live multi-prompt dump failures
+- GTA release + **price** + FIFA tomorrow was decomposing into chatty residue (`i need you to search…`, orphaned `who is playing`) and **dropped cost entirely**
+- Sports domain carve started at message start → `_clip_span_to_clause` kept GTA half and **lost FIFA**
+- `python release notes` rewrote to `python release date` (docs ≠ launch)
+- `tommrrow` never fixed → relative day pins failed
+- `sorry not tomorrow today! july 9th…` emitted apology as a search query
+- July 9 schedule follow-up searched generic “sports games” with **no FIFA subject inheritance**
+
+### Fixes (`research.py` + subject enrich in `core.py`)
+- Spelling: tommrrow/tommorow → tomorrow (applied in prep)
+- GTA release + price force-domain queries; sports span starts at league keywords
+- Preserve release notes / changelog queries
+- Drop apology/correction smalltalk clauses
+- Explicit calendar pin (`July 9 2026`); `enrich_sports_query_with_subject` for follow-ups
+- Test: `test_e22_live_transcript_gta_fifa_release_notes_july9`
+
+## v7.6.3 - Search provider cascade + free DDG engineering
+
+### Principle
+- Own the **agent layer** (multi-intent, grounder); **pluggable retrieval** for indexes.
+- Free path stays DuckDuckGo by default — engineered to act more like paid agent search.
+
+### Code
+- `agent/web_search_providers.py`: DDG / Tavily / Brave adapters + cascade
+- Free upgrades: news channel, query variants (date / site: authority), empty-result simplify retry, thin-snippet `ddgs.extract`
+- `web_search` tool uses orchestrator; `WEB_SEARCH_PROVIDER=auto|duckduckgo|tavily|brave`
+- Docs: `docs/SEARCH_ENGINEERING.md` (scope, gaps, DIY vs paid)
+
+### Tests
+- `tests/test_web_search_providers.py`
+
+## v7.6.2 - Live sports data path (vs crawl search) + provider notes
+
+### Category mismatch
+- Web search (Tavily/Brave/Exa) = **crawled** pages; live scores/odds need **structured feeds**.
+- New first-class path: `sports_live` + `agent/sports_data.py` (The Odds API).
+- Preferred for live score / who-won / moneyline; **schedule/slate** stays on `web_search`.
+- Fallback to grounded web search if key missing, league unmapped, or API empty.
+
+### Config
+- `ODDS_API_KEY` / `THE_ODDS_API_KEY`, `SPORTS_LIVE_ENABLED` (default true)
+- Prepared: `WEB_SEARCH_PROVIDER`, `BRAVE_SEARCH_API_KEY` (Brave swap = follow-up)
+
+### Docs
+- `docs/SEARCH_INFRASTRUCTURE.md` — Tavily acquisition uncertainty, Brave/Exa/Firecrawl notes
+
+### Tests
+- `tests/test_sports_live.py` — intent classification + missing-key fallback
+
+## v7.6.1 - Chat embeds (sources, weather, fixtures under answers)
+
+### UI (ChatGPT/Claude-inspired, text-first)
+- Assistant **final** bubbles can carry structured `embeds` under the markdown answer.
+- Types: **source chips**, **featured link card**, **weather high/low stat**, **schedule list**, **search query chips**.
+- Built client-side from this turn’s research runs + answer text (`buildChatEmbeds`) so placement stays under the relevant reply — not a separate chaotic panel.
+- Research panel still holds the full audit trail; embeds are the polished “spice” in-chat.
+
+### Files
+- `apps/web/src/features/embeds/*` — types, builder, `ChatEmbeds` renderer, vitest
+- `index.tsx` — Message.embeds, accumulate turn research, render under ChatBubble
+
+## v7.6.0d - Stage 3 no longer collapses multi-intent to one search
+
+### Live log root cause
+- Stage 3 forced schedule path for FIFA+tomorrow, then `_extract_search_query` → `normalize_web_search_query` returned **only the primary** (FIFA).
+- That single string was passed as **both** tool query and `original_request`, so weather was never searched.
+- Log line `Search grounding %s query=%r` was also broken (loguru needs `{}`, not `%s`).
+
+### Fix
+- Multi-intent Stage 3: pass **full user turn** into grounded search; never run multi through `_extract_search_query`.
+- `_grounded_web_search` prefers `_active_user_query` when it has more domains than the collapsed arg.
+- `_invoke_web_research_query(..., original_request=)` keeps the full utterance for fan-out.
+- Force Stage 3 for multi-intent on tool-calling models (not only pure schedule).
+- Fix search grounding log format.
+
+## v7.6.0c - General multi-intent domains (no more combo recipes)
+
+### Honest diagnosis
+- General decomposition **was** already wired (`looks_like_multi_intent` → `decompose_search_intents` → `resolve_web_search_queries`), but it was too weak: sports detection missed FIFA/`matches`, domain diversity was not a first-class multi signal, and `plus`/also splits + model single-arg paths could collapse to one query. Live “temp tomorrow + FIFA matches” only ran weather.
+
+### System-wide fix (not weather+FIFA recipe)
+- **`intent_domains()`** — weather / sports / finance / entertainment / news / fact / odds tags
+- Multi-intent when **2+ domains** in one utterance (works on novel combos)
+- Broader sports clause: FIFA, world cup, matches/games + day, leagues — general sports normalize, not a multi recipe
+- Heuristic decompose splits on **also / plus / as well as**; domain carve-out if split yields one query
+- Model tool arg never replaces multi user text; same-domain model dupes not appended
+- User turn is always original_request for grounded multi fan-out
+
+### Weather synthesis consistency
+- Never ask “what city?” when evidence/subject already names a place
+- Repair path catches city-ask contradictions + multi-question “answer every block” instructions
+
+### Tests
+- E21: live weather+FIFA transcript + 4 novel no-recipe combos + city-ask detector
+
 ## v7.6.0b - Search honesty, tomorrow schedules, dedupe, routine isolation
 
 ### Critical — false “I can’t search”

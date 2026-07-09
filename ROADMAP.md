@@ -15,7 +15,8 @@
 **v7.5.1 done:** mount/symlink/`..` boundary checks; dual denylist; coding_loop state machine module + project folder helper; readiness loop includes confirm.  
 **v7.5.2 done:** coding loop started in `process_query`; advanced from tool_end / TaskPlanner / pending writes; readiness+doctor expose state; E17 multi-file fixture.  
 **v7.6.0 done:** real stdio MCP client (`initialize` → `tools/list` → `tools/call`); `mcp__server__tool` registration; singleton manager shared by agent + Trust Center; configured ≠ available; mock server tests.  
-**Still open (polish):** deeper UI binding of checklist/Code panel to `coding_loop` stream events; v7.6.1 chat E2E invoke polish; v7.6.2 approval gates UX; then v7.7 calendar/tasks.
+**v7.6.2 done (partial):** dedicated `sports_live` path (The Odds API) for scores/odds — default over crawl search; schedule stays web_search; Brave/Tavily eval in `docs/SEARCH_INFRASTRUCTURE.md`.  
+**Still open (polish):** Brave as real secondary web provider; SportRadar-class feeds if Odds API coverage gaps; deeper UI coding_loop binding; v7.7 calendar/tasks.
 
 See detailed plan in section **“Next sequence plan (v7.5–v7.7)”** at the end of this file.  
 Full capability test rundown: `apps/backend/TEST_RUNDOWN.md`.

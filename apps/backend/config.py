@@ -432,6 +432,17 @@ class Config:
         self.tavily_api_key = os.getenv("TAVILY_API_KEY", "").strip()
         self.tavily_search_depth = os.getenv("TAVILY_SEARCH_DEPTH", "advanced").strip().lower() or "advanced"
         self.tavily_max_results = int(os.getenv("TAVILY_MAX_RESULTS", "8") or 8)
+        # Secondary / future web search providers (optional; Tavily remains default crawl search)
+        self.brave_search_api_key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+        self.web_search_provider = (
+            os.getenv("WEB_SEARCH_PROVIDER", "auto").strip().lower() or "auto"
+        )  # auto | duckduckgo | tavily | brave
+        # Live sports structured data (The Odds API) — preferred over crawl for scores/odds
+        self.odds_api_key = (
+            os.getenv("ODDS_API_KEY", "").strip()
+            or os.getenv("THE_ODDS_API_KEY", "").strip()
+        )
+        self.sports_live_enabled = os.getenv("SPORTS_LIVE_ENABLED", "true").lower() == "true"
         raw_blocked = os.getenv("WEB_SEARCH_BLOCKED_DOMAINS", "")
         self.web_search_blocked_domains = [
             d.strip().lower().lstrip(".")
@@ -951,6 +962,10 @@ class Config:
             "tavily_api_key",
             "tavily_search_depth",
             "tavily_max_results",
+            "brave_search_api_key",
+            "web_search_provider",
+            "odds_api_key",
+            "sports_live_enabled",
             "tesseract_path",
             "web_search_blocked_domains",
             "enable_system_actions",

@@ -543,6 +543,199 @@ def test_e12_search_query_not_raw_chat_prompt():
     assert out
 
 
+def test_e21_general_multi_intent_no_recipe_including_weather_fifa():
+    """
+    System-wide multi-intent (domain diversity), NOT a weather+FIFA recipe.
+
+    Live transcript that dropped FIFA must fan out to 2+ searches even when the
+    model only passes a weather tool arg. Novel combos with no recipes must work too.
+    """
+    from agent.research import (
+        looks_like_multi_intent,
+        resolve_web_search_queries,
+        normalize_web_search_query,
+        intent_domains,
+    )
+
+    # --- Live failure phrasing (weather + FIFA) ---
+    live = (
+        "damn bro just wondering what the temp going to be tomorrow, also "
+        "what matches are happening for fifa tomorrow also"
+    )
+    assert len(intent_domains(live)) >= 2
+    assert looks_like_multi_intent(live) is True
+    # Lazy model arg must NOT wipe the second intent
+    resolved = resolve_web_search_queries(
+        live,
+        "tomorrow high low weather tomorrow high low temperature forecast",
+        use_decomposition=True,
+    )
+    assert len(resolved) >= 2, resolved
+    rjoin = " ".join(resolved).lower()
+    assert "weather" in rjoin or "temp" in rjoin or "high" in rjoin
+    assert "fifa" in rjoin or "world cup" in rjoin or "match" in rjoin
+    # Not a third weather-only duplicate from model arg
+    weatherish = sum(1 for q in resolved if "weather" in q.lower() or "temp" in q.lower())
+    assert weatherish <= 2, resolved
+
+    # Full grounded path must execute 2+ raw searches
+    agent = _bare_agent()
+    seen = []
+    agent._raw_web_search_execute = lambda q: (
+        seen.append(q)
+        or (
+            "1. Src\n   URL: https://example.com\n   Snippet: High 12 Low 3 Edmonton forecast. "
+            "FIFA World Cup Morocco vs Portugal tomorrow 3pm ET."
+        )
+    )
+    agent._fetch_search_result_page_text = lambda url, **kw: ""
+    agent._request_search_cache = {}
+    agent._active_user_query = live
+    agent._current_subject_text = "Edmonton weather"
+    out = agent._grounded_web_search(
+        "tomorrow high low temperature forecast",
+        original_request=live,
+        emit_tool_events=False,
+    )
+    assert len(seen) >= 2, seen
+    sjoin = " ".join(seen).lower()
+    assert "fifa" in sjoin or "world cup" in sjoin or "match" in sjoin
+    assert "weather" in sjoin or "high" in sjoin or "temp" in sjoin
+
+    # --- Live Stage-3 bug: _extract_search_query collapses to FIFA-only primary ---
+    # original_request was the collapsed string; active_user_query must still fan out.
+    seen2 = []
+    agent._raw_web_search_execute = lambda q: (
+        seen2.append(q)
+        or (
+            "1. Src\n   URL: https://example.com\n   Snippet: High 12 Low 3 Edmonton. "
+            "FIFA slate tomorrow Morocco vs Portugal 3pm ET."
+        )
+    )
+    agent._active_user_query = live
+    collapsed = normalize_web_search_query(live)  # historically FIFA-only primary
+    assert "fifa" in collapsed.lower() or "world cup" in collapsed.lower()
+    agent._grounded_web_search(
+        collapsed,
+        original_request=collapsed,  # Stage 3 used to pass this as BOTH
+        emit_tool_events=False,
+    )
+    assert len(seen2) >= 2, f"Stage3 collapse must not wipe multi; got {seen2}"
+    s2 = " ".join(seen2).lower()
+    assert ("weather" in s2 or "high" in s2 or "temp" in s2 or "edmonton" in s2), seen2
+    assert ("fifa" in s2 or "world cup" in s2 or "match" in s2), seen2
+
+    # --- Novel combos never seen in recipes ---
+    novels = [
+        "what is the apple stock price and also what is the weather in seattle tomorrow",
+        "when does the new Dune movie release and also any local news in toronto today",
+        "what was the lakers score last night and also what is the capital of peru",
+        "bitcoin price right now plus weather in denver",
+    ]
+    for n in novels:
+        assert looks_like_multi_intent(n) is True, n
+        # No GTA/weather-sports-only assumption: just must be multi
+        r = resolve_web_search_queries(n, n.split("and")[0][:40], use_decomposition=True)
+        assert len(r) >= 2, (n, r)
+
+    # Weather city-ask detector
+    agent2 = _bare_agent()
+    agent2._current_subject_text = "Edmonton"
+    evidence = "Edmonton high 12 low 3 cloudy AccuWeather"
+    assert agent2._answer_asks_city_despite_known_location(
+        "I can give you the weather forecast. What city are you interested in?",
+        evidence,
+    )
+    assert not agent2._answer_asks_city_despite_known_location(
+        "Edmonton tomorrow: high 12, low 3, cloudy.",
+        evidence,
+    )
+
+
+def test_e22_live_transcript_gta_fifa_release_notes_july9():
+    """
+    Live multi-prompt dump (2026-07-09):
+      - GTA release + cost AND FIFA tomorrow must fan into distinct compact queries
+      - \"python release notes\" must NOT become \"python release date\"
+      - \"sorry not tomorrow today! july 9th what games\" must drop apology + pin date
+      - July 9 follow-up inherits FIFA from subject
+    """
+    from agent.research import (
+        resolve_web_search_queries,
+        normalize_web_search_query_single,
+        looks_like_multi_intent,
+        enrich_sports_query_with_subject,
+        _is_orphan_price_query,
+    )
+
+    gta_fifa = (
+        "i need you to search when gta 6 is released how much money it costs and then "
+        "explain to me when the next fifa matchup is tommrrow and who is playing"
+    )
+    assert looks_like_multi_intent(gta_fifa) is True
+    resolved = resolve_web_search_queries(gta_fifa, gta_fifa, use_decomposition=True)
+    assert len(resolved) >= 2, resolved
+    rjoin = " ".join(resolved).lower()
+    assert "gta" in rjoin
+    assert "fifa" in rjoin or "world cup" in rjoin
+    assert any("price" in q.lower() or "cost" in q.lower() for q in resolved), resolved
+    assert any("release" in q.lower() for q in resolved), resolved
+    # No chatty residue shipped to providers
+    for q in resolved:
+        assert "i need you" not in q.lower()
+        assert "explain to me" not in q.lower()
+        assert "who is playing" != q.lower().strip()
+        assert not _is_orphan_price_query(q), q
+
+    # Second live phrasing: cost clause split from GTA → must rebind entity
+    gta_cost_fifa = (
+        "when does gta 6 come out and how much will it cost? and also can you tell me "
+        "what fifa games are happening today"
+    )
+    r2 = resolve_web_search_queries(gta_cost_fifa, gta_cost_fifa, use_decomposition=True)
+    assert len(r2) >= 3, r2
+    r2j = " ".join(r2).lower()
+    assert "gta" in r2j and ("fifa" in r2j or "world cup" in r2j)
+    assert any(
+        "gta" in q.lower() and ("price" in q.lower() or "cost" in q.lower()) for q in r2
+    ), r2
+    assert not any(_is_orphan_price_query(q) for q in r2), r2
+    assert not any(q.lower().strip() == "how much will it cost" for q in r2), r2
+
+    notes = normalize_web_search_query_single("search for latest python release notes")
+    assert "release notes" in notes.lower() or "changelog" in notes.lower(), notes
+    assert "release date" not in notes.lower(), notes
+
+    july = resolve_web_search_queries(
+        "sorry not tommrow today! july 9th what games are being played then?",
+        use_decomposition=True,
+    )
+    assert len(july) == 1, july
+    assert "sorry" not in july[0].lower()
+    assert "july" in july[0].lower() or "9" in july[0]
+    # Subject continuity: prior FIFA turn
+    enriched = enrich_sports_query_with_subject(
+        july[0],
+        "FIFA World Cup matches schedule fixtures tomorrow",
+    )
+    assert "fifa" in enriched.lower() or "world cup" in enriched.lower(), enriched
+
+    agent = _bare_agent()
+    seen = []
+    agent._raw_web_search_execute = lambda q: (
+        seen.append(q)
+        or "1. Src\n   URL: https://example.com\n   Snippet: GTA 6 Nov 19 2026 $70. FIFA QF July 9."
+    )
+    agent._fetch_search_result_page_text = lambda url, **kw: ""
+    agent._request_search_cache = {}
+    agent._active_user_query = gta_fifa
+    agent._grounded_web_search(gta_fifa, original_request=gta_fifa, emit_tool_events=False)
+    assert len(seen) >= 2, seen
+    sjoin = " ".join(seen).lower()
+    assert "gta" in sjoin
+    assert "fifa" in sjoin or "world cup" in sjoin
+
+
 def test_e19_general_decompose_novel_compound_and_simple_fp():
     """
     General multi-intent fallback (no weather/sports/GTA recipe):
@@ -835,16 +1028,17 @@ def test_e14_weather_without_city_no_recursion():
         assert parts, s
         assert all("weather" in p.lower() or "Oilers" in p or "schedule" in p.lower() for p in parts) or parts
 
-    # Leaf weather normalizer never needs a city
+    # Leaf weather normalizer never needs a city (may pin calendar day)
     bare = _normalize_weather_query("check the weather for me")
-    assert bare == "weather today high low temperature forecast", bare
+    assert bare.lower().startswith("weather"), bare
+    assert "high" in bare.lower() and "low" in bare.lower(), bare
     with_city = _normalize_weather_query("check the weather", city_hint="Calgary")
     assert with_city.startswith("Calgary weather"), with_city
     # Social+weather should not leave chat crumbs in the query
     social = normalize_web_search_query(
         "not much just chilling hope you're well echo! look good! can you check the weather for me tho?"
     )
-    assert social == "weather today high low temperature forecast", social
+    assert "weather" in social.lower() and "high" in social.lower(), social
     assert "chilling" not in social.lower() and "echo" not in social.lower()
 
     # Full grounded path must not recurse

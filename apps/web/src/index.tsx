@@ -18,6 +18,9 @@ import { AvatarEditor } from "./components/AvatarEditor";
 import { buildResearchRunFromToolEvent, normalizeResearchRun } from "./features/research/buildResearchRun";
 import { useResearchStore } from "./features/research/store";
 import type { ResearchRun } from "./features/research/types";
+import { buildChatEmbeds } from "./features/embeds/buildChatEmbeds";
+import { ChatEmbeds } from "./features/embeds/ChatEmbeds";
+import type { ChatEmbed } from "./features/embeds/types";
 import {
   agentActivityReducer,
   initialAgentActivity,
@@ -76,11 +79,161 @@ type Message = {
    * "final" = post-tool answer. Used for timeline ordering only.
    */
   streamBeat?: "partial" | "final";
+  /**
+   * Rich embeds under the bubble (sources, weather stats, schedule, link cards).
+   * Derived from research + answer text — chat stays text-first.
+   */
+  embeds?: ChatEmbed[];
 };
 
 /** Rough client-side token estimate (chars / 3.5) — matches context meter */
 const estimateTokens = (text: string): number =>
   Math.max(0, Math.round(String(text || "").length / 3.5));
+
+/** Tools that fire every turn and would spam the chat activity list. */
+const SILENT_CHAT_TOOLS = new Set([
+  "get_system_time",
+  "project_update_context",
+]);
+
+/** Human label for any tool including MCP (`mcp__server__tool`). */
+const formatToolDisplayName = (rawName: string): string => {
+  const name = String(rawName || "").trim();
+  if (!name) return "tool";
+  if (name.startsWith("mcp__")) {
+    const parts = name.split("__").filter(Boolean);
+    // mcp, server, tool...
+    if (parts.length >= 3) {
+      const server = parts[1].replace(/_/g, " ");
+      const tool = parts.slice(2).join("__").replace(/_/g, " ");
+      return `MCP · ${server} · ${tool}`;
+    }
+    return `MCP · ${name.replace(/^mcp__/, "").replace(/__/g, " · ").replace(/_/g, " ")}`;
+  }
+  const known: Record<string, string> = {
+    web_search: "Web search",
+    sports_live: "Live sports",
+    file_read: "File read",
+    file_write: "File write",
+    file_list: "File list",
+    file_delete: "File delete",
+    file_move: "File move",
+    file_copy: "File copy",
+    file_mkdir: "Make folder",
+    terminal_run: "Terminal",
+    artifact_write: "Artifact write",
+    notepad_write: "Notepad",
+    browse_task: "Browse page",
+    youtube_transcript: "YouTube transcript",
+    vision_qa: "Vision",
+    analyze_screen: "Screen OCR",
+    take_screenshot: "Screenshot",
+    calculate: "Calculate",
+    system_info: "System info",
+    daily_briefing: "Daily briefing",
+    discord_read_channel: "Discord read",
+    discord_send_channel: "Discord send",
+  };
+  if (known[name]) return known[name];
+  return name.replace(/_/g, " ");
+};
+
+/** Pull a short human preview from tool input (JSON / query= / free text). */
+const previewToolInput = (rawName: string, rawInput: string, maxLen = 100): string => {
+  let inputPreview = String(rawInput || "").replace(/\s+/g, " ").trim();
+  if (!inputPreview) return "";
+  const m =
+    inputPreview.match(/['"]query['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]path['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]command['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]url['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]channel['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]text['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]input['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/['"]name['"]\s*:\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/\bquery\s*[:=]\s*['"]([^'"]+)['"]/i) ||
+    inputPreview.match(/\bpath\s*[:=]\s*['"]([^'"]+)['"]/i);
+  if (m && m[1]) inputPreview = m[1].trim().replace(/['"]$/g, "");
+  // Strip dict braces noise
+  if (inputPreview.startsWith("{") && inputPreview.length > 80) {
+    inputPreview = inputPreview.slice(0, 80);
+  }
+  if (inputPreview.length > maxLen) inputPreview = inputPreview.slice(0, maxLen) + "…";
+  if (/how(?:'re| are) you|look great|liking how you look/i.test(inputPreview) && inputPreview.length > 100) {
+    inputPreview = inputPreview.slice(0, 80) + "…";
+  }
+  return inputPreview;
+};
+
+const toolActivityStepType = (rawName: string): "search" | "read" | "tool" => {
+  const n = String(rawName || "").toLowerCase();
+  if (n === "web_search" || n === "sports_live") return "search";
+  if (n === "file_read" || n === "browse_task" || n === "youtube_transcript") return "read";
+  return "tool"; // includes MCP mcp__server__tool
+};
+
+/** Running / done labels for any tool (built-in + MCP). */
+const formatToolActivity = (
+  rawName: string,
+  phase: "start" | "done" | "failed",
+  opts?: { input?: string; output?: string; error?: string }
+): string => {
+  const name = String(rawName || "tool");
+  const low = name.toLowerCase();
+  const label = formatToolDisplayName(name);
+  const input = previewToolInput(name, opts?.input || "");
+  const out = String(opts?.output || "").replace(/\s+/g, " ").trim();
+  const err = String(opts?.error || "").replace(/\s+/g, " ").trim();
+
+  if (phase === "failed") {
+    return `Failed ${label}${err ? `: ${err.slice(0, 100)}` : ""}`;
+  }
+
+  // Specialized search copy
+  if (low === "web_search") {
+    if (phase === "start") return input ? `Searching: ${input}` : "Searching the web…";
+    const provM = out.match(/Search provider:\s*([a-z0-9_,]+)/i);
+    const via = provM?.[1] ? ` via ${provM[1].replace(/,/g, "+")}` : "";
+    const insufficient =
+      /search_evidence_insufficient|accepted=false/i.test(out) ||
+      (/insufficient/i.test(out) && !/\d+\.\s/.test(out));
+    const sources = (out.match(/^\s*\d+\.\s+/gm) || []).length;
+    if (insufficient) return input ? `Search done${via} (weak evidence): ${input}` : `Search finished${via} — weak evidence`;
+    if (sources > 0) return input ? `Search done${via} (${sources} sources): ${input}` : `Search done${via} (${sources} sources)`;
+    return input ? `Search done${via}: ${input}` : `Search done${via}`.trim();
+  }
+  if (low === "sports_live") {
+    if (phase === "start") return input ? `Live sports: ${input}` : "Live sports data…";
+    const ok = /ok\s*=\s*true/i.test(out);
+    if (ok) return input ? `Live sports done: ${input}` : "Live sports done";
+    return input ? `Live sports unavailable: ${input}` : "Live sports unavailable — may fall back to web";
+  }
+
+  if (phase === "start") {
+    if (low.startsWith("mcp__")) {
+      return input ? `${label}: ${input}` : `Using ${label}…`;
+    }
+    if (low === "file_read") return input ? `Reading: ${input}` : "Reading file…";
+    if (low === "file_write") return input ? `Writing: ${input}` : "Writing file…";
+    if (low === "terminal_run") return input ? `Running: ${input}` : "Running terminal…";
+    if (low === "browse_task") return input ? `Browsing: ${input}` : "Browsing page…";
+    return input ? `${label}: ${input}` : `Using ${label}…`;
+  }
+
+  // done
+  if (low.startsWith("mcp__")) {
+    const preview = out.slice(0, 80);
+    return preview ? `${label} done — ${preview}${out.length > 80 ? "…" : ""}` : `${label} done`;
+  }
+  if (low === "file_read") return input ? `Read ${input}` : "File read done";
+  if (low === "file_write") return input ? `Wrote ${input}` : "File write done";
+  if (low === "terminal_run") {
+    const code = out.match(/ExitCode\s*=\s*(-?\d+)/i)?.[1];
+    return code != null ? `Terminal done (exit ${code})` : "Terminal done";
+  }
+  const preview = out.slice(0, 90);
+  return preview ? `${label} done — ${preview}${out.length > 90 ? "…" : ""}` : `${label} done`;
+};
 
 const formatTokenCount = (n: number): string => {
   if (!Number.isFinite(n) || n < 0) return "0";
@@ -894,6 +1047,21 @@ const globalCss = `
            display: block;
            overflow: hidden;
            text-overflow: ellipsis;
+         }
+         .chat-embed-link:hover {
+           opacity: 0.92;
+         }
+         .chat-embed-link:hover .chat-embed-source-title {
+           border-bottom-color: currentColor !important;
+         }
+         .chat-embed-source-title:hover {
+           border-bottom-color: currentColor !important;
+           opacity: 0.95;
+         }
+         .chat-embed-source-open:hover,
+         .chat-embed-source-url:hover {
+           opacity: 1 !important;
+           text-decoration: underline;
          }
          .research-source:hover {
            opacity: 1;
@@ -1925,6 +2093,11 @@ const ChatBubble: React.FC<{
           </div>
         )}
 
+        {/* Rich embeds under assistant text (sources / weather / fixtures / links) */}
+        {!isUser && !stillTyping && msg.embeds && msg.embeds.length > 0 ? (
+          <ChatEmbeds embeds={msg.embeds} colors={colors} />
+        ) : null}
+
         {!isUser && isConfirmPrompt ? (
           <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
             <button
@@ -2616,7 +2789,7 @@ export const Dashboard: React.FC = () => {
   const [monitorText, setMonitorText] = useState<string>("");
   const [monitorAt, setMonitorAt] = useState<number>(0);
   const [monitorError, setMonitorError] = useState<string | null>(null);
-  const toolInfoRef = useRef<Record<string, { name: string; input: string }>>({});
+  const toolInfoRef = useRef<Record<string, { name: string; input: string; requestId?: string }>>({});
   const latestCodeFilenameRef = useRef<string | null>(null);
   const [capabilitiesData, setCapabilitiesData] = useState<any>(null);
   const [codingReadiness, setCodingReadiness] = useState<CodingReadiness | null>(null);
@@ -3644,6 +3817,9 @@ export const Dashboard: React.FC = () => {
     setLiveReplyDraft("");
     dispatchActivity({ type: "stream_start" });
     setStreaming(true);
+    // Drop prior-turn tool metadata so done-labels never inherit stale queries
+    // (e.g. Python search label leaking into a later GTA+FIFA turn).
+    toolInfoRef.current = {};
     // Seed a visible "working" step immediately so chat always shows progress
     // (avatar can animate before the first tool/thinking event arrives).
     const runRequestId = crypto.randomUUID();
@@ -3655,6 +3831,9 @@ export const Dashboard: React.FC = () => {
     let sawPartialBeat = false;
     /** Floor timestamp for tool/search activity after the first partial. */
     let toolsAfterPartialAt = 0;
+    /** Research runs + queries this turn — feed chat embeds under the final bubble. */
+    const turnResearchRuns: ResearchRun[] = [];
+    const turnSearchQueries: string[] = [];
     setActivities((prev) => [
       ...prev,
       {
@@ -3875,55 +4054,19 @@ export const Dashboard: React.FC = () => {
       };
       const upsertTool = (evt: AgentStreamEvent) => {
         if (evt.type === "tool_start") {
-          toolInfoRef.current[evt.id] = { name: evt.name, input: evt.input };
+          // Scope tool metadata to this stream turn (avoid stale labels from prior turns)
+          toolInfoRef.current[evt.id] = { name: evt.name, input: evt.input, requestId: runRequestId };
           dispatchActivity({ type: "tool_start", id: evt.id, name: evt.name });
-          const toolVerb =
-            evt.name === "web_search" ? "Searching" :
-            evt.name === "file_read" ? "Reading" :
-            evt.name === "file_write" ? "Writing" :
-            evt.name === "terminal_run" ? "Running" :
-            "Using";
-          // Prefer the bare query string for web_search so chat shows what Tavily got.
-          let inputPreview = String(evt.input || "").replace(/\s+/g, " ").trim();
-          if (evt.name === "web_search" && inputPreview) {
-            // LangChain / Python may pass "{'query': '...'}" or JSON or "query=..."
-            const m =
-              inputPreview.match(/['"]query['"]\s*:\s*['"]([^'"]+)['"]/i) ||
-              inputPreview.match(/['"]query['"]\s*:\s*['"]([^'"]+)['"]/) ||
-              inputPreview.match(/\{['"]query['"]:\s*['"]([^'"]+)['"]\}/i) ||
-              inputPreview.match(/\bquery\s*[:=]\s*['"]([^'"]+)['"]/i) ||
-              inputPreview.match(/\bquery\s*[:=]\s*([^{\[\]'"][^}\]]*)/i);
-            if (m && m[1]) inputPreview = m[1].trim().replace(/['"]$/g, "");
-            // Drop social multi-intent noise if it slipped through
-            if (inputPreview.length > 120 && /how(?:'re| are) you|look great|liking how you look/i.test(inputPreview)) {
-              inputPreview = inputPreview.slice(0, 100) + "…";
-            }
-          }
-          // Hide silent/internal tools from the chat step list (time inject, calc, …).
-          const silentTools = new Set([
-            "get_system_time",
-            "calculate",
-            "system_info",
-            "project_update_context",
-            "store_memory",
-            "save_memory",
-            "recall_memory",
-            "search_memory",
-            "query_memory",
-          ]);
-          if (!silentTools.has(String(evt.name || "").toLowerCase())) {
-            const reqId = eventRequestId(evt);
+          const toolNameStart = String(evt.name || "").toLowerCase();
+          // Only hide pure injects that fire almost every turn
+          if (!SILENT_CHAT_TOOLS.has(toolNameStart)) {
             const stepAt = sawPartialBeat
               ? Math.max(Date.now(), toolsAfterPartialAt)
               : normalizeTimestampMs(evt.at || Date.now());
             appendThinkingStep(evt, {
               id: evt.id,
-              type: evt.name === "web_search" ? "search" : evt.name === "file_read" ? "read" : "tool",
-              content: inputPreview
-                ? evt.name === "web_search"
-                  ? `Searching: ${inputPreview}`
-                  : `${toolVerb} ${evt.name}: ${inputPreview}`
-                : `${toolVerb} ${evt.name}`,
+              type: toolActivityStepType(evt.name || ""),
+              content: formatToolActivity(evt.name || "tool", "start", { input: evt.input }),
               status: "running",
               at: stepAt,
             });
@@ -3934,54 +4077,33 @@ export const Dashboard: React.FC = () => {
         if (evt.type === "tool_end") {
           dispatchActivity({ type: "tool_end", id: evt.id });
           const info = toolInfoRef.current[evt.id];
-          const toolName = info?.name || evt.name || "tool";
-          const silentTools = new Set([
-            "get_system_time",
-            "calculate",
-            "system_info",
-            "project_update_context",
-            "store_memory",
-            "save_memory",
-            "recall_memory",
-            "search_memory",
-            "query_memory",
-          ]);
-          if (silentTools.has(String(toolName || "").toLowerCase())) {
+          // Ignore tool_end that belongs to another turn's metadata
+          if (info && (info as { requestId?: string }).requestId && (info as { requestId?: string }).requestId !== runRequestId) {
             return;
           }
-          if (toolName === "web_search") {
-            const normalized = normalizeResearchRun(evt.research) || buildResearchRunFromToolEvent(evt.id, toolName, info?.input || "", evt.output || "", evt.at || Date.now());
+          const toolName = info?.name || evt.name || "tool";
+          const toolNameLow = String(toolName || "").toLowerCase();
+          if (SILENT_CHAT_TOOLS.has(toolNameLow)) {
+            return;
+          }
+          // Research panel still fed by web_search
+          if (toolNameLow === "web_search") {
+            const normalized =
+              normalizeResearchRun(evt.research) ||
+              buildResearchRunFromToolEvent(
+                evt.id,
+                toolName,
+                info?.input || "",
+                evt.output || "",
+                evt.at || Date.now()
+              );
             if (normalized) {
               prependResearchRun(normalized);
+              turnResearchRuns.push(normalized);
+              if (normalized.query) turnSearchQueries.push(normalized.query);
+            } else if (info?.input) {
+              turnSearchQueries.push(String(info.input).replace(/\s+/g, " ").trim().slice(0, 120));
             }
-            const count = normalized?.evidence_count || 0;
-            const outLow = String(evt.output || "").toLowerCase();
-            const insufficient =
-              outLow.includes("search_evidence_insufficient") ||
-              outLow.includes("accepted=false") ||
-              (count === 0 && outLow.includes("insufficient"));
-            const qPreview = String(info?.input || "")
-              .replace(/\s+/g, " ")
-              .trim()
-              .slice(0, 80);
-            const summary = insufficient
-              ? qPreview
-                ? `Search done (weak evidence): ${qPreview}`
-                : "Search finished — evidence insufficient"
-              : count
-                ? qPreview
-                  ? `Search done (${count} sources): ${qPreview}`
-                  : `Search done (${count} sources)`
-                : qPreview
-                  ? `Search done: ${qPreview}`
-                  : "Search done";
-            markThinkingStep(
-              evt,
-              evt.id,
-              { status: "done", content: summary },
-              { toolName: "web_search", stepType: "search" },
-            );
-            return;
           }
           // Capture code blocks for CodeVisualizer
           const codingTools = new Set(["file_write", "file_read", "artifact_write", "terminal_run", "notepad_write"]);
@@ -4042,17 +4164,18 @@ export const Dashboard: React.FC = () => {
               setVisualizerPin("coding");
             }
           }
-          const isFileOp = codingTools.has(toolName);
-          const activityOutput = isFileOp && (evt.output || "").length > 200
-            ? `${toolName === "file_read" ? "Read" : "Wrote"} ${(evt.output || "").length} chars`
-            : (evt.output || "done").slice(0, 120);
-          const stepType: ThinkingStep["type"] =
-            toolName === "file_read" ? "read" : toolName === "web_search" ? "search" : "tool";
+          // Unified done label: built-in, sports, MCP (mcp__server__tool), skills, …
           markThinkingStep(
             evt,
             evt.id,
-            { status: "done", content: `${toolName}: ${activityOutput}` },
-            { toolName, stepType },
+            {
+              status: "done",
+              content: formatToolActivity(toolName, "done", {
+                input: info?.input || "",
+                output: evt.output || "",
+              }),
+            },
+            { toolName, stepType: toolActivityStepType(toolName) },
           );
           return;
         }
@@ -4061,14 +4184,20 @@ export const Dashboard: React.FC = () => {
           dispatchActivity({ type: "tool_error", id: evt.id, message: evt.error });
           const info = toolInfoRef.current[evt.id];
           const toolName = info?.name || "tool";
-          const stepType: ThinkingStep["type"] =
-            toolName === "web_search" ? "search" : toolName === "file_read" ? "read" : "tool";
-          markThinkingStep(
-            evt,
-            evt.id,
-            { status: "failed", content: `Failed ${toolName}: ${evt.error}` },
-            { toolName, stepType },
-          );
+          if (!SILENT_CHAT_TOOLS.has(String(toolName || "").toLowerCase())) {
+            markThinkingStep(
+              evt,
+              evt.id,
+              {
+                status: "failed",
+                content: formatToolActivity(toolName, "failed", {
+                  input: info?.input || "",
+                  error: evt.error,
+                }),
+              },
+              { toolName, stepType: toolActivityStepType(toolName) },
+            );
+          }
           setEchoReaction("error");
         }
       };
@@ -4287,7 +4416,14 @@ export const Dashboard: React.FC = () => {
               if (evt.trace_id) setLatestTraceId(String(evt.trace_id));
             }
             if (Array.isArray(evt.research) && evt.research.length) {
-              replaceResearchRuns(evt.research.map((item) => normalizeResearchRun(item)).filter((item): item is ResearchRun => Boolean(item)));
+              const finals = evt.research
+                .map((item) => normalizeResearchRun(item))
+                .filter((item): item is ResearchRun => Boolean(item));
+              replaceResearchRuns(finals);
+              for (const r of finals) {
+                if (!turnResearchRuns.some((t) => t.id === r.id)) turnResearchRuns.push(r);
+                if (r.query) turnSearchQueries.push(r.query);
+              }
             }
 
             liveReplyDraftRef.current = "";
@@ -4298,6 +4434,12 @@ export const Dashboard: React.FC = () => {
             if (reply && !partialReplies.some((p) => p.trim() === reply)) {
               const alreadyStreamed = liveDraft.length > 0;
               const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
+              // Rich embeds under the answer (sources, weather, fixtures) — text stays primary.
+              const embeds = buildChatEmbeds({
+                answerText: reply,
+                researchRuns: turnResearchRuns,
+                searchQueries: turnSearchQueries,
+              });
               addMessage({
                 id: crypto.randomUUID(),
                 role: "assistant",
@@ -4306,6 +4448,7 @@ export const Dashboard: React.FC = () => {
                 at: Math.max(Date.now(), toolsAfterPartialAt + 1),
                 skipTypewriter: alreadyStreamed || partialReplies.length > 0,
                 streamBeat: "final",
+                embeds: embeds.length ? embeds : undefined,
                 usage: buildMessageUsage(reply, useAppStore.getState().messages, ctxWindow, {
                   provider: providerInfo?.provider,
                   model: providerInfo?.model,
