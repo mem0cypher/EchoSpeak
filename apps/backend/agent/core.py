@@ -1230,6 +1230,14 @@ Return ONLY the JSON array, no explanation:
         task = self.pending_tasks[self.current_task_index]
         tool_name = task.get("tool", "")
         logger.debug(f"execute_next_task: index={self.current_task_index}, tool={tool_name}")
+        # Synthetic plan markers (not real tools) — never invoke
+        if str(tool_name) in {"active_work_restore", "plan_note", "resume"}:
+            task["status"] = "completed"
+            task["result"] = task.get("result") or "ok"
+            self.completed_tasks.append(task)
+            self.current_task_index += 1
+            self._emit_task_step(task, "done", str(task.get("result") or "ok")[:80])
+            return task
         if hasattr(self.agent, "_check_context_budget_mid_task"):
             self.agent._check_context_budget_mid_task("before_task", task)
         
@@ -3185,6 +3193,31 @@ class EchoSpeakAgent:
             ):
                 if re.search(r"(?i)\b(start|open|scan|look|desktop|folder)\b", user_input or ""):
                     goal = prior.goal or goal
+            # Never persist tool-wrapper noise into durable digest
+            clean_digest = self._strip_tool_file_body(str(samples or ""))
+            if "### " not in clean_digest and samples:
+                # multi-file digests keep ### headers — strip each section body only
+                parts = []
+                for chunk in re.split(r"(?=^### )", str(samples or ""), flags=re.M):
+                    if not chunk.strip():
+                        continue
+                    hm = re.match(r"^(### [^\n]+)\n?(.*)$", chunk, flags=re.S)
+                    if hm:
+                        parts.append(hm.group(1) + "\n" + self._strip_tool_file_body(hm.group(2)))
+                    else:
+                        parts.append(self._strip_tool_file_body(chunk))
+                clean_digest = "\n\n".join(parts) if parts else clean_digest
+            # Cheap freshness fingerprints (basename → mtime)
+            mtimes: Dict[str, float] = dict(prior.file_mtimes or {})
+            try:
+                rootp = _P(path)
+                for name in (files or prior.files_known or []):
+                    base = _P(str(name)).name
+                    cand = rootp / base
+                    if cand.is_file():
+                        mtimes[base] = float(cand.stat().st_mtime)
+            except Exception:
+                pass
             state = ActiveWorkState(
                 thread_id=self._active_work_thread(),
                 kind="coding_project",
@@ -3194,11 +3227,13 @@ class EchoSpeakAgent:
                 goal=goal or prior.goal or f"Work on {_P(path).name}",
                 last_user_message=str(user_input or "")[:400],
                 next_step=next_step_for_phase(
-                    phase, has_samples=bool(samples), goal=goal or prior.goal or ""
+                    phase, has_samples=bool(clean_digest), goal=goal or prior.goal or ""
                 ),
                 files_known=files or prior.files_known,
                 listing=str(listing or "")[:4000],
-                code_digest=str(samples or "")[:8000],
+                code_digest=str(clean_digest or "")[:8000],
+                features_present=list(prior.features_present or [])[:30],
+                file_mtimes=mtimes,
                 last_tools=list(
                     {
                         str(tr.get("tool") or "")
@@ -3497,13 +3532,22 @@ class EchoSpeakAgent:
             re.search(
                 r"\b("
                 r"add|implement|update the code|update|change|edit|fix|write|"
-                r"make sure|apply|feature|health|hp|scoreboard|score bar|"
+                r"make sure|make|also|apply|feature|health|hp|scoreboard|score bar|"
                 r"you died|game over|restart|new game|damage|hit points|"
+                r"powerup|power-up|drop|spawn|"
                 r"please scan.{0,40}update|scan.{0,20}(?:and|&).{0,20}update"
                 r")\b",
                 low,
             )
         )
+        # Follow-up in an active coding session: short "also make X" without Desktop keywords
+        try:
+            aw = self._load_active_work()
+            if aw and aw.is_active() and aw.project_path and aw.has_usable_scan():
+                if implement or re.search(r"\b(can we|could you|please|now|next|also|and)\b", low):
+                    return True
+        except Exception:
+            pass
         if not implement:
             return False
         if self._is_local_filesystem_intent(user_input) or self._is_coding_project_intent(user_input):
@@ -3683,17 +3727,104 @@ class EchoSpeakAgent:
             "already_done": already_done,
         }
 
+    def _parse_code_digest_to_files(self, digest: str, project: str) -> Dict[str, str]:
+        """Map ### name headers in code_digest back to absolute paths under project."""
+        out: Dict[str, str] = {}
+        if not digest:
+            return out
+        root = Path(project)
+        current = ""
+        buf: List[str] = []
+        for line in str(digest).splitlines():
+            m = re.match(r"^###\s+(\S+)\s*$", line.strip())
+            if m:
+                if current:
+                    body = self._strip_tool_file_body("\n".join(buf))
+                    p = root / Path(current).name
+                    if body:
+                        out[str(p.resolve()) if p.exists() else str(p)] = body
+                current = m.group(1).strip()
+                buf = []
+            else:
+                buf.append(line)
+        if current:
+            body = self._strip_tool_file_body("\n".join(buf))
+            p = root / Path(current).name
+            if body:
+                out[str(p.resolve()) if p.exists() else str(p)] = body
+        return out
+
+    def _file_is_stale_vs_active_work(self, path: str, aw) -> bool:
+        """Cheap freshness: mtime vs stored fingerprint (not a full re-read)."""
+        try:
+            p = Path(path)
+            if not p.is_file():
+                return True
+            base = p.name
+            stored = (getattr(aw, "file_mtimes", None) or {}).get(base)
+            if stored is None:
+                # no mtime yet — treat as stale only if digest missing this file
+                dig = str(getattr(aw, "code_digest", "") or "")
+                if base.lower() not in dig.lower():
+                    return True
+                # digest has it; use updated_at as weak bound
+                ua = float(getattr(aw, "updated_at", 0) or 0)
+                if ua <= 0:
+                    return False
+                return p.stat().st_mtime > ua + 1.0
+            return abs(float(p.stat().st_mtime) - float(stored)) > 0.5
+        except Exception:
+            return True
+
+    def _files_relevant_to_request(self, user_input: str, files: List[str]) -> List[str]:
+        """Which known project files likely matter for this follow-up ask."""
+        low = (user_input or "").lower()
+        picked: List[str] = []
+        for fp in files:
+            name = Path(fp).name.lower()
+            # explicit filename mention
+            if name in low or Path(fp).stem.lower() in low:
+                picked.append(fp)
+                continue
+            # feature → file heuristics
+            if re.search(r"\b(health|hp|damage|enemy|bullet|score|die|dead|restart|game over)\b", low):
+                if name.endswith((".js", ".ts", ".py")):
+                    picked.append(fp)
+                elif re.search(r"\b(hud|bar|screen|button|style|css|layout)\b", low) and name.endswith(
+                    (".html", ".css")
+                ):
+                    picked.append(fp)
+                elif name.endswith((".html", ".css")) and re.search(
+                    r"\b(health|scoreboard|you died|restart|hud)\b", low
+                ):
+                    picked.append(fp)
+        if not picked:
+            # default: primary logic + maybe html if UI words
+            for fp in files:
+                if Path(fp).suffix.lower() in {".js", ".ts", ".py"}:
+                    picked.append(fp)
+                    break
+            if re.search(r"\b(ui|hud|screen|button|style|css|html|bar)\b", low):
+                for fp in files:
+                    if Path(fp).suffix.lower() in {".html", ".css"} and fp not in picked:
+                        picked.append(fp)
+        return picked or list(files)[:2]
+
     def _try_coding_implement_plan(
         self,
         user_input: str,
         callbacks: Optional[list] = None,
     ) -> Optional[tuple]:
-        """Scan-first coding plan (adaptive steps) — not a fixed inspect/read/write-all loop.
+        """Incremental coding plan: reuse stored project state on follow-ups.
 
-        1) Scan project (list + read)
-        2) Detect gaps vs user goal
-        3) Only then plan apply-edit steps for files that still need work
-        4) Emit compact task_plan for the chat checklist
+        Case-2 fix: state *is* on disk (active_work) but was ignored — every turn
+        forced full inspect/read-all. Now:
+
+        1) Load active_work for this thread/project
+        2) If usable scan exists for same project → skip full inspect; only
+           re-read files that are stale or relevant to the new request
+        3) Plan = gaps vs current state (features_present + digest + cheap mtimes)
+        4) Apply only to files that still need work
         """
         if not self._is_coding_implement_intent(user_input):
             return None
@@ -3717,54 +3848,137 @@ class EchoSpeakAgent:
             pass
         self._update_active_work_goal(user_input)
 
-        # ── Phase A: SCAN plan only (never pre-announce write-all) ──
-        scan_tasks: List[Dict[str, Any]] = [
-            {
-                "index": 0,
-                "description": f"Scan {Path(project).name}",
-                "tool": "file_list",
-                "params": {"path": project},
-                "depends_on": -1,
-                "status": "pending",
-                "result": None,
-            }
-        ]
-        for i, fp in enumerate(files, start=1):
-            scan_tasks.append(
+        aw = self._load_active_work()
+        reuse = bool(
+            aw
+            and aw.same_project(project)
+            and aw.has_usable_scan()
+        )
+        read_contents: Dict[str, str] = {}
+        plan_tasks: List[Dict[str, Any]] = []
+        idx = 0
+
+        if reuse:
+            # ── Follow-up path: use stored state, selective re-check ──
+            cached = self._parse_code_digest_to_files(str(aw.code_digest or ""), project)
+            # Normalize keys to actual file paths
+            for fp in files:
+                base = Path(fp).name
+                for ck, body in list(cached.items()):
+                    if Path(ck).name.lower() == base.lower() and body:
+                        read_contents[fp] = body
+            relevant = self._files_relevant_to_request(user_input, files)
+            stale = [fp for fp in relevant if self._file_is_stale_vs_active_work(fp, aw)]
+            # Always re-check relevant files if missing from digest
+            for fp in relevant:
+                if fp not in read_contents and fp not in stale:
+                    stale.append(fp)
+
+            plan_tasks.append(
                 {
-                    "index": i,
-                    "description": f"Scan {Path(fp).name}",
-                    "tool": "file_read",
-                    "params": {"path": fp},
-                    "depends_on": 0,
+                    "index": idx,
+                    "description": f"Resume {Path(project).name} (stored state)",
+                    "tool": "active_work_restore",
+                    "params": {"path": project},
+                    "depends_on": -1,
+                    "status": "completed",
+                    "result": f"features={','.join((aw.features_present or [])[:8]) or 'unknown'}; files={len(aw.files_known or [])}",
+                }
+            )
+            idx += 1
+            self._hydrate_from_active_work(aw)
+
+            if stale:
+                for fp in stale:
+                    plan_tasks.append(
+                        {
+                            "index": idx,
+                            "description": f"Re-check {Path(fp).name} (stale/relevant)",
+                            "tool": "file_read",
+                            "params": {"path": fp},
+                            "depends_on": 0,
+                            "status": "pending",
+                            "result": None,
+                        }
+                    )
+                    idx += 1
+                self._last_user_input_for_plan = user_input
+                self._emit_coding_plan_as_tasks(plan_tasks)
+                # mark resume step done in UI
+                self._task_planner._emit_task_step(plan_tasks[0], "done", plan_tasks[0].get("result") or "resumed")
+                self._task_planner.current_task_index = 1
+                logger.info(
+                    "Coding plan phase=resume project={} recheck={}",
+                    project,
+                    [Path(f).name for f in stale],
+                )
+                while self._task_planner.current_task_index < len(self._task_planner.pending_tasks):
+                    task = self._task_planner.execute_next_task(self.tools, callbacks)
+                    if not task:
+                        break
+                    if task.get("status") == "completed" and task.get("tool") == "file_read":
+                        path = str((task.get("params") or {}).get("path") or "")
+                        read_contents[path] = self._strip_tool_file_body(str(task.get("result") or ""))
+                    if task.get("status") == "failed":
+                        break
+            else:
+                # Pure resume — no disk re-read needed
+                self._last_user_input_for_plan = user_input
+                self._emit_coding_plan_as_tasks(plan_tasks)
+                self._task_planner._emit_task_step(plan_tasks[0], "done", plan_tasks[0].get("result") or "resumed")
+                self._task_planner.current_task_index = 1
+                logger.info("Coding plan phase=resume-pure project={} (no stale files)", project)
+        else:
+            # ── Cold start: full scan once ──
+            plan_tasks.append(
+                {
+                    "index": idx,
+                    "description": f"Scan {Path(project).name}",
+                    "tool": "file_list",
+                    "params": {"path": project},
+                    "depends_on": -1,
                     "status": "pending",
                     "result": None,
                 }
             )
+            idx += 1
+            for fp in files:
+                plan_tasks.append(
+                    {
+                        "index": idx,
+                        "description": f"Scan {Path(fp).name}",
+                        "tool": "file_read",
+                        "params": {"path": fp},
+                        "depends_on": 0,
+                        "status": "pending",
+                        "result": None,
+                    }
+                )
+                idx += 1
+            self._last_user_input_for_plan = user_input
+            self._emit_coding_plan_as_tasks(plan_tasks)
+            logger.info(
+                "Coding plan phase=scan-cold project={} files={}",
+                project,
+                [Path(f).name for f in files],
+            )
+            try:
+                from agent.coding_loop import CodingPhase
 
-        self._last_user_input_for_plan = user_input
-        self._emit_coding_plan_as_tasks(scan_tasks)
-        logger.info("Coding plan phase=scan project={} files={}", project, [Path(f).name for f in files])
-
-        try:
-            from agent.coding_loop import CodingPhase
-
-            loop = getattr(self, "_coding_loop", None)
-            if loop is not None:
-                loop.fast_forward_to(CodingPhase.INSPECT, note="scan before plan")
-        except Exception:
-            pass
-
-        read_contents: Dict[str, str] = {}
-        while self._task_planner.current_task_index < len(self._task_planner.pending_tasks):
-            task = self._task_planner.execute_next_task(self.tools, callbacks)
-            if not task:
-                break
-            if task.get("status") == "completed" and task.get("tool") == "file_read":
-                path = str((task.get("params") or {}).get("path") or "")
-                read_contents[path] = self._strip_tool_file_body(str(task.get("result") or ""))
-            if task.get("status") == "failed":
-                break
+                loop = getattr(self, "_coding_loop", None)
+                if loop is not None:
+                    loop.fast_forward_to(CodingPhase.INSPECT, note="cold scan")
+            except Exception:
+                pass
+            while self._task_planner.current_task_index < len(self._task_planner.pending_tasks):
+                task = self._task_planner.execute_next_task(self.tools, callbacks)
+                if not task:
+                    break
+                if task.get("status") == "completed" and task.get("tool") == "file_read":
+                    path = str((task.get("params") or {}).get("path") or "")
+                    read_contents[path] = self._strip_tool_file_body(str(task.get("result") or ""))
+                if task.get("status") == "failed":
+                    break
 
         if not read_contents:
             try:
@@ -3781,7 +3995,7 @@ class EchoSpeakAgent:
                 pass
 
         if not read_contents:
-            msg = f"Scanned {project} but could not read sources."
+            msg = f"Could not load sources for {project}."
             self._task_planner.reset()
             self._last_tts_text = self._clamp_tts_text(msg)
             self._record_turn(user_input, msg)
@@ -3792,22 +4006,39 @@ class EchoSpeakAgent:
                 user_input,
                 path=project,
                 listing="\n".join(Path(f).name for f in files),
-                samples="\n\n".join(f"### {Path(p).name}\n{c[:2000]}" for p, c in list(read_contents.items())[:4]),
+                samples="\n\n".join(
+                    f"### {Path(p).name}\n{self._strip_tool_file_body(c)[:2500]}"
+                    for p, c in list(read_contents.items())[:6]
+                ),
                 phase="implement",
             )
         except Exception:
             pass
 
         gaps = self._scan_coding_gaps(user_input, read_contents)
+        # Merge durable features_present with scan
+        try:
+            store = getattr(self, "_active_work_store", None)
+            if store is not None:
+                st = store.load(self._active_work_thread())
+                merged_present = list(dict.fromkeys(
+                    list(st.features_present or []) + list(gaps.get("present") or [])
+                ))[:30]
+                # features user asked for that are present
+                st.features_present = merged_present
+                if gaps.get("present"):
+                    store.save(st)
+        except Exception:
+            pass
+
         if gaps.get("already_done"):
             msg = (
-                f"Scanned {Path(project).name}: already has "
-                f"{', '.join(gaps.get('present') or ['the requested pieces'])}. "
+                f"{Path(project).name}: already has "
+                f"{', '.join(gaps.get('present') or ['the requested pieces'])} "
+                f"({'from stored state' if reuse else 'from scan'}). "
                 "Nothing to re-apply — say what you want changed next."
             )
-            # Compact final checklist: scan done only
-            done_tasks = list(self._task_planner.pending_tasks)
-            for t in done_tasks:
+            for t in self._task_planner.pending_tasks:
                 if t.get("status") == "pending":
                     t["status"] = "completed"
                     t["result"] = "already present"
@@ -3819,14 +4050,15 @@ class EchoSpeakAgent:
 
         target_files: List[str] = list(gaps.get("target_files") or [])
         if not target_files:
-            target_files = list(read_contents.keys())[:1]
+            target_files = self._files_relevant_to_request(user_input, list(read_contents.keys()))[:2]
 
-        # ── Phase B: adaptive apply plan (only files that need work) ──
+        # ── Phase B: adaptive apply (only files that need work) ──
+        base = [dict(t) for t in self._task_planner.pending_tasks]
+        # mark base completed if still pending (resume-pure)
+        for t in base:
+            if t.get("status") == "pending" and t.get("tool") != "file_write":
+                t["status"] = "completed"
         apply_tasks: List[Dict[str, Any]] = []
-        # Keep completed scan steps visible, then append apply steps
-        base = []
-        for t in self._task_planner.pending_tasks:
-            base.append(dict(t))
         idx = len(base)
         for fp in target_files:
             gap_note = ", ".join((gaps.get("wanted") or ["edits"])[:4])
@@ -3844,17 +4076,16 @@ class EchoSpeakAgent:
             idx += 1
 
         full_plan = base + apply_tasks
-        # re-index
         for i, t in enumerate(full_plan):
             t["index"] = i
         write_start = len(base)
         self._emit_coding_plan_as_tasks(full_plan)
-        # restore completed scan status on re-emit
         for i in range(write_start):
             t = self._task_planner.pending_tasks[i]
             t["status"] = "completed"
-            self._task_planner.completed_tasks.append(t)
-            self._task_planner._emit_task_step(t, "done", str(t.get("result") or "scanned")[:80])
+            if t not in self._task_planner.completed_tasks:
+                self._task_planner.completed_tasks.append(t)
+            self._task_planner._emit_task_step(t, "done", str(t.get("result") or "ok")[:80])
         self._task_planner.current_task_index = write_start
 
         try:

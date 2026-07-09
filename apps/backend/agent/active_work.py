@@ -50,12 +50,33 @@ class ActiveWorkState:
     files_known: List[str] = field(default_factory=list)
     listing: str = ""
     code_digest: str = ""  # short samples / structure notes
+    # Session-scoped coding memory (multi-turn incremental work)
+    features_present: List[str] = field(default_factory=list)  # e.g. health, score, death_screen
+    file_mtimes: Dict[str, float] = field(default_factory=dict)  # basename or path → mtime
     last_tools: List[str] = field(default_factory=list)
     stall_count: int = 0
     updated_at: float = 0.0
 
     def is_active(self) -> bool:
         return bool(self.kind and self.phase not in ("", "idle", "done") and self.project_path)
+
+    def same_project(self, project_path: str) -> bool:
+        try:
+            a = Path(str(self.project_path or "")).resolve()
+            b = Path(str(project_path or "")).resolve()
+            return bool(self.project_path) and a == b
+        except Exception:
+            return bool(self.project_path) and str(self.project_path).lower() == str(project_path or "").lower()
+
+    def has_usable_scan(self) -> bool:
+        """True when we can skip a full re-inspect on a follow-up."""
+        return bool(
+            self.project_path
+            and self.files_known
+            and self.code_digest
+            and len(self.code_digest) > 80
+            and self.phase not in ("", "idle")
+        )
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -122,14 +143,18 @@ class ActiveWorkStore:
         ]
         if s.files_known:
             lines.append("files_known: " + ", ".join(s.files_known[:20]))
+        if s.features_present:
+            lines.append("features_already_present: " + ", ".join(s.features_present[:20]))
         if s.listing:
-            lines.append("listing:\n" + s.listing[:1200])
+            lines.append("listing:\n" + s.listing[:800])
         if s.code_digest:
             lines.append("code_digest:\n" + s.code_digest[:2000])
         lines.append(
-            "RULES: Project is already open. Do NOT re-list the whole Desktop. "
-            "Do NOT ask what kind of project it is. Use file_read/file_write under "
-            "project_path. Prefer next_step unless the user changes goal."
+            "RULES: Project is already open with prior scan state. "
+            "Do NOT re-list Desktop. Do NOT full re-inspect every file from scratch. "
+            "On follow-ups: use files_known + features_already_present + code_digest; "
+            "only re-read files relevant to the new ask or marked stale. "
+            "Plan = changes given current state, not a brand-new project plan."
         )
         lines.append("=== END ACTIVE WORK ===")
         text = "\n".join(lines)

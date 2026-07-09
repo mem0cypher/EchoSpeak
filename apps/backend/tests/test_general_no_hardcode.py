@@ -281,6 +281,66 @@ def test_active_work_replan_on_incomplete_implement_goal():
     assert "active_work_restore" in tools
 
 
+def test_coding_followup_reuses_active_work_skips_full_rescan():
+    """Case 2: state stored but was ignored — follow-up must resume, not cold-scan all files."""
+    import tempfile
+    from pathlib import Path
+    from agent.core import EchoSpeakAgent
+    from agent.active_work import ActiveWorkState, ActiveWorkStore
+
+    desk = Path.home() / "Desktop" / "2d-shooter-game"
+    if not desk.is_dir():
+        return
+    tid = "test-aw-followup-" + tempfile.mkdtemp()[-8:]
+    store = ActiveWorkStore()
+    # Simulate prior turn wrote usable project fingerprint
+    digest = (
+        "### game.js\nconst player={hp:100}; function damagePlayer(){}\n"
+        "### index.html\n<div id='healthBar'></div>\n"
+        "### style.css\n.health-bar{}\n"
+    )
+    mtimes = {}
+    for name in ("game.js", "index.html", "style.css"):
+        p = desk / name
+        if p.is_file():
+            mtimes[name] = float(p.stat().st_mtime)
+    store.save(
+        ActiveWorkState(
+            thread_id=tid,
+            kind="coding_project",
+            phase="implement",
+            project_path=str(desk),
+            project_name="2d-shooter-game",
+            goal="health and scoreboard",
+            next_step="Continue implementation",
+            files_known=["game.js", "index.html", "style.css"],
+            listing="game.js\nindex.html\nstyle.css",
+            code_digest=digest,
+            features_present=["health", "score"],
+            file_mtimes=mtimes,
+        )
+    )
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    agent._current_thread_id = tid
+    aw = agent._load_active_work()
+    assert aw is not None and aw.has_usable_scan()
+    assert aw.same_project(str(desk))
+    # Follow-up should classify as implement + same project resume
+    q = "also make enemies drop a powerup when killed"
+    assert agent._is_coding_implement_intent(q) is True
+    # Relevant files should prefer js for gameplay ask
+    files = agent._coding_project_source_files(str(desk))
+    rel = agent._files_relevant_to_request(q, files)
+    assert any(Path(f).name == "game.js" for f in rel)
+    # Stale check: matching mtimes => not stale
+    for f in files:
+        if Path(f).name in mtimes:
+            assert agent._file_is_stale_vs_active_work(f, aw) is False
+    # Digest parses back into files without needing disk re-read of all three
+    parsed = agent._parse_code_digest_to_files(digest, str(desk))
+    assert any("game.js" in k.replace("\\", "/") for k in parsed)
+
+
 def test_coding_implement_intent_uses_plan_state_hooks():
     """Feature edits on Desktop game must be recognized as implement + plan-worthy."""
     import tempfile
