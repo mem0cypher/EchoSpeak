@@ -2651,7 +2651,11 @@ class EchoSpeakAgent:
         return False
 
     def _try_pin_desktop_project_from_user(self, user_input: str) -> Optional[str]:
-        """Match user tokens to real Desktop folders — discovery, not a name whitelist."""
+        """Match user tokens to real Desktop folders — discovery, not a name whitelist.
+
+        Safety: never substring-match 2-letter scraps (e.g. \"on\" inside \"button\" → \"to\"
+        matching \"…to-do-list…\"). Prefer exact, then longest substantial token overlap.
+        """
         try:
             from agent.tools import set_active_project_root, _desktop_root
         except Exception:
@@ -2668,38 +2672,67 @@ class EchoSpeakAgent:
 
         text = self._extract_user_request_text(user_input or "")
         low = re.sub(r"\s+", " ", (text or "").lower())
-        # Candidate slugs from phrasing + kebab/snake tokens (generic)
+        # Candidate slugs — word-bounded prefixes only (never bare \"on\" mid-word)
         candidates: list[str] = []
         for m in re.finditer(
-            r"(?:start on|start|open|project|folder|called|named|thats called|that's called|"
+            r"\b(?:start on|start|open|project|folder|called|named|thats called|that's called|"
             r"that is called|work on|continue on|in|on)\s+([a-z0-9][\w.-]{1,48})",
             low,
         ):
             candidates.append(m.group(1).strip(".,!?"))
         for m in re.finditer(r"\b([a-z0-9]+(?:[-_][a-z0-9]+)+)\b", low):
             candidates.append(m.group(1))
-        # Also try contiguous words as a slug: "2d shooter" → "2d-shooter"
+        # Contiguous words as slug: "2d shooter" → "2d-shooter" / "2d-shooter-game"
         for m in re.finditer(r"\b([a-z0-9]{1,12})\s+([a-z0-9]{2,20})(?:\s+([a-z0-9]{2,20}))?\b", low):
             candidates.append(f"{m.group(1)}-{m.group(2)}")
             if m.group(3):
                 candidates.append(f"{m.group(1)}-{m.group(2)}-{m.group(3)}")
+        # Single substantial tokens (e.g. "shooter") — never short scraps
+        for m in re.finditer(r"\b([a-z0-9]{5,32})\b", low):
+            candidates.append(m.group(1))
 
+        # Score candidates against folders; pick best (never first weak substring hit)
+        best: Optional[tuple] = None  # (score, path_str)
         seen: set[str] = set()
+        stop = {
+            "the", "and", "for", "with", "from", "this", "that", "your", "my",
+            "to", "a", "an", "of", "on", "in", "at", "is", "it", "we", "me",
+            "app", "new", "file", "code", "desktop", "folder", "project",
+            "button", "pause", "please", "build", "create", "make", "also",
+            "brand", "list",  # alone too weak; need product phrasing
+        }
         for c in candidates:
-            key = c.lower().replace("_", "-")
-            if not key or key in seen:
+            key = c.lower().replace("_", "-").strip("-")
+            if not key or key in seen or key in stop:
                 continue
             seen.add(key)
+            if len(key) < 3:
+                continue
             # Exact folder name
             if key in folders:
                 path = folders[key]
-                set_active_project_root(str(path))
-                return str(path)
-            # Contains / contained-by match (e.g. user "2d-shooter" → folder "2d-shooter-game")
+                score = 1000 + len(key)
+                if best is None or score > best[0]:
+                    best = (score, str(path))
+                continue
             for name, path in folders.items():
-                if key == name or key in name or name in key:
-                    set_active_project_root(str(path))
-                    return str(path)
+                if key == name:
+                    score = 1000 + len(key)
+                elif len(key) >= 4 and key in name:
+                    # substantial token contained in folder name
+                    score = 100 + len(key)
+                elif len(name) >= 4 and name in key and len(name) >= 6:
+                    score = 80 + len(name)
+                else:
+                    continue
+                # Prefer multi-token product names (shooter-game) over generic scraps
+                if "-" in key:
+                    score += 20
+                if best is None or score > best[0]:
+                    best = (score, str(path))
+        if best:
+            set_active_project_root(best[1])
+            return best[1]
         return None
 
     def _desktop_folder_names(self) -> dict:
@@ -3540,69 +3573,184 @@ class EchoSpeakAgent:
                 low,
             )
         )
-        # Follow-up in an active coding session: short "also make X" without Desktop keywords
+        # Follow-up only when stored work is RELEVANT to this utterance (not any pin)
         try:
+            from agent.active_work import request_continues_project
+
             aw = self._load_active_work()
-            if aw and aw.is_active() and aw.project_path and aw.has_usable_scan():
+            if (
+                aw
+                and aw.is_active()
+                and aw.project_path
+                and aw.has_usable_scan()
+                and request_continues_project(user_input, aw)
+            ):
                 if implement or re.search(r"\b(can we|could you|please|now|next|also|and)\b", low):
                     return True
         except Exception:
             pass
+        # Brand-new build/create language is coding implement even without active work
+        if re.search(
+            r"\b(build|create|make|scaffold)\s+(?:me\s+|us\s+)?(?:a|an|the|my|our)\b",
+            low,
+        ):
+            return True
         if not implement:
             return False
         if self._is_local_filesystem_intent(user_input) or self._is_coding_project_intent(user_input):
             return True
         try:
+            from agent.active_work import request_continues_project
+
             aw = self._load_active_work()
-            if aw and aw.is_active() and aw.project_path:
+            if aw and aw.is_active() and aw.project_path and request_continues_project(user_input, aw):
                 return True
         except Exception:
             pass
         try:
             from agent.tools import get_active_project_root
 
-            if get_active_project_root() is not None:
-                return True
+            if get_active_project_root() is not None and self._is_coding_project_intent(user_input):
+                # pin alone is not enough — avoid hijacking wrong project
+                return False
         except Exception:
             pass
-        return bool(str(getattr(self, "_last_local_project_path", "") or "").strip())
+        return False
+
+    def _active_work_is_relevant(self, user_input: str, aw=None) -> bool:
+        """Safety gate before resuming a pin — never reuse unrelated project state."""
+        try:
+            from agent.active_work import request_continues_project
+
+            state = aw if aw is not None else self._load_active_work()
+            if not state or not getattr(state, "project_path", ""):
+                return False
+            return bool(request_continues_project(user_input, state))
+        except Exception:
+            return False
+
+    def _allocate_new_desktop_project(self, user_input: str) -> str:
+        """Create/return a NEW Desktop folder for a brand-new app — never an old pin."""
+        try:
+            from agent.active_work import infer_new_project_slug
+            from agent.tools import _desktop_root, set_active_project_root
+
+            desk = _desktop_root()
+            slug = infer_new_project_slug(user_input)
+            # avoid colliding with existing folders
+            path = desk / slug
+            if path.exists():
+                for i in range(2, 50):
+                    cand = desk / f"{slug}-{i}"
+                    if not cand.exists():
+                        path = cand
+                        break
+            path.mkdir(parents=True, exist_ok=True)
+            set_active_project_root(str(path))
+            self._last_local_project_path = str(path.resolve())
+            # Clear prior active work so we don't keep the old project fingerprint
+            try:
+                store = getattr(self, "_active_work_store", None)
+                if store is not None:
+                    from agent.active_work import ActiveWorkState, infer_goal_from_user
+
+                    store.save(
+                        ActiveWorkState(
+                            thread_id=self._active_work_thread(),
+                            kind="coding_project",
+                            phase="inspect",
+                            project_path=str(path.resolve()),
+                            project_name=path.name,
+                            goal=infer_goal_from_user(user_input) or f"Build {path.name}",
+                            last_user_message=str(user_input or "")[:400],
+                            next_step="Scaffold new project files",
+                            files_known=[],
+                            listing="",
+                            code_digest="",
+                            features_present=[],
+                            file_mtimes={},
+                        )
+                    )
+            except Exception:
+                pass
+            logger.info("Allocated new Desktop project path={}", path)
+            return str(path.resolve())
+        except Exception as exc:
+            logger.warning("allocate new project failed: {}", exc)
+            return ""
 
     def _resolve_coding_project_path(self, user_input: str = "") -> str:
-        """Best project root for coding implement plans."""
+        """Best project root for coding plans — ONLY resume pin if request is relevant.
+
+        Safety: never return a prior unrelated project (e.g. shooter) for a new app ask.
+        Order matters: relevance-gated active work before weak Desktop fuzzy pin.
+        """
+        low = re.sub(r"\s+", " ", str(user_input or "").lower())
+        is_new_product = bool(
+            re.search(
+                r"\b(build|create|make|scaffold)\s+(?:me\s+|us\s+)?(?:a|an|the|my|our)\b",
+                low,
+            )
+            or re.search(r"\b(new project|brand[- ]?new|from scratch)\b", low)
+        )
+
+        # 1) Resume active work when relevance gate passes (before fuzzy pin)
         try:
             aw = self._load_active_work()
-            if aw and getattr(aw, "project_path", ""):
+            if (
+                aw
+                and getattr(aw, "project_path", "")
+                and self._active_work_is_relevant(user_input, aw)
+                and not is_new_product
+            ):
                 p = Path(str(aw.project_path))
                 if p.is_dir():
                     return str(p.resolve())
         except Exception:
             pass
-        try:
-            from agent.tools import get_active_project_root
 
-            root = get_active_project_root()
-            if root is not None and Path(str(root)).is_dir():
-                return str(Path(str(root)).resolve())
-        except Exception:
-            pass
-        pin = str(getattr(self, "_last_local_project_path", "") or "").strip()
-        if pin and Path(pin).is_dir():
-            return str(Path(pin).resolve())
+        # 2) Strong Desktop folder match from user tokens (scored, no weak substrings)
         try:
             pinned = self._try_pin_desktop_project_from_user(user_input or "")
             if pinned and Path(pinned).is_dir():
-                return str(Path(pinned).resolve())
+                # Even a pin must not override "brand new app" into an old game folder
+                if is_new_product:
+                    aw = self._load_active_work()
+                    if aw and aw.same_project(pinned) and not self._active_work_is_relevant(user_input, aw):
+                        pinned = None
+                if pinned:
+                    return str(Path(pinned).resolve())
         except Exception:
             pass
-        # Deep-scan if user named a Desktop project
         try:
-            if self._is_local_filesystem_intent(user_input or ""):
+            if self._is_local_filesystem_intent(user_input or "") and not is_new_product:
                 scan = self._run_local_project_deep_scan(user_input or "")
                 path = str((scan or {}).get("path") or "")
                 if path and Path(path).is_dir():
                     return str(Path(path).resolve())
         except Exception:
             pass
+
+        # 3) Brand-new product → allocate NEW Desktop folder (never old pin)
+        if is_new_product:
+            return self._allocate_new_desktop_project(user_input or "")
+
+        # 4) Soft pin only if it matches relevant active work (global pin is sticky/dangerous)
+        try:
+            from agent.tools import get_active_project_root
+
+            root = get_active_project_root()
+            if root is not None and Path(str(root)).is_dir():
+                aw = self._load_active_work()
+                if aw and aw.same_project(str(root)) and self._active_work_is_relevant(user_input, aw):
+                    return str(Path(str(root)).resolve())
+        except Exception:
+            pass
+        pin = str(getattr(self, "_last_local_project_path", "") or "").strip()
+        if pin and Path(pin).is_dir():
+            aw = self._load_active_work()
+            if aw and aw.same_project(pin) and self._active_work_is_relevant(user_input, aw):
+                return str(Path(pin).resolve())
         return ""
 
     def _coding_project_source_files(self, project_path: str, *, max_files: int = 8) -> List[str]:
@@ -3727,6 +3875,170 @@ class EchoSpeakAgent:
             "already_done": already_done,
         }
 
+    def _scaffold_new_project_plan(
+        self,
+        user_input: str,
+        project: str,
+        callbacks: Optional[list] = None,
+    ) -> Optional[tuple]:
+        """Scaffold a brand-new Desktop project in `project` only — never an old pin."""
+        root = Path(project)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            msg = f"Could not create project folder {project}: {exc}"
+            self._last_tts_text = self._clamp_tts_text(msg)
+            self._record_turn(user_input, msg)
+            return msg, True
+
+        # Generate minimal multi-file starter under THIS path only
+        try:
+            ctx_win = int(getattr(getattr(config, "local", None), "context_length", 0) or 4096)
+        except Exception:
+            ctx_win = 4096
+        budget = max(600, min(2200, ctx_win // 2))
+        prompt = (
+            f"Create a minimal working web app for:\n{user_input[:500]}\n\n"
+            f"Project folder: {project}\n"
+            "Output COMPLETE files as:\n"
+            "### FILE: index.html\n```html\n...\n```\n"
+            "### FILE: style.css\n```css\n...\n```\n"
+            "### FILE: app.js\n```js\n...\n```\n"
+            "Keep it small and self-contained. No prose outside the files."
+        )[: budget + 400]
+        try:
+            if hasattr(self, "_emit_thinking_step"):
+                self._emit_thinking_step("thought", f"Scaffolding new project {root.name}…", "running")
+            llm_out = self.llm_wrapper.invoke(prompt)
+            if hasattr(self, "_emit_thinking_step"):
+                self._emit_thinking_step("thought", f"Scaffolding new project {root.name}…", "done")
+        except Exception as exc:
+            err = str(exc)
+            if re.search(r"unload|not loaded|model.*(unavailable|down)", err, flags=re.I):
+                msg = (
+                    f"Model provider is not ready ({err[:160]}). "
+                    "Load/start the model in LM Studio, then ask again — "
+                    f"I will create a NEW folder at {project} (not any old project)."
+                )
+            else:
+                msg = f"Could not scaffold {root.name}: {err[:200]}"
+            self._last_tts_text = self._clamp_tts_text(msg)
+            self._record_turn(user_input, msg)
+            return msg, True
+
+        sections: Dict[str, str] = {}
+        current = ""
+        buf: List[str] = []
+        for line in (llm_out or "").splitlines():
+            m = re.match(r"^###\s*FILE:\s*(.+?)\s*$", line.strip(), flags=re.I)
+            if m:
+                if current:
+                    body = "\n".join(buf)
+                    body = re.sub(r"^```[\w]*\s*\n?", "", body.strip())
+                    body = re.sub(r"\n?```\s*$", "", body.strip())
+                    sections[Path(current).name] = self._strip_tool_file_body(body)
+                current = m.group(1).strip().strip("`")
+                buf = []
+            else:
+                buf.append(line)
+        if current:
+            body = "\n".join(buf)
+            body = re.sub(r"^```[\w]*\s*\n?", "", body.strip())
+            body = re.sub(r"\n?```\s*$", "", body.strip())
+            sections[Path(current).name] = self._strip_tool_file_body(body)
+
+        if not sections:
+            # deterministic minimal shell so we never write into wrong project
+            sections = {
+                "index.html": (
+                    "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"UTF-8\"/>"
+                    f"<title>{root.name}</title><link rel=\"stylesheet\" href=\"style.css\"/>"
+                    "</head><body><div id=\"app\"></div><script src=\"app.js\"></script></body></html>\n"
+                ),
+                "style.css": "body{font-family:system-ui;margin:2rem;background:#0b0d12;color:#e8eaef;}\n",
+                "app.js": "document.getElementById('app').textContent='Ready — edit me.';\n",
+            }
+
+        tasks: List[Dict[str, Any]] = [
+            {
+                "index": 0,
+                "description": f"New project {root.name} (not prior pin)",
+                "tool": "plan_note",
+                "params": {"path": project},
+                "depends_on": -1,
+                "status": "completed",
+                "result": str(project),
+            }
+        ]
+        i = 1
+        for name, content in sections.items():
+            # Absolute path under the NEW folder only
+            fp = str((root / Path(name).name).resolve())
+            # Reject any path escape
+            if not str(Path(fp).resolve()).startswith(str(root.resolve())):
+                continue
+            tasks.append(
+                {
+                    "index": i,
+                    "description": f"Create {Path(name).name}",
+                    "tool": "file_write",
+                    "params": {"path": fp, "content": content},
+                    "depends_on": 0,
+                    "status": "pending",
+                    "result": None,
+                }
+            )
+            i += 1
+
+        self._last_user_input_for_plan = user_input
+        self._emit_coding_plan_as_tasks(tasks)
+        self._task_planner._emit_task_step(tasks[0], "done", project)
+        self._task_planner.current_task_index = 1
+        results = self._task_planner.execute_all(self.tools, callbacks)
+
+        if self._pending_action is not None:
+            # Safety: pending write must target the new project only
+            try:
+                kw = (self._pending_action or {}).get("kwargs") or {}
+                wpath = str(kw.get("path") or "")
+                if wpath and not str(Path(wpath).resolve()).startswith(str(root.resolve())):
+                    self._pending_action = None
+                    msg = (
+                        f"Blocked a write outside new project {root.name}. "
+                        f"Would have targeted: {wpath}"
+                    )
+                    self._task_planner.reset()
+                    self._last_tts_text = self._clamp_tts_text(msg)
+                    self._record_turn(user_input, msg)
+                    return msg, True
+            except Exception:
+                pass
+            display = self._format_pending_action(self._pending_action)
+            response_text = (
+                f"New project folder: {project}\n"
+                f"Prepared starter files there (not any previous project). "
+                f"Reply 'confirm' to save.\n\n{display}"
+            )
+            self._last_tts_text = self._clamp_tts_text(response_text)
+            self._record_turn(user_input, response_text)
+            return response_text, True
+
+        summary = f"Scaffolded new project at {project}."
+        try:
+            self._save_active_work_from_scan(
+                user_input,
+                path=project,
+                listing="\n".join(sections.keys()),
+                samples="\n\n".join(f"### {n}\n{c[:1500]}" for n, c in sections.items()),
+                phase="ready",
+            )
+        except Exception:
+            pass
+        self._task_planner.reset()
+        self._last_tts_text = self._clamp_tts_text(summary)
+        self._record_turn(user_input, summary)
+        return summary, True
+
     def _parse_code_digest_to_files(self, digest: str, project: str) -> Dict[str, str]:
         """Map ### name headers in code_digest back to absolute paths under project."""
         out: Dict[str, str] = {}
@@ -3835,10 +4147,14 @@ class EchoSpeakAgent:
         self._ensure_coding_loop(user_input)
         project = self._resolve_coding_project_path(user_input)
         if not project:
+            # Last resort new project (never fall back to an unrelated pin)
+            project = self._allocate_new_desktop_project(user_input)
+        if not project:
             return None
         files = self._coding_project_source_files(project)
+        # Brand-new empty folder: scaffold plan will create files via writes
         if not files:
-            return None
+            files = []
 
         try:
             from agent.tools import set_active_project_root
@@ -3849,10 +4165,13 @@ class EchoSpeakAgent:
         self._update_active_work_goal(user_input)
 
         aw = self._load_active_work()
+        # CRITICAL: same path alone is not enough — request must be about this project
         reuse = bool(
             aw
             and aw.same_project(project)
             and aw.has_usable_scan()
+            and self._active_work_is_relevant(user_input, aw)
+            and files  # empty new folder is never a resume
         )
         read_contents: Dict[str, str] = {}
         plan_tasks: List[Dict[str, Any]] = []
@@ -3929,7 +4248,10 @@ class EchoSpeakAgent:
                 self._task_planner.current_task_index = 1
                 logger.info("Coding plan phase=resume-pure project={} (no stale files)", project)
         else:
-            # ── Cold start: full scan once ──
+            # ── Cold start: new folder scaffold OR full scan of existing files ──
+            if not files:
+                # Empty brand-new project — never touch an unrelated pin
+                return self._scaffold_new_project_plan(user_input, project, callbacks)
             plan_tasks.append(
                 {
                     "index": idx,
@@ -3995,6 +4317,9 @@ class EchoSpeakAgent:
                 pass
 
         if not read_contents:
+            # Empty new project path → scaffold, never write into a wrong old project
+            if not files:
+                return self._scaffold_new_project_plan(user_input, project, callbacks)
             msg = f"Could not load sources for {project}."
             self._task_planner.reset()
             self._last_tts_text = self._clamp_tts_text(msg)

@@ -281,6 +281,81 @@ def test_active_work_replan_on_incomplete_implement_goal():
     assert "active_work_restore" in tools
 
 
+def test_new_app_request_never_resumes_unrelated_shooter_project():
+    """CRITICAL: to-do list must not reuse 2d-shooter-game pin/path."""
+    import tempfile
+    from pathlib import Path
+    from agent.core import EchoSpeakAgent
+    from agent.active_work import (
+        ActiveWorkState,
+        ActiveWorkStore,
+        request_continues_project,
+        infer_new_project_slug,
+    )
+
+    desk = Path.home() / "Desktop" / "2d-shooter-game"
+    if not desk.is_dir():
+        return
+    tid = "test-aw-newproj-" + tempfile.mkdtemp()[-8:]
+    store = ActiveWorkStore()
+    store.save(
+        ActiveWorkState(
+            thread_id=tid,
+            kind="coding_project",
+            phase="implement",
+            project_path=str(desk),
+            project_name="2d-shooter-game",
+            goal="health and scoreboard for shooter",
+            next_step="Continue shooter",
+            files_known=["game.js", "index.html", "style.css"],
+            listing="game.js\nindex.html\nstyle.css",
+            code_digest="### game.js\n// canvas shooter enemies\n",
+            features_present=["health", "score"],
+            file_mtimes={"game.js": 1.0},
+        )
+    )
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    agent._current_thread_id = tid
+    aw = agent._load_active_work()
+    q_new = "build me a brand new to-do list app on my desktop"
+    assert request_continues_project(q_new, aw) is False
+    assert agent._active_work_is_relevant(q_new, aw) is False
+    path = agent._resolve_coding_project_path(q_new)
+    assert path
+    assert "2d-shooter" not in path.lower().replace("_", "-")
+    assert "todo" in path.lower().replace("_", "-") or "to-do" in path.lower() or "list" in path.lower()
+    # slug helper sanity
+    slug = infer_new_project_slug(q_new)
+    assert "todo" in slug or "list" in slug
+    assert "desktop" not in slug
+
+    # Continuity gate on the *shooter* fingerprint (in-memory), independent of overwrite
+    q_cont = "also add a pause button to the shooter game"
+    assert request_continues_project(q_cont, aw) is True
+    # Restore shooter state on a fresh thread and confirm path resolves to shooter
+    tid2 = "test-aw-cont-" + tempfile.mkdtemp()[-8:]
+    store.save(
+        ActiveWorkState(
+            thread_id=tid2,
+            kind="coding_project",
+            phase="implement",
+            project_path=str(desk),
+            project_name="2d-shooter-game",
+            goal="health and scoreboard for shooter",
+            next_step="Continue shooter",
+            files_known=["game.js", "index.html", "style.css"],
+            listing="game.js\nindex.html\nstyle.css",
+            code_digest="### game.js\n// canvas shooter enemies\n" + ("x" * 100),
+            features_present=["health", "score"],
+            file_mtimes={"game.js": 1.0},
+        )
+    )
+    agent2 = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    agent2._current_thread_id = tid2
+    path2 = agent2._resolve_coding_project_path(q_cont)
+    assert "2d-shooter" in path2.lower().replace("_", "-")
+
+
 def test_coding_followup_reuses_active_work_skips_full_rescan():
     """Case 2: state stored but was ignored — follow-up must resume, not cold-scan all files."""
     import tempfile

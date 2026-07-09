@@ -82,6 +82,149 @@ class ActiveWorkState:
         return asdict(self)
 
 
+def request_continues_project(user_input: str, state: "ActiveWorkState") -> bool:
+    """Hard relevance gate: only resume stored project when the ask is about THAT project.
+
+    Critical safety: never reuse an unrelated prior pin (e.g. 2d-shooter-game) for a
+    brand-new app request (e.g. to-do list). False → treat as fresh project.
+    """
+    if not state or not state.project_path:
+        return False
+    text = re.sub(r"\s+", " ", str(user_input or "").strip().lower())
+    if not text:
+        return False
+
+    name = (state.project_name or Path(state.project_path).name or "").lower()
+    name_tokens = {t for t in re.split(r"[-_\s.]+", name) if len(t) >= 2}
+
+    # Explicit continuity: user names the stored project / path
+    if name and name in text.replace(" ", "-"):
+        return True
+    if name_tokens and all(tok in text for tok in name_tokens if tok not in {"2d", "app", "game", "project"}):
+        # e.g. "shooter" "game" both in text for 2d-shooter-game
+        strong = [t for t in name_tokens if t not in {"2d", "app", "game", "project", "the", "my"}]
+        if strong and any(t in text for t in strong):
+            # still need no conflicting new-product intent below
+            pass
+
+    # Explicit NEW project language → never resume
+    if re.search(
+        r"\b("
+        r"new project|brand[- ]?new|from scratch|start over|different project|"
+        r"another project|separate project|instead build|instead create|"
+        r"build me|create me|make me|scaffold|greenfield"
+        r")\b",
+        text,
+    ):
+        return False
+
+    # "build/create/make a|an <product>" where product is NOT the stored project
+    m = re.search(
+        r"\b(?:build|create|make|scaffold|start)\s+(?:me\s+|us\s+)?(?:a|an|the|my|our)\s+([a-z0-9][\w\s-]{1,48})",
+        text,
+    )
+    if m:
+        product = re.sub(r"\s+", " ", m.group(1).strip().lower())
+        product = re.sub(r"\b(app|application|project|website|site|tool|game)\b", "", product).strip()
+        product_tokens = {t for t in re.split(r"[-_\s]+", product) if len(t) >= 3}
+        # If product shares almost no tokens with stored name → new project
+        if product_tokens and name_tokens:
+            overlap = product_tokens & name_tokens
+            # allow generic words
+            generic = {"app", "game", "web", "simple", "basic", "new", "the", "for"}
+            overlap -= generic
+            product_tokens -= generic
+            if product_tokens and not overlap:
+                return False
+        elif product_tokens and not name_tokens:
+            return False
+
+    # Domain conflict: stored looks like a game, user asks for todo/list/notes/etc.
+    stored_blob = " ".join(
+        [
+            name,
+            " ".join(state.files_known or [])[:200],
+            (state.goal or "")[:200],
+            (state.code_digest or "")[:400],
+        ]
+    ).lower()
+    is_game_stored = bool(
+        re.search(r"\b(shooter|game\.js|canvas|enemy|npc|bullet|player\.hp)\b", stored_blob)
+        or re.search(r"\bgame\b", name)
+    )
+    is_todo_ask = bool(
+        re.search(r"\b(to-?do|todo|task list|checklist|notes app|habit tracker|kanban)\b", text)
+    )
+    is_other_app = bool(
+        re.search(
+            r"\b(weather app|chat app|blog|calculator|dashboard|crm|portfolio|landing page)\b",
+            text,
+        )
+    )
+    if is_game_stored and (is_todo_ask or is_other_app):
+        return False
+    if is_todo_ask and not re.search(r"\b(to-?do|todo|task)\b", stored_blob):
+        return False
+
+    # Continuity language without a conflicting new product
+    if re.search(
+        r"\b("
+        r"also|same project|this project|the project|that project|"
+        r"continue|keep going|next|follow[- ]?up|while you'?re at it|"
+        r"in the game|to the game|our game|the code we|what we (?:just |already )?built"
+        r")\b",
+        text,
+    ):
+        # Block if they also introduced a clearly different product noun phrase
+        if m and product_tokens and name_tokens and not (product_tokens & name_tokens):
+            return False
+        return True
+
+    # Feature edit that matches stored features / domain (follow-up style)
+    if state.features_present:
+        for feat in state.features_present:
+            ft = str(feat or "").lower()
+            if ft and ft in text:
+                return True
+
+    # Default: NO resume unless clearly continuous — safer than silent wrong pin
+    # Short referential follow-ups without new product nouns
+    if re.search(r"\b(add|fix|edit|change|update|implement)\b", text) and not m:
+        if re.search(r"\b(it|this|that|there|here)\b", text) or len(text.split()) <= 14:
+            # still reject domain flip
+            if is_game_stored and is_todo_ask:
+                return False
+            return True
+
+    return False
+
+
+def infer_new_project_slug(user_input: str) -> str:
+    """Slug for a brand-new Desktop project folder from the user utterance."""
+    text = re.sub(r"\s+", " ", str(user_input or "").strip().lower())
+    m = re.search(
+        r"\b(?:build|create|make|scaffold|start)\s+(?:me\s+|us\s+)?(?:a|an|the|my|our)\s+([a-z0-9][\w\s-]{1,48})",
+        text,
+    )
+    raw = m.group(1) if m else ""
+    if not raw:
+        # fallback: last noun-ish chunk
+        raw = re.sub(r"^(please|can you|could you|lets|let's)\s+", "", text)[:48]
+    raw = re.sub(
+        r"\b("
+        r"app|application|project|website|site|for me|please|"
+        r"brand[- ]?new|on my desktop|on the desktop|from scratch"
+        r")\b",
+        " ",
+        raw,
+    )
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.strip()).strip("-")[:48]
+    return slug or "new-project"
+
+    def as_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class ActiveWorkStore:
     """Load/save ActiveWorkState per thread on disk."""
 
