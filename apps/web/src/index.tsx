@@ -3731,32 +3731,21 @@ export const Dashboard: React.FC = () => {
     }
   };
 
-  /** Live plan for the current turn — sticky below tools, not buried in older messages. */
+  /**
+   * ONE plan for the current turn only — sticky under tools/thinking.
+   * Never inject historical task_plan rows into the timeline (that pinned
+   * checklists high above the current conversation).
+   */
   const liveTaskPlan = useMemo(() => {
     if (!taskPlans.length) return null;
-    const isOpen = (entry: TaskPlanEntry) => {
-      if (!entry.plan.active || !entry.plan.tasks.length) return false;
-      return entry.plan.tasks.some((t) =>
-        ["pending", "running", "retrying", "awaiting_confirmation", "blocked"].includes(t.status)
-      );
-    };
-    // Prefer the open plan for this stream; else most recent open plan; else none (historical only).
-    const open = [...taskPlans].reverse().find(isOpen);
-    if (open) return open;
-    // While streaming, keep the latest plan visible at the bottom even if just completed.
-    if (streaming) {
-      return taskPlans[taskPlans.length - 1] || null;
-    }
-    return null;
-  }, [taskPlans, streaming]);
+    // Always the latest plan only (one checklist, current turn).
+    const latest = taskPlans[taskPlans.length - 1];
+    if (!latest?.plan?.tasks?.length) return null;
+    return latest;
+  }, [taskPlans]);
 
   const timeline = useMemo<TimelineItem[]>(() => {
-    const liveId = liveTaskPlan?.id;
-    const historicalPlans = taskPlans.filter((entry) => {
-      // Live plan is rendered sticky at bottom — exclude from chronological merge
-      if (liveId && entry.id === liveId) return false;
-      return entry.plan.active && entry.plan.tasks.length > 0;
-    });
+    // Plans are NOT merged into history — only messages + activity cards.
     const merged: TimelineItem[] = [
       ...messages.map(
         (m): TimelineItem => ({
@@ -3774,21 +3763,12 @@ export const Dashboard: React.FC = () => {
           item: a,
         })
       ),
-      ...historicalPlans.map(
-        (entry): TimelineItem => ({
-          kind: "task_plan",
-          id: entry.id,
-          at: entry.at,
-          entry,
-        })
-      ),
     ];
     // Chronological with multi-beat contract:
-    //   user → first spoken assistant beat (partial) → tool/search rows → plan → final answer
-    // Only *partial* assistant messages (skipTypewriter) force above tools — not finals.
-    // task_plan ranks AFTER activity so checklists sit under tools, not above old chatter.
+    //   user → first spoken assistant beat (partial) → tool/search rows → final answer
+    // Plan checklist is rendered separately under the stream (liveTaskPlan).
     const kindRank = (k: TimelineItem["kind"]) =>
-      k === "message" ? 0 : k === "activity" ? 1 : k === "task_plan" ? 2 : 3;
+      k === "message" ? 0 : k === "activity" ? 1 : 2;
     const isPartialBeat = (t: TimelineItem) => {
       if (t.kind !== "message") return false;
       const m = (t as Extract<TimelineItem, { kind: "message" }>).msg;
@@ -3817,7 +3797,7 @@ export const Dashboard: React.FC = () => {
       return kindRank(a.kind) - kindRank(b.kind);
     });
     return merged;
-  }, [messages, activities, taskPlans, liveTaskPlan]);
+  }, [messages, activities]);
 
   const lastMsgLen = messages.length ? (messages[messages.length - 1]?.text || "").length : 0;
   const activityLen = activities.length;
@@ -3913,6 +3893,8 @@ export const Dashboard: React.FC = () => {
     if (userTypingTimerRef.current) clearTimeout(userTypingTimerRef.current);
     setDocSources([]);
     activeTaskPlanIdRef.current = null;
+    // Fresh turn = fresh checklist only (no stacked plans from prior messages)
+    setTaskPlans([]);
     liveReplyDraftRef.current = "";
     setLiveReplyDraft("");
     dispatchActivity({ type: "stream_start" });
@@ -5615,11 +5597,11 @@ export const Dashboard: React.FC = () => {
                         )
                       )}
                     </AnimatePresence>
-                    {/* Live plan sticky under current turn (tools/thinking), not high in history */}
-                    {liveTaskPlan && liveTaskPlan.plan.active && liveTaskPlan.plan.tasks.length > 0 ? (
+                    {/* Current-turn plan only — always under latest tools, never mid-history */}
+                    {liveTaskPlan && liveTaskPlan.plan.tasks.length > 0 ? (
                       <div
                         key={`live-plan-${liveTaskPlan.id}`}
-                        style={{ width: "100%", padding: "4px 4px 8px", order: 9999 }}
+                        style={{ width: "100%", padding: "8px 4px 10px" }}
                       >
                         <TaskChecklist plan={liveTaskPlan.plan} />
                       </div>

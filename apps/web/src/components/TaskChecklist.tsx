@@ -74,6 +74,23 @@ export function taskPlanReducer(
   if (event.type === "task_step" && event.data) {
     const d = event.data;
     const idx = d.index ?? 0;
+    // Never show raw file bodies / ECHO wrappers in the checklist
+    let preview = String(d.result_preview || "").trim();
+    if (preview) {
+      preview = preview
+        .replace(/<<<ECHO_FILE\b[^>]*>>>/gi, "")
+        .replace(/<<<END_ECHO_FILE>>>/gi, "")
+        .replace(/^(Read|Wrote|Appended)\s+\d+\s+chars\b.*$/im, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 90);
+      // Drop if it still looks like source code dump
+      if (preview.length > 80 || /[{};]|function\s|const\s|=>/.test(preview)) {
+        if (!/chars|saved|listed|scanned|present|done/i.test(preview)) {
+          preview = preview.slice(0, 48) + (preview.length > 48 ? "…" : "");
+        }
+      }
+    }
     return {
       ...state,
       tasks: state.tasks.map((t) =>
@@ -81,7 +98,7 @@ export function taskPlanReducer(
           ? {
               ...t,
               status: (d.status ?? t.status) as TaskStepStatus,
-              resultPreview: d.result_preview || t.resultPreview,
+              resultPreview: preview || t.resultPreview,
             }
           : t,
       ),

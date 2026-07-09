@@ -547,6 +547,42 @@ def _echo_file_payload(path: Path | str, content: str, *, action: str = "read") 
     return f"{header}\n{body}\n<<<END_ECHO_FILE>>>"
 
 
+def strip_echo_file_wrapper(text: str) -> str:
+    """Extract pure file body from tool output. Never write wrappers into source files.
+
+    Handles:
+      Read N chars from path
+      <<<ECHO_FILE ...>>>
+      <body>
+      <<<END_ECHO_FILE>>>
+    """
+    raw = str(text or "")
+    if not raw:
+        return ""
+    # Prefer ECHO_FILE body
+    m = re.search(
+        r"<<<ECHO_FILE\b[^>]*>>>\s*\n?(.*?)\n?\s*<<<END_ECHO_FILE>>>",
+        raw,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+    # Drop leading "Read N chars…" / "Wrote N chars…" summary lines
+    lines = raw.splitlines()
+    if lines and re.match(r"^(Read|Wrote|Appended)\s+\d+\s+chars\b", lines[0], flags=re.I):
+        body = "\n".join(lines[1:])
+        # If residual markers, strip them
+        body = re.sub(r"^<<<ECHO_FILE\b[^>]*>>>\s*\n?", "", body, flags=re.I)
+        body = re.sub(r"\n?<<<END_ECHO_FILE>>>\s*$", "", body, flags=re.I)
+        return body
+    # Bare markers without full pair
+    if "<<<ECHO_FILE" in raw or "<<<END_ECHO_FILE>>>" in raw:
+        raw = re.sub(r"^.*?<<<ECHO_FILE\b[^>]*>>>\s*\n?", "", raw, count=1, flags=re.I | re.DOTALL)
+        raw = re.sub(r"\n?<<<END_ECHO_FILE>>>.*$", "", raw, flags=re.I | re.DOTALL)
+        return raw
+    return raw
+
+
 @tool(args_schema=FileReadArgs, description="Read a text file from an allowed workspace directory.")
 def file_read(path: str, max_chars: int = 100000) -> str:
     target = _safe_file_path(path)
@@ -621,7 +657,8 @@ def file_write(path: str, content: str, append: bool = False) -> str:
     target = _safe_file_path(path)
     if target is None:
         return f"Path not allowed. Allowed roots: {_format_file_tool_roots()}. Prefer Desktop/<project>/filename for user projects."
-    body = content or ""
+    # Never persist tool wrapper / "Read N chars" pollution into real source files
+    body = strip_echo_file_wrapper(content or "")
     if not append and _looks_like_code_stub(str(path), body):
         return (
             "Rejected stub write: content is too small or comment-only for a code file. "

@@ -876,15 +876,53 @@ class TaskPlanner:
         except Exception:
             pass
 
+    def _sanitize_task_preview(self, tool_name: str, result_preview: str, params: Optional[Dict] = None) -> str:
+        """Short, human checklist line — never dump full file bodies / ECHO wrappers."""
+        raw = str(result_preview or "").strip()
+        tool = str(tool_name or "").strip().lower()
+        params = params or {}
+        path = str(params.get("path") or "").strip()
+        name = Path(path).name if path else ""
+        # Strip wrapper pollution
+        try:
+            from agent.tools import strip_echo_file_wrapper
+
+            cleaned = strip_echo_file_wrapper(raw)
+        except Exception:
+            cleaned = raw
+        cleaned = re.sub(r"<<<ECHO_FILE\b[^>]*>>>", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"<<<END_ECHO_FILE>>>", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"(?im)^(Read|Wrote|Appended)\s+\d+\s+chars\b.*$", "", cleaned).strip()
+        if tool == "file_list":
+            lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()][:6]
+            return (", ".join(lines) if lines else "listed")[:80]
+        if tool == "file_read":
+            n = len(cleaned)
+            return f"{name or 'file'} · {n} chars" if n else f"read {name or 'file'}"
+        if tool == "file_write":
+            n = len(cleaned) if cleaned and "chars" not in cleaned[:40].lower() else len(str(params.get("content") or ""))
+            if re.search(r"\bWrote\s+(\d+)\s+chars\b", raw, flags=re.I):
+                m = re.search(r"\bWrote\s+(\d+)\s+chars\b", raw, flags=re.I)
+                return f"saved {name or 'file'} · {m.group(1)} chars"
+            return f"saved {name or 'file'}" + (f" · {n} chars" if n else "")
+        # Generic: one short line, no code dumps
+        one = re.sub(r"\s+", " ", cleaned.splitlines()[0] if cleaned else "")[:72]
+        return one or "done"
+
     def _emit_task_step(self, task: Dict, status: str, result_preview: str = "") -> None:
         """Emit a task_step NDJSON event for a single step status change."""
         try:
+            preview = self._sanitize_task_preview(
+                str(task.get("tool") or ""),
+                result_preview,
+                task.get("params") if isinstance(task.get("params"), dict) else {},
+            )
             step_data = {
                 "index": int(task.get("index", self.current_task_index)),
                 "status": status,
                 "description": task.get("description", task.get("tool", "Task")),
                 "tool": task.get("tool", ""),
-                "result_preview": (result_preview[:200] if result_preview else ""),
+                "result_preview": (preview[:100] if preview else ""),
                 "total": len(self.pending_tasks),
             }
             buf = getattr(self.agent, '_stream_buffer', None)
@@ -3564,15 +3602,98 @@ class EchoSpeakAgent:
         except Exception:
             pass
 
+    def _strip_tool_file_body(self, text: str) -> str:
+        """Pure source from tool output (no ECHO wrappers / Read N chars lines)."""
+        try:
+            from agent.tools import strip_echo_file_wrapper
+
+            return strip_echo_file_wrapper(str(text or ""))
+        except Exception:
+            raw = str(text or "")
+            raw = re.sub(
+                r"<<<ECHO_FILE\b[^>]*>>>\s*\n?(.*?)\n?\s*<<<END_ECHO_FILE>>>",
+                r"\1",
+                raw,
+                flags=re.DOTALL | re.I,
+            )
+            return raw
+
+    def _scan_coding_gaps(self, user_input: str, read_contents: Dict[str, str]) -> Dict[str, Any]:
+        """After a real scan, decide what is still missing — not a fixed write-everything loop."""
+        low = re.sub(r"\s+", " ", (user_input or "").lower())
+        joined = "\n".join(read_contents.values()).lower()
+        wanted: List[str] = []
+        present: List[str] = []
+
+        def _need(label: str, ask: str, have: str) -> None:
+            if re.search(ask, low) or re.search(ask, low.replace(" ", "")):
+                if re.search(have, joined):
+                    present.append(label)
+                else:
+                    wanted.append(label)
+
+        _need("health", r"\b(health|hp|hit points)\b", r"\b(health|player\.hp|maxhp|healthfill|healthbar)\b")
+        _need("scoreboard", r"\b(scoreboard|score bar|best score)\b", r"\b(scoreboard|bestscore|best-score|best_score)\b")
+        _need("score", r"\bscore\b", r"\b(score|scoreel|#score)\b")
+        _need("death_screen", r"\b(you died|game over|death screen|died)\b", r"\b(you died|deathscreen|game.?over|gameState\s*=\s*[\"']dead)\b")
+        _need("restart", r"\b(restart|new game|play again|refresh game)\b", r"\b(resetGame|restart|new game|start new)\b")
+        _need("damage", r"\b(damage|lose health|hit the player)\b", r"\b(damagePlayer|ENEMY_DAMAGE|player\.hp\s*[-+]=)\b")
+
+        # Generic edit ask with no feature keywords → touch primary logic file only
+        if not wanted and not present:
+            if re.search(r"\b(add|fix|edit|update|change|implement|make)\b", low):
+                wanted.append("requested_edits")
+
+        # Files that likely need work: prefer those that don't already satisfy, or primary logic
+        target_files: List[str] = []
+        for path, body in read_contents.items():
+            name = Path(path).name.lower()
+            body_l = body.lower()
+            needs = False
+            if "health" in wanted and name.endswith((".js", ".html", ".css")):
+                if name.endswith(".js") or ("health" not in body_l and name.endswith((".html", ".css"))):
+                    needs = True
+            if "scoreboard" in wanted or "score" in wanted:
+                if name.endswith((".js", ".html", ".css")):
+                    needs = True
+            if "death_screen" in wanted or "restart" in wanted:
+                if name.endswith((".js", ".html", ".css")):
+                    needs = True
+            if "damage" in wanted and name.endswith((".js", ".py", ".ts")):
+                needs = True
+            if "requested_edits" in wanted and name.endswith((".js", ".py", ".ts", ".html")):
+                needs = True
+            if needs:
+                target_files.append(path)
+
+        if not target_files and wanted:
+            # fallback: primary logic file
+            for path in read_contents:
+                if Path(path).suffix.lower() in {".js", ".py", ".ts"}:
+                    target_files.append(path)
+                    break
+            if not target_files:
+                target_files = list(read_contents.keys())[:1]
+
+        already_done = bool(present) and not wanted
+        return {
+            "wanted": wanted,
+            "present": present,
+            "target_files": target_files,
+            "already_done": already_done,
+        }
+
     def _try_coding_implement_plan(
         self,
         user_input: str,
         callbacks: Optional[list] = None,
     ) -> Optional[tuple]:
-        """Code-enforced coding plan: inspect → read → implement writes (uses plan state).
+        """Scan-first coding plan (adaptive steps) — not a fixed inspect/read/write-all loop.
 
-        Industry pattern: explicit to-do / plan state drives tools; the model does not
-        only narrate steps. Emits task_plan/task_step so the UI checklist tracks work.
+        1) Scan project (list + read)
+        2) Detect gaps vs user goal
+        3) Only then plan apply-edit steps for files that still need work
+        4) Emit compact task_plan for the chat checklist
         """
         if not self._is_coding_implement_intent(user_input):
             return None
@@ -3595,38 +3716,24 @@ class EchoSpeakAgent:
         except Exception:
             pass
         self._update_active_work_goal(user_input)
-        try:
-            self._save_active_work_from_scan(
-                user_input,
-                path=project,
-                listing="\n".join(Path(f).name for f in files),
-                samples=str(getattr(self, "_last_local_project_samples", "") or "")[:8000],
-                phase="implement",
-            )
-        except Exception:
-            pass
 
-        # Build durable plan steps (inspect → read each → write each)
-        tasks: List[Dict[str, Any]] = []
-        idx = 0
-        tasks.append(
+        # ── Phase A: SCAN plan only (never pre-announce write-all) ──
+        scan_tasks: List[Dict[str, Any]] = [
             {
-                "index": idx,
-                "description": f"Inspect project {Path(project).name}",
+                "index": 0,
+                "description": f"Scan {Path(project).name}",
                 "tool": "file_list",
                 "params": {"path": project},
                 "depends_on": -1,
                 "status": "pending",
                 "result": None,
             }
-        )
-        idx += 1
-        read_indices: List[int] = []
-        for fp in files:
-            tasks.append(
+        ]
+        for i, fp in enumerate(files, start=1):
+            scan_tasks.append(
                 {
-                    "index": idx,
-                    "description": f"Read {Path(fp).name}",
+                    "index": i,
+                    "description": f"Scan {Path(fp).name}",
                     "tool": "file_read",
                     "params": {"path": fp},
                     "depends_on": 0,
@@ -3634,97 +3741,159 @@ class EchoSpeakAgent:
                     "result": None,
                 }
             )
-            read_indices.append(idx)
-            idx += 1
-        write_start = idx
-        for fp in files:
-            tasks.append(
-                {
-                    "index": idx,
-                    "description": f"Apply edits to {Path(fp).name}",
-                    "tool": "file_write",
-                    "params": {"path": fp, "content": ""},
-                    "depends_on": read_indices[-1] if read_indices else 0,
-                    "status": "pending",
-                    "result": None,
-                }
-            )
-            idx += 1
 
         self._last_user_input_for_plan = user_input
-        self._emit_coding_plan_as_tasks(tasks)
-        logger.info(
-            "Coding implement plan: project={} files={} steps={}",
-            project,
-            [Path(f).name for f in files],
-            len(tasks),
-        )
+        self._emit_coding_plan_as_tasks(scan_tasks)
+        logger.info("Coding plan phase=scan project={} files={}", project, [Path(f).name for f in files])
 
-        # Advance coding loop into implement
         try:
             from agent.coding_loop import CodingPhase
 
             loop = getattr(self, "_coding_loop", None)
             if loop is not None:
-                loop.fast_forward_to(CodingPhase.IMPLEMENT, note="coding implement plan")
+                loop.fast_forward_to(CodingPhase.INSPECT, note="scan before plan")
         except Exception:
             pass
 
-        # Execute inspect + reads via planner (emits task_step running/done)
         read_contents: Dict[str, str] = {}
-        while self._task_planner.current_task_index < write_start:
+        while self._task_planner.current_task_index < len(self._task_planner.pending_tasks):
             task = self._task_planner.execute_next_task(self.tools, callbacks)
             if not task:
                 break
             if task.get("status") == "completed" and task.get("tool") == "file_read":
                 path = str((task.get("params") or {}).get("path") or "")
-                read_contents[path] = str(task.get("result") or "")
+                read_contents[path] = self._strip_tool_file_body(str(task.get("result") or ""))
             if task.get("status") == "failed":
                 break
 
         if not read_contents:
-            # Try direct reads if planner failed
             try:
                 from agent.tools import file_read
 
                 for fp in files:
                     try:
-                        read_contents[fp] = str(file_read.invoke({"path": fp}) or "")
+                        read_contents[fp] = self._strip_tool_file_body(
+                            str(file_read.invoke({"path": fp}) or "")
+                        )
                     except Exception:
                         pass
             except Exception:
                 pass
 
         if not read_contents:
-            msg = f"I found {project} but could not read its source files to apply edits."
+            msg = f"Scanned {project} but could not read sources."
             self._task_planner.reset()
             self._last_tts_text = self._clamp_tts_text(msg)
             self._record_turn(user_input, msg)
             return msg, True
 
-        # LLM generates SEARCH/REPLACE or full content per file; fill write tasks
+        try:
+            self._save_active_work_from_scan(
+                user_input,
+                path=project,
+                listing="\n".join(Path(f).name for f in files),
+                samples="\n\n".join(f"### {Path(p).name}\n{c[:2000]}" for p, c in list(read_contents.items())[:4]),
+                phase="implement",
+            )
+        except Exception:
+            pass
+
+        gaps = self._scan_coding_gaps(user_input, read_contents)
+        if gaps.get("already_done"):
+            msg = (
+                f"Scanned {Path(project).name}: already has "
+                f"{', '.join(gaps.get('present') or ['the requested pieces'])}. "
+                "Nothing to re-apply — say what you want changed next."
+            )
+            # Compact final checklist: scan done only
+            done_tasks = list(self._task_planner.pending_tasks)
+            for t in done_tasks:
+                if t.get("status") == "pending":
+                    t["status"] = "completed"
+                    t["result"] = "already present"
+                    self._task_planner._emit_task_step(t, "done", "already present")
+            self._task_planner.reset()
+            self._last_tts_text = self._clamp_tts_text(msg)
+            self._record_turn(user_input, msg)
+            return msg, True
+
+        target_files: List[str] = list(gaps.get("target_files") or [])
+        if not target_files:
+            target_files = list(read_contents.keys())[:1]
+
+        # ── Phase B: adaptive apply plan (only files that need work) ──
+        apply_tasks: List[Dict[str, Any]] = []
+        # Keep completed scan steps visible, then append apply steps
+        base = []
+        for t in self._task_planner.pending_tasks:
+            base.append(dict(t))
+        idx = len(base)
+        for fp in target_files:
+            gap_note = ", ".join((gaps.get("wanted") or ["edits"])[:4])
+            apply_tasks.append(
+                {
+                    "index": idx,
+                    "description": f"Apply: {Path(fp).name} ({gap_note})",
+                    "tool": "file_write",
+                    "params": {"path": fp, "content": ""},
+                    "depends_on": max(0, idx - 1),
+                    "status": "pending",
+                    "result": None,
+                }
+            )
+            idx += 1
+
+        full_plan = base + apply_tasks
+        # re-index
+        for i, t in enumerate(full_plan):
+            t["index"] = i
+        write_start = len(base)
+        self._emit_coding_plan_as_tasks(full_plan)
+        # restore completed scan status on re-emit
+        for i in range(write_start):
+            t = self._task_planner.pending_tasks[i]
+            t["status"] = "completed"
+            self._task_planner.completed_tasks.append(t)
+            self._task_planner._emit_task_step(t, "done", str(t.get("result") or "scanned")[:80])
+        self._task_planner.current_task_index = write_start
+
+        try:
+            from agent.coding_loop import CodingPhase
+
+            loop = getattr(self, "_coding_loop", None)
+            if loop is not None:
+                loop.fast_forward_to(CodingPhase.IMPLEMENT, note="apply after scan")
+        except Exception:
+            pass
+
+        # Compact edit prompt — small context models (4k) cannot take full triple-file dumps
+        try:
+            ctx_win = int(getattr(getattr(config, "local", None), "context_length", 0) or 0)
+        except Exception:
+            ctx_win = 0
+        if ctx_win <= 0:
+            ctx_win = int(getattr(config, "llm_trim_max_tokens", 0) or 4096)
+        # leave room for system + completion
+        budget = max(800, min(2800, ctx_win // 2))
+        per_file = max(400, budget // max(1, len(target_files)))
+
         file_blobs = "\n\n".join(
-            f"### FILE: {Path(p).name}\n```\n{c[:12000]}\n```" for p, c in read_contents.items()
+            f"### FILE: {Path(p).name}\n```\n{(read_contents.get(p) or '')[:per_file]}\n```"
+            for p in target_files
         )
+        missing = ", ".join(gaps.get("wanted") or ["requested changes"])
+        already = ", ".join(gaps.get("present") or ["(none)"])
         edit_prompt = (
-            "You are implementing features in an existing local project. "
-            "Apply the user's request to the files below.\n\n"
-            f"User request:\n{user_input}\n\n"
-            f"Project path: {project}\n\n"
-            f"{file_blobs}\n\n"
-            "For EACH file you change, output one or more SEARCH/REPLACE blocks labeled with the filename:\n\n"
-            "### FILE: name.ext\n"
-            "<<<<<<< SEARCH\n"
-            "[exact lines from that file]\n"
-            "=======\n"
-            "[replacement]\n"
-            ">>>>>>> REPLACE\n\n"
-            "Rules:\n"
-            "- Prefer SEARCH/REPLACE over full-file dumps.\n"
-            "- Only change what the user asked for.\n"
-            "- Keep the game/app playable.\n"
-            "- Output ONLY labeled blocks (and optional ### FILE headers). No prose plan.\n"
+            "Implement ONLY the missing pieces. Do not rewrite unrelated code.\n"
+            f"User: {user_input[:400]}\n"
+            f"Missing: {missing}\nAlready present: {already}\n"
+            f"Project: {project}\n\n{file_blobs}\n\n"
+            "Output SEARCH/REPLACE blocks per file:\n"
+            "### FILE: name.ext\n<<<<<<< SEARCH\n...\n=======\n...\n>>>>>>> REPLACE\n"
+            "Only files that need changes. No prose."
         )
+        if len(edit_prompt) > budget + 500:
+            edit_prompt = edit_prompt[: budget + 500]
 
         def _parse_search_replace_blocks(llm_output: str) -> list:
             blocks = []
@@ -3739,7 +3908,6 @@ class EchoSpeakAgent:
         def _apply_search_replace(original: str, blocks: list) -> tuple:
             content = original
             applied = 0
-            skipped = 0
             for search_text, replace_text in blocks:
                 if search_text in content:
                     content = content.replace(search_text, replace_text, 1)
@@ -3758,24 +3926,25 @@ class EchoSpeakAgent:
                     after = "\n".join(orig_lines[lines_before + search_line_count :])
                     content = before + ("\n" if before else "") + replace_text + ("\n" if after else "") + after
                     applied += 1
-                else:
-                    skipped += 1
-            return content, applied, skipped
+            return content, applied
 
         try:
             if hasattr(self, "_emit_thinking_step"):
-                self._emit_thinking_step("thought", "Generating code edits from plan…", "running")
+                self._emit_thinking_step("thought", f"Planning edits for: {missing}", "running")
             llm_out = self.llm_wrapper.invoke(edit_prompt)
             if hasattr(self, "_emit_thinking_step"):
-                self._emit_thinking_step("thought", "Generating code edits from plan…", "done")
+                self._emit_thinking_step("thought", f"Planning edits for: {missing}", "done")
         except Exception as exc:
-            msg = f"I scanned {project} and built a plan, but edit generation failed: {exc}"
+            msg = f"Scan done on {Path(project).name} (missing: {missing}), but edit gen failed: {exc}"
+            for t in self._task_planner.pending_tasks[write_start:]:
+                t["status"] = "failed"
+                t["result"] = str(exc)[:120]
+                self._task_planner._emit_task_step(t, "failed", str(exc)[:80])
             self._task_planner.reset()
             self._last_tts_text = self._clamp_tts_text(msg)
             self._record_turn(user_input, msg)
             return msg, True
 
-        # Split LLM output by ### FILE: headers
         sections: Dict[str, str] = {}
         current_name = ""
         buf: List[str] = []
@@ -3790,16 +3959,15 @@ class EchoSpeakAgent:
                 buf.append(line)
         if current_name:
             sections[current_name] = "\n".join(buf)
-        # If no headers, apply global blocks to primary game.js/html
-        if not sections:
-            sections = {Path(files[0]).name: llm_out or ""}
+        if not sections and target_files:
+            sections = {Path(target_files[0]).name: llm_out or ""}
 
         new_by_path: Dict[str, str] = {}
-        for fp, original in read_contents.items():
+        for fp in target_files:
+            original = self._strip_tool_file_body(read_contents.get(fp) or "")
             name = Path(fp).name
             section = sections.get(name) or sections.get(name.lower()) or ""
             if not section.strip():
-                # try fuzzy key
                 for k, v in sections.items():
                     if k.lower() == name.lower() or name.lower() in k.lower():
                         section = v
@@ -3808,38 +3976,41 @@ class EchoSpeakAgent:
                 continue
             blocks = _parse_search_replace_blocks(section)
             if blocks:
-                new_content, applied, _skipped = _apply_search_replace(original, blocks)
+                new_content, applied = _apply_search_replace(original, blocks)
                 if applied > 0:
-                    new_by_path[fp] = new_content
+                    new_by_path[fp] = self._strip_tool_file_body(new_content)
                     continue
-            # Whole-file fallback if section looks like full source
             cleaned = re.sub(r"^```[\w]*\s*\n?", "", section.strip())
             cleaned = re.sub(r"\n?```\s*$", "", cleaned.strip())
-            if len(cleaned) > 40 and cleaned != original:
+            cleaned = self._strip_tool_file_body(cleaned)
+            if len(cleaned) > 40 and cleaned != original and "<<<ECHO_FILE" not in cleaned:
                 new_by_path[fp] = cleaned
 
         if not new_by_path:
-            # Last resort: one whole-file regenerate for the main logic file
-            primary = next((f for f in files if f.endswith(".js") or f.endswith(".py")), files[0])
+            # Small single-file fallback only (respect context)
+            primary = target_files[0]
             try:
+                body = (read_contents.get(primary) or "")[:per_file]
                 whole = self.llm_wrapper.invoke(
-                    f"User request: {user_input}\n\nCurrent {Path(primary).name}:\n```\n"
-                    f"{read_contents.get(primary, '')[:14000]}\n```\n\n"
-                    "Return COMPLETE updated file content only."
+                    f"Missing: {missing}\nUser: {user_input[:300]}\n\n"
+                    f"### FILE: {Path(primary).name}\n```\n{body}\n```\n"
+                    "Return SEARCH/REPLACE blocks only for this file."
                 )
-                cleaned = re.sub(r"^```[\w]*\s*\n?", "", (whole or "").strip())
-                cleaned = re.sub(r"\n?```\s*$", "", cleaned.strip())
-                if cleaned:
-                    new_by_path[primary] = cleaned
+                blocks = _parse_search_replace_blocks(whole or "")
+                if blocks:
+                    new_content, applied = _apply_search_replace(
+                        self._strip_tool_file_body(read_contents.get(primary) or ""), blocks
+                    )
+                    if applied > 0:
+                        new_by_path[primary] = self._strip_tool_file_body(new_content)
             except Exception:
                 pass
 
         if not new_by_path:
             brief = (
-                f"Plan for {Path(project).name} is ready (inspect + reads done), "
-                "but I could not produce valid file edits. Ask me to try again or specify the file."
+                f"Scanned {Path(project).name}. Missing: {missing}. "
+                "Could not produce safe edits (model/context). Try again or name one file."
             )
-            # Mark remaining write tasks failed
             for t in self._task_planner.pending_tasks:
                 if t.get("tool") == "file_write" and t.get("status") == "pending":
                     t["status"] = "failed"
@@ -3855,7 +4026,7 @@ class EchoSpeakAgent:
                 continue
             path = str((t.get("params") or {}).get("path") or "")
             if path in new_by_path:
-                t["params"]["content"] = new_by_path[path]
+                t["params"]["content"] = self._strip_tool_file_body(new_by_path[path])
                 t["status"] = "pending"
             else:
                 t["status"] = "completed"
