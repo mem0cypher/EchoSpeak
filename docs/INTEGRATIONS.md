@@ -5,6 +5,7 @@ This document explains the **advanced tooling stack** that was implemented in Ec
 ---
 
 ## Recent Updates
+- **Runtime contracts (v7.6.10, partial / pending live validation)**: Equal model access, Session-bound `/capabilities`, Project vs skill-workspace separation, confirm types A–D, ToolRun truth — canonical in `docs/RUNTIME_CONTRACTS.md` + `docs/LIFECYCLE_TRUTHFULNESS.md`.
 - **Endpoint contract audit (v7.3.0)**: Fixed `/capabilities.trust`, `/coding/readiness` provider readiness, `/memory/compact` query/body compatibility, and routine webhook HMAC enforcement when a global webhook secret is configured.
 - **Integration doctor coverage (v7.3.0)**: `/doctor` now includes platform integration readiness for Discord, Telegram, Twitch, Twitter/X, and routine webhook signing state.
 - **Agent diagnostics + deterministic checks (v7.3.0)**: Execution records now include Stage 4 branch/tool-calling mode metadata, and `ReflectionEngine` verifies concrete terminal/file/JSON outcomes before using LLM reflection.
@@ -59,13 +60,7 @@ Web UI (current):
 ### What it does
 EchoSpeak supports **action tools** (browser actions, desktop automation, app launching). These are **never executed immediately**.
 
-Instead, Echo:
-
-1. Proposes the action.
-2. Stores it as a persisted **approval record** tied to the current execution and thread.
-3. Waits for you to reply **`confirm`** or **`cancel`**.
-
-This also applies during multi-step plans: the agent can run multiple read-only tools in sequence, but it will pause at the first action tool and require confirmation before continuing.
+Instead, Echo proposes the action, stores a durable approval (exact mutation) or offered action (prepare go-ahead), and waits for an explicit user response. **A plain yes is not universal write approval.** Full confirm types (prepare / exact mutation / continue / retry): **`docs/LIFECYCLE_TRUTHFULNESS.md` §4**. Multi-step plans pause at the first action tool for type-B approval when required.
 
 ### Why this matters
 Local LLMs can occasionally:
@@ -81,8 +76,9 @@ This safety layer prevents accidental actions.
 EchoSpeak also runs an Action Parser pass before heuristic tool routing. The Action Parser returns a single structured JSON action (or “none”), then the agent validates that proposed action against:
 
 - env hard gates (`ENABLE_SYSTEM_ACTIONS`, tool-specific `ALLOW_*` flags)
-- workspace tool allowlist (ceiling)
+- Project / workspace **path** scope (not a hard `TOOLS.txt` ceiling — v7.6.10)
 - file root enforcement and terminal denylist enforcement (tool-level safety)
+- confirmation types in **`docs/LIFECYCLE_TRUTHFULNESS.md` §4**
 
 If valid and confirmation-gated, Echo proposes the action and waits for you to reply `confirm` or `cancel`.
 
@@ -104,16 +100,18 @@ Config:
   - `ExecutionRecord`
   - `ThreadSessionState`
 
-### Workspaces + skills allowlist semantics
+### Workspaces + skills + Project scope
 
-- Workspaces define the tool allowlist ceiling.
-- Skills can only further restrict tool access; skills must not expand tool access beyond the workspace.
+- Skill workspaces provide prompts and soft tool preference lists.
+- Skills must not invent tools that are not registered.
+- Hard gates: registration, Project path, permissions, approvals — see **`docs/RUNTIME_CONTRACTS.md` §B**.
 
 Web UI mode selector:
 
 - `auto | chat | coding | research`
 - The UI sends this as `workspace` in `POST /query/stream`
 - The backend applies it per request in `apps/backend/api/server.py`
+- Interaction mode is not the same as Project attachment (chat + attached Project is valid)
 
 ### What counts as an action tool
 Current action tools include:

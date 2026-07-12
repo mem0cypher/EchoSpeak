@@ -22,7 +22,7 @@ EchoSpeak has three conceptual layers that work together:
 │  • Reads user message                                       │
 │  • Decides: conversational reply OR system action           │
 │  • Chooses tool + arguments                                 │
-│  • Enforces guardrails (allowlists, permissions, confirm)   │
+│  • Enforces guardrails (path scope, permissions, confirm)   │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -55,15 +55,19 @@ EchoSpeak has three conceptual layers that work together:
 │  • "How to behave" instructions                             │
 │  • Teach trigger phrases, tool choice, safety norms         │
 │                                                             │
-│  Workspaces (hard allowlists):                              │
+│  Workspaces (skill prompts + soft tool preference lists):   │
 │  • apps/backend/workspaces/<workspace>/TOOLS.txt             │
-│  • Limit which tools are available                          │
+│  • Soft guidance — not a hard ceiling (v7.6.10)              │
+│  • Real gates: registration + Project path scope + ALLOW_*  │
 │                                                             │
 │  Environment Flags (runtime switches):                      │
 │  • ENABLE_SYSTEM_ACTIONS, ALLOW_FILE_WRITE, etc.            │
 │  • Final "on/off" gates                                     │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+Hard product contracts (equal models, Project vs mode, ToolRuns, hydration):
+`docs/RUNTIME_CONTRACTS.md` + `docs/LIFECYCLE_TRUTHFULNESS.md`.
 
 ---
 
@@ -76,20 +80,20 @@ Input sources: Web UI, Discord bot, Telegram bot (v5.4.0), Heartbeat scheduler (
 User input
   │
   ▼
+Bind mode + create execution (ThreadSessionState / ToolRuns)
+  │
+  ▼
 Stage 1: _pq_parse_and_preempt
-  • Setup, multi-task planning, approval hydration, slash commands
-  • Discord routing, pre-tool heuristics
-  • Can short-circuit (return early)
+  • Pending approvals, multi-task resume, slash commands, heuristics
+  • Can short-circuit
   │
   ▼
 Stage 2: _pq_build_context
-  • Memory retrieval, document context, time context
-  • Builds ContextBundle dataclass
+  • Memory, documents, time → ContextBundle
   │
   ▼
 Stage 3: _pq_shortcut_queries
-  • Multi-web fan-out, schedule lookups
-  • Can short-circuit
+  • Web/schedule/coding shortcuts (can short-circuit)
   │
   ▼
 Stage 4: _pq_invoke_llm_agents
@@ -97,10 +101,18 @@ Stage 4: _pq_invoke_llm_agents
   │
   ▼
 Stage 5: _pq_finalize_response
-  • Direct LLM fallback, TTS selection, memory recording
+  • Fallback, TTS, memory recording, execution finalize
 ```
 
 Each stage is a separate method, testable in isolation.
+
+**Runtime contracts** (equal models, Project lifecycle, hydration, coding
+targets, streaming, approval scope, Known limitations):
+`docs/RUNTIME_CONTRACTS.md`.  
+**Lifecycle truthfulness** (recovery, confirm types, ToolRun truth, projection,
+corruption): `docs/LIFECYCLE_TRUTHFULNESS.md`.  
+Thread schema: `docs/THREAD_EXECUTION_CONTEXT.md`.  
+v7.6.10: **implemented (partial); pending live validation** — diagram ≠ acceptance.
 
 ### Update Context Layer (v6.7.0)
 
@@ -640,7 +652,10 @@ System Prompt Composition:
    - Set `requires_confirmation: True` in TOOL_METADATA for action tools.
    - Set `policy_flags` for env-gated tools.
 
-3. **Allowlist**: Add to workspace `TOOLS.txt`
+3. **Workspace list (optional soft preference)**: You may list the tool in
+   workspace `TOOLS.txt` for skill guidance. Availability is **not** limited to
+   that file — registration + Project scope + policy flags decide execution
+   (see `docs/RUNTIME_CONTRACTS.md` §B).
 
 The Tool Registry (`agent/tool_registry.py`) is the single source of truth for:
 - Which tools are action tools (`ToolRegistry.is_action(name)`)
@@ -727,13 +742,15 @@ Activating a project injects its `context_prompt` into the system prompt:
 
 | Problem | Check |
 |---------|-------|
-| Tool not being chosen | Workspace `TOOLS.txt` allowlist |
-| Update query returns generic answer | Check `project_update_context` is in workspace allowlist and `_find_tool()` routes update phrases correctly |
+| Tool not being chosen | Registration + `GET /capabilities?thread_id=` (Session Project bound) + policy flags; `TOOLS.txt` is soft guidance only (`docs/RUNTIME_CONTRACTS.md` §B) |
+| Update query returns generic answer | Check `project_update_context` is registered/routed and `_find_tool()` matches update phrases |
 | Autonomous tweets hallucinate | Check `UpdateContextService` is providing grounded commit/diff context to the tweet prompt |
-| Simple chat/help prompt feels too slow | Confirm `_allowed_lc_tool_names()` is returning no tools for normal chat and that the query did not accidentally trigger a Discord/time/tool heuristic |
+| Simple chat/help prompt feels too slow | Confirm routing stayed on chat/utility path and did not accidentally trigger Discord/time/tool heuristics |
 | "Actions disabled" | `ENABLE_SYSTEM_ACTIONS` + specific `ALLOW_*` flags |
 | Wrong tool proposed | Skill triggers, routing heuristics in `core.py` |
 | Tool arguments wrong | Args schema in `tools.py`, skill examples |
+| Explicit file edit hits wrong file | Mutation target must follow user-named basenames (`docs/RUNTIME_CONTRACTS.md` §F) |
 | Memory not recalled | Check memory type, try pinning important facts |
 | Discord channel recap hangs | Check bot readiness, Discord loop health, and whether `discord_read_channel()` is timing out quickly instead of blocking for a long period |
 | Soul not applied | `SOUL_ENABLED=true`, check `SOUL_PATH` |
+| Recovery / confirm / “Proceeding.” lies | `docs/LIFECYCLE_TRUTHFULNESS.md` + live gate §11 |

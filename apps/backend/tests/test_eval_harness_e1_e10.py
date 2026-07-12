@@ -616,6 +616,10 @@ def test_e21_general_multi_intent_no_recipe_including_weather_fifa():
     agent._active_user_query = live
     collapsed = normalize_web_search_query(live)  # historically FIFA-only primary
     assert "fifa" in collapsed.lower() or "world cup" in collapsed.lower()
+    # This is a separate simulated request; clear the per-request anti-loop state.
+    agent._request_grounded_results = {}
+    agent._request_grounded_inflight = set()
+    agent._request_grounded_count = 0
     agent._grounded_web_search(
         collapsed,
         original_request=collapsed,  # Stage 3 used to pass this as BOTH

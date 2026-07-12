@@ -149,8 +149,14 @@ const SourcesExpanded: React.FC<{
                   ...metaFont,
                   color: "rgba(255,255,255,0.32)",
                   letterSpacing: "0.02em",
-                  lineHeight: 1.4,
-                  maxWidth: 420,
+                  lineHeight: 1.45,
+                  width: "100%",
+                  maxWidth: "100%",
+                  minWidth: 0,
+                  boxSizing: "border-box",
+                  overflowWrap: "anywhere",
+                  wordBreak: "break-word",
+                  whiteSpace: "pre-wrap",
                 }}
               >
                 {item.title ? (
@@ -158,23 +164,16 @@ const SourcesExpanded: React.FC<{
                     style={{
                       color: "rgba(255,255,255,0.45)",
                       marginBottom: 2,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
+                      overflowWrap: "anywhere",
+                      wordBreak: "break-word",
+                      whiteSpace: "normal",
                     }}
                   >
                     {item.title}
                   </div>
                 ) : null}
                 {hasSnippet ? (
-                  <div
-                    style={{
-                      display: "-webkit-box",
-                      WebkitLineClamp: 3,
-                      WebkitBoxOrient: "vertical",
-                      overflow: "hidden",
-                    }}
-                  >
+                  <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", wordBreak: "break-word" }}>
                     {item.snippet}
                   </div>
                 ) : null}
@@ -190,7 +189,9 @@ const SourcesExpanded: React.FC<{
                       textDecoration: "underline",
                       textUnderlineOffset: 2,
                       wordBreak: "break-all",
+                      overflowWrap: "anywhere",
                       fontSize: 9,
+                      maxWidth: "100%",
                     }}
                   >
                     open ↗
@@ -239,7 +240,7 @@ const SearchedToggle: React.FC<{
 const SearchedExpanded: React.FC<{
   embed: Extract<ChatEmbed, { kind: "query_chip" }>;
 }> = ({ embed }) => (
-  <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 2, width: "100%" }}>
+  <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 2, width: "100%", minWidth: 0 }}>
     {embed.queries.map((q) => (
       <div
         key={q}
@@ -247,10 +248,10 @@ const SearchedExpanded: React.FC<{
         style={{
           ...metaFont,
           color: "rgba(255,255,255,0.34)",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
-          maxWidth: 420,
+          whiteSpace: "pre-wrap",
+          overflowWrap: "anywhere",
+          wordBreak: "break-word",
+          maxWidth: "100%",
           letterSpacing: "0.02em",
         }}
       >
@@ -381,7 +382,16 @@ export const ChatEmbeds: React.FC<{ embeds?: ChatEmbed[]; colors: Palette }> = (
   return (
     <div
       className="chat-embeds"
-      style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 2, maxWidth: 520 }}
+      style={{
+        marginTop: 4,
+        display: "flex",
+        flexDirection: "column",
+        gap: 2,
+        width: "100%",
+        maxWidth: "100%",
+        minWidth: 0,
+        boxSizing: "border-box",
+      }}
     >
       {sorted.map((embed) => {
         if (embed.kind === "weather_stat") {
@@ -415,8 +425,8 @@ export const ChatEmbeds: React.FC<{ embeds?: ChatEmbed[]; colors: Palette }> = (
 };
 
 /**
- * Footer meta row BELOW time/tokens: "sources · N  ·  searched · M" on one line.
- * Expand panels open under the row.
+ * Footer meta inline with time/tokens: "· sources · N · searched · M".
+ * Expand panels open on the next line (flex-basis 100% when parent is flex-wrap).
  */
 export const ChatEmbedFooter: React.FC<{ embeds?: ChatEmbed[]; colors: Palette }> = ({ embeds }) => {
   const [openSources, setOpenSources] = useState(false);
@@ -442,16 +452,20 @@ export const ChatEmbedFooter: React.FC<{ embeds?: ChatEmbed[]; colors: Palette }
 
   if (!sources && !searched && !linkOnly) return null;
 
+  const expandedOpen = (openSources && sources) || (openSearched && searched);
+
   return (
-    <div className="chat-embed-footer" style={{ marginTop: 4, maxWidth: 520 }}>
-      {/* Single horizontal meta row — sources and searched side by side */}
+    <>
+      <span style={{ opacity: 0.45 }}>·</span>
       <div
+        className="chat-embed-footer"
         style={{
-          display: "flex",
+          display: "inline-flex",
           flexWrap: "wrap",
           alignItems: "center",
           gap: 6,
           ...metaFont,
+          minWidth: 0,
         }}
       >
         {sources ? (
@@ -460,9 +474,6 @@ export const ChatEmbedFooter: React.FC<{ embeds?: ChatEmbed[]; colors: Palette }
             open={openSources}
             onToggle={() => {
               setOpenSources((v) => !v);
-              if (openSources) {
-                /* closing */
-              }
             }}
           />
         ) : null}
@@ -490,9 +501,12 @@ export const ChatEmbedFooter: React.FC<{ embeds?: ChatEmbed[]; colors: Palette }
           </>
         ) : null}
       </div>
-
-      {openSources && sources ? <SourcesExpanded embed={sources} /> : null}
-      {openSearched && searched ? <SearchedExpanded embed={searched} /> : null}
-    </div>
+      {expandedOpen ? (
+        <div style={{ flexBasis: "100%", width: "100%", minWidth: 0 }}>
+          {openSources && sources ? <SourcesExpanded embed={sources} /> : null}
+          {openSearched && searched ? <SearchedExpanded embed={searched} /> : null}
+        </div>
+      ) : null}
+    </>
   );
 };

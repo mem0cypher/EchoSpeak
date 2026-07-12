@@ -22,7 +22,8 @@ export type TaskStepStatus =
   | "failed"
   | "retrying"
   | "awaiting_confirmation"
-  | "blocked";
+  | "blocked"
+  | "skipped";
 
 export interface TaskStep {
   index: number;
@@ -51,6 +52,17 @@ export function createEmptyTaskPlan(): TaskPlanState {
   return { tasks: [], reflections: [], active: false };
 }
 
+function normalizeStatus(value: unknown): TaskStepStatus {
+  const status = String(value || "pending").toLowerCase();
+  if (["complete", "completed", "success"].includes(status)) return "done";
+  if (["active", "in_progress"].includes(status)) return "running";
+  if (["pending_confirmation", "needs_permission", "approval_required"].includes(status)) return "awaiting_confirmation";
+  if (["done", "running", "failed", "retrying", "awaiting_confirmation", "blocked", "skipped"].includes(status)) {
+    return status as TaskStepStatus;
+  }
+  return "pending";
+}
+
 // ── Reducer for stream events ──────────────────────────────────────
 
 export function taskPlanReducer(
@@ -63,7 +75,7 @@ export function taskPlanReducer(
         index: t.index ?? 0,
         description: t.description ?? t.tool ?? "Task",
         tool: t.tool ?? "",
-        status: (t.status ?? "pending") as TaskStepStatus,
+        status: normalizeStatus(t.status),
         resultPreview: "",
       })),
       reflections: [],
@@ -97,7 +109,7 @@ export function taskPlanReducer(
         t.index === idx
           ? {
               ...t,
-              status: (d.status ?? t.status) as TaskStepStatus,
+              status: normalizeStatus(d.status ?? t.status),
               resultPreview: preview || t.resultPreview,
             }
           : t,
@@ -139,6 +151,8 @@ function statusIcon(status: TaskStepStatus): string {
       return "⏸";
     case "blocked":
       return "⊘";
+    case "skipped":
+      return "-";
     case "pending":
     default:
       return "○";
@@ -159,6 +173,8 @@ function statusColor(status: TaskStepStatus): string {
       return "#a78bfa"; // purple
     case "blocked":
       return "#6b7280"; // gray
+    case "skipped":
+      return "#64748b";
     case "pending":
     default:
       return "#9ca3af"; // light gray
@@ -174,13 +190,14 @@ interface TaskChecklistProps {
 export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
   if (!plan.active || plan.tasks.length === 0) return null;
 
-  const completedCount = plan.tasks.filter((t) => t.status === "done").length;
+  const completedCount = plan.tasks.filter((t) => t.status === "done" || t.status === "skipped").length;
   const totalCount = plan.tasks.length;
   const allDone = completedCount === totalCount;
   const hasFailed = plan.tasks.some((t) => t.status === "failed");
 
   return (
-    <div
+    <details
+      aria-label="Task progress"
       style={{
         margin: "6px 0 10px",
         padding: "2px 0",
@@ -195,7 +212,8 @@ export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
       }}
     >
       {/* Header */}
-      <div
+      <summary
+        aria-live="polite"
         style={{
           display: "flex",
           alignItems: "center",
@@ -203,6 +221,7 @@ export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
           marginBottom: "8px",
           paddingBottom: "6px",
           borderBottom: "1px solid rgba(255,255,255,0.06)",
+          cursor: "pointer",
         }}
       >
         <span style={{ color: "rgba(255,255,255,0.55)", fontWeight: 600, fontSize: "11px", letterSpacing: "0.08em", textTransform: "uppercase" }}>
@@ -218,7 +237,7 @@ export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
         >
           {completedCount}/{totalCount}
         </span>
-      </div>
+      </summary>
 
       {/* Steps */}
       <AnimatePresence>
@@ -320,7 +339,7 @@ export const TaskChecklist: React.FC<TaskChecklistProps> = ({ plan }) => {
           );
         })}
       </AnimatePresence>
-    </div>
+    </details>
   );
 };
 

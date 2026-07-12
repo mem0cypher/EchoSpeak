@@ -1,0 +1,667 @@
+import React, { useMemo, useState } from "react";
+
+type Project = { id: string; name: string; workspace_root?: string; archived?: boolean; git_metadata?: Record<string, any> };
+type Session = { id: string; name: string; at: number; projectId?: string };
+
+type SidebarProps = {
+  collapsed: boolean;
+  projects: Project[];
+  sessions: Session[];
+  activeProjectId: string;
+  activeSessionId: string;
+  activeView: string;
+  onToggleCollapsed(): void;
+  onNewSession(projectId?: string): void;
+  onAddFolder(): void;
+  onSelectSession(id: string): void;
+  onSelectProject(id: string): void;
+  onDetachProject(): void;
+  onRenameSession(id: string, title: string): void;
+  onDeleteSession(id: string): void;
+  onDeleteProject(id: string): void;
+  onView(view: "avatar" | "research" | "code" | "tasks" | "studio"): void;
+};
+
+const surface = "#0a0a0a";
+const border = "rgba(255,255,255,.10)";
+const muted = "rgba(255,255,255,.48)";
+
+/** Minimal monochrome icons — readable in the 50px collapsed rail. */
+function Icon({
+  name,
+  size = 15,
+  active = false,
+}: {
+  name:
+    | "chat"
+    | "session"
+    | "folder"
+    | "avatar"
+    | "research"
+    | "code"
+    | "tasks"
+    | "studio"
+    | "plus"
+    | "expand"
+    | "collapse";
+  size?: number;
+  active?: boolean;
+}) {
+  const stroke = active ? "#fff" : "rgba(255,255,255,0.72)";
+  const common = {
+    width: size,
+    height: size,
+    viewBox: "0 0 24 24",
+    fill: "none" as const,
+    stroke,
+    strokeWidth: 1.7,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+    "aria-hidden": true as const,
+  };
+
+  switch (name) {
+    case "chat":
+      return (
+        <svg {...common}>
+          <path d="M5 6.5h14a1.5 1.5 0 0 1 1.5 1.5v7a1.5 1.5 0 0 1-1.5 1.5H10l-4 3v-3H5A1.5 1.5 0 0 1 3.5 15V8A1.5 1.5 0 0 1 5 6.5z" />
+        </svg>
+      );
+    case "session":
+      return (
+        <svg {...common}>
+          <rect x="4.5" y="5.5" width="15" height="13" rx="2" />
+          <path d="M8 10h8M8 13.5h5" />
+        </svg>
+      );
+    case "folder":
+      return (
+        <svg {...common}>
+          <path d="M3.5 8.5V7a1.5 1.5 0 0 1 1.5-1.5h4l2 2H19A1.5 1.5 0 0 1 20.5 9v8a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 17V8.5z" />
+        </svg>
+      );
+    case "avatar":
+      return (
+        <svg {...common}>
+          <rect x="4" y="4" width="16" height="16" rx="2.5" />
+          <circle cx="9.5" cy="11" r="1.15" fill={stroke} stroke="none" />
+          <circle cx="14.5" cy="11" r="1.15" fill={stroke} stroke="none" />
+          <path d="M9.2 15c.7 1 1.8 1.5 2.8 1.5s2.1-.5 2.8-1.5" />
+        </svg>
+      );
+    case "research":
+      return (
+        <svg {...common}>
+          <circle cx="11" cy="11" r="6" />
+          <path d="M20 20l-3.5-3.5" />
+        </svg>
+      );
+    case "code":
+      return (
+        <svg {...common}>
+          <path d="M9 7.5 4.5 12 9 16.5" />
+          <path d="M15 7.5 19.5 12 15 16.5" />
+        </svg>
+      );
+    case "tasks":
+      return (
+        <svg {...common}>
+          <path d="M9.5 12.5 11.5 14.5 16 9.5" />
+          <rect x="4" y="4" width="16" height="16" rx="2.5" />
+        </svg>
+      );
+    case "studio":
+      return (
+        <svg {...common}>
+          <circle cx="12" cy="12" r="3" />
+          <path d="M12 4.5v2.2M12 17.3v2.2M4.5 12h2.2M17.3 12h2.2M6.7 6.7l1.6 1.6M15.7 15.7l1.6 1.6M17.3 6.7l-1.6 1.6M8.3 15.7l-1.6 1.6" />
+        </svg>
+      );
+    case "plus":
+      return (
+        <svg {...common}>
+          <path d="M12 6v12M6 12h12" />
+        </svg>
+      );
+    case "expand":
+      return (
+        <svg {...common}>
+          <path d="M9 6.5 14.5 12 9 17.5" />
+        </svg>
+      );
+    case "collapse":
+      return (
+        <svg {...common}>
+          <path d="M15 6.5 9.5 12 15 17.5" />
+        </svg>
+      );
+    default:
+      return null;
+  }
+}
+
+const viewDefs: {
+  id: "avatar" | "research" | "code" | "tasks" | "studio";
+  label: string;
+  icon: "avatar" | "research" | "code" | "tasks" | "studio";
+  title: string;
+}[] = [
+  { id: "avatar", label: "Avatar", icon: "avatar", title: "Avatar" },
+  { id: "research", label: "Research", icon: "research", title: "Research" },
+  { id: "code", label: "Code", icon: "code", title: "Code" },
+  { id: "tasks", label: "Tasks", icon: "tasks", title: "Tasks" },
+  { id: "studio", label: "Studio", icon: "studio", title: "Studio · Settings & Models" },
+];
+
+export function ProjectSidebar(props: SidebarProps) {
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [projectsOpen, setProjectsOpen] = useState(true);
+  const [viewsOpen, setViewsOpen] = useState(true);
+  const iconOnly = props.collapsed;
+  const projects = useMemo(() => props.projects.filter((project) => !project.archived), [props.projects]);
+  const sessions = props.sessions;
+  const looseSessions = sessions.filter((session) => !session.projectId);
+
+  const railButton = (active = false): React.CSSProperties => ({
+    // Do not force width:100% here — row items share space with fixed action buttons.
+    width: iconOnly ? "100%" : undefined,
+    maxWidth: "100%",
+    minHeight: iconOnly ? 38 : 36,
+    border: 0,
+    borderRadius: 2,
+    background: active
+      ? "linear-gradient(90deg, rgba(255,255,255,.10), rgba(255,255,255,.025) 62%, transparent)"
+      : "transparent",
+    color: active ? "#fff" : "rgba(255,255,255,.62)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: iconOnly ? "center" : "flex-start",
+    gap: 8,
+    padding: iconOnly ? 0 : "0 8px",
+    cursor: "pointer",
+    fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+    fontSize: 12.5,
+    textAlign: "left",
+    minWidth: 0,
+    boxSizing: "border-box",
+  });
+
+  const iconSlot = (active = false): React.CSSProperties => ({
+    width: iconOnly ? 23 : 21,
+    height: iconOnly ? 23 : 21,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+    opacity: active ? 1 : 0.88,
+  });
+
+  /** Title text: always truncates; never steals space from trailing action buttons. */
+  const titleEllipsis: React.CSSProperties = {
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    minWidth: 0,
+    flex: "1 1 auto",
+  };
+
+  const sessionRow = (session: Session, nested = false) => (
+    <div
+      key={session.id}
+      className="echo-side-row"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        width: "100%",
+        maxWidth: "100%",
+        minWidth: 0,
+        // Indent title only via padding — marginLeft + width 100% was clipping × off the right.
+        paddingLeft: !iconOnly && nested ? 13 : 0,
+        boxSizing: "border-box",
+      }}
+    >
+      <button
+        className={`echo-side-button ${props.activeSessionId === session.id ? "is-active" : ""}`}
+        type="button"
+        style={{
+          ...railButton(props.activeSessionId === session.id),
+          flex: "1 1 auto",
+          minWidth: 0,
+          width: "auto",
+          // Nested: slightly less left pad so label still reads as indented under project
+          paddingLeft: !iconOnly && nested ? 4 : undefined,
+        }}
+        onClick={() => props.onSelectSession(session.id)}
+        title={session.name}
+        aria-label={`Session: ${session.name}`}
+      >
+        <span style={iconSlot(props.activeSessionId === session.id)}>
+          <Icon name="session" size={iconOnly ? 16 : 15} active={props.activeSessionId === session.id} />
+        </span>
+        {!iconOnly && <span style={titleEllipsis}>{session.name}</span>}
+      </button>
+      {!iconOnly && (
+        <div className="echo-row-actions" aria-label="Session actions">
+          <button
+            type="button"
+            title="Rename Session"
+            onClick={() => {
+              const title = window.prompt("Rename Session", session.name)?.trim();
+              if (title && title !== session.name) props.onRenameSession(session.id, title);
+            }}
+          >
+            ···
+          </button>
+          <button
+            type="button"
+            title="Delete Session"
+            onClick={() => {
+              if (window.confirm(`Delete “${session.name}”?`)) props.onDeleteSession(session.id);
+            }}
+          >
+            ×
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <aside
+      className="echo-sidebar"
+      aria-label="Project and Session sidebar"
+      style={{
+        minWidth: 0,
+        width: "100%",
+        height: "100%",
+        overflow: "hidden",
+        borderRight: `1px solid ${border}`,
+        background: surface,
+        padding: iconOnly ? 6 : 10,
+        display: "flex",
+        flexDirection: "column",
+        gap: iconOnly ? 8 : 12,
+      }}
+    >
+      <style>{`
+      .echo-side-button { transition: background .14s ease, color .14s ease, opacity .14s ease; }
+      .echo-side-button:hover { background: linear-gradient(90deg, rgba(255,255,255,.065), rgba(255,255,255,.018) 68%, transparent) !important; color: #fff !important; }
+      .echo-side-button:focus-visible, .echo-row-actions button:focus-visible { outline: 1px solid rgba(255,255,255,.72); outline-offset: 2px; }
+      .echo-side-button.is-active { font-weight: 600; }
+      .echo-side-button:active { background: linear-gradient(90deg, rgba(255,255,255,.09), rgba(255,255,255,.025) 68%, transparent) !important; }
+      /* Fixed trailing slot — never shrinks when titles are long */
+      .echo-row-actions {
+        display: flex;
+        flex: 0 0 auto;
+        flex-shrink: 0;
+        align-items: center;
+        opacity: 0.55;
+        transition: opacity .14s ease;
+      }
+      .echo-side-row:hover .echo-row-actions,
+      .echo-side-row:focus-within .echo-row-actions { opacity: 1; }
+      .echo-row-actions button {
+        width: 24px;
+        height: 30px;
+        border: 0;
+        background: transparent;
+        color: rgba(255,255,255,.7);
+        cursor: pointer;
+        padding: 0;
+        font-size: 13px;
+        flex-shrink: 0;
+      }
+      .echo-row-actions button:hover { color: #fff; background: #181818; }
+      .echo-side-row {
+        min-width: 0;
+        max-width: 100%;
+        overflow: hidden;
+        box-sizing: border-box;
+      }
+      /* Keep action cluster flush to the rail edge even when the row is indented */
+      .echo-side-row .echo-row-actions {
+        margin-left: auto;
+        margin-right: 0;
+      }
+      .echo-sidebar-scroll {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-x: hidden;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: ${iconOnly ? 8 : 12}px;
+      }
+      .echo-rail-divider {
+        height: 1px;
+        background: rgba(255,255,255,.07);
+        margin: ${iconOnly ? "4px 6px" : "5px 3px"};
+      }
+    `}</style>
+
+      {/* Brand + collapse */}
+      <div
+        style={{
+          height: 38,
+          flexShrink: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: iconOnly ? "center" : "space-between",
+          padding: iconOnly ? 0 : "0 4px",
+          gap: 6,
+        }}
+      >
+        {iconOnly ? (
+          <button
+            className="echo-side-button"
+            type="button"
+            title="Expand sidebar"
+            aria-label="Expand sidebar"
+            onClick={props.onToggleCollapsed}
+            style={{
+              width: 34,
+              height: 34,
+              borderRadius: 2,
+              border: 0,
+              background: "transparent",
+              cursor: "pointer",
+              display: "grid",
+              placeItems: "center",
+              padding: 0,
+            }}
+          >
+            <img src="/logo.png" alt="EchoSpeak" style={{ width: 18, height: 18, borderRadius: 2, display: "block" }} />
+          </button>
+        ) : (
+          <>
+            <div style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 0 }}>
+              <img src="/logo.png" alt="" style={{ width: 16, height: 16, borderRadius: 2 }} />
+              <strong style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 16 }}>EchoSpeak</strong>
+            </div>
+            <button
+              className="echo-side-button"
+              type="button"
+              title="Collapse sidebar"
+              aria-label="Collapse sidebar"
+              onClick={props.onToggleCollapsed}
+              style={{
+                width: 28,
+                height: 28,
+                borderRadius: 2,
+                border: 0,
+                color: "rgba(255,255,255,.72)",
+                background: "transparent",
+                cursor: "pointer",
+                display: "grid",
+                placeItems: "center",
+                padding: 0,
+              }}
+            >
+              <Icon name="collapse" size={15} />
+            </button>
+          </>
+        )}
+      </div>
+
+      <div className="echo-sidebar-scroll">
+        <section aria-label="Workspace" style={{ padding: iconOnly ? "0 1px" : 0, display: "grid", gap: 7, flex: "0 0 auto" }}>
+          <div style={{ display: "grid", gap: 2 }}>
+            {!iconOnly && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "4px 4px 2px",
+                  minWidth: 0,
+                  width: "100%",
+                  boxSizing: "border-box",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: 10,
+                    color: muted,
+                    letterSpacing: ".1em",
+                    textTransform: "uppercase",
+                    minWidth: 0,
+                    flex: "1 1 auto",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  Quick Chats
+                </span>
+                <button
+                  className="echo-side-button"
+                  type="button"
+                  onClick={() => props.onNewSession()}
+                  title="Start new chat"
+                  aria-label="Start new chat"
+                  style={{
+                    width: 26,
+                    height: 24,
+                    border: 0,
+                    background: "transparent",
+                    color: "rgba(255,255,255,.7)",
+                    borderRadius: 2,
+                    cursor: "pointer",
+                    display: "grid",
+                    placeItems: "center",
+                    padding: 0,
+                    flex: "0 0 auto",
+                    flexShrink: 0,
+                  }}
+                >
+                  <Icon name="plus" size={15} />
+                </button>
+              </div>
+            )}
+
+            {iconOnly && (
+              <button
+                className="echo-side-button"
+                type="button"
+                style={railButton()}
+                onClick={() => props.onNewSession()}
+                title="New chat"
+                aria-label="New chat"
+              >
+                <span style={iconSlot()}>
+                  <Icon name="plus" size={16} />
+                </span>
+              </button>
+            )}
+
+            <button
+              className={`echo-side-button ${!props.activeProjectId ? "is-active" : ""}`}
+              type="button"
+              style={{ ...railButton(!props.activeProjectId), width: "100%" }}
+              onClick={props.onDetachProject}
+              title="Quick chats · outside projects"
+              aria-label="Quick chats outside projects"
+            >
+              <span style={iconSlot(!props.activeProjectId)}>
+                <Icon name="chat" size={iconOnly ? 16 : 15} active={!props.activeProjectId} />
+              </span>
+              {!iconOnly && <span style={titleEllipsis}>Outside Projects</span>}
+            </button>
+
+            {looseSessions.map((session) => sessionRow(session))}
+
+            <div className="echo-rail-divider" />
+
+            {!iconOnly && (
+              <button
+                className="echo-side-button"
+                type="button"
+                onClick={() => setProjectsOpen((value) => !value)}
+                aria-expanded={projectsOpen}
+                style={{ ...railButton(), minHeight: 28, padding: "0 4px", color: muted }}
+              >
+                <span style={{ flex: 1, fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase" }}>Projects</span>
+                <span style={{ fontSize: 11 }}>{projectsOpen ? "–" : "+"}</span>
+              </button>
+            )}
+
+            {(iconOnly || projectsOpen) &&
+              projects.map((project) => {
+                const childSessions = sessions.filter((session) => session.projectId === project.id);
+                const open = expanded[project.id] ?? props.activeProjectId === project.id;
+                const isActive = props.activeProjectId === project.id;
+                return (
+                  <div key={project.id} style={{ minWidth: 0, maxWidth: "100%" }}>
+                    <div
+                      className="echo-side-row"
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        width: "100%",
+                        maxWidth: "100%",
+                        minWidth: 0,
+                        boxSizing: "border-box",
+                      }}
+                    >
+                      <button
+                        className={`echo-side-button ${isActive ? "is-active" : ""}`}
+                        type="button"
+                        style={{
+                          ...railButton(isActive),
+                          flex: "1 1 auto",
+                          minWidth: 0,
+                          width: "auto",
+                        }}
+                        onClick={() => {
+                          setExpanded((value) => ({ ...value, [project.id]: !open }));
+                          props.onSelectProject(project.id);
+                        }}
+                        title={project.workspace_root || project.name}
+                        aria-label={`Project: ${project.name}`}
+                      >
+                        <span style={iconSlot(isActive)}>
+                          <Icon name="folder" size={iconOnly ? 16 : 15} active={isActive} />
+                        </span>
+                        {!iconOnly && <span style={titleEllipsis}>{project.name}</span>}
+                      </button>
+                      {!iconOnly && (
+                        <div className="echo-row-actions" aria-label="Project actions">
+                          <button type="button" title="New Session in Project" onClick={() => props.onNewSession(project.id)}>
+                            +
+                          </button>
+                          <button
+                            type="button"
+                            title="Delete Project"
+                            onClick={() => {
+                              if (
+                                window.confirm(
+                                  `Delete Project “${project.name}”? Its Sessions will become independent.`,
+                                )
+                              )
+                                props.onDeleteProject(project.id);
+                            }}
+                          >
+                            ×
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                    {/* Sessions under a project: hide in rail to keep icons clear; open sidebar to manage */}
+                    {!iconOnly && open && childSessions.map((session) => sessionRow(session, true))}
+                    {!iconOnly && open && !childSessions.length && (
+                      <button
+                        type="button"
+                        className="echo-side-button"
+                        onClick={() => props.onNewSession(project.id)}
+                        style={{
+                          ...railButton(),
+                          width: "100%",
+                          maxWidth: "100%",
+                          boxSizing: "border-box",
+                          paddingLeft: 21,
+                          color: muted,
+                        }}
+                      >
+                        + Session in Project
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+
+            {iconOnly && (
+              <button
+                className="echo-side-button"
+                type="button"
+                style={railButton()}
+                onClick={() => props.onAddFolder()}
+                title="Add project folder"
+                aria-label="Add project folder"
+              >
+                <span style={iconSlot()}>
+                  <Icon name="folder" size={16} />
+                </span>
+              </button>
+            )}
+          </div>
+        </section>
+
+        <div className="echo-rail-divider" />
+
+        <nav aria-label="Workspace views" style={{ display: "grid", gap: 3, flex: "0 0 auto" }}>
+          {!iconOnly && (
+            <button
+              className="echo-side-button"
+              type="button"
+              onClick={() => setViewsOpen((value) => !value)}
+              aria-expanded={viewsOpen}
+              style={{ ...railButton(), minHeight: 28, padding: "0 4px", color: muted }}
+            >
+              <span style={{ flex: 1, fontSize: 10, letterSpacing: ".12em", textTransform: "uppercase" }}>Views</span>
+              <span style={{ fontSize: 11 }}>{viewsOpen ? "–" : "+"}</span>
+            </button>
+          )}
+          {(iconOnly || viewsOpen) &&
+            viewDefs.map((view) => {
+              const active = props.activeView === view.id;
+              return (
+                <button
+                  className={`echo-side-button ${active ? "is-active" : ""}`}
+                  type="button"
+                  key={view.id}
+                  style={{ ...railButton(active), width: "100%" }}
+                  onClick={() => props.onView(view.id)}
+                  title={view.title}
+                  aria-label={view.title}
+                >
+                  <span style={iconSlot(active)}>
+                    <Icon name={view.icon} size={iconOnly ? 16 : 15} active={active} />
+                  </span>
+                  {!iconOnly && <span style={titleEllipsis}>{view.label}</span>}
+                </button>
+              );
+            })}
+        </nav>
+      </div>
+
+      {iconOnly && (
+        <button
+          className="echo-side-button"
+          type="button"
+          title="Expand sidebar"
+          aria-label="Expand sidebar"
+          onClick={props.onToggleCollapsed}
+          style={{
+            ...railButton(),
+            flexShrink: 0,
+            marginTop: 2,
+          }}
+        >
+          <span style={iconSlot()}>
+            <Icon name="expand" size={16} />
+          </span>
+        </button>
+      )}
+    </aside>
+  );
+}

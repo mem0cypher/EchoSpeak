@@ -153,7 +153,10 @@ def _is_forbidden_mount_host(path: Path) -> Optional[str]:
 
 
 def path_is_within_root(path: Path, root: Path) -> bool:
-    """True if path is under root after resolve (follows symlinks via resolve())."""
+    """True if path is under root after resolve (follows symlinks via resolve()).
+
+    On Windows, slash style and drive-letter case must not cause false denials.
+    """
     try:
         p = path.expanduser().resolve()
         r = root.expanduser().resolve()
@@ -163,6 +166,12 @@ def path_is_within_root(path: Path, root: Path) -> bool:
         p.relative_to(r)
         return True
     except ValueError:
+        pass
+    try:
+        p_parts = [part.casefold() for part in p.parts]
+        r_parts = [part.casefold() for part in r.parts]
+        return len(p_parts) >= len(r_parts) and p_parts[: len(r_parts)] == r_parts
+    except Exception:
         return False
 
 

@@ -26,22 +26,12 @@ type TodoPanelProps = {
   variant?: "panel" | "visualizer";
 };
 
-const PRIORITY_COLORS: Record<TodoItem["priority"], string> = {
-  high: "#ef4444",
-  medium: "#f59e0b",
-  low: "#64748b",
-};
+const mono = "'JetBrains Mono', ui-monospace, monospace";
 
 const STATUS_LABELS: Record<TodoItem["status"], string> = {
   pending: "Pending",
-  in_progress: "Working",
+  in_progress: "In Progress",
   done: "Done",
-};
-
-const STATUS_ICONS: Record<TodoItem["status"], string> = {
-  pending: "○",
-  in_progress: "◔",
-  done: "●",
 };
 
 async function requestJson(url: string, init?: RequestInit) {
@@ -52,6 +42,31 @@ async function requestJson(url: string, init?: RequestInit) {
   }
   return data;
 }
+
+/** Monochrome status mark — Echo style, no green/amber chrome */
+const StatusIcon: React.FC<{ status: TodoItem["status"] }> = ({ status }) => {
+  if (status === "done") {
+    return (
+      <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden>
+        <circle cx="10" cy="10" r="8.5" fill="rgba(255,255,255,0.92)" stroke="rgba(255,255,255,0.92)" strokeWidth="1.2" />
+        <path d="M6.2 10.3l2.4 2.4 5-5" stroke="#0a0a0a" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    );
+  }
+  if (status === "in_progress") {
+    return (
+      <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden>
+        <circle cx="10" cy="10" r="8.5" stroke="rgba(255,255,255,0.55)" strokeWidth="1.4" />
+        <path d="M10 5.5v5l3 2" stroke="rgba(255,255,255,0.85)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    );
+  }
+  return (
+    <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden>
+      <circle cx="10" cy="10" r="8.5" stroke="rgba(255,255,255,0.22)" strokeWidth="1.4" />
+    </svg>
+  );
+};
 
 export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, colors, variant = "panel" }) => {
   const [todos, setTodos] = useState<TodoItem[]>([]);
@@ -64,6 +79,7 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, colors, variant =
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
   const [editDesc, setEditDesc] = useState("");
+  const [editPriority, setEditPriority] = useState<TodoItem["priority"]>("medium");
   const [filter, setFilter] = useState<"all" | TodoItem["status"]>("all");
 
   const refresh = useCallback(async () => {
@@ -89,7 +105,12 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, colors, variant =
       await requestJson(`${apiBase}/todos`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: newTitle.trim(), description: newDesc.trim(), priority: newPriority, status: "pending" }),
+        body: JSON.stringify({
+          title: newTitle.trim(),
+          description: newDesc.trim(),
+          priority: newPriority,
+          status: "pending",
+        }),
       });
       setNewTitle("");
       setNewDesc("");
@@ -123,7 +144,7 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, colors, variant =
           title: editTitle.trim() || todo.title,
           description: editDesc,
           status: todo.status,
-          priority: todo.priority,
+          priority: editPriority,
         }),
       });
       setEditingId(null);
@@ -148,95 +169,232 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, colors, variant =
     return "pending";
   };
 
-  const filteredTodos = filter === "all" ? todos : todos.filter((todo) => todo.status === filter);
+  const filteredTodos = filter === "all" ? todos : todos.filter((t) => t.status === filter);
   const counts = {
     all: todos.length,
-    pending: todos.filter((todo) => todo.status === "pending").length,
-    in_progress: todos.filter((todo) => todo.status === "in_progress").length,
-    done: todos.filter((todo) => todo.status === "done").length,
-  };
-  const completion = counts.all ? Math.round((counts.done / counts.all) * 100) : 0;
-  const rootStyle: React.CSSProperties = variant === "visualizer"
-    ? { height: "100%", overflowY: "auto", padding: "18px 18px 22px" }
-    : {};
-  const cardShell: React.CSSProperties = {
-    display: "flex",
-    flexDirection: "column",
-    gap: 16,
-    background: variant === "visualizer" ? "transparent" : undefined,
-  };
-  const surfaceStyle: React.CSSProperties = {
-    background: "linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02))",
-    border: `1px solid ${colors.line}`,
-    borderRadius: 16,
-    boxShadow: variant === "visualizer" ? "0 18px 40px rgba(0,0,0,0.2)" : "none",
+    pending: todos.filter((t) => t.status === "pending").length,
+    in_progress: todos.filter((t) => t.status === "in_progress").length,
+    done: todos.filter((t) => t.status === "done").length,
   };
 
+  const isViz = variant === "visualizer";
+
+  const wrapStyle: React.CSSProperties = isViz
+    ? {
+        height: "100%",
+        overflowY: "auto",
+        display: "flex",
+        flexDirection: "column",
+        gap: 0,
+        padding: "14px 16px 18px",
+        background: "#000",
+        color: colors.text,
+      }
+    : {};
+
+  const monoLabel: React.CSSProperties = {
+    fontFamily: mono,
+    fontSize: 9,
+    fontWeight: 600,
+    letterSpacing: "0.12em",
+    textTransform: "uppercase",
+    color: "rgba(255,255,255,0.35)",
+  };
+
+  const filterBtnStyle = (active: boolean): React.CSSProperties => ({
+    padding: "5px 11px",
+    borderRadius: 3,
+    border: active ? "1px solid rgba(255,255,255,0.22)" : "1px solid rgba(255,255,255,0.10)",
+    background: active ? "rgba(255,255,255,0.1)" : "transparent",
+    color: active ? "#fff" : "rgba(255,255,255,0.48)",
+    fontSize: 11,
+    fontWeight: 600,
+    cursor: "pointer",
+    transition: "background 0.15s, border-color 0.15s, color 0.15s",
+    letterSpacing: "0.04em",
+    textTransform: "uppercase",
+    fontFamily: mono,
+  });
+
+  const inputStyle: React.CSSProperties = {
+    width: "100%",
+    boxSizing: "border-box",
+    background: "rgba(255,255,255,0.03)",
+    border: "1px solid rgba(255,255,255,0.12)",
+    borderRadius: 3,
+    padding: "9px 12px",
+    color: colors.text,
+    fontSize: 13,
+    outline: "none",
+    fontFamily: "inherit",
+  };
+
+  const softChip = (active = false): React.CSSProperties => ({
+    fontSize: 10,
+    fontWeight: 600,
+    letterSpacing: 0.5,
+    textTransform: "uppercase",
+    padding: "3px 7px",
+    borderRadius: 3,
+    fontFamily: mono,
+    background: active ? "rgba(255,255,255,0.1)" : "rgba(255,255,255,0.04)",
+    color: active ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.45)",
+    border: active ? "1px solid rgba(255,255,255,0.22)" : "1px solid rgba(255,255,255,0.1)",
+  });
+
+  const priorityWeight: Record<TodoItem["priority"], number> = { high: 3, medium: 2, low: 1 };
+
   const content = (
-    <div style={cardShell}>
-      <div style={{ ...surfaceStyle, padding: 18, background: "linear-gradient(135deg, rgba(79,142,255,0.16), rgba(255,255,255,0.04))" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <div style={{ fontSize: 18, fontWeight: 700, color: colors.text }}>Echo Tasks</div>
-            <div style={{ fontSize: 12, color: colors.textDim, lineHeight: 1.55, maxWidth: 560 }}>
-              This is Echo&apos;s working list for the visualizer side. The backend API and the agent tool both point at the same task store.
-            </div>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <span style={{ fontSize: 11, color: colors.textDim }}>{counts.done}/{counts.all} complete</span>
-            <button className="icon-button" type="button" onClick={refresh} disabled={loading} style={{ height: 34, padding: "0 12px", fontSize: 12 }}>
-              {loading ? "Refreshing..." : "Refresh"}
-            </button>
-            <button className="icon-button" type="button" onClick={() => setShowAdd((value) => !value)} style={{ height: 34, padding: "0 12px", fontSize: 12, background: showAdd ? "rgba(255,255,255,0.12)" : undefined }}>
-              {showAdd ? "Close" : "Add Task"}
-            </button>
-          </div>
+    <div style={{ display: "flex", flexDirection: "column", gap: 14, height: isViz ? "100%" : undefined, minHeight: 0 }}>
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12 }}>
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#fff", letterSpacing: -0.2 }}>Tasks</div>
+          <div style={{ ...monoLabel, marginTop: 4 }}>Echo workspace checklist</div>
         </div>
-        <div style={{ marginTop: 14, height: 6, borderRadius: 999, overflow: "hidden", background: "rgba(255,255,255,0.06)" }}>
-          <motion.div animate={{ width: `${completion}%` }} transition={{ duration: 0.4, ease: "easeOut" }} style={{ height: "100%", borderRadius: 999, background: "linear-gradient(90deg, #4f8eff, #22c55e)" }} />
+        <div style={{ display: "flex", gap: 6 }}>
+          <button type="button" onClick={refresh} disabled={loading} style={{ ...filterBtnStyle(false), opacity: loading ? 0.5 : 1 }}>
+            {loading ? "…" : "Refresh"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowAdd((v) => !v)}
+            style={{
+              ...filterBtnStyle(showAdd),
+              background: showAdd ? "rgba(255,255,255,0.1)" : "rgba(255,255,255,0.06)",
+              borderColor: showAdd ? "rgba(255,255,255,0.28)" : "rgba(255,255,255,0.14)",
+              color: "#fff",
+            }}
+          >
+            {showAdd ? "Close" : "+ Add"}
+          </button>
         </div>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10 }}>
-        {([
-          ["All", counts.all, "#94a3b8"],
-          ["Pending", counts.pending, "#64748b"],
-          ["Working", counts.in_progress, "#f59e0b"],
-          ["Done", counts.done, "#22c55e"],
-        ] as const).map(([label, value, tone]) => (
-          <div key={label} style={{ ...surfaceStyle, padding: 12 }}>
-            <div style={{ fontSize: 11, color: colors.textDim, textTransform: "uppercase", letterSpacing: 0.6 }}>{label}</div>
-            <div style={{ marginTop: 6, fontSize: 22, fontWeight: 700, color: tone }}>{value}</div>
+      {/* Counts — monochrome rail */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+          gap: 1,
+          background: "rgba(255,255,255,0.08)",
+          border: "1px solid rgba(255,255,255,0.1)",
+          borderRadius: 3,
+          overflow: "hidden",
+        }}
+      >
+        {(
+          [
+            ["All", counts.all],
+            ["Pending", counts.pending],
+            ["Working", counts.in_progress],
+            ["Done", counts.done],
+          ] as const
+        ).map(([label, val]) => (
+          <div
+            key={label}
+            style={{
+              padding: "10px 12px",
+              background: "#0a0a0a",
+              display: "flex",
+              flexDirection: "column",
+              gap: 4,
+            }}
+          >
+            <div style={monoLabel}>{label}</div>
+            <div style={{ fontSize: 20, fontWeight: 700, color: "#fff", lineHeight: 1, fontFamily: mono }}>{val}</div>
           </div>
         ))}
       </div>
 
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-        {(["all", "pending", "in_progress", "done"] as const).map((value) => (
-          <button key={value} type="button" onClick={() => setFilter(value)} style={{ padding: "7px 12px", borderRadius: 999, border: `1px solid ${filter === value ? "rgba(255,255,255,0.26)" : colors.line}`, background: filter === value ? "rgba(255,255,255,0.1)" : "rgba(255,255,255,0.03)", color: filter === value ? colors.text : colors.textDim, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
-            {value === "all" ? "All" : value === "in_progress" ? "In Progress" : value[0].toUpperCase() + value.slice(1)}
+      {/* Filters */}
+      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+        {(["all", "pending", "in_progress", "done"] as const).map((f) => (
+          <button key={f} type="button" onClick={() => setFilter(f)} style={filterBtnStyle(filter === f)}>
+            {f === "all" ? "All" : f === "in_progress" ? "In Progress" : f[0].toUpperCase() + f.slice(1)}
           </button>
         ))}
       </div>
 
-      {error ? <div style={{ color: colors.danger, background: "rgba(239,68,68,0.08)", border: `1px solid ${colors.danger}33`, borderRadius: 12, padding: 12, fontSize: 12 }}>{error}</div> : null}
+      {error ? (
+        <div
+          style={{
+            color: "rgba(255,255,255,0.75)",
+            background: "rgba(255,255,255,0.04)",
+            border: "1px solid rgba(255,255,255,0.14)",
+            borderRadius: 3,
+            padding: "10px 12px",
+            fontSize: 12,
+          }}
+        >
+          {error}
+        </div>
+      ) : null}
 
+      {/* Add form */}
       <AnimatePresence initial={false}>
         {showAdd ? (
-          <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} style={{ ...surfaceStyle, padding: 16 }}>
-            <div style={{ display: "grid", gap: 12 }}>
-              <input value={newTitle} onChange={(e) => setNewTitle(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addTodo(); }} placeholder="Task title" style={{ width: "100%", background: "rgba(255,255,255,0.05)", border: `1px solid ${colors.line}`, borderRadius: 10, padding: "10px 12px", color: colors.text, fontSize: 13, outline: "none" }} />
-              <textarea value={newDesc} onChange={(e) => setNewDesc(e.target.value)} placeholder="Optional context for Echo" rows={3} style={{ width: "100%", background: "rgba(255,255,255,0.05)", border: `1px solid ${colors.line}`, borderRadius: 10, padding: "10px 12px", color: colors.text, fontSize: 12, outline: "none", resize: "vertical", fontFamily: "inherit" }} />
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                <div style={{ display: "flex", gap: 8 }}>
-                  {(["low", "medium", "high"] as const).map((priority) => (
-                    <button key={priority} type="button" onClick={() => setNewPriority(priority)} style={{ padding: "7px 10px", borderRadius: 999, border: `1px solid ${newPriority === priority ? PRIORITY_COLORS[priority] : colors.line}`, background: newPriority === priority ? `${PRIORITY_COLORS[priority]}1f` : "rgba(255,255,255,0.03)", color: newPriority === priority ? PRIORITY_COLORS[priority] : colors.textDim, cursor: "pointer", fontSize: 11, fontWeight: 700, textTransform: "uppercase" }}>
-                      {priority}
+          <motion.div
+            key="add-form"
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            style={{ overflow: "hidden" }}
+          >
+            <div
+              style={{
+                padding: 14,
+                background: "rgba(255,255,255,0.03)",
+                border: "1px solid rgba(255,255,255,0.12)",
+                borderRadius: 3,
+                display: "flex",
+                flexDirection: "column",
+                gap: 10,
+              }}
+            >
+              <input
+                value={newTitle}
+                onChange={(e) => setNewTitle(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") addTodo();
+                }}
+                placeholder="Task title..."
+                autoFocus
+                style={inputStyle}
+              />
+              <textarea
+                value={newDesc}
+                onChange={(e) => setNewDesc(e.target.value)}
+                placeholder="Description / context for Echo (optional)"
+                rows={2}
+                style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5 }}
+              />
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {(["low", "medium", "high"] as const).map((p) => (
+                    <button key={p} type="button" onClick={() => setNewPriority(p)} style={softChip(newPriority === p)}>
+                      {p}
                     </button>
                   ))}
                 </div>
-                <button className="icon-button" type="button" onClick={addTodo} disabled={!newTitle.trim()} style={{ height: 34, padding: "0 14px", fontSize: 12 }}>
-                  Create Task
+                <button
+                  type="button"
+                  onClick={addTodo}
+                  disabled={!newTitle.trim()}
+                  style={{
+                    padding: "7px 16px",
+                    borderRadius: 3,
+                    border: "1px solid rgba(255,255,255,0.22)",
+                    background: "rgba(255,255,255,0.08)",
+                    color: "#fff",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    cursor: newTitle.trim() ? "pointer" : "not-allowed",
+                    opacity: newTitle.trim() ? 1 : 0.45,
+                    fontFamily: mono,
+                  }}
+                >
+                  Create
                 </button>
               </div>
             </div>
@@ -244,54 +402,264 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, colors, variant =
         ) : null}
       </AnimatePresence>
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {/* List */}
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 6,
+          flex: isViz ? 1 : undefined,
+          overflowY: isViz ? "auto" : undefined,
+          minHeight: 0,
+        }}
+      >
+        {loading && todos.length === 0 ? (
+          <div style={{ padding: "24px 0", textAlign: "center", color: "rgba(255,255,255,0.35)", fontSize: 12, fontFamily: mono }}>
+            Loading tasks…
+          </div>
+        ) : null}
+
+        {!loading && filteredTodos.length === 0 ? (
+          <div
+            style={{
+              padding: "36px 20px",
+              textAlign: "center",
+              background: "rgba(255,255,255,0.02)",
+              border: "1px solid rgba(255,255,255,0.08)",
+              borderRadius: 3,
+            }}
+          >
+            <div
+              style={{
+                width: 28,
+                height: 28,
+                margin: "0 auto 12px",
+                borderRadius: 3,
+                border: "1px solid rgba(255,255,255,0.12)",
+                background: "rgba(255,255,255,0.03)",
+              }}
+            />
+            <div style={{ fontSize: 13, color: "rgba(255,255,255,0.45)" }}>
+              {filter === "all" ? "No tasks yet — add one above" : `No ${filter.replace("_", " ")} tasks`}
+            </div>
+          </div>
+        ) : null}
+
         <AnimatePresence initial={false}>
-          {filteredTodos.map((todo) => (
-            <motion.div key={todo.id} layout initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} style={{ ...surfaceStyle, padding: 14, background: todo.status === "done" ? "linear-gradient(180deg, rgba(34,197,94,0.07), rgba(255,255,255,0.02))" : undefined }}>
-              {editingId === todo.id ? (
-                <div style={{ display: "grid", gap: 10 }}>
-                  <input value={editTitle} onChange={(e) => setEditTitle(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") saveEdit(todo); }} style={{ width: "100%", background: "rgba(255,255,255,0.05)", border: `1px solid ${colors.line}`, borderRadius: 10, padding: "10px 12px", color: colors.text, fontSize: 13, outline: "none" }} />
-                  <textarea value={editDesc} onChange={(e) => setEditDesc(e.target.value)} rows={3} style={{ width: "100%", background: "rgba(255,255,255,0.05)", border: `1px solid ${colors.line}`, borderRadius: 10, padding: "10px 12px", color: colors.text, fontSize: 12, outline: "none", resize: "vertical", fontFamily: "inherit" }} />
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <button className="icon-button" type="button" onClick={() => saveEdit(todo)} style={{ height: 32, padding: "0 12px", fontSize: 12 }}>Save</button>
-                    <button className="icon-button" type="button" onClick={() => setEditingId(null)} style={{ height: 32, padding: "0 12px", fontSize: 12 }}>Cancel</button>
-                  </div>
-                </div>
-              ) : (
-                <>
-                  <div style={{ display: "grid", gridTemplateColumns: "24px 1fr auto auto", gap: 10, alignItems: "start" }}>
-                    <button type="button" onClick={() => updateStatus(todo, cycleStatus(todo.status))} style={{ marginTop: 2, background: "none", border: "none", color: todo.status === "done" ? "#22c55e" : todo.status === "in_progress" ? "#f59e0b" : colors.textDim, fontSize: 18, cursor: "pointer", padding: 0, lineHeight: 1 }}>
-                      {STATUS_ICONS[todo.status]}
-                    </button>
-                    <div style={{ display: "grid", gap: 6 }}>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: todo.status === "done" ? colors.textDim : colors.text, textDecoration: todo.status === "done" ? "line-through" : "none" }}>{todo.title}</div>
-                      {todo.description ? <div style={{ fontSize: 12, color: colors.textDim, lineHeight: 1.55 }}>{todo.description}</div> : null}
-                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                        <span style={{ fontSize: 10, padding: "4px 8px", borderRadius: 999, background: `${PRIORITY_COLORS[todo.priority]}22`, color: PRIORITY_COLORS[todo.priority], fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5 }}>{todo.priority}</span>
-                        <span style={{ fontSize: 10, padding: "4px 8px", borderRadius: 999, background: "rgba(255,255,255,0.06)", color: colors.textDim, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5 }}>{STATUS_LABELS[todo.status]}</span>
-                        <span style={{ fontSize: 10, color: colors.textDim }}>Updated {todo.updated_at ? new Date(todo.updated_at).toLocaleString() : "—"}</span>
+          {[...filteredTodos]
+            .sort((a, b) => {
+              if (a.status === "done" && b.status !== "done") return 1;
+              if (a.status !== "done" && b.status === "done") return -1;
+              return priorityWeight[b.priority] - priorityWeight[a.priority];
+            })
+            .map((todo) => (
+              <motion.div
+                key={todo.id}
+                layout
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.15 }}
+              >
+                {editingId === todo.id ? (
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 10,
+                      padding: "12px 14px",
+                      background: "rgba(255,255,255,0.03)",
+                      border: "1px solid rgba(255,255,255,0.16)",
+                      borderRadius: 3,
+                    }}
+                  >
+                    <input
+                      value={editTitle}
+                      onChange={(e) => setEditTitle(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") saveEdit(todo);
+                      }}
+                      style={inputStyle}
+                    />
+                    <textarea
+                      value={editDesc}
+                      onChange={(e) => setEditDesc(e.target.value)}
+                      rows={2}
+                      style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5 }}
+                    />
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        {(["low", "medium", "high"] as const).map((p) => (
+                          <button key={p} type="button" onClick={() => setEditPriority(p)} style={softChip(editPriority === p)}>
+                            {p}
+                          </button>
+                        ))}
+                      </div>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button
+                          type="button"
+                          onClick={() => saveEdit(todo)}
+                          style={{
+                            padding: "5px 12px",
+                            borderRadius: 3,
+                            border: "1px solid rgba(255,255,255,0.22)",
+                            background: "rgba(255,255,255,0.08)",
+                            color: "#fff",
+                            fontSize: 11,
+                            fontWeight: 700,
+                            cursor: "pointer",
+                            fontFamily: mono,
+                          }}
+                        >
+                          Save
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditingId(null)}
+                          style={{
+                            padding: "5px 12px",
+                            borderRadius: 3,
+                            border: "1px solid rgba(255,255,255,0.1)",
+                            background: "transparent",
+                            color: "rgba(255,255,255,0.5)",
+                            fontSize: 11,
+                            fontWeight: 600,
+                            cursor: "pointer",
+                            fontFamily: mono,
+                          }}
+                        >
+                          Cancel
+                        </button>
                       </div>
                     </div>
-                    <button type="button" onClick={() => { setEditingId(todo.id); setEditTitle(todo.title); setEditDesc(todo.description); }} style={{ background: "none", border: "none", color: colors.textDim, fontSize: 12, cursor: "pointer", padding: "4px 6px" }}>Edit</button>
-                    <button type="button" onClick={() => deleteTodo(todo.id)} style={{ background: "none", border: "none", color: colors.textDim, fontSize: 12, cursor: "pointer", padding: "4px 6px" }}>Delete</button>
                   </div>
-                </>
-              )}
-            </motion.div>
-          ))}
+                ) : (
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "flex-start",
+                      gap: 12,
+                      padding: "12px 14px",
+                      background: todo.status === "done" ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.03)",
+                      border: "1px solid rgba(255,255,255,0.1)",
+                      borderLeft:
+                        todo.status === "done"
+                          ? "2px solid rgba(255,255,255,0.35)"
+                          : todo.status === "in_progress"
+                            ? "2px solid rgba(255,255,255,0.7)"
+                            : "2px solid rgba(255,255,255,0.12)",
+                      borderRadius: 3,
+                      transition: "border-color 0.15s, background 0.15s",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => updateStatus(todo, cycleStatus(todo.status))}
+                      title={`Cycle status (currently ${STATUS_LABELS[todo.status]})`}
+                      style={{
+                        flexShrink: 0,
+                        marginTop: 1,
+                        background: "none",
+                        border: "none",
+                        cursor: "pointer",
+                        padding: 0,
+                        lineHeight: 0,
+                      }}
+                    >
+                      <StatusIcon status={todo.status} />
+                    </button>
+
+                    <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 5 }}>
+                      <div
+                        style={{
+                          fontSize: 13,
+                          fontWeight: 600,
+                          color: todo.status === "done" ? "rgba(255,255,255,0.4)" : "#fff",
+                          textDecoration: todo.status === "done" ? "line-through" : "none",
+                          lineHeight: 1.35,
+                          wordBreak: "break-word",
+                        }}
+                      >
+                        {todo.title}
+                      </div>
+                      {todo.description ? (
+                        <div style={{ fontSize: 12, color: "rgba(255,255,255,0.42)", lineHeight: 1.5, wordBreak: "break-word" }}>
+                          {todo.description}
+                        </div>
+                      ) : null}
+                      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", marginTop: 2 }}>
+                        <span style={softChip(todo.priority === "high")}>{todo.priority}</span>
+                        <span style={softChip(todo.status === "in_progress")}>{STATUS_LABELS[todo.status]}</span>
+                        {todo.updated_at ? (
+                          <span style={{ fontSize: 10, color: "rgba(255,255,255,0.22)", fontFamily: mono }}>
+                            {new Date(todo.updated_at).toLocaleDateString()}
+                          </span>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    <div style={{ display: "flex", gap: 2, flexShrink: 0, alignItems: "flex-start" }}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingId(todo.id);
+                          setEditTitle(todo.title);
+                          setEditDesc(todo.description);
+                          setEditPriority(todo.priority);
+                        }}
+                        style={{
+                          background: "none",
+                          border: "none",
+                          color: "rgba(255,255,255,0.4)",
+                          fontSize: 11,
+                          cursor: "pointer",
+                          padding: "3px 7px",
+                          borderRadius: 3,
+                          fontFamily: mono,
+                        }}
+                        onMouseEnter={(e) => {
+                          e.currentTarget.style.color = "#fff";
+                        }}
+                        onMouseLeave={(e) => {
+                          e.currentTarget.style.color = "rgba(255,255,255,0.4)";
+                        }}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteTodo(todo.id)}
+                        style={{
+                          background: "none",
+                          border: "none",
+                          color: "rgba(255,255,255,0.35)",
+                          fontSize: 11,
+                          cursor: "pointer",
+                          padding: "3px 7px",
+                          borderRadius: 3,
+                          fontFamily: mono,
+                        }}
+                        onMouseEnter={(e) => {
+                          e.currentTarget.style.color = "rgba(255,255,255,0.85)";
+                        }}
+                        onMouseLeave={(e) => {
+                          e.currentTarget.style.color = "rgba(255,255,255,0.35)";
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </motion.div>
+            ))}
         </AnimatePresence>
       </div>
-
-      {!loading && filteredTodos.length === 0 ? (
-        <div style={{ ...surfaceStyle, padding: 24, textAlign: "center", color: colors.textDim, fontSize: 13 }}>
-          {filter === "all" ? "No tasks yet. Create one for Echo." : `No ${filter.replace("_", " ")} tasks right now.`}
-        </div>
-      ) : null}
     </div>
   );
 
   if (variant === "visualizer") {
-    return <div style={rootStyle}>{content}</div>;
+    return <div style={wrapStyle}>{content}</div>;
   }
 
   return (

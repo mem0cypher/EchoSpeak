@@ -58,6 +58,7 @@ Core observations:
 
 - Strong local-first direction: user data, memory, settings, and artifacts are held locally by default.
 - Provider readiness preflight now prevents generic LM Studio/Ollama connection failures from masquerading as agent reasoning failures.
+- **Runtime contracts (v7.6.10):** `docs/RUNTIME_CONTRACTS.md` + `docs/LIFECYCLE_TRUTHFULNESS.md`; code partial; **pending live validation** (§K / §11). Known debt listed in Runtime Contracts §J.
 - Coding workspace prompt now pushes an inspect -> plan -> implement -> verify -> summarize lifecycle.
 - Chat continuity was improved with explicit current-subject state and referential follow-up resolution.
 - Reflection has moved in the right direction: deterministic checks now run before LLM self-grading for terminal/file/JSON outcomes.
@@ -340,7 +341,7 @@ Good docs:
 - `CHANGES.md` has current v7.3 notes.
 
 Docs needing cleanup:
-- Terminal allowlist references remain in `README.md`, `.env.example`, `TEST_RUNDOWN.md`, `onboard-tui`, and stale generated JS.
+- Terminal allowlist references remain in some `.env.example` / onboard-tui / stale generated JS paths (README current text updated for denylist + Project gates in the v7.6.10 doc pass).
 - `AUDIT.md` is older and overlaps with this pre-testing audit.
 - `TEST_RUNDOWN.md` still carries v6.7 language and old terminal behavior.
 - Integration docs should distinguish "implemented runtime" vs "skill present" vs "external bridge required" vs "planned".

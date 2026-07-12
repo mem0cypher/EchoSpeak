@@ -1,5 +1,34 @@
 # Changes
 
+## v7.6.10 - Runtime contracts / lifecycle truthfulness (in progress)
+
+**Status: implemented in code (partial); pending live validation** — not closed
+until `docs/LIFECYCLE_TRUTHFULNESS.md` §11 **and** `docs/RUNTIME_CONTRACTS.md` §K
+pass. Unit tests alone are not acceptance.
+
+### Canonical docs (do not fork rules here)
+
+| Doc | Owns |
+|-----|------|
+| **`docs/RUNTIME_CONTRACTS.md`** | Equal models; Mode/Project/permissions; Project+Code lifecycle; refresh hydration; search/utility/references; coding targets; streaming/concurrency; approval-scope identity; **Known limitations**; live gate §K |
+| **`docs/LIFECYCLE_TRUTHFULNESS.md`** | Recovery evidence (I.1); confirm types A–D (I.2); ToolRun truth; projection/status (I.3); corruption; truthful finals |
+
+### Documented but not “closed”
+- Equal model access (no local/small gates; real context window)
+- Chat ≠ workspace; Project remains in chat; `/capabilities` Session-bound; no TOOLS.txt hard ceiling
+- Attach/switch/detach/delete scope transaction; Code workspace real Project state
+- Full Turn hydrate after refresh (ToolRuns, research, approvals, verification)
+- Utility ≠ research; one search row; offered actions; durable claims for double-check
+- Placeholders rejected; list→read; no understand/mutate without ToolRuns
+- Client request_id ↔ Turn; Session-switch abort; process lock
+- **Gap called out:** explicit `index.html` edit retargeted to `game.js`; supporting reads must not become write targets; approval must use stable project/session/path/hash; Studio/capabilities refresh must not cancel pending approval
+- Known debt: ToolOutcome→text, dual search stacks, `core.py` size, tool bypasses, approval revalidation, missing transition tests
+
+### Explicit non-goals
+- UI redesign; Project authority loosen; editing user’s `Desktop/2d-shooter-game` during repair
+
+---
+
 ## v7.6.9 - Code visualizer + file read/write payload pipeline
 
 ### Live bugs

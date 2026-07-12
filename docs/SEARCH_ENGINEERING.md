@@ -2,6 +2,14 @@
 
 **Audience:** building Echo-quality search **with what we have** (DuckDuckGo + grounder), while keeping **paid options** pluggable.
 
+**User-facing search honesty / one canonical row / utility ≠ research /
+referential double-check / ungrounded numbers:**
+
+- Packaging + utility/sports isolation: **`docs/RUNTIME_CONTRACTS.md` §E**
+- ToolRun identity + final-response truth: **`docs/LIFECYCLE_TRUTHFULNESS.md`** §§5, 8
+
+Do not fork rules here. v7.6.10: implemented partial; pending live validation.
+
 ---
 
 ## 1. Scope: two different products
@@ -32,22 +40,21 @@ We **can** engineer packaging so free retrieval behaves more like paid agent sea
 
 ## 3. Architecture (options + free default)
 
-```
-WEB_SEARCH_PROVIDER=auto|duckduckgo|tavily|brave
+```text
+WEB_SEARCH_PROVIDER=auto|searxng|duckduckgo|brave
 
 run_web_search(query)
-  ├─ build_query_variants()     # date, site: authority, simplify
-  ├─ for provider in order:
-  │     ddg.text + ddg.news
-  │     tavily / brave if keys
-  ├─ empty → simplify retry
-  └─ thin snippets → ddg.extract(top URLs)
+  -> normalize_provider_query() and reject vague subjectless searches
+  -> build_query_variants() for date, authority, and simplified retry angles
+  -> try providers in order:
+       searxng when configured, brave when configured, duckduckgo fallback
+  -> dedupe URLs and optionally enrich thin DuckDuckGo snippets
 
 SearchGrounder (unchanged)
-  └─ multi-intent / score / soft-accept / synthesize
+  -> multi-intent / score / soft-accept / synthesize
 ```
 
-**Default with no keys:** DuckDuckGo-only cascade (your current reality, upgraded).
+**Default with no keys or SearXNG:** DuckDuckGo-only cascade.
 
 ---
 
@@ -55,13 +62,15 @@ SearchGrounder (unchanged)
 
 Module: `agent/web_search_providers.py`
 
-1. **Provider interface** — `duckduckgo` | `tavily` | `brave`
-2. **Cascade** — `auto` picks available keys, always can fall to DDG
-3. **Query variants** — month/year for news; `site:` for weather/sports authority
-4. **News channel** — `ddgs.news` when query looks newsworthy
-5. **Empty retry** — simplified query if zero hits
-6. **Extract upgrade** — when snippet thin / weather without numbers, `ddgs.extract(url)`
-7. **Metadata** — `Provider:` line in tool output for debugging
+1. **Provider interface** - `searxng` | `duckduckgo` | `brave`
+2. **Cascade** - `auto` prefers SearXNG when explicitly configured, then Brave, always DDG fallback
+3. **Query normalization** - shared typo/framing cleanup before providers run
+4. **Vague-query guard** - refuses searches with no concrete subject
+5. **Query variants** - month/year for news; `site:` for weather/sports authority
+6. **News channel** - `ddgs.news` when query looks newsworthy
+7. **Empty retry** - simplified query if zero hits
+8. **Extract upgrade** - when snippet thin / weather without numbers, `ddgs.extract(url)`
+9. **Metadata** - `Provider:` line in tool output for debugging
 
 `web_search` tool now routes through this orchestrator.
 
@@ -70,20 +79,15 @@ Module: `agent/web_search_providers.py`
 ## 5. Config
 
 ```env
-# auto = use any configured paid keys, always DDG fallback
+# auto = SearXNG when explicitly configured, then optional Brave, always DDG fallback
 WEB_SEARCH_PROVIDER=auto
-
-# optional paid
-TAVILY_API_KEY=
+SEARXNG_BASE_URL=http://localhost:8080
 BRAVE_SEARCH_API_KEY=
-
-# live sports (not crawl)
 ODDS_API_KEY=
 SPORTS_LIVE_ENABLED=true
 ```
 
 ---
-
 ## 6. What we will not DIY
 
 - Scraping Google SERP HTML as a “secret API”

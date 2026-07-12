@@ -2,14 +2,14 @@
 
 Scope
 -----
-Paid APIs (Brave/Tavily/Exa/Firecrawl) sell two things:
+Paid APIs (Brave/Exa/Firecrawl) sell two things:
   1) A web index + crawl ops  → hard to DIY
   2) Agent packaging (clean JSON, extract, recency) → *engineerable*
 
 Echo already owns (2) via multi-intent + SearchGrounder. This module owns
 **retrieval adapters** so we can:
   - squeeze more quality out of DuckDuckGo (default free path)
-  - optionally plug Tavily / Brave when keys exist
+  - optionally plug Brave when a key exists
   - cascade: preferred → fallback without changing the grounder
 
 Engineering upgrades on free DDG (no paid key required)
@@ -97,6 +97,37 @@ def _is_sportsish(q: str) -> bool:
         )
     )
 
+
+def normalize_provider_query(query: str) -> str:
+    """Normalize chatty/typo-prone text before any provider sees it."""
+    raw = re.sub(r"\s+", " ", str(query or "").strip())
+    if not raw:
+        return ""
+    try:
+        from agent.research import normalize_web_search_query
+
+        normalized = normalize_web_search_query(raw)
+        if normalized:
+            return re.sub(r"\s+", " ", normalized).strip()
+    except Exception:
+        pass
+    return raw
+
+
+def is_vague_search_query(query: str) -> bool:
+    """Reject search inputs that have no searchable subject."""
+    text = re.sub(r"\s+", " ", str(query or "").strip().lower())
+    if not text:
+        return True
+    tokens = re.findall(r"[a-z0-9][a-z0-9_-]*", text)
+    vague = {
+        "search", "research", "look", "lookup", "find", "check", "web", "online",
+        "it", "this", "that", "these", "those", "same", "topic", "thing",
+        "more", "again", "deeper", "latest", "current", "today", "tomorrow",
+        "please", "info", "information", "about", "into", "on", "for", "up",
+    }
+    substantive = [tok for tok in tokens if tok not in vague]
+    return not substantive
 
 def build_query_variants(query: str, *, max_variants: int = 3) -> List[str]:
     """Extra free retrieval angles when the primary query is thin."""
@@ -314,61 +345,48 @@ class DuckDuckGoProvider:
         return ""
 
 
-class TavilyProvider:
-    name = "tavily"
+class SearXNGProvider:
+    """Self-hosted SearXNG adapter for the legacy web_search cascade."""
 
-    def __init__(self, api_key: str, max_results: int = 8, timeout_s: float = 10.0, depth: str = "advanced"):
-        self.api_key = (api_key or "").strip()
-        self.max_results = max_results
+    name = "searxng"
+
+    def __init__(self, base_url: str, max_results: int = 8, timeout_s: float = 12.0):
+        self.base_url = str(base_url or "").strip().rstrip("/")
+        self.max_results = max(3, min(int(max_results), 20))
         self.timeout_s = timeout_s
-        self.depth = depth
 
     @property
     def available(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.base_url)
 
     def search(self, query: str, **_kwargs) -> SearchProviderResult:
         if not self.available:
-            return SearchProviderResult(provider=self.name, errors=["TAVILY_API_KEY not set"])
+            return SearchProviderResult(provider=self.name, errors=["SEARXNG_BASE_URL not set"])
         q = str(query or "").strip()
+        if not q:
+            return SearchProviderResult(provider=self.name, errors=["empty query"])
         try:
-            import requests
+            from agent.search_provider import SearXNGSearchProvider
 
-            resp = requests.post(
-                "https://api.tavily.com/search",
-                json={
-                    "api_key": self.api_key,
-                    "query": q,
-                    "search_depth": self.depth,
-                    "max_results": max(1, min(self.max_results, 10)),
-                    "include_answer": False,
-                    "include_raw_content": True,
-                },
-                timeout=self.timeout_s,
-            )
-            resp.raise_for_status()
-            data = resp.json() or {}
-            hits = []
-            for r in data.get("results") or []:
-                hits.append(
-                    SearchHit(
-                        title=str(r.get("title") or "No title").strip(),
-                        url=str(r.get("url") or "").strip(),
-                        snippet=str(r.get("content") or "").strip(),
-                        extract=str(r.get("raw_content") or "").strip()[:4000],
-                        date=str(r.get("published_date") or r.get("published_at") or "").strip(),
-                        provider=self.name,
-                        query=q,
-                    )
+            rows = SearXNGSearchProvider(self.base_url, timeout_s=self.timeout_s).search(q, limit=self.max_results)
+            hits = [
+                SearchHit(
+                    title=row.title,
+                    url=row.url,
+                    snippet=row.snippet,
+                    provider=self.name,
+                    query=q,
+                    score_hint=0.1,
                 )
+                for row in rows
+            ]
             return SearchProviderResult(hits=_dedupe_hits(hits), provider=self.name, queries_used=[q])
         except Exception as exc:
             return SearchProviderResult(
                 provider=self.name,
-                errors=[_format_provider_error("Tavily", exc, self.timeout_s)],
+                errors=[_format_provider_error("SearXNG", exc, self.timeout_s)],
                 queries_used=[q],
             )
-
 
 class BraveProvider:
     """Brave Search API — optional; independent index."""
@@ -465,27 +483,25 @@ def _dedupe_hits(hits: Sequence[SearchHit]) -> List[SearchHit]:
 def resolve_provider_order(config: Any) -> List[str]:
     """Return ordered provider names based on config + available keys."""
     pref = str(getattr(config, "web_search_provider", "auto") or "auto").strip().lower()
-    tavily = bool(str(getattr(config, "tavily_api_key", "") or "").strip())
     brave = bool(str(getattr(config, "brave_search_api_key", "") or "").strip())
+    searxng = bool(str(getattr(config, "searxng_base_url", "") or "").strip())
 
-    if pref == "tavily":
-        order = ["tavily", "duckduckgo"]
+    if pref == "searxng":
+        order = ["searxng", "duckduckgo"]
     elif pref == "brave":
         order = ["brave", "duckduckgo"]
     elif pref == "duckduckgo" or pref == "ddg":
         order = ["duckduckgo"]
-    else:  # auto
+    else:
         order = []
-        if tavily:
-            order.append("tavily")
+        if searxng:
+            order.append("searxng")
         if brave:
             order.append("brave")
         order.append("duckduckgo")
-    # Always ensure ddg last fallback unless exclusive
     if "duckduckgo" not in order:
         order.append("duckduckgo")
     return order
-
 
 def run_web_search(
     query: str,
@@ -504,16 +520,23 @@ def run_web_search(
     if config is None:
         from config import config as config  # noqa: A001
 
+    normalized_query = normalize_provider_query(query)
+    if is_vague_search_query(normalized_query):
+        return SearchProviderResult(
+            provider="none",
+            errors=["Search query is too vague; provide a concrete subject, entity, or question."],
+            queries_used=[],
+        )
+
     timeout = float(getattr(config, "web_search_timeout", 10) or 10)
-    max_results = int(getattr(config, "tavily_max_results", 8) or 8)
+    max_results = int(getattr(config, "web_search_max_results", 8) or 8)
 
     providers: Dict[str, Any] = {
         "duckduckgo": DuckDuckGoProvider(max_results=max_results, timeout_s=timeout),
-        "tavily": TavilyProvider(
-            api_key=str(getattr(config, "tavily_api_key", "") or ""),
+        "searxng": SearXNGProvider(
+            base_url=str(getattr(config, "searxng_base_url", "") or ""),
             max_results=max_results,
             timeout_s=timeout,
-            depth=str(getattr(config, "tavily_search_depth", "advanced") or "advanced"),
         ),
         "brave": BraveProvider(
             api_key=str(getattr(config, "brave_search_api_key", "") or ""),
@@ -523,7 +546,7 @@ def run_web_search(
     }
 
     order = resolve_provider_order(config)
-    variants = build_query_variants(query, max_variants=3)
+    variants = build_query_variants(normalized_query, max_variants=3)
     all_hits: List[SearchHit] = []
     all_errors: List[str] = []
     queries_used: List[str] = []
@@ -533,7 +556,7 @@ def run_web_search(
         prov = providers.get(pname)
         if prov is None:
             continue
-        if pname in {"tavily", "brave"} and not getattr(prov, "available", False):
+        if pname in {"brave", "searxng"} and not getattr(prov, "available", False):
             continue
         for vq in variants:
             res = prov.search(vq, news=_is_newsish(vq))

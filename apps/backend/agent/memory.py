@@ -779,6 +779,7 @@ class AgentMemory:
         mode: Optional[str] = None,
         thread_id: Optional[str] = None,
         source: str = "auto",
+        project_path: Optional[str] = None,
     ) -> Optional[str]:
         """Add a durable memory item (typed + optionally pinned). Returns id or None."""
         cleaned = str(text or "").strip()
@@ -815,6 +816,7 @@ class AgentMemory:
             "thread_id": thread_value,
             "namespace": namespace_key,
             "source": str(source or "auto"),
+            "project_path": str(project_path or "").strip(),
         }
 
         if not self.use_faiss:
@@ -831,7 +833,7 @@ class AgentMemory:
                     "metadata": metadata,
                 }
             )
-            if self.file_memory_enabled and str(source or "auto") == "curated":
+            if self.file_memory_enabled and str(source or "auto") == "curated" and not str(project_path or "").strip():
                 self.append_curated_memory(cleaned)
             return doc_id
 
@@ -845,11 +847,17 @@ class AgentMemory:
             store.add_documents([document])
         path = self._namespace_dir(mode_value, thread_value) if self.partition_enabled else self.memory_root
         self._save_vector_store(store, path)
-        if self.file_memory_enabled and str(source or "auto") == "curated":
+        if self.file_memory_enabled and str(source or "auto") == "curated" and not str(project_path or "").strip():
             self.append_curated_memory(cleaned)
         return doc_id
 
-    def list_pinned_items(self, mode: Optional[str] = None, thread_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    def list_pinned_items(
+        self,
+        mode: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        limit: int = 50,
+        project_path: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         items = self.list_items(offset=0, limit=max(200, limit), mode=mode, thread_id=thread_id)
         pinned: List[Dict[str, Any]] = []
         for it in items:
@@ -857,12 +865,26 @@ class AgentMemory:
             if not isinstance(meta, dict):
                 continue
             if meta.get("pinned") is True:
+                item_project = str(meta.get("project_path") or "").strip()
+                if project_path and item_project and item_project != str(project_path).strip():
+                    continue
                 pinned.append(it)
         pinned.sort(key=lambda x: (x.get("timestamp") or ""), reverse=True)
         return pinned[:limit]
 
-    def pinned_context(self, mode: Optional[str] = None, thread_id: Optional[str] = None, max_chars: int = 800) -> str:
-        items = self.list_pinned_items(mode=mode, thread_id=thread_id, limit=50)
+    def pinned_context(
+        self,
+        mode: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        max_chars: int = 800,
+        project_path: Optional[str] = None,
+    ) -> str:
+        items = self.list_pinned_items(
+            mode=mode,
+            thread_id=thread_id,
+            limit=50,
+            project_path=project_path,
+        )
         if not items:
             return ""
         lines: List[str] = []
@@ -1255,7 +1277,14 @@ class AgentMemory:
         self._save_to_disk()
         return deleted
 
-    def retrieve_relevant(self, query: str, k: int = 5, mode: Optional[str] = None, thread_id: Optional[str] = None) -> List[Document]:
+    def retrieve_relevant(
+        self,
+        query: str,
+        k: int = 5,
+        mode: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        project_path: Optional[str] = None,
+    ) -> List[Document]:
         if not self.use_faiss:
             return []
         if self.partition_enabled:
@@ -1267,16 +1296,35 @@ class AgentMemory:
             if any(score is not None for _doc, score in scored):
                 scored.sort(key=lambda item: float(item[1] if item[1] is not None else 0.0))
             docs = [doc for doc, _score in scored]
+            if project_path:
+                docs = [
+                    doc for doc in docs
+                    if not str((getattr(doc, "metadata", {}) or {}).get("project_path") or "").strip()
+                    or str((getattr(doc, "metadata", {}) or {}).get("project_path") or "").strip() == str(project_path).strip()
+                ]
             return docs[:k]
         if self.vector_store is None:
             return []
         results = self.vector_store.similarity_search(query, k=max(k, 8))
         results = [d for d in results if not (getattr(d, "metadata", {}) or {}).get("bootstrap")]
+        if project_path:
+            results = [
+                doc for doc in results
+                if not str((getattr(doc, "metadata", {}) or {}).get("project_path") or "").strip()
+                or str((getattr(doc, "metadata", {}) or {}).get("project_path") or "").strip() == str(project_path).strip()
+            ]
         results = results[:k]
         logger.debug(f"Retrieved {len(results)} relevant memories for query: {query[:50]}...")
         return results
 
-    def get_conversation_context(self, query: str, k: int = 5, mode: Optional[str] = None, thread_id: Optional[str] = None) -> str:
+    def get_conversation_context(
+        self,
+        query: str,
+        k: int = 5,
+        mode: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        project_path: Optional[str] = None,
+    ) -> str:
         # When raw auto-store is off, do not inject type=conversation dumps into the
         # prompt (session + ephemeral chat history own multi-turn continuity). This
         # keeps session summary and FAISS from fighting each other with stale turns.
@@ -1290,6 +1338,11 @@ class AgentMemory:
                 for m in self.simple_memory
                 if self._mode_matches(m.get("mode"), mode)
                 and self._thread_matches(m.get("thread_id"), thread_id)
+                and (
+                    not project_path
+                    or not str((m.get("metadata") or {}).get("project_path") or "").strip()
+                    or str((m.get("metadata") or {}).get("project_path") or "").strip() == str(project_path).strip()
+                )
             ]
             if not inject_raw_conversations:
                 filtered = []
@@ -1306,7 +1359,13 @@ class AgentMemory:
                 return ""
             return "\n\n".join([m["text"] for m in matched[-k:]])
         
-        docs = self.retrieve_relevant(query, k=max(k * 3, 8), mode=mode, thread_id=thread_id)
+        docs = self.retrieve_relevant(
+            query,
+            k=max(k * 3, 8),
+            mode=mode,
+            thread_id=thread_id,
+            project_path=project_path,
+        )
         if not docs:
             return ""
 

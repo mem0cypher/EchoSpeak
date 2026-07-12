@@ -71,12 +71,157 @@ _SPELLING_FIXES = {
     "tomorow": "tomorrow",
     "tomorro": "tomorrow",
     "todya": "today",
+    "yesteday": "yesterday",
+    "yesturday": "yesterday",
+    "yeterday": "yesterday",
+    "schedul": "schedule",
+    "schdule": "schedule",
+    "scroe": "score",
+    "socre": "score",
+    "scors": "scores",
+    "reults": "results",
+    "resutls": "results",
+    "standigns": "standings",
+    "playffs": "playoffs",
+    "playofs": "playoffs",
+    "champoins": "champions",
+    "champons": "champions",
+    "leauge": "league",
+    "legaue": "league",
+    "premire": "premier",
+    "weahter": "weather",
+    "weathr": "weather",
+    "forcast": "forecast",
+    "forecst": "forecast",
+    "temprature": "temperature",
+    "temperture": "temperature",
+    "bitconi": "bitcoin",
+    "bitcone": "bitcoin",
+    "etherium": "ethereum",
+    "etheruem": "ethereum",
+    "electon": "election",
+    "elction": "election",
+    "hurrican": "hurricane",
+    "hurricaine": "hurricane",
+    "earthquak": "earthquake",
+    "earthquke": "earthquake",
+    "comparson": "comparison",
+    "comparsion": "comparison",
+    "diffrence": "difference",
+    "differece": "difference",
+    "relase": "release",
+    "realease": "release",
+    "reveiw": "review",
+    "reivew": "review",
+    "movei": "movie",
+    "moive": "movie",
+    "traler": "trailer",
+    "trialer": "trailer",
     # Politeness STT (must not become its own search: "pelsae check")
     "pelsae": "please",
     "plese": "please",
     "plase": "please",
     "pealse": "please",
 }
+
+# High-frequency entities for fuzzy typo correction (edit-distance matching).
+# These are common search terms that speech-to-text and fast typing often mangle.
+_FUZZY_ENTITIES = {
+    # Sports
+    "fifa", "champions", "league", "premier", "basketball", "football",
+    "soccer", "baseball", "hockey", "tennis", "olympics", "playoffs",
+    "standings", "tournament", "championship", "semifinals", "quarterfinals",
+    "stanley", "match", "matches", "schedule", "scores", "results", "highlights",
+    # Teams
+    "lakers", "warriors", "celtics", "knicks", "yankees", "dodgers",
+    "cowboys", "patriots", "eagles", "chiefs", "arsenal", "chelsea",
+    "liverpool", "barcelona", "madrid", "juventus", "bayern", "manchester",
+    # General search
+    "weather", "forecast", "temperature", "bitcoin", "ethereum",
+    "cryptocurrency", "election", "president", "earthquake", "hurricane",
+    "trailer", "release", "review", "comparison", "difference",
+    "between", "versus", "tonight", "tomorrow", "yesterday", "schedule",
+    "movie", "score", "game", "today",
+}
+
+# Common English words that should NOT trigger fuzzy correction
+_COMMON_STOP = {
+    "the", "a", "an", "and", "or", "but", "is", "are", "was", "were",
+    "be", "been", "being", "have", "has", "had", "do", "does", "did",
+    "will", "would", "could", "should", "may", "might", "shall", "can",
+    "not", "no", "yes", "for", "to", "from", "with", "at", "by", "in",
+    "on", "of", "it", "its", "this", "that", "these", "those", "my",
+    "your", "his", "her", "our", "their", "me", "him", "them", "us",
+    "who", "what", "when", "where", "whether", "how", "why", "which", "all", "each",
+    "some", "any", "few", "more", "most", "other", "than", "then", "so",
+    "if", "up", "out", "about", "into", "over", "after", "also", "just",
+    "like", "very", "too", "here", "there", "now", "even", "still",
+    "back", "well", "much", "many", "only", "also", "just", "get", "got",
+    "let", "put", "say", "tell", "give", "take", "come", "go", "make",
+    "know", "think", "see", "look", "want", "use", "find", "need",
+    "hey", "echo", "please", "check", "okay", "real", "quick",
+}
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Compute Levenshtein edit distance between two strings."""
+    if len(a) < len(b):
+        return _levenshtein(b, a)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (ca != cb)))
+        prev = curr
+    return prev[-1]
+
+
+def _fuzzy_correct_word(word: str) -> str:
+    """Fuzzy-correct a word against high-frequency search entities.
+
+    Only corrects if:
+    - Word is >= 4 chars and not a common English word
+    - Edit distance is 1 (for words 4-5 chars) or <= 2 (for words 6+ chars)
+    - There's a single unambiguous match (not multiple candidates)
+    """
+    low = word.lower()
+    if len(low) < 4:
+        return word
+    if low in _COMMON_STOP:
+        return word
+    if low in _FUZZY_ENTITIES:
+        return word  # already correct
+
+    best_match = None
+    best_dist = 999
+    ambiguous = False
+
+    max_dist = 1 if len(low) <= 5 else 2
+
+    for entity in _FUZZY_ENTITIES:
+        # Quick length filter — edit distance can't be less than length difference
+        if abs(len(low) - len(entity)) > max_dist:
+            continue
+        dist = _levenshtein(low, entity)
+        if dist <= max_dist:
+            if dist < best_dist:
+                best_dist = dist
+                best_match = entity
+                ambiguous = False
+            elif dist == best_dist and best_match != entity:
+                ambiguous = True
+
+    if best_match and not ambiguous:
+        # Preserve original casing style
+        if word.isupper():
+            return best_match.upper()
+        if word[:1].isupper():
+            return best_match[:1].upper() + best_match[1:]
+        return best_match
+    return word
+
 
 _WEATHER_TERMS = {
     "weather",
@@ -224,7 +369,11 @@ _SPORTS_STOP = {
 
 
 def apply_spelling_fixes(text: str) -> str:
-    """Apply structural speech/typo fixes (day words, world-cup compound). No entity map."""
+    """Apply structural speech/typo fixes + fuzzy entity correction.
+
+    Two-pass: 1) Static dict for known compound/day/politeness fixes.
+    2) Levenshtein fuzzy match for high-frequency search entities.
+    """
     s = str(text or "")
     if not s:
         return s
@@ -238,14 +387,16 @@ def apply_spelling_fixes(text: str) -> str:
     def _fix_token(m: re.Match) -> str:
         word = m.group(0)
         key = re.sub(r"[^a-z0-9]", "", word.lower())
+        # Pass 1: static dictionary
         fixed = _SPELLING_FIXES.get(key)
-        if not fixed:
-            return word
-        if word.isupper():
-            return fixed.upper()
-        if word[:1].isupper():
-            return fixed[:1].upper() + fixed[1:]
-        return fixed
+        if fixed:
+            if word.isupper():
+                return fixed.upper()
+            if word[:1].isupper():
+                return fixed[:1].upper() + fixed[1:]
+            return fixed
+        # Pass 2: fuzzy entity correction
+        return _fuzzy_correct_word(word)
 
     return re.sub(r"[A-Za-z][A-Za-z']*", _fix_token, s)
 
@@ -332,7 +483,7 @@ def _is_weather_clause(text: str) -> bool:
 
 def _is_local_or_software_game_context(text: str) -> bool:
     """Video-game / code-project language — must NOT be classified as sports."""
-    low = (text or "").lower()
+    low = apply_spelling_fixes(text or "").lower()
     if not low:
         return False
     if re.search(
@@ -506,7 +657,7 @@ def intent_domains(text: str) -> set[str]:
     General mechanism — not a per-combo recipe. Two or more distinct domains
     in one utterance ⇒ multi-intent, regardless of whether we have a recipe.
     """
-    low = (text or "").lower()
+    low = apply_spelling_fixes(text or "").lower()
     if not low:
         return set()
     domains: set[str] = set()
@@ -516,7 +667,7 @@ def intent_domains(text: str) -> set[str]:
         _is_schedule_or_sports_clause(low)
         or re.search(
             r"\b(fifa|world cup|nhl|nba|nfl|mlb|soccer|football|premier league|"
-            r"match(?:es)?|score(?:s)?|standings|playoff)\b",
+            r"stanley cup|championship|match(?:es)?|score(?:s)?|standings|playoff)\b",
             low,
         )
     ):
@@ -538,9 +689,34 @@ def intent_domains(text: str) -> set[str]:
         low,
     ):
         domains.add("fact")
-    if re.search(r"\b(odds|betting|moneyline|spread)\b", low):
+    if re.search(r"\b(odds|betting|moneyline|spread|chances|probability|likelihood|win probability)\b", low):
         domains.add("odds")
+    if is_deep_research_intent(low):
+        domains.add("deep_research")
     return domains
+
+
+def is_deep_research_intent(text: str) -> bool:
+    """True for genuine multi-hop research, not ordinary current-fact lookup."""
+    low = _normalize_text(text or "").lower()
+    if not low:
+        return False
+    explicit = bool(
+        re.search(
+            r"\b(deep research|deep[- ]dive|research report|literature review|"
+            r"multi[- ]hop|investigate|trace (?:the )?(?:root cause|timeline|evidence)|"
+            r"synthesize (?:sources|evidence)|compare (?:sources|evidence|claims)|"
+            r"primary sources|source audit|technical report)\b",
+            low,
+        )
+    )
+    if explicit:
+        return True
+    asks_for_evidence = bool(re.search(r"\b(evidence|sources|citations|timeline|root cause|tradeoffs|conflicts)\b", low))
+    multi_step_verbs = len(
+        re.findall(r"\b(compare|verify|trace|explain|evaluate|rank|summarize|synthesize|investigate)\b", low)
+    )
+    return asks_for_evidence and multi_step_verbs >= 2 and len(low.split()) >= 12
 
 
 def _relative_day_labels(text: str) -> tuple[str, str]:
@@ -820,7 +996,7 @@ def _extract_title_entity(text: str) -> str:
 
     patterns = (
         # Short subject: "when X is released" (X <= 5 tokens)
-        r"(?i)\bwhen\s+((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,4})\s+is\s+(?:released|launching|dropping)\b",
+        r"(?i)\bwhen\s+((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,4})\s+is\s+(?:release|released|launching|dropping)\b",
         r"(?i)\bwhen\s+(?:does|is|will)\s+((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,4})\s+(?:come\s+out|release|launch|drop)\b",
         r"(?i)\bhow much (?:does|will|is)\s+((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,4})\s+(?:cost|be|go for)\b",
         r"(?i)\b(?:price of|cost of)\s+((?:[a-z0-9][\w'.-]*)(?:\s+[a-z0-9][\w'.-]*){0,5})\b",
@@ -950,7 +1126,7 @@ def _normalize_gta_price_query(text: str = "") -> str:
 
 
 def _prep_search_work_text(text: str) -> str:
-    """Strip social fluff before intent detection / split."""
+    """Strip social fluff and conversational framing before intent detection / split."""
     raw = _normalize_text(text)
     if not raw:
         return ""
@@ -970,6 +1146,26 @@ def _prep_search_work_text(text: str) -> str:
     )
     work = re.sub(
         r"(?i)\b(?:can you|could you|would you)\s+(?:please\s+)?(?:check|look up|search|confirm)\s*[?!.]*\s*$",
+        " ",
+        work,
+    )
+    # ── Conversational framing that adds zero search value ──
+    # Agent name / address: "hey echo", "yo echo", "echo can you"
+    work = re.sub(r"(?i)\b(?:hey|yo|hi|hello)\s+echo\b", " ", work)
+    work = re.sub(r"(?i)\becho\s+(?:can you|could you|would you)\b", " ", work)
+    # Filler phrases: "so like", "I was wondering", "just curious", "real quick"
+    work = re.sub(
+        r"(?i)\b(?:so\s+like|I\s+was\s+wondering|do\s+you\s+know|can\s+you\s+tell\s+me|"
+        r"I\s+want\s+to\s+know|I\s+need\s+to\s+find\s+out|help\s+me\s+find|"
+        r"just\s+curious|real\s+quick|out\s+of\s+curiosity|any\s+idea|"
+        r"I\s+was\s+just\s+thinking|you\s+know\s+like)\b",
+        " ",
+        work,
+    )
+    # Strip leading check/search/find verbs at the start of the query
+    work = _normalize_text(work)
+    work = re.sub(
+        r"(?i)^\s*\b(?:check|search\s+for|look\s+up|find|get|show\s+me|tell\s+me\s+(?:about|the)?)\s+(?:the|a|an)?\b",
         " ",
         work,
     )
@@ -1011,6 +1207,8 @@ def _is_smalltalk_clause(text: str) -> bool:
     if not low:
         return True
     if _is_hollow_secondary_clause(low):
+        return True
+    if re.search(r"(?i)\b(look(?:ing)? great|look(?:ing)? good|you look|liking how you look|love your look)\b", low):
         return True
     # Pure politeness / confirmation tails (never search these alone)
     if re.search(
@@ -1073,7 +1271,11 @@ def looks_like_multi_intent(text: str) -> bool:
     domains = intent_domains(t)
     if len(domains) >= 2:
         return True
-    # Single-fact short asks never multi
+    if re.search(r"(?i)\b(and then|also|plus|as well as)\b", t):
+        product_need = bool(re.search(r"(?i)\b(release(?:d|s)?|come out|cost|price|how much|pre-?order)\b", t))
+        sports_need = bool(re.search(r"(?i)\b(fifa|world cup|match(?:up|es)?|who(?:'s| is)? playing|next game|next match)\b", t))
+        if product_need and sports_need:
+            return True    # Single-fact short asks never multi
     if len(words) < 10:
         return False
     low = t.lower()
@@ -1203,14 +1405,51 @@ def recipe_multi_search_queries(text: str) -> list[str]:
     return _dedupe_queries(out)[:4]
 
 
+def _query_token_set(q: str) -> set[str]:
+    """Extract content word tokens for Jaccard similarity comparison."""
+    stop = {
+        "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "at",
+        "each", "full", "list", "with", "please", "make", "sure", "its",
+        "is", "are", "was", "were", "what", "when", "where", "how", "who",
+        "do", "does", "did", "can", "will", "has", "have",
+    }
+    toks = set(re.findall(r"[a-z0-9]+", q.lower()))
+    return {t for t in toks if t not in stop and len(t) > 1}
+
+
+def _jaccard_similarity(a: set, b: set) -> float:
+    """Jaccard similarity between two sets."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
 def _dedupe_queries(queries: list[str]) -> list[str]:
+    """Deduplicate queries using exact match + Jaccard token-set similarity.
+
+    Pass 1: exact normalized string match (original behavior).
+    Pass 2: Jaccard similarity >= 0.5 on content-word token sets (catches
+    near-duplicates like 'FIFA matches today' vs 'FIFA games today').
+    """
     deduped: list[str] = []
     seen: set[str] = set()
+    accepted_token_sets: list[set[str]] = []
     for q in queries:
         key = _normalize_text(q).lower()
         if not key or key in seen:
             continue
+        # Jaccard near-duplicate check
+        q_tokens = _query_token_set(key)
+        is_near_dupe = False
+        if q_tokens:
+            for accepted_set in accepted_token_sets:
+                if _jaccard_similarity(q_tokens, accepted_set) >= 0.5:
+                    is_near_dupe = True
+                    break
+        if is_near_dupe:
+            continue
         seen.add(key)
+        accepted_token_sets.append(q_tokens)
         deduped.append(_normalize_text(q))
     return deduped
 
@@ -2347,18 +2586,80 @@ def build_search_intent(original_request: str, resolved_request: str = "", curre
 class SearchGrounder:
     """Deterministic query construction, retry, and evidence condensation before LLM synthesis."""
 
-    def __init__(self, max_candidates: int = 3, relevance_threshold: float = 0.36):
+    def __init__(
+        self,
+        max_candidates: int = 3,
+        relevance_threshold: float = 0.36,
+        *,
+        primary_sources_only: bool = False,
+    ):
         self.max_candidates = max(1, int(max_candidates or 3))
         self.relevance_threshold = float(relevance_threshold)
+        self.primary_sources_only = bool(primary_sources_only)
+
+    @staticmethod
+    def _is_likely_primary_source(evidence: GroundedEvidence) -> bool:
+        """Conservative primary-source classifier used for an explicit user constraint.
+
+        It intentionally rejects unattributed snippets and common aggregators.  A
+        false negative yields an honest insufficient-evidence result; it must not
+        silently broaden an exact "primary sources only" request.
+        """
+        from urllib.parse import urlparse
+
+        url = str(evidence.url or "").strip()
+        title = str(evidence.title or "").lower()
+        summary = str(evidence.summary or "").lower()
+        if not url:
+            return False
+        try:
+            host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+        except Exception:
+            host = ""
+        if not host:
+            return False
+        aggregators = (
+            "wikipedia.org", "reddit.com", "quora.com", "medium.com",
+            "forbes.com", "reuters.com", "apnews.com", "bbc.", "cnn.com",
+            "nytimes.com", "theguardian.com", "espn.com", "cbssports.com",
+        )
+        if any(token in host for token in aggregators):
+            return False
+        if host.endswith((".gov", ".gov.uk", ".gc.ca", ".mil", ".int")):
+            return True
+        if host.startswith(("docs.", "developer.", "developers.", "support.")):
+            return True
+        if host in {"github.com", "gitlab.com"}:
+            return True
+        authority_markers = (
+            "official site", "official website", "official documentation",
+            "documentation", "press release", "newsroom", "investor relations",
+            "standards body", "regulator",
+        )
+        return any(marker in title or marker in summary for marker in authority_markers)
 
     def build_candidates(self, intent: SearchIntent) -> list[SearchCandidate]:
         # Always normalize — never ship raw multi-intent chat as the Tavily string.
         base = normalize_web_search_query(intent.resolved_request or intent.original_request)
         if not base:
             base = _normalize_text(intent.resolved_request or intent.original_request)
-        if intent.ambiguous and intent.current_subject and intent.current_subject.lower() not in base.lower():
+        followup_text = _normalize_text(intent.original_request or intent.resolved_request or "")
+        hollow_followup = bool(
+            intent.current_subject
+            and re.fullmatch(
+                r"(?i)(?:please\s+)?(?:do\s+a\s+)?(?:deep(?:er)?\s+search|dig\s+deeper|"
+                r"look\s+into\s+it\s+more|check\s+more|expand\s+on\s+that)[.!?]?",
+                followup_text,
+            )
+        )
+        if hollow_followup:
+            base = _normalize_text(apply_spelling_fixes(intent.current_subject))
+        elif intent.ambiguous and intent.current_subject and intent.current_subject.lower() not in base.lower():
             base = f"{base} about {intent.current_subject}"
-        base = self._clean_query(base)
+        if not hollow_followup:
+            base = self._clean_query(base)
+        else:
+            base = self._clean_query(base) if not base else _normalize_text(base)
         candidates: list[SearchCandidate] = [SearchCandidate(base, "cleaned user intent", 0.72, ["base"])]
 
         # Release-date / trailer style asks need tight factual candidates.
@@ -2417,15 +2718,12 @@ class SearchGrounder:
                 *candidates,
             ]
         elif intent.schedule_need:
-            today = datetime.now().strftime("%Y-%m-%d")
-            tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-            year = datetime.now().strftime("%Y")
             day_word, cal = _relative_day_labels(intent.resolved_request or intent.original_request or "")
             if not day_word:
                 day_word = "today"
                 cal = datetime.now().strftime("%A %B %d %Y")
-            day_iso = tomorrow if day_word == "tomorrow" else today
-            # Already-rich query (calendar + kickoff + TZ) → single candidate, no variant storm
+            # A schedule retry must be materially different (an authority
+            # search), never the same query padded with a date three times.
             rich = bool(
                 re.search(r"(?i)\b(kickoff|convert|timezone|mnt|mountain|match list)\b", base)
                 and re.search(r"(?i)\b(today|tomorrow|thursday|friday|july|\d{4})\b", base)
@@ -2435,21 +2733,13 @@ class SearchGrounder:
                     SearchCandidate(base, "schedule rich single", 0.96, ["schedule", "rich"]),
                 ]
             else:
-                # Prefer authority schedule pages over vague "this year" recaps.
-                # Pin calendar label so "tomorrow" isn't a whole tournament month.
+                day_anchor = f"{day_word} {cal}".strip()
                 candidates = [
-                    SearchCandidate(f"{base}", "schedule base", 0.94, ["schedule"]),
                     SearchCandidate(
-                        f"{base} {day_word} {cal} kickoff",
+                        f"{base} {day_anchor} kickoff",
                         f"schedule {day_word} calendar",
                         0.95,
                         ["schedule", day_word, "date"],
-                    ),
-                    SearchCandidate(
-                        f"{base} {day_iso}",
-                        "schedule iso date",
-                        0.93,
-                        ["schedule", "date"],
                     ),
                     SearchCandidate(
                         f"{base} fixtures {day_word} site:espn.com OR site:cbssports.com",
@@ -2466,7 +2756,7 @@ class SearchGrounder:
         seen: set[str] = set()
         for candidate in candidates:
             # Schedule/sports bases are already compact — do not re-run multi-intent normalize.
-            if intent.schedule_need or intent.live_score_need:
+            if hollow_followup or intent.schedule_need or intent.live_score_need:
                 q = _normalize_text(candidate.query)
             else:
                 q = self._clean_query(candidate.query)
@@ -2475,6 +2765,21 @@ class SearchGrounder:
                 candidate.query = q
                 deduped.append(candidate)
                 seen.add(key)
+        if self.primary_sources_only:
+            constrained: list[SearchCandidate] = []
+            for candidate in deduped:
+                query = candidate.query
+                if not re.search(r"(?i)\b(official|documentation|site:)\b", query):
+                    query = f"{query} official source"
+                constrained.append(
+                    SearchCandidate(
+                        query=query,
+                        reason=f"{candidate.reason}; primary-source constraint",
+                        confidence=candidate.confidence,
+                        tags=list(dict.fromkeys([*candidate.tags, "primary_source"])),
+                    )
+                )
+            deduped = constrained
         return deduped[: self.max_candidates]
 
     def _deeper_schedule_candidates(self, base: str, intent: SearchIntent) -> list[SearchCandidate]:
@@ -2525,6 +2830,17 @@ class SearchGrounder:
             for candidate in cands:
                 output = str(execute(candidate.query) or "")
                 evidence = self.score_evidence(output, candidate.query, intent)
+                if self.primary_sources_only:
+                    evidence = [item for item in evidence if self._is_likely_primary_source(item)]
+                    if not evidence:
+                        rejected.append(
+                            {
+                                "query": candidate.query,
+                                "reason": "No attributable primary-source evidence was returned.",
+                                "score": 0.0,
+                            }
+                        )
+                        continue
                 # Fetch pages when we need a concrete answer (schedule, weather, live score, etc.)
                 if (intent.specific_answer_need or intent.schedule_need or intent.weather_need) and fetch_url:
                     evidence, output = self._maybe_fetch_full_page(evidence, output, intent, fetch_url)

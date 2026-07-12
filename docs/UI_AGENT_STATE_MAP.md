@@ -1,6 +1,14 @@
-# UI Agent State Map (from live code — v7.4)
+# UI Agent State Map (from live code — v7.4+)
 
-Research pass before UI work. Sources: `agent/stream_events.py`, `api/server.py` `_StreamingHandler` + `/query/stream`, frontend `index.tsx` consumer.
+Research pass before UI work. Sources: `agent/stream_events.py`, `api/server.py`
+`_StreamingHandler` + `/query/stream`, frontend `index.tsx` consumer.
+
+**ToolRun identity, provisional chrome, status vocabulary, confirm UI:**
+`docs/LIFECYCLE_TRUTHFULNESS.md` §§5–6.  
+**Refresh hydration (full Turns, not text-only), Session stream binding:**
+`docs/RUNTIME_CONTRACTS.md` §§D, G.  
+Implemented partial; pending live validation. This map is event inventory, not
+a second contracts manual.
 
 ## Two stream channels (do not confuse)
 
@@ -70,3 +78,4 @@ Map only signals that actually fire:
 1. Emit `status.agent_mode=thinking` on LLM start; emit `idle` (or prior) on tool_end when no tools remain.
 2. Emit `agent_token` for non-reasoning content tokens on `/query/stream` so reply can stream live.
 3. Prefer single `AgentActivity` reducer in the frontend so avatar + chat never diverge.
+4. Keep ToolRun id identity across stream, hydrate, and OperationalStateCard per **`LIFECYCLE_TRUTHFULNESS.md` §5** and **`RUNTIME_CONTRACTS.md` §D** (historical activity must not re-animate as live).

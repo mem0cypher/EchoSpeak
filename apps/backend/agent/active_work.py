@@ -15,6 +15,7 @@ It is the code-enforced continuity layer — not prompt-only memory.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -87,6 +88,9 @@ def request_continues_project(user_input: str, state: "ActiveWorkState") -> bool
 
     Critical safety: never reuse an unrelated prior pin (e.g. 2d-shooter-game) for a
     brand-new app request (e.g. to-do list). False → treat as fresh project.
+
+    v8.0: Added implicit continuity — definite articles, pronouns, and
+    continuation phrases resume the active project without naming it.
     """
     if not state or not state.project_path:
         return False
@@ -96,6 +100,38 @@ def request_continues_project(user_input: str, state: "ActiveWorkState") -> bool
 
     name = (state.project_name or Path(state.project_path).name or "").lower()
     name_tokens = {t for t in re.split(r"[-_\s.]+", name) if len(t) >= 2}
+
+    # ── Implicit continuity: resume when user clearly refers to prior work ──
+
+    # Definite article + project-type noun = "the app", "the project", "the game"
+    if re.search(
+        r"\b(the|this|that|our|my)\s+(app|project|game|site|website|page|tool|dashboard|code)\b",
+        text,
+    ):
+        return True
+
+    # Pronouns referencing prior work: "build it", "make it", "finish it", "do it"
+    if re.search(
+        r"\b(build|make|finish|complete|continue|fix|update|edit|deploy|ship|test)\s+it\b",
+        text,
+    ):
+        return True
+
+    # Continuation phrases (no new product mentioned)
+    if re.search(
+        r"\b("
+        r"let'?s\s+(?:keep\s+going|continue|go|do\s+(?:it|this)|start|get\s+started|keep\s+building)|"
+        r"keep\s+(?:going|building|working|coding)|"
+        r"let'?s\s+(?:make|build|finish|complete)\s+(?:it|the)|"
+        r"(?:okay|ok|alright|sure|yeah|yep|yes|sounds?\s+good|looks?\s+good)\s*(?:,\s*)?(?:let'?s|do\s+it|go|go\s+ahead|build|make|start|continue)|"
+        r"get\s+started|start\s+building|start\s+coding|"
+        r"where\s+(?:were\s+we|did\s+we\s+leave\s+off)|"
+        r"pick\s+(?:up|back\s+up)\s+where|"
+        r"back\s+to\s+(?:it|the\s+project|work|coding)"
+        r")\b",
+        text,
+    ):
+        return True
 
     # Explicit continuity: user names the stored project / path
     if name and name in text.replace(" ", "-"):
@@ -119,8 +155,10 @@ def request_continues_project(user_input: str, state: "ActiveWorkState") -> bool
         return False
 
     # "build/create/make a|an <product>" where product is NOT the stored project
+    # KEY FIX: "make THE app" uses definite article → resume, not new.
+    # Only INDEFINITE article (a/an) + different product noun → new project.
     m = re.search(
-        r"\b(?:build|create|make|scaffold|start)\s+(?:me\s+|us\s+)?(?:a|an|the|my|our)\s+([a-z0-9][\w\s-]{1,48})",
+        r"\b(?:build|create|make|scaffold|start)\s+(?:me\s+|us\s+)?(?:a|an)\s+([a-z0-9][\w\s-]{1,48})",
         text,
     )
     if m:
@@ -189,7 +227,7 @@ def request_continues_project(user_input: str, state: "ActiveWorkState") -> bool
 
     # Default: NO resume unless clearly continuous — safer than silent wrong pin
     # Short referential follow-ups without new product nouns
-    if re.search(r"\b(add|fix|edit|change|update|implement)\b", text) and not m:
+    if re.search(r"\b(add|fix|edit|change|update|implement|make)\b", text) and not m:
         if re.search(r"\b(it|this|that|there|here)\b", text) or len(text.split()) <= 14:
             # still reject domain flip
             if is_game_stored and is_todo_ask:
@@ -260,7 +298,12 @@ class ActiveWorkStore:
         payload["code_digest"] = str(payload.get("code_digest") or "")[:8000]
         payload["goal"] = str(payload.get("goal") or "")[:500]
         payload["next_step"] = str(payload.get("next_step") or "")[:500]
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        temp = path.with_suffix(path.suffix + ".tmp")
+        with temp.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
 
     def clear(self, thread_id: Optional[str]) -> None:
         path = self.path_for(thread_id)
@@ -372,3 +415,22 @@ def goal_looks_incomplete(state: ActiveWorkState, answer: str, *, tools_ran: Opt
     ):
         return True
     return False
+
+
+def request_approves_plan(user_input: str) -> bool:
+    """True if user's input clearly expresses approval or permission to implement a plan."""
+    low = re.sub(r"\s+", " ", str(user_input or "").strip().lower())
+    if not low:
+        return False
+    return bool(
+        re.search(
+            r"\b("
+            r"looks? (?:good|great|solid|perfect|fine)|"
+            r"approve|approved|approving|approvals?|"
+            r"go ahead|go for it|do it|make it|build it|start|"
+            r"implement|yes|yep|yeah|sure|ok|okay|alright|proceed|"
+            r"let'?s\s+(?:go|do\s+(?:it|this)|start|begin|implement|build|make)"
+            r")\b",
+            low,
+        )
+    )

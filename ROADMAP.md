@@ -16,7 +16,10 @@
 **v7.5.2 done:** coding loop started in `process_query`; advanced from tool_end / TaskPlanner / pending writes; readiness+doctor expose state; E17 multi-file fixture.  
 **v7.6.0 done:** real stdio MCP client (`initialize` → `tools/list` → `tools/call`); `mcp__server__tool` registration; singleton manager shared by agent + Trust Center; configured ≠ available; mock server tests.  
 **v7.6.2 done (partial):** dedicated `sports_live` path (The Odds API) for scores/odds — default over crawl search; schedule stays web_search; Brave/Tavily eval in `docs/SEARCH_INFRASTRUCTURE.md`.  
-**Still open (polish):** Brave as real secondary web provider; SportRadar-class feeds if Odds API coverage gaps; deeper UI coding_loop binding; v7.7 calendar/tasks.
+**v7.6.10 (runtime contracts / lifecycle):** **implemented (partial); pending live validation** — not closed until `docs/LIFECYCLE_TRUTHFULNESS.md` §11 **and** `docs/RUNTIME_CONTRACTS.md` §K. Canonical: Runtime Contracts (equal models, Project lifecycle, hydration, search/utility, coding targets, streaming, approval scope, **Known limitations**) + Lifecycle Truthfulness (recovery I.1, confirm I.2, evidence I.3, ToolRuns, corruption, finals). Explicit-file retarget + over-strict approval invalidation remain **gaps**. Unit tests alone are not acceptance.  
+**Still open:** live §K/§11; fix explicit-file write target; narrow approval identity; Brave secondary provider; SportRadar-class feeds; UI coding_loop binding; v7.7 calendar/tasks; optional VSS ToolRun (`not_checked` until real tool).
+
+**Doc map (v7.6.10):** start at `docs/RUNTIME_CONTRACTS.md`, truthfulness tables in `docs/LIFECYCLE_TRUTHFULNESS.md`. Historical roadmap entries below remain for past milestones and are not rewritten to claim this wave is closed.
 
 See detailed plan in section **“Next sequence plan (v7.5–v7.7)”** at the end of this file.  
 Full capability test rundown: `apps/backend/TEST_RUNDOWN.md`.

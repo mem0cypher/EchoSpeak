@@ -76,4 +76,15 @@ describe("buildChatEmbeds", () => {
     const embeds = buildChatEmbeds({ answerText: "Hey, how's it going?" });
     expect(embeds).toEqual([]);
   });
+
+  it("does not invent sources or searched chips without research runs", () => {
+    const embeds = buildChatEmbeds({
+      answerText: "It will be 12 degrees in Edmonton tomorrow.",
+      searchQueries: ["stale query from nowhere"],
+    });
+    const kinds = embeds.map((e) => e.kind);
+    expect(kinds.includes("sources")).toEqual(false);
+    expect(kinds.includes("query_chip")).toEqual(false);
+    // Weather body embed may still parse from answer text
+  });
 });
