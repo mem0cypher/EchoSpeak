@@ -169,6 +169,10 @@ The pasted runtime log confirms several things:
 - Add provider readiness checks before invoking heavy agent/coding paths.
 - Convert common tool failures into structured failure reasons.
 - Add a "next action" recovery message when a provider/tool is unavailable.
+- Runtime contracts / lifecycle (v7.6.10): **implemented (partial); pending live
+  validation** — `docs/RUNTIME_CONTRACTS.md` (equal models, Project scope,
+  hydration, Known limitations) + `docs/LIFECYCLE_TRUTHFULNESS.md` (recovery /
+  confirm / evidence contracts). Do not duplicate rules.
 - Rename or clarify debug fields like `allowed_tool_names=frozenset()` when empty means "workspace does not restrict beyond policy".
 
 ### v7.3 - Coding Agent Lifecycle

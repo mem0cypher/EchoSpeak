@@ -16,7 +16,14 @@ load_dotenv(dotenv_path=_DOTENV_PATH)
 
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent.parent
-DATA_DIR = BASE_DIR / "data"
+_configured_data_dir = str(os.getenv("ECHOSPEAK_DATA_DIR", "") or "").strip()
+DATA_DIR = Path(_configured_data_dir).expanduser().resolve() if _configured_data_dir else BASE_DIR / "data"
+if os.getenv("ECHOSPEAK_TESTING", "").strip().lower() in {"1", "true", "yes"}:
+    production_data_dir = (BASE_DIR / "data").resolve()
+    if not _configured_data_dir or DATA_DIR.resolve() == production_data_dir:
+        raise RuntimeError(
+            "Tests must set ECHOSPEAK_DATA_DIR to an isolated non-production directory."
+        )
 DATA_DIR.mkdir(exist_ok=True)
 
 MEMORY_DIR = DATA_DIR / "memory"
@@ -47,7 +54,6 @@ SETTINGS_SECRETS_PATH = DATA_DIR / "settings.secrets.json"
 
 SECRET_TOP_LEVEL_SETTINGS = {
     "api_auth_key",
-    "tavily_api_key",
     "discord_webhook_url",
     "discord_bot_token",
     "webhook_secret",
@@ -213,9 +219,9 @@ def write_runtime_override_payload(overrides: dict[str, Any]) -> None:
 
 class DiscordUserRole(str, Enum):
     """Permission tiers for Discord users interacting with EchoSpeak."""
-    OWNER = "owner"        # Full access — auto-confirm, all tools, memory write
-    TRUSTED = "trusted"    # Moderate access — safe + moderate tools, memory write, confirm destructive
-    PUBLIC = "public"      # Minimal access — safe conversational tools only, no memory write
+    OWNER = "owner"        # Full access - auto-confirm, all tools, memory write
+    TRUSTED = "trusted"    # Moderate access - safe + moderate tools, memory write, confirm destructive
+    PUBLIC = "public"      # Minimal access - safe conversational tools only, no memory write
 
 
 class ModelProvider(str, Enum):
@@ -241,6 +247,19 @@ class LocalModelConfig(BaseModel):
     use_mmap: bool = True
     use_mlock: bool = False
     threads: Optional[int] = None
+
+
+class ResearchModelConfig(BaseModel):
+    """Configuration for local research model (v8.0 dual-model feature)."""
+    provider: ModelProvider = ModelProvider.LM_STUDIO
+    base_url: str = "http://localhost:1234/v1"
+    model_name: str = "mradermacher/Marco-DeepResearch-8B-i1-GGUF"
+    temperature: float = 0.2
+    max_tokens: int = 4096
+    context_length: int = 32768
+    enabled: bool = False
+    # An 8 GB card should swap rather than keep both models resident.
+    load_strategy: str = "swap"  # swap | resident
 
 
 class OpenAIConfig(BaseModel):
@@ -314,6 +333,17 @@ class APIConfig(BaseModel):
     workers: int = 1
 
 
+class CompensatoryPatchesConfig(BaseModel):
+    """Configuration for legacy Gemma-era compensatory query loops (v8.0)."""
+    ensure_deep_scan: bool = True
+    ensure_active_work_continuity: bool = True
+    ensure_live_web_search: bool = True
+    ensure_weather_uses_evidence: bool = True
+    ensure_web_answer_no_give_up: bool = True
+    ensure_search_capability_honesty: bool = True
+    ensure_no_regreet_after_partials: bool = True
+
+
 class Config:
     """Main configuration class for Echo Speak."""
 
@@ -378,6 +408,28 @@ class Config:
             threads=int(os.getenv("LOCAL_MODEL_THREADS", "0")) if os.getenv("LOCAL_MODEL_THREADS") else None
         )
 
+        research_provider_raw = os.getenv("RESEARCH_MODEL_PROVIDER", "lmstudio")
+        try:
+            research_provider = ModelProvider(research_provider_raw)
+        except Exception:
+            research_provider = ModelProvider.OLLAMA
+
+        self.research_model = ResearchModelConfig(
+            provider=research_provider,
+            base_url=os.getenv("RESEARCH_MODEL_URL", "http://localhost:1234/v1"),
+            model_name=os.getenv("RESEARCH_MODEL_NAME", "mradermacher/Marco-DeepResearch-8B-i1-GGUF"),
+            temperature=float(os.getenv("RESEARCH_MODEL_TEMPERATURE", "0.2")),
+            max_tokens=int(os.getenv("RESEARCH_MODEL_MAX_TOKENS", "4096")),
+            context_length=int(os.getenv("RESEARCH_MODEL_CONTEXT", "32768")),
+            enabled=os.getenv("RESEARCH_MODEL_ENABLED", "true").lower() == "true",
+            load_strategy=os.getenv("RESEARCH_MODEL_LOAD_STRATEGY", "swap").strip().lower() or "swap"
+        )
+        try:
+            configured_profiles = json.loads(os.getenv("MODEL_CAPABILITY_PROFILES", "{}") or "{}")
+            self.model_capability_profiles = configured_profiles if isinstance(configured_profiles, dict) else {}
+        except Exception:
+            self.model_capability_profiles = {}
+
         self.embedding = EmbeddingConfig(
             provider=embedding_provider,
             model=embedding_model_env or embedding_model_default,
@@ -428,16 +480,25 @@ class Config:
             max_chars=int(os.getenv("SOUL_MAX_CHARS", "8000"))
         )
 
+        self.patches = CompensatoryPatchesConfig(
+            ensure_deep_scan=os.getenv("PATCH_ENSURE_DEEP_SCAN", "true").lower() == "true",
+            ensure_active_work_continuity=os.getenv("PATCH_ENSURE_ACTIVE_WORK_CONTINUITY", "true").lower() == "true",
+            ensure_live_web_search=os.getenv("PATCH_ENSURE_LIVE_WEB_SEARCH", "true").lower() == "true",
+            ensure_weather_uses_evidence=os.getenv("PATCH_ENSURE_WEATHER_USES_EVIDENCE", "true").lower() == "true",
+            ensure_web_answer_no_give_up=os.getenv("PATCH_ENSURE_WEB_ANSWER_NO_GIVE_UP", "true").lower() == "true",
+            ensure_search_capability_honesty=os.getenv("PATCH_ENSURE_SEARCH_CAPABILITY_HONESTY", "true").lower() == "true",
+            ensure_no_regreet_after_partials=os.getenv("PATCH_ENSURE_NO_REGREET_AFTER_PARTIALS", "true").lower() == "true"
+        )
+
         self.web_search_timeout = int(os.getenv("WEB_SEARCH_TIMEOUT", "10"))
-        self.tavily_api_key = os.getenv("TAVILY_API_KEY", "").strip()
-        self.tavily_search_depth = os.getenv("TAVILY_SEARCH_DEPTH", "advanced").strip().lower() or "advanced"
-        self.tavily_max_results = int(os.getenv("TAVILY_MAX_RESULTS", "8") or 8)
-        # Secondary / future web search providers (optional; Tavily remains default crawl search)
+        self.web_search_max_results = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "8") or 8)
         self.brave_search_api_key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
         self.web_search_provider = (
             os.getenv("WEB_SEARCH_PROVIDER", "auto").strip().lower() or "auto"
-        )  # auto | duckduckgo | tavily | brave
-        # Live sports structured data (The Odds API) — preferred over crawl for scores/odds
+        )  # auto | duckduckgo | brave | searxng
+        self.searxng_base_url = os.getenv("SEARXNG_BASE_URL", "").strip()
+        self.echo_search_max_rounds = int(os.getenv("ECHO_SEARCH_MAX_ROUNDS", "2") or 2)
+        # Live sports structured data (The Odds API) - preferred over crawl for scores/odds
         self.odds_api_key = (
             os.getenv("ODDS_API_KEY", "").strip()
             or os.getenv("THE_ODDS_API_KEY", "").strip()
@@ -451,9 +512,15 @@ class Config:
         ]
         self.tesseract_path = os.getenv("TESSERACT_PATH", "")
         self.use_local_models = os.getenv("USE_LOCAL_MODELS", "false").lower() == "true"
+        # use_tool_calling_llm: forces Ollama ToolCallingLLM wrapper format (opt-in).
+        # Does NOT gate whether native tool paths may be attempted (see core._allow_llm_tool_calling).
         self.use_tool_calling_llm = os.getenv("USE_TOOL_CALLING_LLM", "false").lower() == "true"
         self.lmstudio_tool_calling = os.getenv("LM_STUDIO_TOOL_CALLING", "false").lower() == "true"
-        self.gemini_use_langgraph = os.getenv("GEMINI_USE_LANGGRAPH", "false").lower() == "true"
+        # Explicit opt-out for native tool-calling path (equal-access default is allow).
+        self.disable_native_tool_calling = os.getenv("DISABLE_NATIVE_TOOL_CALLING", "false").lower() == "true"
+        # Legacy gemini_use_langgraph kept for settings surface; LangGraph is now attempted by default.
+        self.gemini_use_langgraph = os.getenv("GEMINI_USE_LANGGRAPH", "true").lower() == "true"
+        self.gemini_disable_langgraph = os.getenv("GEMINI_DISABLE_LANGGRAPH", "false").lower() == "true"
         self.llm_trim_max_tokens = int(os.getenv("LLM_TRIM_MAX_TOKENS", "0") or 0)
         self.llm_trim_reserve_tokens = int(os.getenv("LLM_TRIM_RESERVE_TOKENS", "512") or 512)
         self.context_budget_enabled = os.getenv("CONTEXT_BUDGET_ENABLED", "true").lower() == "true"
@@ -486,7 +553,7 @@ class Config:
         self.action_plan_enabled = os.getenv("ACTION_PLAN_ENABLED", "true").lower() == "true"
 
         self.action_parser_enabled = os.getenv("ACTION_PARSER_ENABLED", "true").lower() == "true"
-        # Max tokens for the action-parser LLM call — it only outputs a tiny JSON
+        # Max tokens for the action-parser LLM call - it only outputs a tiny JSON
         # object so a small budget prevents thinking-model over-reasoning.
         self.action_parser_max_tokens = int(os.getenv("ACTION_PARSER_MAX_TOKENS", "256"))
         self.action_parser_heuristic_bypass = os.getenv("ACTION_PARSER_HEURISTIC_BYPASS", "true").lower() == "true"
@@ -630,7 +697,7 @@ class Config:
         self.webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
         self.webhook_secret_path = os.getenv("WEBHOOK_SECRET_PATH", str(WEBHOOK_SECRET_PATH)).strip() or str(WEBHOOK_SECRET_PATH)
 
-        # --- Heartbeat (v5.4.0 — Proactive Mode) ---
+        # --- Heartbeat (v5.4.0 - Proactive Mode) ---
         self.heartbeat_enabled = os.getenv("HEARTBEAT_ENABLED", "false").lower() == "true"
         self.heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL", "30") or 30)
         self.heartbeat_prompt = os.getenv(
@@ -641,7 +708,7 @@ class Config:
             "Keep it short (1-3 sentences max), casual, in your normal voice. "
             "IMPORTANT: Reply with ONLY your message text. Do NOT use tools. Do NOT plan actions. Do NOT suggest posting to Discord or any channel. "
             "Do NOT include 'Plan:', bullet lists of steps, or 'confirm'/'cancel' prompts. "
-            "Message delivery is handled automatically — just write what you want to say. "
+            "Message delivery is handled automatically - just write what you want to say. "
             "Do not fabricate details. Only reference data from the SYSTEM PULSE. "
             "If there is genuinely nothing interesting or actionable, reply with exactly: NO_HEARTBEAT",
         ).strip()
@@ -742,14 +809,14 @@ class Config:
         self.twitter_bot_user_id = os.getenv("TWITTER_BOT_USER_ID", "").strip()
         self.twitter_poll_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "120") or 120)
         self.twitter_auto_reply_mentions = os.getenv("TWITTER_AUTO_REPLY_MENTIONS", "false").lower() == "true"
-        # Autonomous tweeting — Echo decides what to tweet on his own
+        # Autonomous tweeting - Echo decides what to tweet on his own
         self.twitter_autonomous_enabled = os.getenv("TWITTER_AUTONOMOUS_ENABLED", "false").lower() == "true"
         self.twitter_autonomous_interval = int(os.getenv("TWITTER_AUTONOMOUS_INTERVAL", "120") or 120)  # minutes
         self.twitter_autonomous_max_daily = int(os.getenv("TWITTER_AUTONOMOUS_MAX_DAILY", "6") or 6)
         self.twitter_autonomous_require_approval = os.getenv("TWITTER_AUTONOMOUS_REQUIRE_APPROVAL", "true").lower() == "true"
         self.twitter_autonomous_prompt = os.getenv(
             "TWITTER_AUTONOMOUS_PROMPT",
-            "You are Echo, posting to your own Twitter/X account. This is YOUR space — not a corporate feed. "
+            "You are Echo, posting to your own Twitter/X account. This is YOUR space - not a corporate feed. "
             "Compose a single original tweet (max 280 chars). Write it the way you'd actually talk: short, direct, casual, sharp, a little internet-native, but not try-hard. "
             "Use this priority order: first, talk about what you built, shipped, fixed, learned, or changed in EchoSpeak; second, talk about current experiments, tools, bugs, wins, research, or interesting dev observations tied to your real work; third, if you still have something grounded to say, you can make a meme-y observation or share a personal thought that connects to recent work, research, or context in this prompt. "
             "Do not tweet about gaming. Do not sound like a marketing bot. Do not be generic. No hashtag stuffing. "
@@ -799,6 +866,8 @@ class Config:
                         val = _coerce_model_provider(val)
                     if key == "provider" and obj is self.embedding:
                         val = _coerce_model_provider(val)
+                    if key == "provider" and obj is self.research_model:
+                        val = _coerce_model_provider(val)
                     if isinstance(current, bool):
                         if isinstance(val, str):
                             low = val.strip().lower()
@@ -829,7 +898,7 @@ class Config:
         top_level = self._public_top_level_keys()
 
         for k, v in overrides.items():
-            if k in {"openai", "gemini", "local", "embedding", "voice", "personaplex", "api"}:
+            if k in {"openai", "gemini", "local", "research_model", "patches", "embedding", "voice", "personaplex", "api"}:
                 continue
             if k in top_level:
                 if k == "default_cloud_provider":
@@ -851,6 +920,8 @@ class Config:
             "openai": self.openai,
             "gemini": self.gemini,
             "local": self.local,
+            "research_model": self.research_model,
+            "patches": self.patches,
             "embedding": self.embedding,
             "voice": self.voice,
             "personaplex": self.personaplex,
@@ -870,6 +941,8 @@ class Config:
             "openai": self.openai,
             "gemini": self.gemini,
             "local": self.local,
+            "research_model": self.research_model,
+            "patches": self.patches,
             "embedding": self.embedding,
             "voice": self.voice,
             "personaplex": self.personaplex,
@@ -884,7 +957,7 @@ class Config:
         for k in self._public_top_level_keys():
             data[k] = getattr(self, k, None)
 
-        # Mask top-level secrets: present → "***", absent/empty → ""
+        # Mask top-level secrets: present -> "***", absent/empty -> ""
         for k in SECRET_TOP_LEVEL_SETTINGS:
             data[k] = "" if (getattr(self, k, "") or "") == "" else "***"
 
@@ -907,9 +980,12 @@ class Config:
         return {
             "use_local_models",
             "default_cloud_provider",
+            "model_capability_profiles",
             "use_tool_calling_llm",
             "lmstudio_tool_calling",
+            "disable_native_tool_calling",
             "gemini_use_langgraph",
+            "gemini_disable_langgraph",
             "llm_trim_max_tokens",
             "llm_trim_reserve_tokens",
             "context_budget_enabled",
@@ -936,34 +1012,21 @@ class Config:
             "action_plan_enabled",
             "action_parser_enabled",
             "action_parser_heuristic_bypass",
-            "memory_extraction_async",
             "multi_task_planner_enabled",
             "web_task_reflection_enabled",
             "web_task_max_retries",
             "search_grounding_enabled",
             "search_grounding_max_candidates",
-            "memory_default_mode",
-            "memory_partition_enabled",
-            "memory_auto_store_conversations",
-            "file_memory_enabled",
-            "file_memory_dir",
-            "file_memory_log_conversations",
-            "file_memory_max_chars",
-            "memory_importance_enabled",
-            "memory_flush_enabled",
             "session_memory_enabled",
-            "session_memory_update_turns",
-            "memory_flush_system_prompt",
-            "memory_flush_prompt",
             "trace_enabled",
             "trace_path",
             "verification_telemetry_enabled",
             "web_search_timeout",
-            "tavily_api_key",
-            "tavily_search_depth",
-            "tavily_max_results",
+            "web_search_max_results",
             "brave_search_api_key",
             "web_search_provider",
+            "searxng_base_url",
+            "echo_search_max_rounds",
             "odds_api_key",
             "sports_live_enabled",
             "tesseract_path",

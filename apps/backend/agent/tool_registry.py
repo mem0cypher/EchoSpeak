@@ -259,6 +259,11 @@ class PipelinePlugin:
         """Called after Stage 2 (build context). Can modify the context bundle."""
         return None
 
+    # Pipeline hooks are transforms only. Permission-sensitive behavior must be
+    # registered as an action tool so it receives request-time authority.
+    permission_sensitive: bool = False
+    mutates_external_state: bool = False
+
     def on_shortcut(self, user_input: str, context: Any, **kwargs) -> Any:
         """Called during Stage 3 (shortcuts). Return a tuple to short-circuit."""
         return None
@@ -285,6 +290,10 @@ class PluginRegistry:
     @classmethod
     def register(cls, plugin: PipelinePlugin) -> None:
         """Register a pipeline plugin instance."""
+        if bool(getattr(plugin, "permission_sensitive", False) or getattr(plugin, "mutates_external_state", False)):
+            raise ValueError(
+                f"Plugin '{plugin.name}' declares mutating behavior; register that operation as an action tool instead."
+            )
         # Prevent duplicates by name
         if any(p.name == plugin.name for p in cls._plugins):
             return

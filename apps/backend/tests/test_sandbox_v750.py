@@ -170,7 +170,16 @@ def test_terminal_run_docker_mode_no_host_fallback(monkeypatch, tmp_path):
         ),
     )
     # Simple command (no shell redirection — host safety rejects chaining operators first)
-    out = tools_mod.terminal_run.invoke({"command": "echo should-not-run-on-host", "cwd": str(root)})
+    token = tools_mod.bind_tool_execution_context({
+        "thread_id": "sandbox-test",
+        "project_root": str(root),
+        "workspace_root": str(root),
+        "allowed_tool_names": ["terminal_run"],
+    })
+    try:
+        out = tools_mod.terminal_run.invoke({"command": "echo should-not-run-on-host", "cwd": str(root)})
+    finally:
+        tools_mod.reset_tool_execution_context(token)
     assert "sandbox_unavailable" in out.lower()
     assert "Status=sandbox_unavailable" in out or "status=sandbox_unavailable" in out.lower()
     assert "Mode=docker" in out

@@ -17,6 +17,8 @@ venv/
 
 .pytest_cache/
 **/.pytest_cache/
+**/.pytest-tmp/
+.test-state/
 .mypy_cache/
 **/.mypy_cache/
 .ruff_cache/
@@ -51,6 +53,7 @@ desktop.ini
 npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*
+.pnpm-store/
 
 coverage/
 dist/
@@ -61,3 +64,7 @@ out/
 *.key
 *.p12
 *.pfx
+
+
+# Local Project registry pins (machine paths)
+apps/backend/projects/

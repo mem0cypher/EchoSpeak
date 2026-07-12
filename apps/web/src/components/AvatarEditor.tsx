@@ -187,25 +187,15 @@ export const AvatarEditor: React.FC<AvatarEditorProps> = ({ apiBase, colors, onC
   return (
     <div className="research-scroll">
       <div className="research-card" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-        <div style={{ ...cardStyle, padding: 20, background: "linear-gradient(135deg, rgba(79,142,255,0.16), rgba(255,255,255,0.04))" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <div style={{ fontSize: 18, fontWeight: 700, color: colors.text }}>Avatar Editor</div>
-              <div style={{ fontSize: 12, color: colors.textDim, maxWidth: 560, lineHeight: 1.55 }}>
-                Style Echo&apos;s visualizer avatar and preview changes live. Save persists to the backend, reset restores the default profile.
-              </div>
-            </div>
-            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-              {dirty ? <span style={{ fontSize: 11, color: "#f59e0b" }}>Unsaved</span> : null}
-              {saved ? <span style={{ fontSize: 11, color: "#22c55e" }}>Saved</span> : null}
-              <button className="icon-button" type="button" onClick={save} disabled={saving || !dirty} style={{ height: 34, padding: "0 14px", fontSize: 12, opacity: dirty ? 1 : 0.55 }}>
-                {saving ? "Saving..." : "Save"}
-              </button>
-              <button className="icon-button" type="button" onClick={reset} style={{ height: 34, padding: "0 14px", fontSize: 12 }}>
-                Reset
-              </button>
-            </div>
-          </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 4 }}>
+          {dirty ? <span style={{ fontSize: 11, color: "#f59e0b" }}>Unsaved</span> : null}
+          {saved ? <span style={{ fontSize: 11, color: "#22c55e" }}>Saved</span> : null}
+          <button className="icon-button" type="button" onClick={save} disabled={saving || !dirty} style={{ height: 34, padding: "0 14px", fontSize: 12, opacity: dirty ? 1 : 0.55 }}>
+            {saving ? "Saving..." : "Save"}
+          </button>
+          <button className="icon-button" type="button" onClick={reset} style={{ height: 34, padding: "0 14px", fontSize: 12 }}>
+            Reset
+          </button>
         </div>
 
         {error ? (

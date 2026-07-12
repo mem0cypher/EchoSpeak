@@ -154,21 +154,23 @@ export const buildChatEmbeds = (input: BuildChatEmbedsInput): ChatEmbed[] => {
   const runs = input.researchRuns || [];
   const embeds: ChatEmbed[] = [];
 
+  // Research chrome (sources / searched) only when this Turn actually ran research.
+  // Never invent sources from prior Sessions or bare answer text alone.
+  const researchHappened = runs.length > 0;
   const queries = (input.searchQueries || [])
     .map(normalize)
     .filter(Boolean)
     .slice(0, 4);
   const runQueries = runs.map((r) => normalize(r.query)).filter(Boolean);
-  const allQueries = [...new Set([...queries, ...runQueries])].slice(0, 4);
-  if (allQueries.length >= 2) {
+  const allQueries = [...new Set([...queries, ...runQueries])].filter(Boolean).slice(0, 4);
+  if (researchHappened && allQueries.length >= 1) {
     embeds.push({ id: "queries", kind: "query_chip", queries: allQueries });
   }
 
+  // Body stats may parse from the answer, but evidence-backed weather only from this Turn's runs.
   const weather = parseWeatherStat(answer);
   if (weather) embeds.push(weather);
-
-  // Also try evidence snippets if answer was thin
-  if (!weather) {
+  if (!weather && researchHappened) {
     const blob = runs
       .flatMap((r) => (r.evidence || []).map((e) => e.summary || e.snippet || ""))
       .join(" ");
@@ -179,26 +181,28 @@ export const buildChatEmbeds = (input: BuildChatEmbedsInput): ChatEmbed[] => {
   const schedule = parseScheduleList(answer);
   if (schedule) embeds.push(schedule);
 
-  const sources = sourcesFromResearch(runs, 6);
-  if (sources.length >= 1) {
-    embeds.push({
-      id: "sources",
-      kind: "sources",
-      title: sources.length === 1 ? "Source" : "Sources",
-      items: sources,
-    });
-    // Top source as featured link card (ChatGPT-style citation card)
-    const top = sources[0];
-    if (top.url) {
+  if (researchHappened) {
+    const sources = sourcesFromResearch(runs, 6);
+    if (sources.length >= 1) {
       embeds.push({
-        id: `link-${top.id}`,
-        kind: "link_card",
-        title: top.title,
-        url: top.url,
-        domain: top.domain || domainOf(top.url),
-        snippet: top.snippet,
-        faviconLetter: (top.domain || top.title || "?").charAt(0).toUpperCase(),
+        id: "sources",
+        kind: "sources",
+        title: sources.length === 1 ? "Source" : "Sources",
+        items: sources,
       });
+      // Top source as featured link card only when we have real research evidence.
+      const top = sources[0];
+      if (top.url) {
+        embeds.push({
+          id: `link-${top.id}`,
+          kind: "link_card",
+          title: top.title,
+          url: top.url,
+          domain: top.domain || domainOf(top.url),
+          snippet: top.snippet,
+          faviconLetter: (top.domain || top.title || "?").charAt(0).toUpperCase(),
+        });
+      }
     }
   }
 

@@ -128,12 +128,18 @@ flowchart TD
 
 The pipeline lives in `agent/core.py`:
 
-- `process_query()` is the entry point.
-- `_pq_parse_and_preempt()` handles setup, pending actions, explicit memory commands, adapters, coding intent, Notepad shortcut, and action-parser fallback.
-- `_pq_build_context()` builds memory, document, profile, pinned, continuity, time, and chat history context.
-- `_pq_shortcut_queries()` handles explicit web/schedule/search fast paths for non-native-tool-calling modes.
-- `_pq_invoke_llm_agents()` runs LangGraph, AgentExecutor, and fallback tool agents.
-- `_pq_finalize_response()` handles direct LLM fallback, printed `|TOOL|` recovery, post-processing, memory recording, and TTS selection.
+- `process_query()` — entry (mode bind, execution/ToolRun scope)
+- `_pq_parse_and_preempt()` — setup, pending approvals, memory shortcuts, adapters, action parser
+- `_pq_build_context()` — memory/docs/profile/time/history → ContextBundle
+- `_pq_shortcut_queries()` — web/coding/research shortcuts
+- `_pq_invoke_llm_agents()` — LangGraph / AgentExecutor / fallback
+- `_pq_finalize_response()` — fallback, TTS, memory, execution finalize
+
+**Runtime contracts** (equal models, Project lifecycle, hydration, coding
+targets, streaming, approval scope, Known limitations):
+**`docs/RUNTIME_CONTRACTS.md`**.  
+**Lifecycle truthfulness** (recovery, confirm, ToolRuns, projection, corruption):
+**`docs/LIFECYCLE_TRUTHFULNESS.md`**. Status: implemented partial; pending live validation.
 
 ---
 
@@ -409,7 +415,8 @@ Function: `_pq_parse_and_preempt()`
 Responsibilities:
 
 - Set request/source/thread state.
-- Handle pending `confirm` / `cancel`.
+- Handle pending confirm/cancel against durable approvals (confirm types:
+  `docs/LIFECYCLE_TRUTHFULNESS.md` §4).
 - Handle explicit remember/save-memory commands.
 - Delegate source-specific preprocessing to adapters.
 - Detect coding/project intent.
@@ -538,14 +545,15 @@ desktop_click / desktop_type_text:
 
 The backend separates:
 
-- Tool availability
-- Workspace allowlist
+- Tool registration / availability
+- Project path scope (Session-attached folder)
+- Soft skill-workspace preference lists (`TOOLS.txt` — not a hard ceiling)
 - Source role
-- Policy flags
+- Policy flags (`ALLOW_*`)
 - Confirmation requirement
 - Risk level
 
-This matters because Discord/Twitch/Twitter public sources must not get the same tool power as the local owner.
+This matters because Discord/Twitch/Twitter public sources must not get the same tool power as the local owner. Full contracts: `docs/RUNTIME_CONTRACTS.md` §B.
 
 ---
 
@@ -1005,9 +1013,9 @@ workspaces/research
 
 Each workspace can define:
 
-- `WORKSPACE.md`
-- `TOOLS.txt`
-- `SKILLS.txt`
+- `WORKSPACE.md` (behavior prompt)
+- `TOOLS.txt` (soft tool preference list — not a hard execution ceiling as of v7.6.10)
+- `SKILLS.txt` (soft skill list)
 
 Skills live in:
 
@@ -1021,7 +1029,8 @@ Skills provide:
 - Optional tools
 - Integration-specific behavior
 
-The active workspace helps constrain what tools and behavior Echo should prefer.
+The active skill workspace guides behavior preferences. Real tool authority is
+registration + Project path + permissions + approvals (`docs/RUNTIME_CONTRACTS.md` §B).
 
 ---
 

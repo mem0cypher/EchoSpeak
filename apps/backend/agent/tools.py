@@ -12,6 +12,7 @@ import shutil
 import platform
 import re
 import time
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from typing import Optional, Dict, Any
@@ -26,6 +27,49 @@ from pytesseract import pytesseract
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import config, ModelProvider
+
+
+_tool_execution_context: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "echospeak_tool_execution_context",
+    default=None,
+)
+
+
+def bind_tool_execution_context(context: Dict[str, Any]) -> Token:
+    """Bind one request's authority and filesystem scope to tool execution."""
+    payload = dict(context or {})
+    payload["allowed_tool_names"] = list(dict.fromkeys(payload.get("allowed_tool_names") or []))
+    payload["permissions"] = dict(payload.get("permissions") or {})
+    payload["enforce_tools"] = True
+    payload["strict_scope"] = True
+    return _tool_execution_context.set(payload)
+
+
+def update_tool_execution_context(**updates: Any) -> Dict[str, Any]:
+    payload = dict(_tool_execution_context.get() or {})
+    payload.update(updates)
+    _tool_execution_context.set(payload)
+    return dict(payload)
+
+
+def reset_tool_execution_context(token: Optional[Token]) -> None:
+    if token is not None:
+        _tool_execution_context.reset(token)
+
+
+def get_tool_execution_context() -> Dict[str, Any]:
+    return dict(_tool_execution_context.get() or {})
+
+
+def _tool_scope_denial(tool_name: str) -> str:
+    context = _tool_execution_context.get() or {}
+    if not context or not context.get("enforce_tools"):
+        return f"Tool '{tool_name}' is blocked outside a bound thread execution context."
+    allowed = {str(name) for name in (context.get("allowed_tool_names") or []) if str(name)}
+    if str(tool_name or "") not in allowed:
+        thread_id = str(context.get("thread_id") or "default")
+        return f"Tool '{tool_name}' is not allowed by thread context '{thread_id}'."
+    return ""
 
 
 def _ensure_playwright_browsers() -> bool:
@@ -171,6 +215,17 @@ def _file_tool_extra_roots() -> list[Path]:
 
 
 def _file_tool_roots() -> list[Path]:
+    context = _tool_execution_context.get() or {}
+    if context.get("strict_scope"):
+        scoped = str(context.get("project_root") or context.get("workspace_root") or "").strip()
+        if scoped:
+            try:
+                return [Path(scoped).expanduser().resolve()]
+            except Exception:
+                return []
+        # FILE_TOOL_ROOT is an authority ceiling, not an implicitly attached
+        # Project. A Session without an explicit root has no filesystem scope.
+        return []
     roots = [_file_tool_root()]
     # Always allow user Desktop (common coding destination)
     try:
@@ -184,8 +239,9 @@ def _file_tool_roots() -> list[Path]:
             roots.append(root)
     # Active coding project (may be under Desktop or a discovered path)
     try:
-        if _active_project_root is not None:
-            ap = _active_project_root.resolve()
+        active_project_root = get_active_project_root()
+        if active_project_root is not None:
+            ap = active_project_root.resolve()
             # Allow the project dir itself and its parent (for relative resolves)
             if ap not in roots:
                 roots.append(ap)
@@ -203,30 +259,44 @@ def _desktop_root() -> Path:
 
 # Active coding project root — relative paths like "index.html" resolve here
 # instead of the EchoSpeak repo (live bug: white-screen write to EchoSpeak/index.html).
-_active_project_root: Optional[Path] = None
-
-
 def set_active_project_root(path: Optional[str]) -> None:
-    """Agent sets this when a coding project folder is known (e.g. Desktop/2d-shooter-game)."""
-    global _active_project_root
+    """Set a request-local project root without mutating process-wide scope.
+
+    Never opens legacy broad roots (strict_scope=False) when a real thread is bound.
+    Unbound pins only set project_root and keep enforcement defaults from the active context.
+    """
     raw = str(path or "").strip()
+    context = dict(_tool_execution_context.get() or {})
     if not raw:
-        _active_project_root = None
+        context["project_root"] = ""
+        _tool_execution_context.set(context)
         return
-    # Clear first so _candidate_file_path does not recurse into the old project root
-    _active_project_root = None
     try:
         p = _candidate_file_path(raw, _file_tool_root()).resolve()
-        _active_project_root = p
+        context["project_root"] = str(p)
     except Exception:
         try:
-            _active_project_root = Path(raw).expanduser().resolve()
+            context["project_root"] = str(Path(raw).expanduser().resolve())
         except Exception:
-            _active_project_root = None
+            context["project_root"] = ""
+    # Do not disable strict_scope / enforce_tools — that reopened Desktop/parent roots.
+    if not context.get("thread_id"):
+        context["thread_id"] = str(context.get("session_id") or "default")
+    if "strict_scope" not in context:
+        context["strict_scope"] = True
+    if "enforce_tools" not in context:
+        context["enforce_tools"] = True
+    _tool_execution_context.set(context)
 
 
 def get_active_project_root() -> Optional[Path]:
-    return _active_project_root
+    raw = str((_tool_execution_context.get() or {}).get("project_root") or "").strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser().resolve()
+    except Exception:
+        return None
 
 
 def _candidate_file_path(path: str, root: Path) -> Path:
@@ -242,7 +312,7 @@ def _candidate_file_path(path: str, root: Path) -> Path:
     if candidate.is_absolute():
         return candidate
     # Bare relative paths during coding → project folder, not EchoSpeak repo root
-    proj = _active_project_root
+    proj = get_active_project_root()
     if proj is not None and not low.startswith(("desktop/", "apps/", "src/")):
         try:
             if proj.exists() or True:
@@ -259,16 +329,36 @@ def _safe_file_path(path: str) -> Optional[Path]:
     root = _file_tool_root()
     candidate = _candidate_file_path(path, root)
     try:
-        resolved = candidate.resolve()
+        resolved = candidate.expanduser().resolve()
     except Exception:
         return None
+    # Windows: compare case-insensitively and with normalized separators so
+    # C:/Users/.../game.js and C:\Users\...\game.js under the same project root both pass.
     for allowed_root in _file_tool_roots():
         try:
-            common = os.path.commonpath([str(allowed_root), str(resolved)])
+            allowed_resolved = Path(allowed_root).expanduser().resolve()
         except Exception:
             continue
-        if common == str(allowed_root):
+        try:
+            resolved.relative_to(allowed_resolved)
             return resolved
+        except ValueError:
+            pass
+        # Case-insensitive containment (Windows paths)
+        try:
+            r_parts = [p.casefold() for p in resolved.parts]
+            a_parts = [p.casefold() for p in allowed_resolved.parts]
+            if len(r_parts) >= len(a_parts) and r_parts[: len(a_parts)] == a_parts:
+                return resolved
+        except Exception:
+            continue
+        # Fallback: normalized commonpath with casefold string equality
+        try:
+            common = os.path.commonpath([str(allowed_resolved), str(resolved)])
+            if common.casefold().replace("\\", "/") == str(allowed_resolved).casefold().replace("\\", "/"):
+                return resolved
+        except Exception:
+            continue
     return None
 
 
@@ -515,6 +605,8 @@ def desktop_list_windows(filter: Optional[str] = None, limit: int = 15) -> str:
 
 @tool(args_schema=FileListArgs, description="List files/folders within an allowed workspace directory.")
 def file_list(path: Optional[str] = ".", limit: int = 50) -> str:
+    if denied := _tool_scope_denial("file_list"):
+        return denied
     target = _safe_file_path(path or ".")
     if target is None:
         return f"Path not allowed. Allowed roots: {_format_file_tool_roots()}"
@@ -547,8 +639,57 @@ def _echo_file_payload(path: Path | str, content: str, *, action: str = "read") 
     return f"{header}\n{body}\n<<<END_ECHO_FILE>>>"
 
 
+def strip_echo_file_wrapper(text: str) -> str:
+    """Extract pure file body from tool output. Never write wrappers into source files.
+
+    Handles:
+      Read N chars from path
+      <<<ECHO_FILE ...>>>
+      <body>
+      <<<END_ECHO_FILE>>>
+    """
+    raw = str(text or "")
+    if not raw:
+        return ""
+    # Prefer ECHO_FILE body
+    m = re.search(
+        r"<<<ECHO_FILE\b[^>]*>>>\s*\n?(.*?)\n?\s*<<<END_ECHO_FILE>>>",
+        raw,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+    # Drop leading "Read N chars…" / "Wrote N chars…" summary lines
+    lines = raw.splitlines()
+    if lines and re.match(r"^(Read|Wrote|Appended)\s+\d+\s+chars\b", lines[0], flags=re.I):
+        body = "\n".join(lines[1:])
+        # If residual markers, strip them
+        body = re.sub(r"^<<<ECHO_FILE\b[^>]*>>>\s*\n?", "", body, flags=re.I)
+        body = re.sub(r"\n?<<<END_ECHO_FILE>>>\s*$", "", body, flags=re.I)
+        return body
+    # Bare markers without full pair
+    if "<<<ECHO_FILE" in raw or "<<<END_ECHO_FILE>>>" in raw:
+        raw = re.sub(r"^.*?<<<ECHO_FILE\b[^>]*>>>\s*\n?", "", raw, count=1, flags=re.I | re.DOTALL)
+        raw = re.sub(r"\n?<<<END_ECHO_FILE>>>.*$", "", raw, flags=re.I | re.DOTALL)
+        return raw
+    return raw
+
+
 @tool(args_schema=FileReadArgs, description="Read a text file from an allowed workspace directory.")
 def file_read(path: str, max_chars: int = 100000) -> str:
+    if denied := _tool_scope_denial("file_read"):
+        return denied
+    raw_path = str(path or "").strip()
+    # Planner template residue must never become a filesystem probe.
+    if re.search(r"\{\{[^{}]+\}\}", raw_path) or re.fullmatch(
+        r"(?i)(first_relevant_file|remaining_relevant_files|relevant_files?|"
+        r"target_file|file_to_read|chosen_file)",
+        raw_path,
+    ):
+        return (
+            f"Rejected unresolved planner template path: {raw_path!r}. "
+            "Use a concrete path from file_list or prior tool output."
+        )
     target = _safe_file_path(path)
     if target is None:
         roots = _format_file_tool_roots()
@@ -616,12 +757,15 @@ def _looks_like_code_stub(path: str, content: str) -> bool:
 
 @tool(args_schema=FileWriteArgs, description="Write text to a file (restricted; opt-in system action).")
 def file_write(path: str, content: str, append: bool = False) -> str:
+    if denied := _tool_scope_denial("file_write"):
+        return denied
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_file_write", False):
         return "File write is disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
     target = _safe_file_path(path)
     if target is None:
         return f"Path not allowed. Allowed roots: {_format_file_tool_roots()}. Prefer Desktop/<project>/filename for user projects."
-    body = content or ""
+    # Never persist tool wrapper / "Read N chars" pollution into real source files
+    body = strip_echo_file_wrapper(content or "")
     if not append and _looks_like_code_stub(str(path), body):
         return (
             "Rejected stub write: content is too small or comment-only for a code file. "
@@ -632,15 +776,29 @@ def file_write(path: str, content: str, append: bool = False) -> str:
         target.parent.mkdir(parents=True, exist_ok=True)
         # If writing into a new project dir, pin active project for later relative paths
         try:
-            if target.parent.is_dir() and target.parent.name and target.parent != _file_tool_root():
+            scope = _tool_execution_context.get() or {}
+            if (
+                not str(scope.get("project_root") or "").strip()
+                and target.parent.is_dir()
+                and target.parent.name
+                and target.parent != _file_tool_root()
+            ):
                 # Pin parent when it looks like a project folder under Desktop
                 desk = _desktop_root()
+                active_project_root = get_active_project_root()
                 if str(target.parent).startswith(str(desk)) or (
-                    _active_project_root and str(target).startswith(str(_active_project_root))
+                    active_project_root and str(target).startswith(str(active_project_root))
                 ):
                     set_active_project_root(str(target.parent))
         except Exception:
             pass
+        # Create checkpoint backup before modifying existing file
+        try:
+            from agent.checkpoints import create_checkpoint
+            create_checkpoint(str(target), reason="file_write")
+        except Exception as exc:
+            logger.warning("Checkpoint creation failed: {}", exc)
+
         mode = "a" if append else "w"
         with open(target, mode, encoding="utf-8") as f:
             f.write(body)
@@ -653,6 +811,8 @@ def file_write(path: str, content: str, append: bool = False) -> str:
 
 @tool(args_schema=FileMoveArgs, description="Move/rename a file or folder inside allowed workspace directories (opt-in system action).")
 def file_move(src: str, dst: str, overwrite: bool = False) -> str:
+    if denied := _tool_scope_denial("file_move"):
+        return denied
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_file_write", False):
         return "File operations are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
     src_p = _safe_file_path(src)
@@ -678,6 +838,8 @@ def file_move(src: str, dst: str, overwrite: bool = False) -> str:
 
 @tool(args_schema=FileCopyArgs, description="Copy a file or folder inside allowed workspace directories (opt-in system action).")
 def file_copy(src: str, dst: str, overwrite: bool = False) -> str:
+    if denied := _tool_scope_denial("file_copy"):
+        return denied
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_file_write", False):
         return "File operations are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
     src_p = _safe_file_path(src)
@@ -706,6 +868,8 @@ def file_copy(src: str, dst: str, overwrite: bool = False) -> str:
 
 @tool(args_schema=FileDeleteArgs, description="Delete a file or folder inside allowed workspace directories (opt-in system action).")
 def file_delete(path: str, recursive: bool = False) -> str:
+    if denied := _tool_scope_denial("file_delete"):
+        return denied
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_file_write", False):
         return "File operations are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
     target = _safe_file_path(path)
@@ -719,6 +883,12 @@ def file_delete(path: str, recursive: bool = False) -> str:
                 return "Path is a directory. Set recursive=true to delete folders."
             shutil.rmtree(target)
         else:
+            # Create checkpoint backup before deleting existing file
+            try:
+                from agent.checkpoints import create_checkpoint
+                create_checkpoint(str(target), reason="file_delete")
+            except Exception as exc:
+                logger.warning("Checkpoint creation failed: {}", exc)
             target.unlink()
         return f"Deleted {target}"
     except Exception as e:
@@ -727,6 +897,8 @@ def file_delete(path: str, recursive: bool = False) -> str:
 
 @tool(args_schema=FileMkdirArgs, description="Create a folder inside an allowed workspace directory (opt-in system action).")
 def file_mkdir(path: str, parents: bool = True, exist_ok: bool = True) -> str:
+    if denied := _tool_scope_denial("file_mkdir"):
+        return denied
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_file_write", False):
         return "File operations are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
     target = _safe_file_path(path)
@@ -736,7 +908,9 @@ def file_mkdir(path: str, parents: bool = True, exist_ok: bool = True) -> str:
         target.mkdir(parents=bool(parents), exist_ok=bool(exist_ok))
         # Pin coding project so later bare "index.html" / "game.js" resolve here
         try:
-            set_active_project_root(str(target))
+            scope = _tool_execution_context.get() or {}
+            if not str(scope.get("project_root") or "").strip():
+                set_active_project_root(str(target))
         except Exception:
             pass
         return f"Created folder: {target}"
@@ -810,6 +984,8 @@ def _terminal_command_denied(command: str) -> Optional[str]:
 
 @tool(args_schema=TerminalRunArgs, description="Run a PowerShell command (Windows; denylisted dangerous commands; opt-in system action).")
 def terminal_run(command: str, cwd: Optional[str] = ".", timeout: Optional[int] = None) -> str:
+    if denied := _tool_scope_denial("terminal_run"):
+        return denied
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_terminal_commands", False):
         return "Terminal commands are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_TERMINAL_COMMANDS=true, then restart the API."
 
@@ -945,6 +1121,8 @@ def _safe_artifact_filename(name: Optional[str]) -> str:
 
 @tool(args_schema=ArtifactWriteArgs, description="Write text to a safe artifacts folder and return the file path.")
 def artifact_write(filename: Optional[str] = None, content: str = "") -> str:
+    if denied := _tool_scope_denial("artifact_write"):
+        return denied
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_file_write", False):
         return "Artifact write is disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_FILE_WRITE=true, then restart the API."
     data = str(content or "")
@@ -1022,6 +1200,8 @@ def open_application(app: str, args: Optional[str] = None) -> str:
 
 @tool(args_schema=NotepadWriteArgs, description="Open Notepad, type text, and save a copy to the artifacts folder (opt-in system action).")
 def notepad_write(content: str, filename: Optional[str] = None) -> str:
+    if denied := _tool_scope_denial("notepad_write"):
+        return denied
     if not getattr(config, "enable_system_actions", False):
         return "System actions are disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true, then restart the API."
     if not getattr(config, "allow_open_application", False):
@@ -3838,6 +4018,7 @@ TOOL_METADATA: Dict[str, Dict[str, Any]] = {
     # Destructive risk tools (delete/terminal)
     "file_delete": {"risk_level": "destructive", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_FILE_WRITE"]},
     "terminal_run": {"risk_level": "destructive", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_TERMINAL_COMMANDS"]},
+    "checkpoint_undo": {"risk_level": "destructive", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_FILE_WRITE"]},
     # Self-modification tools
     "self_edit": {"risk_level": "destructive", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_SELF_MODIFICATION"]},
     "self_rollback": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_SELF_MODIFICATION"]},
@@ -4199,6 +4380,21 @@ def self_list(path: str = "") -> str:
 # PROJECT STATUS / SHOWCASE TOOL (v8.0.0)
 # ============================================================================
 
+@tool(description="Undo the latest checkpointed file change in the current thread and project. Requires exact approval.")
+def checkpoint_undo() -> str:
+    if denied := _tool_scope_denial("checkpoint_undo"):
+        return denied
+    context = get_tool_execution_context()
+    if not context or not context.get("strict_scope"):
+        return "Undo is blocked outside a bound thread execution context."
+    from agent.checkpoints import undo_last_change
+
+    result = undo_last_change(
+        thread_id=str(context.get("thread_id") or "default"),
+        project_root=str(context.get("project_root") or ""),
+    )
+    return result if str(result).startswith("Successfully reverted") else f"Error: {result}"
+
 class ProjectStatusArgs(BaseModel):
     workspace_path: str = Field(
         default="",
@@ -4208,6 +4404,8 @@ class ProjectStatusArgs(BaseModel):
 
 @tool(args_schema=ProjectStatusArgs, description="Check the current project status: git changes, test results, todos, and build health. Use this to self-verify work, showcase finished projects, or diagnose issues.")
 def project_status(workspace_path: str = "") -> str:
+    if denied := _tool_scope_denial("project_status"):
+        return denied
     """
     Comprehensive project health check and showcase report.
     Checks git status, runs tests, reads todos, and produces a structured report.
@@ -4376,6 +4574,7 @@ def get_available_tools() -> list:
         terminal_run,
         system_info,
         project_status,
+        checkpoint_undo,
         # Self-modification tools
         self_edit,
         self_rollback,

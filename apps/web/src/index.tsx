@@ -1,30 +1,36 @@
-import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { create } from "zustand";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { SquareAvatarVisual } from "./components/SquareAvatarVisual";
 import { getToolCategory, getToolDisplayDetails } from "./components/echoAnimationUtils";
-import { InlineCodeDiff } from "./components/InlineCodeDiff";
 import type { CodeDiffSession } from "./components/InlineCodeDiff";
-import { WorkspaceExplorer } from "./components/WorkspaceExplorer";
+import { CodeWorkspace } from "./components/CodeWorkspace";
+import type { LiveFileChange, LiveTerminalEntry } from "./components/CodeWorkspace";
 import { TaskChecklist, createEmptyTaskPlan, taskPlanReducer } from "./components/TaskChecklist";
 import type { TaskPlanState } from "./components/TaskChecklist";
 import type { EchoReaction, ToolCategory } from "./components/echoAnimationUtils";
 import { TodoPanel } from "./components/TodoPanel";
 import { AvatarEditor } from "./components/AvatarEditor";
+import { ProjectSidebar } from "./components/ProjectSidebar";
+import { loadRuntimeLayout, runtimeGridColumns, saveRuntimeLayout } from "./runtimeLayout";
 import { buildResearchRunFromToolEvent, normalizeResearchRun } from "./features/research/buildResearchRun";
 import { useResearchStore } from "./features/research/store";
 import type { ResearchRun } from "./features/research/types";
+import { buildResponseRenderPlan } from "./features/responseRenderer/buildResponseRenderPlan";
+import { ResponseRenderer } from "./features/responseRenderer/ResponseRenderer";
+import type { ResponseRenderIntent, ResponseRenderPlan } from "./features/responseRenderer/types";
 import { buildChatEmbeds } from "./features/embeds/buildChatEmbeds";
 import { ChatEmbeds, ChatEmbedFooter } from "./features/embeds/ChatEmbeds";
 import type { ChatEmbed } from "./features/embeds/types";
+import { CapabilityRegistryGroups, OperationalStateCard } from "./features/operations/OperationalStateCard";
+import type { OperationalApproval, OperationalThreadState } from "./features/operations/OperationalStateCard";
 import {
   agentActivityReducer,
   initialAgentActivity,
-  isConfirmPromptText,
+  isStreamEventCurrent,
+  isStreamThreadCurrent,
   toolCategoryFromPhase,
   type AgentActivityState,
 } from "./agentActivity";
@@ -79,11 +85,18 @@ type Message = {
    * "final" = post-tool answer. Used for timeline ordering only.
    */
   streamBeat?: "partial" | "final";
-  /**
-   * Rich embeds under the bubble (sources, weather stats, schedule, link cards).
-   * Derived from research + answer text — chat stays text-first.
-   */
+  /** Structured assistant response plan. Plain text remains the fallback. */
+  renderPlan?: ResponseRenderPlan;
+  /** Research / weather / source embeds under the final answer. */
   embeds?: ChatEmbed[];
+  /** Authoritative backend state captured for this assistant turn. */
+  operation?: { state: OperationalThreadState; success: boolean; executionId?: string };
+  /** Retrieval sources captured for this exact assistant turn. */
+  docSources?: DocSource[];
+  /** Durable Turn / execution id from backend (maps client stream key → history). */
+  executionId?: string;
+  /** Client stream key used while the Turn was open (debugging correlation). */
+  clientRequestId?: string;
 };
 
 /** Rough client-side token estimate (chars / 3.5) — matches context meter */
@@ -189,18 +202,24 @@ const formatToolActivity = (
     return `Failed ${label}${err ? `: ${err.slice(0, 100)}` : ""}`;
   }
 
-  // Specialized search copy
+  // Specialized search copy — one user-facing summary per ToolRun (no provider "via" spam).
   if (low === "web_search") {
+    // Wrapper shells are not user-facing completion lines.
+    if (/\(expanded to |\(superseded by canonical/i.test(out)) {
+      return phase === "start" ? (input ? `Searching: ${input}` : "Searching the web…") : "";
+    }
     if (phase === "start") return input ? `Searching: ${input}` : "Searching the web…";
-    const provM = out.match(/Search provider:\s*([a-z0-9_,]+)/i);
-    const via = provM?.[1] ? ` via ${provM[1].replace(/,/g, "+")}` : "";
     const insufficient =
       /search_evidence_insufficient|accepted=false/i.test(out) ||
       (/insufficient/i.test(out) && !/\d+\.\s/.test(out));
     const sources = (out.match(/^\s*\d+\.\s+/gm) || []).length;
-    if (insufficient) return input ? `Search done${via} (weak evidence): ${input}` : `Search finished${via} — weak evidence`;
-    if (sources > 0) return input ? `Search done${via} (${sources} sources): ${input}` : `Search done${via} (${sources} sources)`;
-    return input ? `Search done${via}: ${input}` : `Search done${via}`.trim();
+    if (insufficient) return input ? `Search finished (weak evidence): ${input}` : "Search finished — weak evidence";
+    if (sources > 0) return input ? `Search done (${sources} sources): ${input}` : `Search done (${sources} sources)`;
+    return input ? `Search done: ${input}` : "Search done";
+  }
+  if (low === "get_system_time") {
+    if (phase === "start") return "Checking the time…";
+    return "Got the time";
   }
   if (low === "sports_live") {
     if (phase === "start") return input ? `Live sports: ${input}` : "Live sports data…";
@@ -262,7 +281,7 @@ const buildMessageUsage = (
 
 type AgentStreamEvent =
   | { type: "tool_start"; id: string; name: string; input: string; at: number; request_id?: string }
-  | { type: "tool_end"; id: string; name?: string; output: string; research?: ResearchRun; at: number; request_id?: string }
+  | { type: "tool_end"; id: string; name?: string; output: string; research?: ResearchRun; outcome?: { success: boolean; status: string; error_code?: string; error_message?: string; retryable?: boolean }; at: number; request_id?: string }
   | { type: "tool_error"; id: string; error: string; at: number; request_id?: string }
   | { type: "thinking"; content: string; at: number; request_id?: string }
   | { type: "thinking_step"; step_type: string; content: string; status: string; at: number; request_id?: string }
@@ -272,7 +291,8 @@ type AgentStreamEvent =
   | { type: "task_step"; data: { index: number; status: string; description?: string; tool?: string; result_preview?: string; total?: number }; at?: number; request_id?: string }
   | { type: "task_reflection"; data: { index: number; accepted: boolean; reason?: string; cycle?: number }; at?: number; request_id?: string }
   | { type: "partial_reply"; response: string; speak?: boolean; segment?: number; reason?: string; request_id?: string; at: number }
-  | { type: "final"; response: string; spoken_text?: string; success: boolean; memory_count: number; doc_sources?: DocSource[]; research?: ResearchRun[]; execution_id?: string; trace_id?: string; thread_state?: ThreadSessionState | null; partial_replies?: string[]; request_id?: string; at: number }
+  | { type: "final"; response: string; spoken_text?: string; success: boolean; memory_count: number; doc_sources?: DocSource[]; research?: ResearchRun[]; response_render?: ResponseRenderIntent; execution_id?: string; trace_id?: string; thread_state?: ThreadSessionState | null; partial_replies?: string[]; request_id?: string; at: number }
+  | { type: "turn_bound"; request_id?: string; execution_id?: string; turn_id?: string; thread_id?: string; active_project_id?: string; at: number }
   | { type: "error"; message: string; at: number; request_id?: string };
 
 /** Square spinner — Echo's shape, no emoji */
@@ -417,18 +437,22 @@ type DocumentListResponse = {
   enabled: boolean;
 };
 
-type ThreadSessionState = {
+type ThreadSessionState = OperationalThreadState & {
   thread_id: string;
-  workspace_id: string;
-  active_project_id: string;
-  pending_approval_id: string;
-  last_execution_id: string;
-  last_trace_id: string;
-  runtime_provider: string;
+  workspace_id?: string;
+  active_project_id?: string;
+  pending_approval_id?: string;
+  last_execution_id?: string;
+  last_trace_id?: string;
+  runtime_provider?: string;
+  selected_model_id?: string;
+  active_turn_id?: string;
+  model_profile?: Record<string, any>;
+  context_budget?: Record<string, any>;
   updated_at: number;
 };
 
-type ApprovalRecord = {
+type ApprovalRecord = OperationalApproval & {
   id: string;
   thread_id: string;
   execution_id?: string | null;
@@ -440,6 +464,11 @@ type ApprovalRecord = {
   summary: string;
   risk_level: string;
   policy_flags: string[];
+  permission_level?: string;
+  constraints?: string[];
+  policy_snapshot?: Record<string, any>;
+  retry_count?: number;
+  execution_context?: Record<string, any>;
   session_permissions: Record<string, boolean>;
   dry_run_available: boolean;
   source: string;
@@ -465,6 +494,14 @@ type PendingActionEnvelope = {
   policy_flags?: string[];
   session_permissions?: Record<string, boolean>;
   dry_run_available?: boolean;
+};
+
+type ApprovalDecisionEnvelope = {
+  approval: ApprovalRecord;
+  success: boolean;
+  response: string;
+  execution_id?: string | null;
+  thread_state: ThreadSessionState;
 };
 
 type ExecutionRecord = {
@@ -512,9 +549,6 @@ const isLmStudioOnlyLocked = (info: ProviderInfo | null): boolean => {
   if (!providers.length) return false;
   return providers.length === 1 && providers[0].id === "lmstudio";
 };
-
-const workspaceModes = ["auto", "chat", "coding", "research"] as const;
-type WorkspaceMode = (typeof workspaceModes)[number];
 
 const fetchWithTimeout = async (url: string, init?: RequestInit, timeoutMs: number = 4500) => {
   const controller = new AbortController();
@@ -712,12 +746,28 @@ const defaultAvatarConfig: AvatarConfig = {
 };
 
 const globalCss = `
-         :root { --ui-scale: 1.2; }
+         :root {
+           /* ~112.5% browser zoom (~90% of prior 125% scale); shell size compensates so layout fits viewport */
+           --ui-scale: 1.125;
+         }
          @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
          * { box-sizing: border-box; }
-         body { margin: 0; background: ${colors.bg}; font-family: 'Inter', 'Manrope', system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+         html, body {
+           margin: 0;
+           width: 100%;
+           height: 100%;
+           overflow: hidden;
+           background: ${colors.bg};
+           font-family: 'Inter', 'Manrope', system-ui, sans-serif;
+           -webkit-font-smoothing: antialiased;
+         }
+         #root {
+           width: 100%;
+           height: 100%;
+           overflow: hidden;
+         }
          * { scrollbar-width: thin; scrollbar-color: #333 transparent; }
-         *::-webkit-scrollbar { width: 6px; height: 6px; }
+         *::-webkit-scrollbar { width: 8px; height: 8px; }
          *::-webkit-scrollbar-track { background: transparent; }
          *::-webkit-scrollbar-thumb { background: #333; border-radius: 0; }
          *::-webkit-scrollbar-thumb:hover { background: #444; }
@@ -725,38 +775,130 @@ const globalCss = `
          
          .chat-markdown p:first-of-type { margin-top: 0; }
          .chat-markdown p:last-of-type { margin-bottom: 0; }
-         .chat-markdown { font-size: 15px; line-height: 1.65; letter-spacing: 0.01em; }
-         .chat-text { font-size: 15px; line-height: 1.65; letter-spacing: 0.01em; }
+         .chat-markdown {
+           font-size: 15px;
+           line-height: 1.65;
+           letter-spacing: 0.01em;
+           overflow-wrap: anywhere;
+           word-break: break-word;
+           min-width: 0;
+           max-width: 100%;
+         }
+         .chat-markdown pre {
+           max-width: 100%;
+           overflow-x: auto;
+           white-space: pre;
+         }
+         .chat-markdown code {
+           overflow-wrap: anywhere;
+           word-break: break-word;
+         }
+         .chat-markdown img,
+         .chat-markdown table {
+           max-width: 100%;
+         }
+         .chat-markdown table {
+           display: block;
+           overflow-x: auto;
+         }
+         .chat-text {
+           font-size: 15px;
+           line-height: 1.65;
+           letter-spacing: 0.01em;
+           white-space: pre-wrap;
+           overflow-wrap: anywhere;
+           word-break: break-word;
+           min-width: 0;
+           max-width: 100%;
+         }
          .chat-line-user { color: rgba(255,255,255,0.55); text-align: right; }
-         .chat-line-assistant { color: rgba(255,255,255,0.92); text-align: left; }
-         .chat-flat { background: transparent !important; border: none !important; box-shadow: none !important; border-radius: 0 !important; backdrop-filter: none !important; }
+         .chat-line-assistant { color: rgba(255,255,255,0.92); text-align: left; min-width: 0; max-width: 100%; }
+         .chat-flat { background: transparent !important; border: none !important; box-shadow: none !important; border-radius: 0 !important; backdrop-filter: none !important; min-width: 0; }
+         .chat-embeds,
+         .chat-embed-footer {
+           width: 100%;
+           max-width: 100%;
+           min-width: 0;
+           box-sizing: border-box;
+         }
          
+         /* Layout units are pre-zoom; zoom scales the whole UI to ~125% while fitting the real viewport */
          .app-shell {
-           width: calc(100vw / var(--ui-scale) + 4px);
+           width: calc(100vw / var(--ui-scale));
            height: calc(100vh / var(--ui-scale));
+           height: calc(100dvh / var(--ui-scale));
+           max-width: calc(100vw / var(--ui-scale));
+           max-height: calc(100vh / var(--ui-scale));
+           max-height: calc(100dvh / var(--ui-scale));
            display: grid;
+           grid-template-rows: minmax(0, 1fr);
            gap: 0;
            padding: 0;
+           margin: 0;
            background: ${colors.bg};
            zoom: var(--ui-scale);
            transform-origin: top left;
+           overflow: hidden;
+         }
+         .app-shell > * {
+           min-width: 0;
+           min-height: 0;
+           max-height: 100%;
+           overflow: hidden;
+         }
+         .echo-sidebar {
+           width: 100%;
+           height: 100%;
+           min-width: 0;
+           min-height: 0;
+           overflow: hidden;
+           z-index: 2;
+           /* density lives on the component; do not add outer padding/gap here */
          }
          .visualizer-pane {
            display: flex;
-           align-items: center;
-           justify-content: center;
+           flex-direction: column;
+           align-items: stretch;
+           justify-content: flex-start;
            background: rgba(0,0,0,0.2);
            border-right: 1px solid ${colors.line};
+           width: 100%;
+           height: 100%;
+           min-width: 0;
+           min-height: 0;
+           overflow: hidden;
+           position: relative;
+           z-index: 1;
+         }
+         .visualizer-pane-body {
+           flex: 1 1 auto;
+           min-width: 0;
+           min-height: 0;
+           width: 100%;
            height: 100%;
            overflow: hidden;
+           display: flex;
+           flex-direction: column;
+         }
+         .visualizer-pane-body.is-avatar {
+           align-items: center;
+           justify-content: center;
+         }
+         .visualizer-pane-body.is-workspace {
+           align-items: stretch;
+           justify-content: flex-start;
          }
          .glow-panel {
            background: ${colors.panel};
            display: flex;
            flex-direction: column;
+           width: 100%;
            height: 100%;
+           min-width: 0;
+           min-height: 0;
            overflow: hidden;
            transition: all 0.3s ease;
+           z-index: 1;
          }
          @keyframes echo-square-spin {
            to { transform: rotate(360deg); }
@@ -766,14 +908,15 @@ const globalCss = `
            50% { opacity: 0.5; }
          }
          .panel-header {
-           display: flex;
+           display: none;
            align-items: center;
-           justify-content: space-between;
-           padding: 20px 28px;
+           justify-content: flex-end;
+           min-height: 44px;
+           padding: 9px 16px;
            border-bottom: 1px solid ${colors.line};
          }
          .panel-header .title {
-           display: flex;
+           display: none;
            gap: 14px;
            align-items: center;
            font-family: 'Space Grotesk', sans-serif;
@@ -789,13 +932,17 @@ const globalCss = `
            border-radius: 0;
          }
          .panel-body {
-          flex: 1;
+          flex: 1 1 auto;
           display: flex;
           flex-direction: column;
-          padding: 20px 20px 18px;
+          padding: 18px 10px 16px 14px;
           overflow: hidden;
           min-height: 0;
+          min-width: 0;
           gap: 14px;
+          width: 100%;
+          height: 100%;
+          box-sizing: border-box;
         }
         .research-panel {
           position: relative;
@@ -911,19 +1058,28 @@ const globalCss = `
            background: rgba(255,255,255,0.045);
            box-shadow: none;
          }
-         /* ── EchoSpeak Studio shell ── */
+         /* ── EchoSpeak Studio shell (portaled to body — full workspace, no chrome bleed) ── */
          .studio-shell {
            position: fixed;
            inset: 0;
-           z-index: 200;
+           z-index: 100000;
+           width: 100vw;
+           height: 100vh;
+           height: 100dvh;
+           max-width: 100vw;
+           max-height: 100dvh;
            display: flex;
            flex-direction: column;
            background:
              radial-gradient(ellipse 80% 50% at 50% -20%, rgba(255,255,255,0.06), transparent 55%),
-             radial-gradient(ellipse 40% 30% at 100% 100%, rgba(79,142,255,0.05), transparent 45%),
+             radial-gradient(ellipse 40% 30% at 100% 100%, rgba(255,255,255,0.03), transparent 45%),
              #030406;
            color: #fff;
            overflow: hidden;
+         }
+         .app-shell.is-studio-covered {
+           visibility: hidden;
+           pointer-events: none;
          }
          .studio-shell::before {
            content: "";
@@ -1142,16 +1298,16 @@ const globalCss = `
            overflow-x: hidden;
            display: flex;
            flex-direction: column;
-           gap: 18px;
+           gap: 12px;
            width: 100%;
-           /* Keep text clear of the scrollbar track */
-           padding: 4px 22px 8px 4px;
+           /* Right padding sits inside stable gutter so text clears the scrollbar */
+           padding: 4px 16px 8px 4px;
            scrollbar-gutter: stable;
            scrollbar-width: thin;
            scrollbar-color: rgba(255,255,255,0.18) transparent;
          }
          .chat-scroll::-webkit-scrollbar {
-           width: 8px;
+           width: 10px;
          }
          .chat-scroll::-webkit-scrollbar-track {
            background: transparent;
@@ -1169,99 +1325,185 @@ const globalCss = `
            border: 2px solid transparent;
          }
 
-         /* ── Composer dock ── */
+         /* ── Composer dock ──
+            Row 1: [ Ask Echo anything ........ ] [ctx] [send]
+            Row 2: [ Provider ▾ ] [mic][mon][viz] [ Model ▾ ]
+         */
          .input-bar {
            margin-top: auto;
            display: flex;
            flex-direction: column;
-           gap: 10px;
+           gap: 8px;
            padding-top: 10px;
            border-top: 1px solid rgba(255,255,255,0.06);
+           min-width: 0;
+           width: 100%;
+           overflow: visible;
          }
          .input-row {
            display: flex;
-           gap: 10px;
+           flex-direction: row;
+           flex-wrap: nowrap;
            align-items: flex-end;
+           gap: 8px;
+           width: 100%;
+           min-width: 0;
+           overflow: visible;
+         }
+         /* Session strip + textarea share one column so edges always line up */
+         .composer-input-stack {
+           flex: 1 1 auto;
+           min-width: 0;
+           display: flex;
+           flex-direction: column;
+           gap: 0;
+         }
+         .session-folder-strip {
+           display: inline-flex;
+           align-items: center;
+           flex-wrap: wrap;
+           gap: 12px;
+           width: fit-content;
+           max-width: 100%;
+           box-sizing: border-box;
+           padding: 5px 10px;
+           margin: 0;
+           font-size: 10px;
+           line-height: 1.3;
+           color: rgba(255,255,255,0.48);
+           font-family: 'JetBrains Mono', ui-monospace, monospace;
+           border: 1px solid rgba(255,255,255,0.10);
+           border-bottom: none;
+           background: rgba(16,16,16,0.5);
+           border-radius: 3px 3px 0 0;
+           position: relative;
+           z-index: 1;
+         }
+         .session-folder-strip.is-drop-active {
+           border-color: rgba(255,255,255,0.65);
+           border-style: dashed;
+           background: rgba(255,255,255,0.07);
          }
          .input-field {
            box-sizing: border-box;
-           flex: 1;
+           width: 100%;
            min-width: 0;
            background: rgba(255,255,255,0.03);
            border: 1px solid rgba(255, 255, 255, 0.12);
-           border-radius: 3px;
-           padding: 14px 16px;
+           border-radius: 0 3px 3px 3px;
+           padding: 10px 14px;
            color: ${colors.text};
            font-size: 15px;
            outline: none;
            transition: border-color 0.15s ease, background 0.15s ease;
            box-shadow: none;
-           backdrop-filter: none;
          }
          .input-field:focus {
            background: rgba(255,255,255,0.045);
            border-color: rgba(255,255,255,0.28);
-           box-shadow: none;
          }
          textarea.input-field {
-           min-height: 48px;
+           min-height: 40px;
            max-height: 148px;
+           height: 40px;
            resize: none;
-           line-height: 1.5;
+           line-height: 1.4;
            overflow-y: auto;
            font-family: inherit;
          }
-         .send-button {
-           width: 48px;
-           height: 48px;
-           flex: 0 0 48px;
+         .composer-trailing {
+           display: flex;
+           flex-direction: row;
+           flex-wrap: nowrap;
+           align-items: center;
+           gap: 6px;
+           flex: 0 0 auto;
+           overflow: visible;
+         }
+         .composer-square,
+         .send-button,
+         .mic-button {
+           width: 36px;
+           height: 36px;
+           flex: 0 0 36px;
            display: grid;
            place-items: center;
-           background: rgba(255,255,255,0.08);
-           border: 1px solid rgba(255,255,255,0.22);
            border-radius: 3px;
+           border: 1px solid rgba(255,255,255,0.14);
+           background: rgba(255,255,255,0.03);
            color: #fff;
            cursor: pointer;
-           transition: background 0.15s ease, border-color 0.15s ease;
-           position: relative;
-           overflow: hidden;
+           transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
            box-shadow: none;
+           padding: 0;
+           box-sizing: border-box;
          }
-         .send-button:hover {
+         .send-button {
+           width: 40px;
+           height: 40px;
+           flex: 0 0 40px;
+           background: rgba(255,255,255,0.08);
+           border-color: rgba(255,255,255,0.22);
+         }
+         .composer-square:hover:not(:disabled),
+         .mic-button:hover:not(:disabled) {
+           background: rgba(255,255,255,0.05);
+           border-color: rgba(255,255,255,0.22);
+         }
+         .send-button:hover:not(:disabled) {
            background: rgba(255,255,255,0.14);
            border-color: rgba(255,255,255,0.4);
-           transform: none;
-           box-shadow: none;
          }
-         .send-button:active {
+         .composer-square:active:not(:disabled),
+         .send-button:active:not(:disabled),
+         .mic-button:active:not(:disabled) {
            background: rgba(255,255,255,0.1);
          }
-
-         /* Unified control rail under the composer */
-         .controls-row {
+         .mic-button.active {
+           background: rgba(239,68,68,0.12);
+           border-color: rgba(239,68,68,0.45);
+           color: #f87171;
+         }
+         .composer-square.active {
+           background: rgba(255,255,255,0.1);
+           border-color: rgba(255,255,255,0.28);
+         }
+         .context-meter-wrap {
+           width: 40px;
+           height: 40px;
+           flex: 0 0 40px;
            display: grid;
-           grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr) minmax(0, 1fr) minmax(0, 1.2fr);
+           place-items: center;
+           overflow: visible;
+           position: relative;
+           z-index: 5;
+         }
+
+         /* Bottom rail: [mic][mon][viz] [Provider] [Model] */
+         .controls-row {
+           display: flex;
+           flex-direction: row;
+           flex-wrap: nowrap;
            align-items: stretch;
-           gap: 1px;
            width: 100%;
+           min-width: 0;
            background: rgba(255,255,255,0.08);
            border: 1px solid rgba(255,255,255,0.1);
            border-radius: 3px;
-           overflow: visible;
+           overflow: hidden;
          }
          .control-slot {
            display: flex;
            flex-direction: column;
            align-items: stretch;
            min-width: 0;
-           width: 100%;
            background: #0a0a0a;
            position: relative;
          }
          .control-slot::before {
            content: attr(data-label);
            display: block;
-           padding: 6px 12px 0;
+           padding: 6px 10px 0;
            font-family: 'JetBrains Mono', ui-monospace, monospace;
            font-size: 9px;
            font-weight: 600;
@@ -1270,20 +1512,31 @@ const globalCss = `
            color: rgba(255,255,255,0.32);
            line-height: 1;
          }
-         .session-slot { position: relative; }
-         .mode-slot,
-         .provider-slot,
-         .model-slot {
-           width: 100%;
+         .provider-slot {
+           flex: 0 1 38%;
+           min-width: 110px;
+           max-width: 220px;
+           border-right: 1px solid rgba(255,255,255,0.08);
          }
-         .input-side-tools {
+         .model-slot {
+           flex: 1 1 auto;
+           min-width: 120px;
+         }
+         .composer-tools-slot {
            display: flex;
-           align-items: flex-end;
-           gap: 8px;
-           padding-bottom: 0;
+           flex-direction: row;
+           flex-wrap: nowrap;
+           align-items: center;
+           justify-content: flex-start;
+           gap: 5px;
+           flex: 0 0 auto;
+           background: #0a0a0a;
+           padding: 0 8px;
+           align-self: stretch;
+           border-right: 1px solid rgba(255,255,255,0.08);
          }
 
-         .icon-button, .mic-button, .provider-picker, .model-picker, .mode-picker, .toolbar-button {
+         .icon-button, .provider-picker, .model-picker, .mode-picker, .toolbar-button {
            position: relative;
            overflow: hidden;
            background: transparent;
@@ -1292,19 +1545,13 @@ const globalCss = `
            color: #fff;
            cursor: pointer;
            transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-           backdrop-filter: none;
          }
-         .icon-button:hover:not(:disabled), .mic-button:hover:not(:disabled), .provider-picker:hover:not(:disabled), .model-picker:hover:not(:disabled), .mode-picker:hover:not(:disabled), .toolbar-button:hover:not(:disabled) {
+         .icon-button:hover:not(:disabled), .provider-picker:hover:not(:disabled), .model-picker:hover:not(:disabled), .mode-picker:hover:not(:disabled), .toolbar-button:hover:not(:disabled) {
            background: rgba(255,255,255,0.05);
-           border-color: transparent;
-           transform: none;
-           box-shadow: none;
          }
-         .icon-button:active:not(:disabled), .mic-button:active:not(:disabled), .provider-picker:active:not(:disabled), .model-picker:active:not(:disabled), .mode-picker:active:not(:disabled), .toolbar-button:active:not(:disabled) {
-           transform: none;
+         .icon-button:active:not(:disabled), .provider-picker:active:not(:disabled), .model-picker:active:not(:disabled), .mode-picker:active:not(:disabled), .toolbar-button:active:not(:disabled) {
            background: rgba(255,255,255,0.07);
          }
-
          .icon-button {
            display: flex;
            align-items: center;
@@ -1312,31 +1559,9 @@ const globalCss = `
            border-radius: 3px;
            border: 1px solid rgba(255,255,255,0.12);
          }
-
-         .mic-button {
-           width: 48px;
-           height: 48px;
-           flex: 0 0 48px;
-           display: grid;
-           place-items: center;
-           border-radius: 3px;
-           border: 1px solid rgba(255,255,255,0.14);
-           background: rgba(255,255,255,0.03);
-         }
-         .mic-button.active {
-           background: rgba(239,68,68,0.12);
-           border-color: rgba(239,68,68,0.45);
-           color: #f87171;
-           box-shadow: none;
-         }
          .inline-switcher {
            display: flex;
            align-items: center;
-           gap: 0;
-           padding: 0;
-           background: transparent;
-           border: none;
-           border-radius: 0;
            width: 100%;
            min-width: 0;
          }
@@ -1351,27 +1576,16 @@ const globalCss = `
          .switcher-dot.offline { background: #ef4444; box-shadow: 0 0 8px #ef444444; }
 
          .provider-picker, .model-picker, .mode-picker, .toolbar-button {
-           height: 36px;
+           height: 34px;
            border-radius: 0;
-           font-size: 12px;
+           font-size: 11px;
            font-weight: 500;
            outline: none;
-           padding: 0 12px 8px;
+           padding: 0 10px 6px;
            line-height: 1.2;
            min-width: 0;
            font-family: 'JetBrains Mono', ui-monospace, monospace;
            letter-spacing: 0.01em;
-         }
-         .toolbar-button {
-           width: 100%;
-           display: flex;
-           align-items: center;
-           justify-content: space-between;
-           text-align: left;
-           gap: 8px;
-         }
-         .toolbar-button.active-rail {
-           background: rgba(255,255,255,0.06);
          }
          .provider-picker, .model-picker, .mode-picker {
            width: 100%;
@@ -1379,8 +1593,8 @@ const globalCss = `
            appearance: none;
            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='rgba(255,255,255,0.45)' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
            background-repeat: no-repeat;
-           background-position: right 10px center;
-           padding-right: 28px;
+           background-position: right 8px center;
+           padding-right: 24px;
          }
          .provider-picker option, .model-picker option, .mode-picker option {
            background: #111;
@@ -1392,40 +1606,6 @@ const globalCss = `
          select option {
            background: #111;
            color: ${colors.text};
-         }
-         .session-menu {
-           position: absolute;
-           bottom: calc(100% + 6px);
-           left: 0;
-           width: min(280px, 70vw);
-           background: #0c0c0c;
-           border: 1px solid rgba(255,255,255,0.12);
-           border-radius: 3px;
-           box-shadow: 0 16px 40px rgba(0,0,0,0.55);
-           z-index: 100;
-           padding: 8px;
-           display: flex;
-           flex-direction: column;
-           gap: 2px;
-         }
-         .session-menu-label {
-           padding: 6px 10px 8px;
-           font-size: 10px;
-           font-weight: 600;
-           color: rgba(255,255,255,0.35);
-           text-transform: uppercase;
-           letter-spacing: 0.1em;
-           font-family: 'JetBrains Mono', ui-monospace, monospace;
-         }
-         @media (max-width: 980px) {
-           .controls-row {
-             grid-template-columns: repeat(2, minmax(0, 1fr));
-           }
-         }
-         @media (max-width: 560px) {
-           .controls-row {
-             grid-template-columns: 1fr;
-           }
          }
        `;
 
@@ -1949,16 +2129,16 @@ const ContextMeter: React.FC<{ messages: Message[]; contextWindow: number }> = (
   const estimatedTokens = messages.reduce((sum, m) => sum + (m.usage?.tokens ?? estimateTokens(m.text)), 0);
   const pct = Math.min(estimatedTokens / contextWindow, 1);
   const displayPct = Math.round(pct * 100);
-  const size = 36;
-  // White by default; warm/alert only when pressure is high
+  const size = 40;
   const fillColor =
     pct > 0.85 ? "rgba(255,255,255,0.95)" : pct > 0.6 ? "rgba(255,255,255,0.88)" : "rgba(255,255,255,0.92)";
-  const trackColor = "rgba(255,255,255,0.12)";
+  const trackColor = "rgba(255,255,255,0.14)";
   const warnTint =
     pct > 0.85 ? "rgba(255,90,90,0.18)" : pct > 0.6 ? "rgba(255,200,80,0.12)" : "transparent";
 
   return (
     <div
+      className="context-meter-wrap"
       style={{
         position: "relative",
         width: size,
@@ -1971,22 +2151,21 @@ const ContextMeter: React.FC<{ messages: Message[]; contextWindow: number }> = (
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       title={`Context ${displayPct}%`}
+      aria-label={`Context ${displayPct}% used`}
     >
       <div
         style={{
           position: "relative",
           width: size,
           height: size,
-          borderRadius: 8,
-          background: warnTint,
-          border: `1.5px solid ${trackColor}`,
-          boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.25)",
+          borderRadius: 3,
+          background: warnTint || "rgba(255,255,255,0.03)",
+          border: `1px solid ${trackColor}`,
           overflow: "hidden",
+          boxSizing: "border-box",
         }}
       >
-        {/* Track */}
-        <div style={{ position: "absolute", inset: 3, borderRadius: 4, background: "rgba(255,255,255,0.04)" }} />
-        {/* Vertical fill from bottom */}
+        <div style={{ position: "absolute", inset: 3, borderRadius: 2, background: "rgba(255,255,255,0.04)" }} />
         <div
           style={{
             position: "absolute",
@@ -1994,26 +2173,24 @@ const ContextMeter: React.FC<{ messages: Message[]; contextWindow: number }> = (
             right: 3,
             bottom: 3,
             height: `calc((100% - 6px) * ${pct})`,
-            borderRadius: 3,
+            borderRadius: 2,
             background: `linear-gradient(180deg, ${fillColor} 0%, rgba(255,255,255,0.55) 100%)`,
-            boxShadow: pct > 0.05 ? "0 0 10px rgba(255,255,255,0.18)" : "none",
             transition: "height 0.4s ease",
           }}
         />
-        {/* % label */}
         <div
           style={{
             position: "absolute",
             inset: 0,
             display: "grid",
             placeItems: "center",
-            fontSize: 9,
-            fontWeight: 800,
-            letterSpacing: "-0.4px",
+            fontSize: 10,
+            fontWeight: 700,
+            letterSpacing: "-0.3px",
             color: pct > 0.45 ? "rgba(0,0,0,0.78)" : "rgba(255,255,255,0.72)",
-            textShadow: pct > 0.45 ? "0 1px 0 rgba(255,255,255,0.25)" : "0 1px 2px rgba(0,0,0,0.45)",
             userSelect: "none",
             fontVariantNumeric: "tabular-nums",
+            fontFamily: "'JetBrains Mono', ui-monospace, monospace",
           }}
         >
           {displayPct}
@@ -2024,20 +2201,23 @@ const ContextMeter: React.FC<{ messages: Message[]; contextWindow: number }> = (
           style={{
             position: "absolute",
             bottom: "calc(100% + 10px)",
-            left: "50%",
-            transform: "translateX(-50%)",
+            /* Open toward the left so the full panel stays visible next to send */
+            right: 0,
+            left: "auto",
+            transform: "none",
             background: "rgba(12,12,14,0.96)",
             border: "1px solid rgba(255,255,255,0.14)",
             borderRadius: 10,
             padding: "10px 12px",
             whiteSpace: "nowrap",
-            zIndex: 999,
+            zIndex: 2000,
             boxShadow: "0 8px 28px rgba(0,0,0,0.55)",
             backdropFilter: "blur(12px)",
             fontSize: 12,
             color: colors.text,
             lineHeight: 1.5,
             minWidth: 160,
+            pointerEvents: "none",
           }}
         >
           <div style={{ fontWeight: 700, marginBottom: 4, color: "#fff", letterSpacing: "-0.02em" }}>Context</div>
@@ -2084,7 +2264,8 @@ const ChatBubble: React.FC<{
   modelLabel?: string;
 }> = ({ msg, streaming, typewriter = false, onQuickReply, contextWindow = 0, providerLabel, modelLabel }) => {
   const isUser = msg.role === "user";
-  const isConfirmPrompt = !isUser ? isConfirmPromptText(msg.text || "") : false;
+  // Approval controls are rendered only from an exact backend approval record.
+  const isConfirmPrompt = false;
   const [shown, setShown] = useState(isUser || !typewriter ? msg.text : "");
   const [metaHover, setMetaHover] = useState(false);
 
@@ -2124,18 +2305,23 @@ const ChatBubble: React.FC<{
         justifyContent: isUser ? "flex-end" : "flex-start",
         position: "relative",
         width: "100%",
-        padding: "10px 4px",
+        minWidth: 0,
+        /* Extra right inset on user rows so text never kisses the scrollbar */
+        padding: isUser ? "8px 2px 6px 0" : "8px 4px 6px",
+        boxSizing: "border-box",
       }}
     >
       <div
         className="chat-flat"
         style={{
           position: "relative",
-          maxWidth: isUser ? "88%" : "100%",
+          maxWidth: isUser ? "94%" : "100%",
           width: isUser ? "auto" : "100%",
+          minWidth: 0,
           color: colors.text,
-          padding: "2px 0",
+          padding: "0",
           overflow: "visible",
+          boxSizing: "border-box",
         }}
       >
         {isUser ? (
@@ -2143,8 +2329,8 @@ const ChatBubble: React.FC<{
             {bodyText}
           </div>
         ) : (
-          <div className="chat-markdown chat-line-assistant">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{bodyText}</ReactMarkdown>
+          <div className="chat-line-assistant" style={{ minWidth: 0, maxWidth: "100%" }}>
+            <ResponseRenderer plan={msg.renderPlan} fallbackText={bodyText} colors={colors} stillTyping={stillTyping} />
             {stillTyping ? (
               <span
                 style={{
@@ -2159,16 +2345,14 @@ const ChatBubble: React.FC<{
                 }}
               />
             ) : null}
+            {!stillTyping && msg.embeds?.length ? (
+              <ChatEmbeds embeds={msg.embeds} colors={colors} />
+            ) : null}
           </div>
         )}
 
-        {/* Body embeds only (weather / fixtures) — sources live under time row */}
-        {!isUser && !stillTyping && msg.embeds && msg.embeds.length > 0 ? (
-          <ChatEmbeds embeds={msg.embeds} colors={colors} />
-        ) : null}
-
         {!isUser && isConfirmPrompt ? (
-          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+          <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
             <button
               onClick={() => onQuickReply?.("confirm")}
               disabled={!canQuickReply}
@@ -2209,108 +2393,144 @@ const ChatBubble: React.FC<{
             </button>
           </div>
         ) : null}
-        {(() => {
-          const msgTokens = msg.usage?.tokens ?? estimateTokens(msg.text);
-          const ctxUsed = msg.usage?.contextUsed ?? msgTokens;
-          const ctxWindow = msg.usage?.contextWindow || contextWindow || 32768;
-          const ctxPct = ctxWindow > 0 ? Math.min(100, Math.round((ctxUsed / ctxWindow) * 100)) : 0;
-          const prov = msg.usage?.provider || providerLabel || "";
-          const model = msg.usage?.model || modelLabel || "";
-          return (
-            <div
-              style={{
-                marginTop: 6,
-                fontSize: 10,
-                color: "rgba(255,255,255,0.28)",
-                fontFamily: "'JetBrains Mono', ui-monospace, monospace",
-                letterSpacing: "0.06em",
-                textAlign: isUser ? "right" : "left",
-                display: "flex",
-                justifyContent: isUser ? "flex-end" : "flex-start",
-                alignItems: "center",
-                gap: 6,
-                position: "relative",
-                flexWrap: "wrap",
-              }}
-            >
-              <span>{new Date(msg.at).toLocaleTimeString()}</span>
-              <span style={{ opacity: 0.45 }}>·</span>
-              <span
-                onMouseEnter={() => setMetaHover(true)}
-                onMouseLeave={() => setMetaHover(false)}
+
+        {/* Compact footer: debug/thread context sits tight against time/tok/ctx/sources */}
+        <div
+          style={{
+            marginTop: 4,
+            display: "flex",
+            flexDirection: "column",
+            gap: 3,
+            minWidth: 0,
+            width: "100%",
+          }}
+        >
+          {!isUser && msg.operation ? (
+            <OperationalStateCard
+              state={msg.operation.state}
+              success={msg.operation.success}
+              executionId={msg.operation.executionId || msg.executionId}
+              compact
+            />
+          ) : null}
+
+          {!isUser && msg.docSources?.length ? (
+            <details style={{ color: colors.textDim, fontSize: 11, minWidth: 0, maxWidth: "100%", margin: 0 }}>
+              <summary style={{ cursor: "pointer", color: colors.text }}>
+                Local sources ({msg.docSources.length})
+              </summary>
+              <div style={{ display: "grid", gap: 2, marginTop: 3, overflowWrap: "anywhere", wordBreak: "break-word" }}>
+                {msg.docSources.map((source, index) => (
+                  <div key={`${source.id || source.source || source.filename || "source"}:${index}`}>
+                    {source.filename || source.source || source.id}
+                    {typeof source.chunk === "number" ? ` · chunk ${source.chunk}` : ""}
+                  </div>
+                ))}
+              </div>
+            </details>
+          ) : null}
+
+          {(() => {
+            const msgTokens = msg.usage?.tokens ?? estimateTokens(msg.text);
+            const ctxUsed = msg.usage?.contextUsed ?? msgTokens;
+            const ctxWindow = msg.usage?.contextWindow || contextWindow || 32768;
+            const ctxPct = ctxWindow > 0 ? Math.min(100, Math.round((ctxUsed / ctxWindow) * 100)) : 0;
+            const prov = msg.usage?.provider || providerLabel || "";
+            const model = msg.usage?.model || modelLabel || "";
+            return (
+              <div
                 style={{
-                  cursor: "default",
-                  borderBottom: "1px dotted rgba(255,255,255,0.18)",
-                  paddingBottom: 1,
+                  marginTop: 0,
+                  fontSize: 10,
+                  color: "rgba(255,255,255,0.28)",
+                  fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+                  letterSpacing: "0.06em",
+                  textAlign: isUser ? "right" : "left",
+                  display: "flex",
+                  justifyContent: isUser ? "flex-end" : "flex-start",
+                  alignItems: "center",
+                  gap: 6,
+                  position: "relative",
+                  flexWrap: "wrap",
                 }}
               >
-                ~{formatTokenCount(msgTokens)} tok
-                {!isUser ? (
-                  <>
-                    <span style={{ opacity: 0.45 }}> · </span>
-                    {ctxPct}% ctx
-                  </>
-                ) : null}
-              </span>
-              {metaHover && (
-                <div
+                <span>{new Date(msg.at).toLocaleTimeString()}</span>
+                <span style={{ opacity: 0.45 }}>·</span>
+                <span
+                  onMouseEnter={() => setMetaHover(true)}
+                  onMouseLeave={() => setMetaHover(false)}
                   style={{
-                    position: "absolute",
-                    bottom: "calc(100% + 8px)",
-                    [isUser ? "right" : "left"]: 0,
-                    background: "rgba(12,12,14,0.96)",
-                    border: "1px solid rgba(255,255,255,0.14)",
-                    borderRadius: 8,
-                    padding: "9px 11px",
-                    zIndex: 50,
-                    boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
-                    backdropFilter: "blur(12px)",
-                    fontSize: 11,
-                    color: colors.text,
-                    lineHeight: 1.55,
-                    minWidth: 168,
-                    letterSpacing: "0.02em",
-                    textAlign: "left",
-                    whiteSpace: "nowrap",
+                    cursor: "default",
+                    borderBottom: "1px dotted rgba(255,255,255,0.18)",
+                    paddingBottom: 1,
                   }}
                 >
-                  <div style={{ fontWeight: 700, color: "#fff", marginBottom: 4, letterSpacing: "-0.02em" }}>
-                    {isUser ? "Message" : "Response"} usage
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 18 }}>
-                    <span style={{ color: colors.textDim }}>This bubble</span>
-                    <span style={{ fontWeight: 600 }}>~{formatTokenCount(msgTokens)}</span>
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 18 }}>
-                    <span style={{ color: colors.textDim }}>Context used</span>
-                    <span style={{ fontWeight: 600 }}>~{formatTokenCount(ctxUsed)}</span>
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 18 }}>
-                    <span style={{ color: colors.textDim }}>Window</span>
-                    <span style={{ fontWeight: 600 }}>{formatTokenCount(ctxWindow)}</span>
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", gap: 18 }}>
-                    <span style={{ color: colors.textDim }}>Fill</span>
-                    <span style={{ fontWeight: 600 }}>{ctxPct}%</span>
-                  </div>
-                  {(prov || model) && (
-                    <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(255,255,255,0.08)", color: colors.textDim, fontSize: 10 }}>
-                      {[prov, model].filter(Boolean).join(" · ")}
+                  ~{formatTokenCount(msgTokens)} tok
+                  {!isUser ? (
+                    <>
+                      <span style={{ opacity: 0.45 }}> · </span>
+                      {ctxPct}% ctx
+                    </>
+                  ) : null}
+                </span>
+                {!isUser && !stillTyping && msg.embeds?.length ? (
+                  <ChatEmbedFooter embeds={msg.embeds} colors={colors} />
+                ) : null}
+                {metaHover && (
+                  <div
+                    style={{
+                      position: "absolute",
+                      bottom: "calc(100% + 8px)",
+                      [isUser ? "right" : "left"]: 0,
+                      background: "rgba(12,12,14,0.96)",
+                      border: "1px solid rgba(255,255,255,0.14)",
+                      borderRadius: 8,
+                      padding: "9px 11px",
+                      zIndex: 50,
+                      boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+                      backdropFilter: "blur(12px)",
+                      fontSize: 11,
+                      color: colors.text,
+                      lineHeight: 1.55,
+                      minWidth: 168,
+                      letterSpacing: "0.02em",
+                      textAlign: "left",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    <div style={{ fontWeight: 700, color: "#fff", marginBottom: 4, letterSpacing: "-0.02em" }}>
+                      {isUser ? "Message" : "Response"} usage
                     </div>
-                  )}
-                  <div style={{ marginTop: 4, fontSize: 9, color: "rgba(255,255,255,0.28)" }}>
-                    Estimates (chars ÷ 3.5)
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 18 }}>
+                      <span style={{ color: colors.textDim }}>This bubble</span>
+                      <span style={{ fontWeight: 600 }}>~{formatTokenCount(msgTokens)}</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 18 }}>
+                      <span style={{ color: colors.textDim }}>Context used</span>
+                      <span style={{ fontWeight: 600 }}>~{formatTokenCount(ctxUsed)}</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 18 }}>
+                      <span style={{ color: colors.textDim }}>Window</span>
+                      <span style={{ fontWeight: 600 }}>{formatTokenCount(ctxWindow)}</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 18 }}>
+                      <span style={{ color: colors.textDim }}>Fill</span>
+                      <span style={{ fontWeight: 600 }}>{ctxPct}%</span>
+                    </div>
+                    {(prov || model) && (
+                      <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(255,255,255,0.08)", color: colors.textDim, fontSize: 10 }}>
+                        {[prov, model].filter(Boolean).join(" · ")}
+                      </div>
+                    )}
+                    <div style={{ marginTop: 4, fontSize: 9, color: "rgba(255,255,255,0.28)" }}>
+                      Estimates (chars ÷ 3.5)
+                    </div>
                   </div>
-                </div>
-              )}
-            </div>
-          );
-        })()}
-
-        {/* sources · N · searched · M — below time/tokens, same meta style */}
-        {!isUser && !stillTyping && msg.embeds && msg.embeds.length > 0 ? (
-          <ChatEmbedFooter embeds={msg.embeds} colors={colors} />
-        ) : null}
+                )}
+              </div>
+            );
+          })()}
+        </div>
       </div>
     </motion.div>
   );
@@ -2334,10 +2554,15 @@ const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; con
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const el = containerRef.current?.closest(".chat-scroll");
-    if (el) {
-      const distFromBottom = el.scrollHeight - Math.ceil(el.scrollTop) - el.clientHeight;
-      if (distFromBottom <= 150) el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
+    const el = containerRef.current?.closest(".chat-scroll") as HTMLElement | null;
+    if (!el) return;
+    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    // Stay glued to the true bottom while tools/thinking update.
+    if (distFromBottom <= 240) {
+      el.scrollTop = el.scrollHeight;
+      requestAnimationFrame(() => {
+        el.scrollTop = el.scrollHeight;
+      });
     }
   }, [steps.map((s) => `${s.id}:${s.status}`).join("|"), anyRunning]);
 
@@ -2352,7 +2577,7 @@ const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; con
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0 }}
       transition={{ duration: 0.18, ease: "easeOut" }}
-      style={{ display: "flex", justifyContent: "flex-start", width: "100%", padding: "4px 0 8px" }}
+      style={{ display: "flex", justifyContent: "flex-start", width: "100%", padding: "2px 0 2px" }}
       ref={containerRef}
     >
       <div className="chat-flat" style={{ width: "100%", maxWidth: "100%", color: colors.textDim }}>
@@ -2474,7 +2699,7 @@ const ActivityCard: React.FC<{ item: ActivityItem }> = ({ item }) => {
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0 }}
       transition={{ duration: 0.18 }}
-      style={{ display: "flex", justifyContent: "flex-start", padding: "4px 0 8px", width: "100%" }}
+      style={{ display: "flex", justifyContent: "flex-start", padding: "1px 0 2px", width: "100%" }}
     >
       <div className="chat-flat" style={{ width: "100%", maxWidth: "100%" }}>
         <div
@@ -2531,6 +2756,19 @@ const ConfirmationCard: React.FC<ConfirmationCardProps> = ({
 }) => {
   const toolName = action?.tool || "unknown";
   const kwargs = action?.kwargs || {};
+  const safeArgumentEntries = Object.entries(kwargs).filter(([key]) =>
+    !/(content|text|message|password|token|secret|api[_-]?key|credential)/i.test(key)
+  );
+  const permissionForFlag = (flag: string) => {
+    const upper = String(flag || "").toUpperCase();
+    if (upper === "ENABLE_SYSTEM_ACTIONS") return "system_actions";
+    if (upper === "ALLOW_FILE_WRITE") return "file_write";
+    if (upper === "ALLOW_TERMINAL_COMMANDS") return "terminal";
+    if (upper === "ALLOW_DESKTOP_AUTOMATION") return "desktop";
+    if (upper === "ALLOW_PLAYWRIGHT") return "playwright";
+    return upper.toLowerCase();
+  };
+  const missingPolicyFlags = policyFlags.filter((flag) => sessionPermissions[permissionForFlag(flag)] === false);
 
   const riskLabels: Record<string, string> = {
     safe: "Safe",
@@ -2600,7 +2838,7 @@ const ConfirmationCard: React.FC<ConfirmationCardProps> = ({
 
         {/* Action details */}
         <div style={{ fontSize: 12.5, lineHeight: 1.6, color: colors.textDim, marginBottom: 10 }}>
-          {Object.entries(kwargs).map(([key, value]) => (
+          {safeArgumentEntries.map(([key, value]) => (
             <div key={key} style={{ marginBottom: 4 }}>
               <span style={{ color: colors.text, fontWeight: 500 }}>{key}:</span>{" "}
               <span style={{ wordBreak: "break-word" }}>
@@ -2618,6 +2856,11 @@ const ConfirmationCard: React.FC<ConfirmationCardProps> = ({
             Requires: {policyFlags.join(", ")}
           </div>
         )}
+        {missingPolicyFlags.length > 0 ? (
+          <div style={{ fontSize: 10.5, color: "#f59e0b", marginBottom: 10 }}>
+            Configuration required: {missingPolicyFlags.join(", ")}. This is an EchoSpeak policy block, not a detected Windows administrator or signature failure.
+          </div>
+        ) : null}
 
         {/* Session permissions */}
         <div style={{
@@ -2646,6 +2889,7 @@ const ConfirmationCard: React.FC<ConfirmationCardProps> = ({
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <button
             onClick={onConfirm}
+            disabled={missingPolicyFlags.length > 0}
             style={{
               flex: 1,
               padding: "8px 16px",
@@ -2803,14 +3047,7 @@ export const Dashboard: React.FC = () => {
   }, []);
 
   const [input, setInput] = useState("");
-  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>(() => {
-    try {
-      const raw = localStorage.getItem("echospeak_workspace_mode") || "auto";
-      return (workspaceModes.includes(raw as any) ? (raw as WorkspaceMode) : "auto");
-    } catch {
-      return "auto";
-    }
-  });
+  const workspaceMode = "auto";
   const [activities, setActivities] = useState<ActivityItem[]>([]);
   const [taskPlans, setTaskPlans] = useState<TaskPlanEntry[]>([]);
   const activeTaskPlanIdRef = useRef<string | null>(null);
@@ -2832,14 +3069,20 @@ export const Dashboard: React.FC = () => {
   const activeGroupButtonRef = useRef<HTMLButtonElement | null>(null);
   const activeGroupMenuRef = useRef<HTMLDivElement | null>(null);
   const [activeGroupPos, setActiveGroupPos] = useState<{ top: number; left: number } | null>(null);
-  const [showVisualizer, setShowVisualizer] = useState<boolean>(true);
+  const [showVisualizer, setShowVisualizer] = useState<boolean>(() => loadRuntimeLayout(typeof window !== "undefined" ? window.localStorage : null).visualizerVisible);
+  const [showSidebar, setShowSidebar] = useState<boolean>(() => loadRuntimeLayout(typeof window !== "undefined" ? window.localStorage : null).sidebarVisible);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => loadRuntimeLayout(typeof window !== "undefined" ? window.localStorage : null).sidebarCollapsed);
+  const [visualizerDensity] = useState<"calm" | "normal" | "dense">(() => loadRuntimeLayout(typeof window !== "undefined" ? window.localStorage : null).visualizerDensity);
+  const [narrowLayout, setNarrowLayout] = useState<boolean>(() => typeof window !== "undefined" && window.innerWidth < 900);
   const [agentMode, setAgentMode] = useState<"idle" | "research" | "coding" | "working" | "thinking">("idle");
   const [agentActivity, dispatchActivity] = useReducer(agentActivityReducer, undefined, initialAgentActivity);
   const [visualizerPin, setVisualizerPin] = useState<null | "ring" | "research" | "coding" | "tasks">(null);
   const [liveReplyDraft, setLiveReplyDraft] = useState("");
   const liveReplyDraftRef = useRef("");
   const [codeSessions, setCodeSessions] = useState<CodeDiffSession[]>([]);
-  const [activeCodeTab, setActiveCodeTab] = useState<number>(0);
+  const [liveTerminal, setLiveTerminal] = useState<LiveTerminalEntry[]>([]);
+  const [liveFileChanges, setLiveFileChanges] = useState<LiveFileChange[]>([]);
+  const [codeRefreshToken, setCodeRefreshToken] = useState(0);
   const [avatarConfig, setAvatarConfig] = useState<AvatarConfig>(defaultAvatarConfig);
   const [memoryItems, setMemoryItems] = useState<MemoryItem[]>([]);
   const [memoryCount, setMemoryCount] = useState<number>(0);
@@ -2872,28 +3115,19 @@ export const Dashboard: React.FC = () => {
   const [selectedMemoryIds, setSelectedMemoryIds] = useState<string[]>([]);
   const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null);
   const [editingMemoryText, setEditingMemoryText] = useState<string>("");
-  const [projects, setProjects] = useState<{ id: string; name: string; description?: string; context_prompt?: string; tags?: string[] }[]>([]);
+  const [projects, setProjects] = useState<{
+    id: string; name: string; description?: string; context_prompt?: string; tags?: string[];
+    workspace_root?: string; archived?: boolean; git_metadata?: Record<string, any>;
+  }[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string>("");
+  const [folderDropActive, setFolderDropActive] = useState(false);
   const [projectsLoading, setProjectsLoading] = useState<boolean>(false);
   const [threadState, setThreadState] = useState<ThreadSessionState | null>(null);
   const [pendingApproval, setPendingApproval] = useState<PendingActionEnvelope | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRecord[]>([]);
   const [approvalsLoading, setApprovalsLoading] = useState<boolean>(false);
+  const [approvalDecisionBusy, setApprovalDecisionBusy] = useState<boolean>(false);
   const [executions, setExecutions] = useState<ExecutionRecord[]>([]);
-  const activeCodeSession = useMemo(() => {
-    const base = codeSessions[activeCodeTab];
-    if (!base) return null;
-    const pendingPath = String(pendingApproval?.action?.kwargs?.path || "");
-    const isPendingSave = Boolean(
-      pendingApproval?.has_pending
-      && pendingApproval?.action?.tool === "file_write"
-      && pendingPath === base.filename,
-    );
-    return {
-      ...base,
-      pendingConfirmation: isPendingSave,
-    };
-  }, [activeCodeTab, codeSessions, pendingApproval]);
   const [executionsLoading, setExecutionsLoading] = useState<boolean>(false);
   const [selectedTrace, setSelectedTrace] = useState<Record<string, any> | null>(null);
   const [selectedTraceId, setSelectedTraceId] = useState<string>("");
@@ -2903,32 +3137,16 @@ export const Dashboard: React.FC = () => {
   const [routines, setRoutines] = useState<{ id: string; name: string; description?: string; enabled: boolean; trigger_type: string; schedule?: string; webhook_path?: string; action_type: string; action_config: Record<string, any>; last_run?: string; next_run?: string; run_count: number }[]>([]);
   const [routinesLoading, setRoutinesLoading] = useState<boolean>(false);
 
-  const [threads, setThreads] = useState<{ id: string; name: string; at: number }[]>([]);
+  const [threads, setThreads] = useState<{ id: string; name: string; at: number; projectId?: string; messageCount?: number }[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string>("");
+  const activeThreadIdRef = useRef<string>("");
+  const activeStreamAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem("echospeak.threads");
-      let list = saved ? JSON.parse(saved) : [];
-      if (!Array.isArray(list) || list.length === 0) {
-        const defaultId = localStorage.getItem("echospeak.thread_id") || crypto.randomUUID();
-        list = [{ id: defaultId, name: "Default Session", at: Date.now() }];
-      }
-      setThreads(list);
-      const lastActive = localStorage.getItem("echospeak.active_thread_id") || list[0].id;
-      setActiveThreadId(lastActive);
-    } catch (e) {
-      const defaultId = crypto.randomUUID();
-      setThreads([{ id: defaultId, name: "Default Session", at: Date.now() }]);
-      setActiveThreadId(defaultId);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (threads.length > 0) {
-      localStorage.setItem("echospeak.threads", JSON.stringify(threads));
-    }
-  }, [threads]);
+    activeThreadIdRef.current = activeThreadId;
+    activeStreamAbortRef.current?.abort();
+    activeStreamAbortRef.current = null;
+  }, [activeThreadId]);
 
   useEffect(() => {
     if (activeThreadId) {
@@ -2943,29 +3161,235 @@ export const Dashboard: React.FC = () => {
     }
   }, [activeThreadId]);
 
+  /**
+   * Reconstruct the completed chat timeline from durable Session → Turn records.
+   * Never parse assistant prose for tools/sources; never restart live stream chrome.
+   */
   const loadHistory = async (threadId: string) => {
     try {
       const tid = encodeURIComponent(String(threadId || "").trim());
-      const resp = await fetchWithTimeout(`${apiBase}/history?thread_id=${tid}`, undefined, 8000);
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data && data.history && Array.isArray(data.history)) {
-          // Parse the string representations back into structured UI messages if possible
-          // The backend returns a list of strings for /history. We will map them to basic chat bubbles.
-          const loadedMsgs = data.history.map((h: string, i: number) => {
+      const resp = await fetchWithTimeout(`${apiBase}/history?thread_id=${tid}`, undefined, 12000);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (activeThreadIdRef.current !== threadId) return;
+
+      const turns: any[] = Array.isArray(data?.turns) ? data.turns : [];
+      if (turns.length > 0) {
+        const loadedMsgs: Message[] = [];
+        const loadedActs: ActivityItem[] = [];
+        const hydratedResearch: ResearchRun[] = [];
+        const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
+
+        for (const turn of turns) {
+          const executionId = String(turn.execution_id || turn.execution?.id || "").trim();
+          const turnStatus = String(turn.progress_status || turn.terminal_status || turn.status || "complete");
+          const turnOpen = ["running", "in_progress", "started", "interrupted"].includes(
+            String(turn.status || "").toLowerCase()
+          ) || turnStatus === "interrupted";
+          const baseAt = Number(turn.created_at || 0) * 1000 || Date.now();
+          const doneAt = Number(turn.completed_at || turn.created_at || 0) * 1000 || baseAt + 1;
+
+          // User + assistant messages (durable items / execution fallback)
+          for (const msg of Array.isArray(turn.messages) ? turn.messages : []) {
+            const role = String(msg.role || "").toLowerCase() === "user" ? "user" : "assistant";
+            const text = String(msg.text || "").trim();
+            if (!text) continue;
+            const atMs = Number(msg.at || 0) * 1000 || (role === "user" ? baseAt : doneAt);
+            const msgId = `hist-${executionId || "x"}-${role}-${msg.item_id || loadedMsgs.length}`;
+            if (loadedMsgs.some((m) => m.id === msgId || (m.executionId === executionId && m.role === role && m.text === text))) {
+              continue;
+            }
+            const researchRuns: ResearchRun[] = [];
+            if (role === "assistant" && Array.isArray(turn.research_runs)) {
+              for (const raw of turn.research_runs) {
+                const normalized = normalizeResearchRun(raw);
+                if (normalized) researchRuns.push(normalized);
+              }
+            }
+            const embeds =
+              role === "assistant" && researchRuns.length
+                ? buildChatEmbeds({
+                    answerText: text,
+                    researchRuns,
+                    searchQueries: researchRuns.map((r) => r.query).filter(Boolean),
+                  })
+                : undefined;
+            const renderPlan =
+              role === "assistant"
+                ? buildResponseRenderPlan({
+                    answerText: text,
+                    researchRuns,
+                    searchQueries: researchRuns.map((r) => r.query).filter(Boolean),
+                  })
+                : undefined;
+            for (const r of researchRuns) {
+              if (!hydratedResearch.some((h) => h.id === r.id)) hydratedResearch.push(r);
+            }
+            // Turn-scoped progress only — never attach full Session action lists
+            // (that painted Pokémon research under a prior "whats up" chat Turn).
+            const turnScopedState: OperationalThreadState = {
+              mode: String(turn.execution?.mode || "chat"),
+              phase: String(turn.execution?.phase || ""),
+              execution_status: turnStatus === "interrupted" ? "in_progress" : String(turnStatus || "complete"),
+              current_execution_id: executionId,
+              last_execution_id: executionId,
+              terminal_status: String(turn.terminal_status || turnStatus),
+              safest_next_action:
+                turnStatus && !["complete", "completed", "ready", ""].includes(String(turnStatus))
+                  ? String(turn.verification?.next_action || turn.progress?.status || "")
+                  : "",
+              completed_actions: [],
+              failed_actions: [],
+              pending_actions: [],
+              plan_steps: [],
+              operation_details: {
+                tools: (Array.isArray(turn.tool_runs) ? turn.tool_runs : [])
+                  .filter((r: any) => {
+                    const st = String(r.status || "").toLowerCase();
+                    return !["cancelled", "canceled", "interrupted"].includes(st);
+                  })
+                  .map((r: any) => String(r.tool_name || ""))
+                  .filter(Boolean),
+              },
+            } as OperationalThreadState;
+            loadedMsgs.push({
+              id: msgId,
+              role,
+              text,
+              at: atMs,
+              skipTypewriter: true,
+              streamBeat: role === "assistant" ? "final" : undefined,
+              executionId: executionId || undefined,
+              clientRequestId: String(turn.request_id || turn.execution?.request_id || "") || undefined,
+              embeds: embeds?.length ? embeds : undefined,
+              renderPlan,
+              operation:
+                role === "assistant"
+                  ? {
+                      state: turnScopedState,
+                      success:
+                        turn.success !== false &&
+                        !["failed", "blocked", "cancelled"].includes(String(turnStatus)),
+                      executionId: executionId || undefined,
+                    }
+                  : undefined,
+              usage: buildMessageUsage(text, loadedMsgs, ctxWindow, {
+                provider: providerInfo?.provider,
+                model: providerInfo?.model,
+              }),
+            });
+          }
+
+          // ToolRuns — exact IDs, completed/failed only (never live spinners after refresh)
+          const runs = Array.isArray(turn.tool_runs) ? turn.tool_runs : [];
+          for (const run of runs) {
+            const runId = String(run.id || "").trim();
+            const toolName = String(run.tool_name || "tool").trim();
+            if (!runId || SILENT_CHAT_TOOLS.has(toolName)) continue;
+            if (loadedActs.some((a) => a.kind === "tool" && a.id === runId)) continue;
+            const args = run.canonical_arguments || {};
+            const inputPreview = previewToolInput(
+              toolName,
+              typeof args === "object" ? JSON.stringify(args) : String(args || "")
+            );
+            const st = String(run.status || "").toLowerCase();
+            const outcome = run.outcome || {};
+            const outcomeOk = outcome.success === true || st === "complete" || st === "success";
+            const outcomeFail =
+              outcome.success === false ||
+              st === "failed" ||
+              st === "error" ||
+              Boolean(outcome.error_message) ||
+              Boolean(outcome.policy_block);
+            let uiStatus: "running" | "done" | "error" = "done";
+            if (outcomeFail) uiStatus = "error";
+            else if (outcomeOk) uiStatus = "done";
+            else if (st === "started" || st === "pending" || st === "running") {
+              // Interrupted mid-run after browser refresh — show as failed/interrupted, not live.
+              uiStatus = turnOpen ? "error" : "done";
+            }
+            const outText =
+              String(outcome.output || outcome.error_message || outcome.error_code || "").trim() ||
+              (uiStatus === "error" && turnOpen ? "Interrupted (page refresh or disconnect)" : "");
+            // Place tools strictly inside this Turn's time window so they never
+            // sort under a previous casual-chat assistant message.
+            const atMs = Math.min(
+              Math.max(Number(run.created_at || 0) * 1000 || baseAt + 10, baseAt + 1),
+              Math.max(doneAt - 1, baseAt + 2)
+            );
+            // Skip pure wrapper fan-out shells — children are the canonical rows.
+            if (
+              toolName === "web_search" &&
+              (String(outText || "").startsWith("(expanded to") ||
+                String(outText || "").startsWith("(superseded by canonical"))
+            ) {
+              continue;
+            }
+            // Hydration: one user-facing web_search row per ToolRun id (already unique).
+            // Skip cancelled/wrapper statuses that slipped past earlier filters.
+            if (toolName === "web_search" && ["cancelled", "canceled"].includes(st)) {
+              continue;
+            }
+            loadedActs.push({
+              kind: "tool",
+              id: runId,
+              name: toolName,
+              input: inputPreview,
+              status: uiStatus,
+              output: outText ? outText.slice(0, 1500) : undefined,
+              at: atMs,
+            });
+          }
+
+          // Durable verification / denial errors as activity rows under the Turn timestamps
+          if (turn.error && String(turn.error).trim()) {
+            const errId = `hist-err-${executionId}`;
+            if (!loadedActs.some((a) => a.id === errId)) {
+              loadedActs.push({
+                kind: "error",
+                id: errId,
+                message: String(turn.error).trim().slice(0, 800),
+                at: doneAt,
+              });
+            }
+          }
+        }
+
+        // Replace — never append (idempotent refresh / session switch)
+        useAppStore.setState({ messages: loadedMsgs });
+        setActivities(loadedActs);
+        // Historical research for Studio panel; chat embeds already on assistant messages.
+        if (hydratedResearch.length) {
+          replaceResearchRuns(hydratedResearch);
+        } else {
+          clearResearchRuns();
+        }
+        // Never resume live stream chrome from history.
+        setAgentMode("idle");
+        setEchoReaction(null);
+        dispatchActivity({ type: "reset" });
+        return;
+      }
+
+      // Legacy fallback: string-only history
+      if (data && data.history && Array.isArray(data.history)) {
+        const loadedMsgs = data.history
+          .map((h: string, i: number) => {
             const isUser = h.startsWith("Human:");
             const text = h.replace(/^(Human:|Assistant:)\s*/, "").trim();
             return {
-              id: `hist-${Date.now()}-${i}`,
-              role: isUser ? "user" : "assistant",
-              text: text,
-              at: Date.now() - (data.history.length - i) * 1000
+              id: `hist-legacy-${threadId}-${i}`,
+              role: (isUser ? "user" : "assistant") as Role,
+              text,
+              at: Date.now() - (data.history.length - i) * 1000,
+              skipTypewriter: true,
             };
-          }).filter((m: any) => m.text);
-          if (loadedMsgs.length > 0) {
-            useAppStore.setState({ messages: loadedMsgs });
-          }
-        }
+          })
+          .filter((m: Message) => m.text);
+        useAppStore.setState({ messages: loadedMsgs });
+        setActivities([]);
+        clearResearchRuns();
+        setAgentMode("idle");
       }
     } catch (e) {
       console.error("Failed to load history:", e);
@@ -2986,39 +3410,33 @@ export const Dashboard: React.FC = () => {
     refreshProjects();
   }, []);
 
-  useEffect(() => {
-    const latestFilename = latestCodeFilenameRef.current;
-    if (latestFilename) {
-      const nextIndex = codeSessions.findIndex((session) => session.filename === latestFilename);
-      latestCodeFilenameRef.current = null;
-      if (nextIndex >= 0 && nextIndex !== activeCodeTab) {
-        setActiveCodeTab(nextIndex);
-        return;
-      }
-    }
-    if (codeSessions.length === 0 && activeCodeTab !== 0) {
-      setActiveCodeTab(0);
-      return;
-    }
-    if (activeCodeTab >= codeSessions.length && codeSessions.length > 0) {
-      setActiveCodeTab(codeSessions.length - 1);
-    }
-  }, [activeCodeTab, codeSessions]);
-
   const refreshThreads = async () => {
     try {
       const resp = await fetchWithTimeout(`${apiBase}/threads?limit=50`, undefined, 6000);
       if (!resp.ok) throw new Error(`Threads failed (${resp.status})`);
       const data = await resp.json();
       const items = Array.isArray(data) ? data : [];
+      let retainedEmptyPlaceholder = false;
       const mapped = items.map((item: any) => ({
         id: String(item.thread_id || item.id || ""),
         name: String(item.title || item.name || "Session"),
         at: normalizeTimestampMs(item.last_active_at || item.created_at || Date.now()),
-      })).filter((item: any) => item.id);
+        projectId: String(item.project_id || ""),
+        messageCount: Number(item.message_count || 0),
+      })).filter((item: any) => {
+        if (!item.id) return false;
+        const placeholder = item.messageCount === 0 && /^(?:new|default)?\s*(?:session|thread)(?:\s+\d+)?$/i.test(item.name.trim());
+        if (!placeholder) return true;
+        if (retainedEmptyPlaceholder) return false;
+        retainedEmptyPlaceholder = true;
+        item.name = "New Session";
+        return true;
+      });
       if (mapped.length) {
         setThreads(mapped);
-        setActiveThreadId((current) => current || mapped[0].id);
+        setActiveThreadId((current) => mapped.some((item: any) => item.id === current) ? current : mapped[0].id);
+      } else {
+        await createNewThread();
       }
     } catch (e) {
       console.error("Failed to refresh threads:", e);
@@ -3031,6 +3449,7 @@ export const Dashboard: React.FC = () => {
       const resp = await fetchWithTimeout(`${apiBase}/threads/${encodeURIComponent(threadId)}/state`, undefined, 5000);
       if (!resp.ok) throw new Error(`Thread state failed (${resp.status})`);
       const data = (await resp.json()) as ThreadSessionState;
+      if (activeThreadIdRef.current !== threadId) return data;
       setThreadState(data);
       setActiveProjectId(String(data.active_project_id || ""));
       setLatestExecutionId(String(data.last_execution_id || ""));
@@ -3048,11 +3467,58 @@ export const Dashboard: React.FC = () => {
       const resp = await fetchWithTimeout(`${apiBase}/pending-action?thread_id=${encodeURIComponent(threadId)}`, undefined, 5000);
       if (!resp.ok) throw new Error(`Pending action failed (${resp.status})`);
       const data = (await resp.json()) as PendingActionEnvelope;
+      if (activeThreadIdRef.current !== threadId) return data;
       setPendingApproval(data);
       return data;
     } catch (e) {
       console.error("Failed to refresh pending approval:", e);
       return null;
+    }
+  };
+
+  const decideApproval = async (approvalId: string, decision: "confirm" | "cancel") => {
+    if (!approvalId || approvalDecisionBusy) return;
+    setApprovalDecisionBusy(true);
+    try {
+      const resp = await fetchWithTimeout(`${apiBase}/approvals/${encodeURIComponent(approvalId)}/${decision}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      }, 30000);
+      if (!resp.ok) {
+        const detail = await resp.text().catch(() => "");
+        throw new Error(resp.status === 409 ? "That approval is stale; nothing was executed." : `Approval failed (${resp.status}): ${detail}`);
+      }
+      const data = (await resp.json()) as ApprovalDecisionEnvelope;
+      if (data.thread_state) {
+        setThreadState(data.thread_state);
+        setLatestExecutionId(String(data.execution_id || data.thread_state.last_execution_id || ""));
+      }
+      setPendingApproval(null);
+      if (data.response) {
+        addMessage({
+          id: crypto.randomUUID(),
+          role: "assistant",
+          text: data.response,
+          at: Date.now(),
+          skipTypewriter: true,
+          operation: data.thread_state ? {
+            state: data.thread_state,
+            success: Boolean(data.success),
+            executionId: data.execution_id || undefined,
+          } : undefined,
+        });
+      }
+      setEchoReaction(data.success ? "success" : "error");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setEchoReaction("error");
+      addMessage({ id: crypto.randomUUID(), role: "assistant", text: message, at: Date.now(), skipTypewriter: true });
+    } finally {
+      setApprovalDecisionBusy(false);
+      await refreshThreadState(activeThreadId);
+      await refreshPendingApproval(activeThreadId);
+      await refreshApprovals(activeThreadId);
+      await refreshExecutions(activeThreadId);
     }
   };
 
@@ -3063,6 +3529,7 @@ export const Dashboard: React.FC = () => {
       const resp = await fetchWithTimeout(`${apiBase}/approvals?thread_id=${encodeURIComponent(threadId)}&limit=25`, undefined, 6000);
       if (!resp.ok) throw new Error(`Approvals failed (${resp.status})`);
       const data = (await resp.json()) as ApprovalListResponse;
+      if (activeThreadIdRef.current !== threadId) return;
       setApprovals(Array.isArray(data.items) ? data.items : []);
     } catch (e) {
       console.error("Failed to refresh approvals:", e);
@@ -3078,6 +3545,7 @@ export const Dashboard: React.FC = () => {
       const resp = await fetchWithTimeout(`${apiBase}/executions?thread_id=${encodeURIComponent(threadId)}&limit=25`, undefined, 6000);
       if (!resp.ok) throw new Error(`Executions failed (${resp.status})`);
       const data = (await resp.json()) as ExecutionListResponse;
+      if (activeThreadIdRef.current !== threadId) return;
       setExecutions(Array.isArray(data.items) ? data.items : []);
     } catch (e) {
       console.error("Failed to refresh executions:", e);
@@ -3116,16 +3584,20 @@ export const Dashboard: React.FC = () => {
     }
   };
 
-  const createNewThread = async () => {
+  const createNewThread = async (projectId: string = "") => {
     try {
       const resp = await fetch(`${apiBase}/threads`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: `Session ${threads.length + 1}`, source: "web", workspace_id: workspaceMode === "auto" ? "" : workspaceMode }),
+        body: JSON.stringify({ title: "New Session", source: "web", project_id: projectId }),
       });
       if (!resp.ok) throw new Error(`Create thread failed (${resp.status})`);
       const data = await resp.json();
-      const nextThread = { id: String(data.thread_id), name: String(data.title || `Session ${threads.length + 1}`), at: normalizeTimestampMs(data.last_active_at || data.created_at || Date.now()) };
+      const nextThread = { id: String(data.thread_id), name: String(data.title || "New Session"), at: normalizeTimestampMs(data.last_active_at || data.created_at || Date.now()), projectId: String(data.project_id || projectId || "") };
+      // Abort previous Session stream before swapping UI state.
+      activeStreamAbortRef.current?.abort();
+      activeStreamAbortRef.current = null;
+      activeThreadIdRef.current = nextThread.id;
       setThreads((prev) => [nextThread, ...prev.filter((item) => item.id !== nextThread.id)]);
       setActiveThreadId(nextThread.id);
       useAppStore.setState({ messages: [] });
@@ -3135,11 +3607,19 @@ export const Dashboard: React.FC = () => {
       clearResearchRuns();
       latestCodeFilenameRef.current = null;
       setCodeSessions([]);
-      setActiveCodeTab(0);
+      setLiveTerminal([]);
+      setLiveFileChanges([]);
+      setCodeRefreshToken((n) => n + 1);
       setPendingApproval(null);
       setApprovals([]);
       setExecutions([]);
       setSelectedTrace(null);
+      dispatchActivity({ type: "reset" });
+      setStreaming(false);
+      liveReplyDraftRef.current = "";
+      setLiveReplyDraft("");
+      setDocSources([]);
+      toolInfoRef.current = {};
     } catch (e) {
       console.error("Failed to create thread:", e);
     }
@@ -3147,7 +3627,17 @@ export const Dashboard: React.FC = () => {
 
   const switchThread = (id: string) => {
     if (id === activeThreadId) return;
+    // Abort synchronously BEFORE clearing UI so late NDJSON cannot repaint the new Session.
+    activeStreamAbortRef.current?.abort();
+    activeStreamAbortRef.current = null;
+    activeThreadIdRef.current = id;
     setActiveThreadId(id);
+    dispatchActivity({ type: "reset" });
+    setStreaming(false);
+    liveReplyDraftRef.current = "";
+    setLiveReplyDraft("");
+    setDocSources([]);
+    toolInfoRef.current = {};
     // In a real app, we might fetch history from backend here.
     // For now, we'll clear local state to start fresh in the new context.
     useAppStore.setState({ messages: [] });
@@ -3157,7 +3647,9 @@ export const Dashboard: React.FC = () => {
     clearResearchRuns();
     latestCodeFilenameRef.current = null;
     setCodeSessions([]);
-    setActiveCodeTab(0);
+    setLiveTerminal([]);
+    setLiveFileChanges([]);
+    setCodeRefreshToken((n) => n + 1);
     setPendingApproval(null);
     setApprovals([]);
     setExecutions([]);
@@ -3172,19 +3664,59 @@ export const Dashboard: React.FC = () => {
     });
   };
 
-  const deleteThread = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (threads.length <= 1) return;
+  const deleteThread = async (id: string) => {
     try {
-      await fetch(`${apiBase}/threads/${encodeURIComponent(id)}`, { method: "DELETE" });
+      const response = await fetch(`${apiBase}/threads/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!response.ok) throw new Error(`Delete Session failed (${response.status})`);
     } catch (e2) {
       console.error("Failed to delete thread:", e2);
     }
     const nextThreads = threads.filter((t) => t.id !== id);
     setThreads(nextThreads);
-    if (id === activeThreadId && nextThreads[0]) {
-      switchThread(nextThreads[0].id);
+    if (id === activeThreadId) {
+      if (nextThreads[0]) switchThread(nextThreads[0].id);
+      else await createNewThread();
     }
+  };
+
+  const attachFolder = async (candidatePath: string = "") => {
+    let path = candidatePath.trim();
+    if (!path) {
+      try {
+        const picker = await fetch(`${apiBase}/projects/pick-folder`, { method: "POST" });
+        if (picker.ok) path = String((await picker.json()).path || "");
+      } catch { /* native picker may not be available outside the desktop host */ }
+    }
+    if (!path) return;
+    const response = await fetch(`${apiBase}/projects/attach-folder`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, session_id: activeThreadId, trust_state: "trusted" }),
+    });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || "Could not attach folder");
+    const project = await response.json();
+    await refreshProjects();
+    setActiveProjectId(String(project.id || ""));
+    setThreads(items => items.map(item => item.id === activeThreadId ? { ...item, projectId: String(project.id || "") } : item));
+    await refreshThreadState(activeThreadId);
+  };
+
+  const folderPathFromDrop = (event: React.DragEvent): string => {
+    const file = event.dataTransfer.files?.[0] as (File & { path?: string }) | undefined;
+    if (file?.path) return file.path;
+    const uri = event.dataTransfer.getData("text/uri-list").split(/\r?\n/).find(line => line && !line.startsWith("#")) || "";
+    const plain = event.dataTransfer.getData("text/plain").trim();
+    const value = uri || plain;
+    if (/^file:\/\//i.test(value)) {
+      try { return decodeURIComponent(new URL(value).pathname).replace(/^\/(?:([A-Za-z]:))/, "$1"); } catch { return ""; }
+    }
+    return /^[A-Za-z]:[\\/]/.test(value) ? value : "";
+  };
+
+  const renameThread = async (id: string, title: string) => {
+    const response = await fetch(`${apiBase}/threads/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title }) });
+    if (!response.ok) return;
+    const data = await response.json();
+    setThreads(items => items.map(item => item.id === id ? { ...item, name: String(data.title || title) } : item));
   };
 
   const docInputRef = useRef<HTMLInputElement | null>(null);
@@ -3253,6 +3785,9 @@ export const Dashboard: React.FC = () => {
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
+  /** Ignore scroll events caused by our own pin-to-bottom so we never unstick mid-update. */
+  const programmaticScrollRef = useRef(false);
+  const pinBottomRafRef = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
@@ -3420,7 +3955,6 @@ export const Dashboard: React.FC = () => {
       setSettingsSavedAt(Date.now());
       await refreshProviderInfo();
       await refreshServices();
-      addMessage({ id: crypto.randomUUID(), role: "assistant", text: "Settings saved.", at: Date.now() });
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e));
       setSettingsError(err.message || String(e));
@@ -3470,7 +4004,7 @@ export const Dashboard: React.FC = () => {
     );
   };
 
-  const runSettingsTest = async (target: "openai" | "gemini" | "tavily" | "local" | "ollama") => {
+  const runSettingsTest = async (target: "openai" | "gemini" | "local" | "ollama") => {
     setSettingsTesting((m) => ({ ...m, [target]: true }));
     try {
       const payload: any = { target };
@@ -3480,9 +4014,6 @@ export const Dashboard: React.FC = () => {
       } else if (target === "gemini") {
         payload.api_key = String(settingsDraft?.gemini?.api_key || "") === "***" ? "" : String(settingsDraft?.gemini?.api_key || "");
         setSettingsTestedKeys((m) => ({ ...m, gemini: payload.api_key }));
-      } else if (target === "tavily") {
-        payload.api_key = String(settingsDraft?.tavily_api_key || "") === "***" ? "" : String(settingsDraft?.tavily_api_key || "");
-        setSettingsTestedKeys((m) => ({ ...m, tavily: payload.api_key }));
       } else {
         payload.provider = String(settingsDraft?.local?.provider || providerDraft.provider || "");
         payload.base_url = String(settingsDraft?.local?.base_url || providerDraft.base_url || "");
@@ -3731,7 +4262,21 @@ export const Dashboard: React.FC = () => {
     }
   };
 
+  /**
+   * ONE plan for the current turn only — sticky under tools/thinking.
+   * Never inject historical task_plan rows into the timeline (that pinned
+   * checklists high above the current conversation).
+   */
+  const liveTaskPlan = useMemo(() => {
+    if (!taskPlans.length) return null;
+    // Always the latest plan only (one checklist, current turn).
+    const latest = taskPlans[taskPlans.length - 1];
+    if (!latest?.plan?.tasks?.length) return null;
+    return latest;
+  }, [taskPlans]);
+
   const timeline = useMemo<TimelineItem[]>(() => {
+    // Plans are NOT merged into history — only messages + activity cards.
     const merged: TimelineItem[] = [
       ...messages.map(
         (m): TimelineItem => ({
@@ -3749,20 +4294,12 @@ export const Dashboard: React.FC = () => {
           item: a,
         })
       ),
-      ...taskPlans.map(
-        (entry): TimelineItem => ({
-          kind: "task_plan",
-          id: entry.id,
-          at: entry.at,
-          entry,
-        })
-      ),
     ];
     // Chronological with multi-beat contract:
     //   user → first spoken assistant beat (partial) → tool/search rows → final answer
-    // Only *partial* assistant messages (skipTypewriter) force above tools — not finals.
+    // Plan checklist is rendered separately under the stream (liveTaskPlan).
     const kindRank = (k: TimelineItem["kind"]) =>
-      k === "message" ? 0 : k === "task_plan" ? 1 : k === "activity" ? 2 : 3;
+      k === "message" ? 0 : k === "activity" ? 1 : 2;
     const isPartialBeat = (t: TimelineItem) => {
       if (t.kind !== "message") return false;
       const m = (t as Extract<TimelineItem, { kind: "message" }>).msg;
@@ -3791,63 +4328,127 @@ export const Dashboard: React.FC = () => {
       return kindRank(a.kind) - kindRank(b.kind);
     });
     return merged;
-  }, [messages, activities, taskPlans]);
+  }, [messages, activities]);
 
   const lastMsgLen = messages.length ? (messages[messages.length - 1]?.text || "").length : 0;
   const activityLen = activities.length;
   const taskPlanLen = taskPlans.reduce((sum, entry) => sum + entry.plan.tasks.length + entry.plan.reflections.length, 0);
 
-  const scrollChatToBottom = (behavior: ScrollBehavior = "smooth", force: boolean = false) => {
-    try {
-      if (!force && !stickToBottomRef.current) return;
-      const el = chatScrollRef.current;
-      if (el) el.scrollTo({ top: el.scrollHeight, behavior });
-    } catch {
-      // ignore
-    }
-  };
-
-  const onChatScroll = () => {
+  /**
+   * Pin chat fully to the latest content. Instant scroll only — smooth scrolling
+   * gets interrupted mid-animation when content keeps growing and leaves the view at ~90–98%.
+   */
+  const scrollChatToBottom = useCallback((force: boolean = false) => {
+    if (!force && !stickToBottomRef.current) return;
     const el = chatScrollRef.current;
     if (!el) return;
-    // Generous threshold to avoid un-sticking when large text blocks rapidly render
-    const threshold = 300;
-    const distFromBottom = el.scrollHeight - Math.ceil(el.scrollTop) - el.clientHeight;
-    stickToBottomRef.current = distFromBottom <= threshold;
+
+    const pin = () => {
+      programmaticScrollRef.current = true;
+      // Direct assignment is more reliable than scrollTo for max bottom.
+      el.scrollTop = el.scrollHeight;
+      // Bottom sentinel (if mounted) — catches residual subpixel / padding cases.
+      try {
+        chatBottomRef.current?.scrollIntoView({ block: "end", behavior: "auto" });
+      } catch {
+        // ignore
+      }
+      el.scrollTop = el.scrollHeight;
+    };
+
+    if (pinBottomRafRef.current) cancelAnimationFrame(pinBottomRafRef.current);
+    // Two frames: after React paint, then after layout (markdown / framer-motion / embeds).
+    pinBottomRafRef.current = requestAnimationFrame(() => {
+      pin();
+      pinBottomRafRef.current = requestAnimationFrame(() => {
+        pin();
+        // Clear flag after the browser has emitted the scroll event for our pin.
+        requestAnimationFrame(() => {
+          programmaticScrollRef.current = false;
+        });
+      });
+    });
+  }, []);
+
+  const onChatScroll = () => {
+    if (programmaticScrollRef.current) return;
+    const el = chatScrollRef.current;
+    if (!el) return;
+    // User is still "at bottom" if within a small slack of the true end.
+    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distFromBottom <= 48;
   };
 
   useEffect(() => {
-    // initial mount / tab switch
+    // initial mount / tab switch — always jump to latest
     if (leftTab === "chat") {
-      requestAnimationFrame(() => scrollChatToBottom("auto", true));
+      stickToBottomRef.current = true;
+      scrollChatToBottom(true);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [leftTab]);
+  }, [leftTab, scrollChatToBottom]);
 
-  useEffect(() => {
-    // new messages/activities/speech states should keep you pinned to bottom unless you scrolled up
+  // Re-pin whenever timeline / draft / tools grow, unless user scrolled up.
+  useLayoutEffect(() => {
     if (leftTab !== "chat") return;
-    
-    // Immediate/short delay scroll
-    const timerId1 = setTimeout(() => {
-      scrollChatToBottom(streaming || speaking ? "auto" : "smooth");
-    }, 50);
-    
-    // Safety fallback for longer Markdown rendering/layout times
-    const timerId2 = setTimeout(() => {
-      scrollChatToBottom(streaming || speaking ? "auto" : "smooth");
-    }, 150);
+    scrollChatToBottom(false);
+  }, [
+    leftTab,
+    timeline.length,
+    lastMsgLen,
+    activityLen,
+    taskPlanLen,
+    streaming,
+    speaking,
+    liveReplyDraft,
+    pendingApproval?.has_pending,
+    scrollChatToBottom,
+  ]);
+
+  // While streaming/speaking, content height keeps changing after effects run — keep pinned.
+  useEffect(() => {
+    if (leftTab !== "chat") return;
+    if (!streaming && !speaking) return;
+    const id = window.setInterval(() => {
+      if (stickToBottomRef.current) scrollChatToBottom(false);
+    }, 80);
+    return () => window.clearInterval(id);
+  }, [leftTab, streaming, speaking, scrollChatToBottom]);
+
+  // When message/tool nodes resize (markdown, embeds, ops card), stay at true bottom.
+  useEffect(() => {
+    const el = chatScrollRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+
+    const pinIfStuck = () => {
+      if (stickToBottomRef.current) scrollChatToBottom(false);
+    };
+
+    const ro = new ResizeObserver(() => pinIfStuck());
+    const observeChildren = () => {
+      ro.disconnect();
+      for (const child of Array.from(el.children)) ro.observe(child);
+    };
+    observeChildren();
+
+    const mo = new MutationObserver(() => {
+      observeChildren();
+      pinIfStuck();
+    });
+    mo.observe(el, { childList: true, subtree: true, characterData: true });
 
     return () => {
-      clearTimeout(timerId1);
-      clearTimeout(timerId2);
+      ro.disconnect();
+      mo.disconnect();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeline.length, lastMsgLen, activityLen, taskPlanLen, streaming, speaking]);
+  }, [scrollChatToBottom, leftTab]);
 
   const sendText = async (overrideText?: string) => {
     const raw = overrideText ?? input;
     if (!raw.trim()) return;
+    const streamThreadId = activeThreadId;
+    activeStreamAbortRef.current?.abort();
+    const streamController = new AbortController();
+    activeStreamAbortRef.current = streamController;
 
     stickToBottomRef.current = true; // force sticky to bottom when sending a message
     if (!overrideText) setInput("");
@@ -3886,7 +4487,11 @@ export const Dashboard: React.FC = () => {
     setUserIsTyping(false);
     if (userTypingTimerRef.current) clearTimeout(userTypingTimerRef.current);
     setDocSources([]);
+    // Turn-local research only — do not carry prior Session source cards into this answer.
+    // Global research panel history is still available in Studio; chat embeds use turnResearchRuns.
     activeTaskPlanIdRef.current = null;
+    // Fresh turn = fresh checklist only (no stacked plans from prior messages)
+    setTaskPlans([]);
     liveReplyDraftRef.current = "";
     setLiveReplyDraft("");
     dispatchActivity({ type: "stream_start" });
@@ -3898,6 +4503,8 @@ export const Dashboard: React.FC = () => {
     // (avatar can animate before the first tool/thinking event arrives).
     const runRequestId = crypto.randomUUID();
     const bootstrapStepId = `${runRequestId}:working`;
+    /** Backend Turn id once create_execution emits turn_bound / final. */
+    let durableTurnId = "";
     let finalHandled = false;
     /** Mid-turn spoken beats already committed (so final doesn't re-add them). */
     const partialReplies: string[] = [];
@@ -3908,34 +4515,63 @@ export const Dashboard: React.FC = () => {
     /** Research runs + queries this turn — feed chat embeds under the final bubble. */
     const turnResearchRuns: ResearchRun[] = [];
     const turnSearchQueries: string[] = [];
-    setActivities((prev) => [
-      ...prev,
-      {
-        kind: "thinking",
-        id: crypto.randomUUID(),
-        content: "thinking…",
-        at: Date.now(),
-        request_id: runRequestId,
-        steps: [
-          {
-            id: bootstrapStepId,
-            type: "tool",
-            content: "thinking…",
-            status: "running",
-            at: Date.now(),
-          },
-        ],
-      },
-    ]);
+    // Close any prior-Turn running chrome so B's tools never paint as A's open work.
+    setActivities((prev) => {
+      const closed = prev.map((a) => {
+        if (a.kind === "tool" && a.status === "running") {
+          return {
+            ...a,
+            status: "error" as const,
+            output: a.output || "Superseded by a new Turn",
+          };
+        }
+        if (a.kind === "thinking" && a.steps?.some((s) => s.status === "running")) {
+          return {
+            ...a,
+            steps: a.steps.map((s) =>
+              s.status === "running" ? { ...s, status: "done" as const } : s
+            ),
+          };
+        }
+        return a;
+      });
+      // Drop idle "thinking…" shells from prior turns (keep completed tool rows).
+      const pruned = closed.filter(
+        (a) =>
+          !(
+            a.kind === "thinking" &&
+            (!a.steps?.length || a.steps.every((s) => s.content === "thinking…" || s.status === "done"))
+          )
+      );
+      return [
+        ...pruned,
+        {
+          kind: "thinking" as const,
+          id: crypto.randomUUID(),
+          content: "thinking…",
+          at: Date.now(),
+          request_id: runRequestId,
+          steps: [
+            {
+              id: bootstrapStepId,
+              type: "tool" as const,
+              content: "thinking…",
+              status: "running" as const,
+              at: Date.now(),
+            },
+          ],
+        },
+      ];
+    });
     try {
       const resp = await fetch(`${apiBase}/query/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: streamController.signal,
         body: JSON.stringify({
           message: requestText,
           include_memory: true,
-          thread_id: activeThreadId,
-          workspace: workspaceMode,
+          thread_id: streamThreadId,
         }),
       });
       if (!resp.ok) {
@@ -3950,8 +4586,8 @@ export const Dashboard: React.FC = () => {
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      // Always pin this turn's activity to one id so we don't spawn duplicate thinking cards
-      // when the backend also sends its own request_id.
+      // Client turn key groups one thinking card. Backend request_id on events is preserved
+      // for durable ToolRun correlation in stream payloads but must not spawn extra cards.
       const eventRequestId = (_evt?: { request_id?: string }) => runRequestId;
       const markThinkingStep = (
         evt: { request_id?: string },
@@ -3971,33 +4607,7 @@ export const Dashboard: React.FC = () => {
               }
               return s;
             });
-            // Fallback: complete oldest running step of same tool/type when ids diverge
-            // (grounder multi-candidate + thinking_step use different ids).
-            if (!matched && (patch.status === "done" || patch.status === "failed")) {
-              const wantType = opts?.stepType;
-              const wantName = (opts?.toolName || "").toLowerCase();
-              let fallbackIdx = -1;
-              for (let i = 0; i < steps.length; i++) {
-                const s = steps[i];
-                if (s.status !== "running") continue;
-                if (wantType && s.type === wantType) {
-                  fallbackIdx = i;
-                  break;
-                }
-                if (wantName && s.content.toLowerCase().includes(wantName)) {
-                  fallbackIdx = i;
-                  break;
-                }
-              }
-              if (fallbackIdx < 0) {
-                // Last resort: first running step
-                fallbackIdx = steps.findIndex((s) => s.status === "running");
-              }
-              if (fallbackIdx >= 0) {
-                steps[fallbackIdx] = { ...steps[fallbackIdx], ...patch, id: steps[fallbackIdx].id };
-                matched = true;
-              }
-            }
+            // No name/type FIFO fallback — only exact ToolRun id may complete a row.
             if (!matched) return p;
             // Keep card under first partial beat if any.
             const nextAt = sawPartialBeat ? Math.max(p.at, toolsAfterPartialAt) : p.at;
@@ -4010,8 +4620,7 @@ export const Dashboard: React.FC = () => {
         const reqId = eventRequestId(evt);
         // Ignore raw thought dumps — they duplicate the bootstrap spinner and clutter chat.
         if (step.type === "thought") {
-          const short = String(step.content || "").trim().slice(0, 80);
-          if (!short) return;
+          const short = "Working";
           setActivities((prev) =>
             prev.map((p) => {
               if (p.kind !== "thinking" || p.request_id !== reqId) return p;
@@ -4036,19 +4645,35 @@ export const Dashboard: React.FC = () => {
             );
             // Also drop post-partial placeholder once real tool/search steps land.
             prevSteps = prevSteps.filter((s) => s.id !== `${reqId}:post-partial-working`);
-            // Upsert by id so tool_end can complete the same row.
+            // Upsert by exact ToolRun id only — never complete a different row by tool name/type.
             const byId = prevSteps.findIndex((s) => s.id === step.id);
             let nextSteps: ThinkingStep[];
             if (byId >= 0) {
-              nextSteps = prevSteps.map((s, i) => (i === byId ? { ...s, ...step } : s));
-            } else if (step.status === "done" || step.status === "failed") {
-              const runIdx = prevSteps.findIndex((s) => s.status === "running" && s.type === step.type);
-              if (runIdx >= 0) {
-                nextSteps = prevSteps.map((s, i) => (i === runIdx ? { ...s, ...step, id: s.id } : s));
+              const existing = prevSteps[byId];
+              // Terminal steps ignore trailing events (idempotent).
+              if (
+                (existing.status === "done" || existing.status === "failed") &&
+                (step.status === "done" || step.status === "failed" || step.status === "running")
+              ) {
+                nextSteps = prevSteps;
               } else {
-                nextSteps = [...prevSteps, step];
+                nextSteps = prevSteps.map((s, i) => (i === byId ? { ...s, ...step } : s));
               }
+            } else if (step.status === "done" || step.status === "failed") {
+              // No open row with this id — append terminal (do not steal another running row).
+              nextSteps = [...prevSteps, step];
             } else {
+              // tool_start: drop only provisional request-scoped placeholders of same type
+              // (ids like `${reqId}:search:...`), never another real ToolRun UUID.
+              prevSteps = prevSteps.filter(
+                (s) =>
+                  !(
+                    s.status === "running" &&
+                    s.type === step.type &&
+                    s.id !== step.id &&
+                    String(s.id).startsWith(`${reqId}:`)
+                  )
+              );
               nextSteps = [...prevSteps, step];
             }
             // NEVER pull the card earlier (Math.min was pinning Search done above the first beat).
@@ -4078,27 +4703,40 @@ export const Dashboard: React.FC = () => {
       };
 
       const completeAllRunningSteps = (status: "done" | "failed" = "done") => {
+        // Only this Turn's thinking card — never force-complete prior turns.
+        // Provisional chrome ids (`${requestId}:…`) that never got a real tool_end must
+        // be dropped, not force-completed as a second "Calculate done" / "Search done".
         setActivities((prev) =>
           prev.map((p) => {
-            if (p.kind !== "thinking" || !p.steps?.length) return p;
-            return {
-              ...p,
-              steps: p.steps.map((s) =>
-                s.status === "running"
-                  ? {
-                      ...s,
-                      status,
-                      content: status === "failed" && !/fail/i.test(s.content) ? `${s.content} — failed` : s.content,
-                    }
-                  : s
-              ),
-            };
+            if (p.kind !== "thinking" || p.request_id !== runRequestId || !p.steps?.length) return p;
+            const nextSteps = p.steps
+              .map((s) => {
+                if (s.status !== "running") return s;
+                const id = String(s.id || "");
+                const provisional = id.startsWith(`${runRequestId}:`);
+                if (provisional && s.type !== "thought") {
+                  // Drop orphan tool/search/read chrome — ToolRun UUID rows own those.
+                  return null;
+                }
+                return {
+                  ...s,
+                  status,
+                  content:
+                    status === "failed" && !/fail/i.test(s.content)
+                      ? `${s.content} — failed`
+                      : s.content,
+                };
+              })
+              .filter((s): s is NonNullable<typeof s> => s != null && Boolean(String(s.content || "").trim() || s.type === "thought"));
+            return { ...p, steps: nextSteps };
           })
         );
       };
       const upsertTaskPlan = (evt: AgentStreamEvent) => {
         const reqId = eventRequestId(evt);
-        const eventAt = normalizeTimestampMs("at" in evt ? evt.at : Date.now());
+        // Always prefer "now" for plan placement so the checklist tracks the current turn
+        // (backend `at` can lag or collide with older messages and pin the plan high up).
+        const eventAt = Date.now();
         setTaskPlans((prev) => {
           if (evt.type === "task_plan") {
             const id = crypto.randomUUID();
@@ -4108,7 +4746,7 @@ export const Dashboard: React.FC = () => {
               {
                 id,
                 at: eventAt,
-                request_id: reqId,
+                request_id: reqId || runRequestId,
                 plan: taskPlanReducer(createEmptyTaskPlan(), evt),
               },
             ];
@@ -4116,12 +4754,18 @@ export const Dashboard: React.FC = () => {
 
           const activeId =
             activeTaskPlanIdRef.current ||
-            [...prev].reverse().find((entry) => entry.request_id === reqId)?.id;
+            [...prev].reverse().find((entry) => entry.request_id === reqId || entry.request_id === runRequestId)?.id ||
+            [...prev].reverse().find((entry) => entry.plan.active)?.id;
           if (!activeId) return prev;
 
           return prev.map((entry) =>
             entry.id === activeId
-              ? { ...entry, plan: taskPlanReducer(entry.plan, evt) }
+              ? {
+                  ...entry,
+                  // Bump timestamp on every step so historical placement follows the turn
+                  at: eventAt,
+                  plan: taskPlanReducer(entry.plan, evt),
+                }
               : entry
           );
         });
@@ -4132,6 +4776,34 @@ export const Dashboard: React.FC = () => {
           toolInfoRef.current[evt.id] = { name: evt.name, input: evt.input, requestId: runRequestId };
           dispatchActivity({ type: "tool_start", id: evt.id, name: evt.name });
           const toolNameStart = String(evt.name || "").toLowerCase();
+          // Live Code workspace: real terminal process start (this session stream only)
+          if (toolNameStart === "terminal_run") {
+            const rawIn = String(evt.input || "");
+            let command = rawIn;
+            try {
+              const j = JSON.parse(rawIn);
+              if (j && typeof j === "object" && j.command) command = String(j.command);
+            } catch {
+              const m = rawIn.match(/['"]command['"]\s*:\s*['"]([^'"]+)['"]/i);
+              if (m) command = m[1];
+            }
+            setLiveTerminal((prev) => [
+              ...prev.filter((t) => t.id !== evt.id),
+              {
+                id: evt.id,
+                command: command.replace(/\s+/g, " ").trim().slice(0, 500) || "(terminal)",
+                output: "",
+                status: "running",
+                exitCode: null,
+                running: true,
+                at: normalizeTimestampMs(evt.at || Date.now()),
+                turnId: durableTurnId || runRequestId,
+                toolRunId: evt.id,
+              },
+            ]);
+            setVisualizerPin("coding");
+            setAgentMode("coding");
+          }
           // Only hide pure injects that fire almost every turn
           if (!SILENT_CHAT_TOOLS.has(toolNameStart)) {
             const stepAt = sawPartialBeat
@@ -4149,8 +4821,11 @@ export const Dashboard: React.FC = () => {
         }
 
         if (evt.type === "tool_end") {
-          dispatchActivity({ type: "tool_end", id: evt.id });
           const info = toolInfoRef.current[evt.id];
+          const toolFailed = evt.outcome?.success === false;
+          dispatchActivity(toolFailed
+            ? { type: "tool_error", id: evt.id, message: evt.outcome?.error_message || "Tool failed" }
+            : { type: "tool_end", id: evt.id });
           // Ignore tool_end that belongs to another turn's metadata
           if (info && (info as { requestId?: string }).requestId && (info as { requestId?: string }).requestId !== runRequestId) {
             return;
@@ -4160,8 +4835,32 @@ export const Dashboard: React.FC = () => {
           if (SILENT_CHAT_TOOLS.has(toolNameLow)) {
             return;
           }
+          // Outer fan-out / superseded shells — no second "Search done" timeline line.
+          const outRaw = String(evt.output || "");
+          if (
+            toolNameLow === "web_search" &&
+            (/\(expanded to /i.test(outRaw) || /\(superseded by canonical/i.test(outRaw))
+          ) {
+            markThinkingStep(
+              evt,
+              evt.id,
+              { status: "done", content: "" },
+              { toolName, stepType: toolActivityStepType(toolName) },
+            );
+            // Drop empty wrapper steps from the thinking card
+            setActivities((prev) =>
+              prev.map((p) => {
+                if (p.kind !== "thinking" || p.request_id !== runRequestId || !p.steps) return p;
+                return {
+                  ...p,
+                  steps: p.steps.filter((s) => s.id !== evt.id || Boolean(String(s.content || "").trim())),
+                };
+              })
+            );
+            return;
+          }
           // Research panel still fed by web_search
-          if (toolNameLow === "web_search") {
+          if (!toolFailed && toolNameLow === "web_search") {
             const normalized =
               normalizeResearchRun(evt.research) ||
               buildResearchRunFromToolEvent(
@@ -4179,17 +4878,29 @@ export const Dashboard: React.FC = () => {
               turnSearchQueries.push(String(info.input).replace(/\s+/g, " ").trim().slice(0, 120));
             }
           }
-          // Capture code for Code visualizer (needs real file bodies, not "Wrote 15 chars")
-          const codingTools = new Set(["file_write", "file_read", "artifact_write", "terminal_run", "notepad_write"]);
+          // Capture code for Code workspace (real file bodies + terminal ToolRuns)
+          const codingTools = new Set([
+            "file_write",
+            "file_read",
+            "file_delete",
+            "file_move",
+            "file_copy",
+            "file_mkdir",
+            "artifact_write",
+            "terminal_run",
+            "notepad_write",
+            "checkpoint_undo",
+          ]);
           if (codingTools.has(toolName)) {
             const rawInput = info?.input || "";
             const rawOutput = String(evt.output || "");
             const echo = parseEchoFileBlock(rawOutput);
             const parsedIn = parseFileToolInput(rawInput);
-            const pathFromSummary = (rawOutput.match(/(?:Wrote|Appended|Read) \d+ chars (?:to|from) (.+?)(?:\n|$)/i) || [])[1]?.trim() || "";
+            const pathFromSummary = (rawOutput.match(/(?:Wrote|Appended|Read|Deleted|Moved|Copied).+?(?:to|from)\s+(.+?)(?:\n|$)/i) || [])[1]?.trim() || "";
             const fullPath = echo?.path || parsedIn.path || pathFromSummary || "";
             const filename = basenamePath(fullPath) || basenamePath(parsedIn.path) || toolName || "output";
             const lang = langFromFilename(filename, toolName);
+            const eventAt = normalizeTimestampMs(evt.at || Date.now());
 
             let fileBody = "";
             if (echo?.content != null && echo.content.length > 0) {
@@ -4213,10 +4924,80 @@ export const Dashboard: React.FC = () => {
                 rawOutput.trim()
               );
 
+            if (toolName === "terminal_run") {
+              const exitM = rawOutput.match(/ExitCode\s*=\s*(-?\d+)/i);
+              const statusM = rawOutput.match(/Status\s*=\s*(\S+)/i);
+              const modeM = rawOutput.match(/Mode\s*=\s*(\S+)/i);
+              const reasonM = rawOutput.match(/Reason\s*=\s*(.+)/i);
+              const exitCode = exitM ? Number(exitM[1]) : null;
+              let command = rawInput;
+              try {
+                const j = JSON.parse(rawInput);
+                if (j && typeof j === "object" && j.command) command = String(j.command);
+              } catch {
+                const m = rawInput.match(/['"]command['"]\s*:\s*['"]([^'"]+)['"]/i);
+                if (m) command = m[1];
+              }
+              const bodyLines: string[] = [];
+              let pastHeader = false;
+              for (const line of rawOutput.split("\n")) {
+                if (!pastHeader && /^(ExitCode|Status|Mode|Reason|DurationMs)\s*=/i.test(line)) continue;
+                pastHeader = true;
+                bodyLines.push(line);
+              }
+              setLiveTerminal((prev) => {
+                const without = prev.filter((t) => t.id !== evt.id);
+                return [
+                  ...without,
+                  {
+                    id: evt.id,
+                    command: String(command || "").replace(/\s+/g, " ").trim().slice(0, 500) || "(terminal)",
+                    output: bodyLines.join("\n").trim() || rawOutput,
+                    status: statusM?.[1] || (toolFailed ? "fail" : "pass"),
+                    exitCode: Number.isFinite(exitCode as number) ? exitCode : null,
+                    running: false,
+                    at: eventAt,
+                    turnId: durableTurnId || runRequestId,
+                    toolRunId: evt.id,
+                    mode: modeM?.[1] || "",
+                    reason: reasonM?.[1]?.trim() || "",
+                  },
+                ];
+              });
+            } else {
+              const action =
+                toolName === "file_read"
+                  ? "inspect"
+                  : toolName === "file_delete"
+                    ? "delete"
+                    : toolName === "file_mkdir"
+                      ? "mkdir"
+                      : toolName.startsWith("file_")
+                        ? toolName.replace("file_", "")
+                        : "modify";
+              setLiveFileChanges((prev) => [
+                {
+                  id: evt.id,
+                  path: fullPath || filename,
+                  toolName,
+                  action,
+                  status: toolFailed ? "failed" : "complete",
+                  summary: (rawOutput.split("\n")[0] || toolName).slice(0, 200),
+                  at: eventAt,
+                  turnId: durableTurnId || runRequestId,
+                  toolRunId: evt.id,
+                  verified: !toolFailed && !isError,
+                  currentContent: toolName === "file_write" || toolName === "file_read" ? fileBody || undefined : undefined,
+                },
+                ...prev.filter((c) => c.id !== evt.id),
+              ].slice(0, 80));
+            }
+
             latestCodeFilenameRef.current = filename;
             setCodeSessions((prev) => {
               const existing =
                 prev.find((session) => session.filename === filename) ||
+                prev.find((session) => fullPath && session.filename === fullPath) ||
                 prev.find((session) => fullPath && session.filename === fullPath);
               let nextSession: CodeDiffSession;
 
@@ -4243,20 +5024,24 @@ export const Dashboard: React.FC = () => {
                     ? `Saved ${fileBody.length.toLocaleString()} chars → ${basenamePath(fullPath || filename)}`
                     : (rawOutput.split("\n")[0] || `Write ${filename}`).slice(0, 160),
                 };
+              } else if (toolName === "terminal_run") {
+                // Terminal lives in the Terminal pane — keep codeSessions for file diffs only
+                return prev;
               } else {
                 nextSession = {
                   filename: fullPath || filename,
                   language: lang,
-                  originalContent: displayContent,
+                  originalContent: existing?.originalContent || "",
                   currentContent: displayContent,
                   status: "output",
-                  summary: toolName === "terminal_run" ? "Terminal output" : undefined,
+                  summary: undefined,
                 };
               }
 
               const [nextSessions] = replaceCodeSession(prev, nextSession);
               return nextSessions;
             });
+            setCodeRefreshToken((n) => n + 1);
             setVisualizerPin("coding");
             setAgentMode("coding");
           }
@@ -4265,10 +5050,11 @@ export const Dashboard: React.FC = () => {
             evt,
             evt.id,
             {
-              status: "done",
-              content: formatToolActivity(toolName, "done", {
+              status: toolFailed ? "failed" : "done",
+              content: formatToolActivity(toolName, toolFailed ? "failed" : "done", {
                 input: info?.input || "",
                 output: evt.output || "",
+                error: evt.outcome?.error_message || "",
               }),
             },
             { toolName, stepType: toolActivityStepType(toolName) },
@@ -4280,6 +5066,21 @@ export const Dashboard: React.FC = () => {
           dispatchActivity({ type: "tool_error", id: evt.id, message: evt.error });
           const info = toolInfoRef.current[evt.id];
           const toolName = info?.name || "tool";
+          if (String(toolName || "").toLowerCase() === "terminal_run") {
+            setLiveTerminal((prev) =>
+              prev.map((t) =>
+                t.id === evt.id
+                  ? {
+                      ...t,
+                      running: false,
+                      status: "fail",
+                      output: t.output || String(evt.error || "Terminal error"),
+                      at: normalizeTimestampMs(evt.at || Date.now()),
+                    }
+                  : t,
+              ),
+            );
+          }
           if (!SILENT_CHAT_TOOLS.has(String(toolName || "").toLowerCase())) {
             markThinkingStep(
               evt,
@@ -4299,6 +5100,7 @@ export const Dashboard: React.FC = () => {
       };
 
       while (true) {
+        if (!isStreamEventCurrent(streamThreadId, activeThreadIdRef.current, streamController.signal.aborted)) break;
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
@@ -4315,8 +5117,22 @@ export const Dashboard: React.FC = () => {
           } catch (e) {
             continue;
           }
+          if (!isStreamEventCurrent(streamThreadId, activeThreadIdRef.current, streamController.signal.aborted)) continue;
 
-          if (evt.type === "task_plan" || evt.type === "task_step" || evt.type === "task_reflection") {
+          if (evt.type === "turn_bound") {
+            const execId = String(evt.execution_id || evt.turn_id || "").trim();
+            if (execId) {
+              durableTurnId = execId;
+              setLatestExecutionId(execId);
+              // Remap any live Code rows that still carry the client stream key.
+              setLiveTerminal((prev) =>
+                prev.map((t) => (t.turnId === runRequestId ? { ...t, turnId: execId } : t))
+              );
+              setLiveFileChanges((prev) =>
+                prev.map((c) => (c.turnId === runRequestId ? { ...c, turnId: execId } : c))
+              );
+            }
+          } else if (evt.type === "task_plan" || evt.type === "task_step" || evt.type === "task_reflection") {
             upsertTaskPlan(evt);
             if (evt.type === "task_step" && evt.data?.status) {
               dispatchActivity({ type: "task_step", status: String(evt.data.status) });
@@ -4328,15 +5144,91 @@ export const Dashboard: React.FC = () => {
             const st = String(evt.status || "running").toLowerCase();
             const status: ThinkingStep["status"] =
               st === "failed" || st === "error" ? "failed" : st === "done" || st === "complete" ? "done" : "running";
-            // Prefer stable ids so running → done maps to one row (no stuck spinner).
-            const stableId = `${eventRequestId(evt)}:${stepType}:${String(evt.content || "").slice(0, 48)}`;
-            appendThinkingStep(evt, {
-              id: stableId,
-              type: stepType,
-              content: evt.content,
-              status,
-              at: normalizeTimestampMs(evt.at || Date.now()),
-            });
+            const content = String(evt.content || "").trim();
+            // thinking_step is provisional chrome only. Never complete real ToolRun UUIDs
+            // by type/name FIFO — tool_start/tool_end own ToolRun identity.
+            if (stepType === "thought") {
+              appendThinkingStep(evt, {
+                id: `${eventRequestId(evt)}:thought`,
+                type: "thought",
+                content,
+                status: "running",
+                at: normalizeTimestampMs(evt.at || Date.now()),
+              });
+            } else {
+              setActivities((prev) => {
+                const idx = prev.findIndex((p) => p.kind === "thinking" && p.request_id === runRequestId);
+                if (idx >= 0) {
+                  const card = prev[idx] as Extract<ActivityItem, { kind: "thinking" }>;
+                  const steps = [...(card.steps || [])];
+                  // Only update provisional request-scoped placeholders (never ToolRun UUIDs).
+                  const provisionalIdx = steps.findIndex(
+                    (s) =>
+                      s.status === "running" &&
+                      s.type === stepType &&
+                      String(s.id).startsWith(`${runRequestId}:`)
+                  );
+                  if (provisionalIdx >= 0 && status === "running") {
+                    steps[provisionalIdx] = {
+                      ...steps[provisionalIdx],
+                      content: content || steps[provisionalIdx].content,
+                      status: "running",
+                    };
+                    const next = [...prev];
+                    next[idx] = { ...card, steps };
+                    return next;
+                  }
+                  // Terminal thinking_step without ToolRun id: ignore (wait for tool_end).
+                  if (status === "done" || status === "failed") {
+                    return prev;
+                  }
+                  // No open tool row yet — provisional running row only
+                  if (status === "running") {
+                    const stableId = `${runRequestId}:${stepType}:${content.slice(0, 48)}`;
+                    if (!steps.some((s) => s.id === stableId)) {
+                      const floor = sawPartialBeat ? Math.max(toolsAfterPartialAt, card.at) : card.at;
+                      const next = [...prev];
+                      next[idx] = {
+                        ...card,
+                        at: Math.max(floor, normalizeTimestampMs(evt.at || Date.now())),
+                        steps: [
+                          ...steps.filter((s) => s.id !== bootstrapStepId && s.id !== `${runRequestId}:post-partial-working`),
+                          {
+                            id: stableId,
+                            type: stepType,
+                            content,
+                            status: "running",
+                            at: normalizeTimestampMs(evt.at || Date.now()),
+                          },
+                        ],
+                      };
+                      return next;
+                    }
+                  }
+                } else if (status === "running") {
+                  return [
+                    ...prev,
+                    {
+                      kind: "thinking" as const,
+                      id: crypto.randomUUID(),
+                      content: "",
+                      at: normalizeTimestampMs(evt.at || Date.now()),
+                      request_id: runRequestId,
+                      steps: [
+                        {
+                          id: `${runRequestId}:${stepType}:${content.slice(0, 48)}`,
+                          type: stepType,
+                          content,
+                          status: "running" as const,
+                          at: normalizeTimestampMs(evt.at || Date.now()),
+                        },
+                      ],
+                    },
+                  ];
+                }
+                return prev;
+              });
+            }
           } else if (evt.type === "agent_token") {
             const tok = String(evt.data || "");
             if (tok) {
@@ -4496,8 +5388,27 @@ export const Dashboard: React.FC = () => {
               if (draft) reply = draft;
             }
 
-            dispatchActivity({ type: "final", response: reply || partialReplies[partialReplies.length - 1] || "" });
-            completeAllRunningSteps("done");
+            if (evt.execution_id) {
+              durableTurnId = String(evt.execution_id);
+            }
+            const executionStatus = String(evt.thread_state?.execution_status || "");
+            dispatchActivity({
+              type: "final",
+              response: reply || partialReplies[partialReplies.length - 1] || "",
+              executionStatus,
+              success: evt.success,
+            });
+            // Only mark tool rows done when backend authority says complete — not on soft success.
+            if (executionStatus === "complete" && evt.success) {
+              completeAllRunningSteps("done");
+            } else if (
+              ["failed", "blocked", "retryable", "cancelled", "partially_complete", "in_progress", "needs_permission"].includes(
+                executionStatus
+              ) ||
+              !evt.success
+            ) {
+              completeAllRunningSteps(executionStatus === "needs_permission" ? "done" : "failed");
+            }
             if (typeof evt.memory_count === "number") {
               setMemoryCount(evt.memory_count);
             }
@@ -4530,12 +5441,35 @@ export const Dashboard: React.FC = () => {
             if (reply && !partialReplies.some((p) => p.trim() === reply)) {
               const alreadyStreamed = liveDraft.length > 0;
               const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
-              // Rich embeds under the answer (sources, weather, fixtures) — text stays primary.
+              const renderPlan = buildResponseRenderPlan({
+                answerText: reply,
+                intent: evt.response_render,
+                researchRuns: turnResearchRuns,
+                searchQueries: turnSearchQueries,
+              });
               const embeds = buildChatEmbeds({
                 answerText: reply,
                 researchRuns: turnResearchRuns,
                 searchQueries: turnSearchQueries,
               });
+              const finalExecId = String(evt.execution_id || durableTurnId || "").trim();
+              // Scope Session thread_state actions to this execution only.
+              const liveOpState = evt.thread_state
+                ? ({
+                    ...evt.thread_state,
+                    current_execution_id: finalExecId || evt.thread_state.current_execution_id,
+                    last_execution_id: finalExecId || evt.thread_state.last_execution_id,
+                    completed_actions: (evt.thread_state.completed_actions || []).filter(
+                      (a: any) => !finalExecId || String(a?.execution_id || "") === finalExecId
+                    ),
+                    failed_actions: (evt.thread_state.failed_actions || []).filter(
+                      (a: any) => !finalExecId || String(a?.execution_id || "") === finalExecId
+                    ),
+                    pending_actions: (evt.thread_state.pending_actions || []).filter(
+                      (a: any) => !finalExecId || String(a?.execution_id || "") === finalExecId
+                    ),
+                  } as OperationalThreadState)
+                : undefined;
               addMessage({
                 id: crypto.randomUUID(),
                 role: "assistant",
@@ -4544,7 +5478,18 @@ export const Dashboard: React.FC = () => {
                 at: Math.max(Date.now(), toolsAfterPartialAt + 1),
                 skipTypewriter: alreadyStreamed || partialReplies.length > 0,
                 streamBeat: "final",
+                renderPlan,
                 embeds: embeds.length ? embeds : undefined,
+                executionId: finalExecId || undefined,
+                clientRequestId: runRequestId,
+                operation: liveOpState
+                  ? {
+                      state: liveOpState,
+                      success: Boolean(evt.success),
+                      executionId: finalExecId || undefined,
+                    }
+                  : undefined,
+                docSources: Array.isArray(evt.doc_sources) ? evt.doc_sources : undefined,
                 usage: buildMessageUsage(reply, useAppStore.getState().messages, ctxWindow, {
                   provider: providerInfo?.provider,
                   model: providerInfo?.model,
@@ -4561,18 +5506,28 @@ export const Dashboard: React.FC = () => {
                 text: "(no response)",
                 at: Date.now(),
                 skipTypewriter: true,
+                operation: evt.thread_state ? {
+                  state: evt.thread_state,
+                  success: Boolean(evt.success),
+                  executionId: evt.execution_id,
+                } : undefined,
               });
             }
 
-            setEchoReaction(isConfirmPromptText(reply) ? null : "success");
+            setEchoReaction(evt.success && executionStatus !== "needs_permission" ? "success" : evt.success ? null : "error");
             setAgentMode("idle");
-            refreshPendingApproval(activeThreadId);
-            refreshApprovals(activeThreadId);
-            refreshExecutions(activeThreadId);
+            refreshPendingApproval(streamThreadId);
+            refreshApprovals(streamThreadId);
+            refreshExecutions(streamThreadId);
+            void refreshThreads();
           }
         }
       }
     } catch (err) {
+      if (streamController.signal.aborted) {
+        // Aborted (Session switch / cancel): never paint error into the next Session.
+        return;
+      }
       const msg = String(err);
       const pretty = msg.includes("Failed to fetch") ? `Backend offline (${apiBase})` : msg;
       setBackendOnline(false);
@@ -4584,9 +5539,30 @@ export const Dashboard: React.FC = () => {
       ]);
       setEchoReaction("error");
     } finally {
+      const owned = activeStreamAbortRef.current === streamController;
+      const sameThread = isStreamThreadCurrent(streamThreadId, activeThreadIdRef.current);
+      const aborted = streamController.signal.aborted;
+
+      if (owned) {
+        activeStreamAbortRef.current = null;
+      }
+
+      // Always clear phase machine so tool/search never sticks after switch or cancel.
+      if (aborted || !sameThread) {
+        dispatchActivity({ type: "reset" });
+      } else {
+        dispatchActivity({ type: "stream_end" });
+      }
+
+      // Do not mutate chat of a different Session (switch already cleared UI).
+      if (!sameThread) {
+        return;
+      }
+
       setStreaming(false);
-      // If stream died without final but we already streamed tokens, promote draft once.
-      if (!finalHandled && liveReplyDraftRef.current.trim()) {
+      // If stream died without final but we already streamed tokens, promote draft once
+      // only when the user did not cancel/abort mid-flight.
+      if (!finalHandled && !aborted && liveReplyDraftRef.current.trim()) {
         const orphan = liveReplyDraftRef.current;
         const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
         addMessage({
@@ -4604,19 +5580,27 @@ export const Dashboard: React.FC = () => {
       }
       liveReplyDraftRef.current = "";
       setLiveReplyDraft("");
-      dispatchActivity({ type: "stream_end" });
-      // Safety net: any still-running step rows stop spinning when the stream closes.
-      // Do not call stopTts here — that was cutting off speech when final→finally raced.
+      // An EOF without a final event is an interruption, never implicit success.
+      // Only close running steps for THIS turn's thinking card.
       setActivities((prev) =>
         prev.map((p) => {
-          if (p.kind !== "thinking" || !p.steps?.length) return p;
+          if (p.kind !== "thinking" || p.request_id !== runRequestId || !p.steps?.length) return p;
           if (!p.steps.some((s) => s.status === "running")) return p;
           return {
             ...p,
-            steps: p.steps.map((s) => (s.status === "running" ? { ...s, status: "done" as const } : s)),
+            steps: p.steps.map((s) =>
+              s.status === "running"
+                ? { ...s, status: finalHandled && !aborted ? ("done" as const) : ("failed" as const) }
+                : s
+            ),
           };
         })
       );
+      if (!finalHandled && streamThreadId && !aborted) {
+        void refreshThreadState(streamThreadId);
+        void refreshPendingApproval(streamThreadId);
+        void refreshExecutions(streamThreadId);
+      }
     }
   };
 
@@ -4972,6 +5956,21 @@ export const Dashboard: React.FC = () => {
     };
   }, [monitoring, apiBase]);
 
+  useEffect(() => {
+    saveRuntimeLayout(typeof window !== "undefined" ? window.localStorage : null, {
+      sidebarVisible: showSidebar,
+      sidebarCollapsed,
+      visualizerVisible: showVisualizer,
+      visualizerDensity,
+    });
+  }, [showSidebar, sidebarCollapsed, showVisualizer, visualizerDensity]);
+
+  useEffect(() => {
+    const onResize = () => setNarrowLayout(window.innerWidth < 900);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
   const showModelPicker =
     providerDraft.provider === "openai" ||
     providerDraft.provider === "gemini" ||
@@ -5000,50 +5999,146 @@ export const Dashboard: React.FC = () => {
     setShowVisualizer(true);
   };
 
+  const shellColumns = runtimeGridColumns({
+    sidebarVisible: showSidebar,
+    sidebarCollapsed: sidebarCollapsed || narrowLayout,
+    visualizerVisible: showVisualizer && !narrowLayout,
+    visualizerDensity,
+  });
+
   return (
     <div
+      className="echo-root"
       style={{
-        minHeight: "100vh",
+        width: "100%",
+        height: "100%",
+        maxHeight: "100dvh",
         background: colors.bg,
         color: colors.text,
         overflow: "hidden",
+        position: "relative",
       }}
     >
       <style>{globalCss}</style>
+      {!showSidebar && !studioOpen ? (
+        <button
+          className="icon-button"
+          onClick={() => setShowSidebar(true)}
+          title="Show sidebar"
+          style={{ position: "fixed", left: 10, top: 10, zIndex: 100 }}
+        >
+          ☰
+        </button>
+      ) : null}
       <div
-        className="app-shell"
+        className={"app-shell" + (studioOpen ? " is-studio-covered" : "")}
         style={{
-          gridTemplateColumns: showVisualizer ? "1fr 1fr" : "1fr",
+          gridTemplateColumns: shellColumns,
         }}
+        aria-hidden={studioOpen || undefined}
       >
-        {showVisualizer ? (
-          <div className="visualizer-pane" style={{ display: "flex", flexDirection: "column", position: "relative" }}>
-            {/* Mode Indicator Pills */}
+        {showSidebar ? <ProjectSidebar
+          collapsed={sidebarCollapsed || narrowLayout}
+          projects={projects}
+          sessions={threads}
+          activeProjectId={activeProjectId}
+          activeSessionId={activeThreadId}
+          activeView={leftTab === "research" ? "research" : leftTab !== "chat" ? "studio" : visualizerPin === "coding" ? "code" : visualizerPin === "tasks" ? "tasks" : "avatar"}
+          onToggleCollapsed={() => setSidebarCollapsed(v => !v)}
+          onNewSession={createNewThread}
+          onAddFolder={() => void attachFolder()}
+          onSelectSession={switchThread}
+          onSelectProject={async (id) => {
+            const existing = threads.find(item => item.projectId === id);
+            if (existing) switchThread(existing.id);
+            else await createNewThread(id);
+          }}
+          onDetachProject={async () => {
+            const response = await fetch(`${apiBase}/projects/deactivate?thread_id=${encodeURIComponent(activeThreadId)}`, { method: "POST" });
+            if (!response.ok) return;
+            const data = await response.json();
+            setActiveProjectId("");
+            setThreads(items => items.map(item => item.id === activeThreadId ? { ...item, projectId: "" } : item));
+            if (data.thread_state) setThreadState(data.thread_state);
+            // Clear live Code projection so detached Project cannot linger in UI.
+            setLiveTerminal([]);
+            setLiveFileChanges([]);
+            setCodeSessions([]);
+            setCodeRefreshToken((n) => n + 1);
+          }}
+          onRenameSession={(id, title) => void renameThread(id, title)}
+          onDeleteSession={(id) => void deleteThread(id)}
+          onDeleteProject={async (id) => {
+            const response = await fetch(`${apiBase}/projects/${encodeURIComponent(id)}`, { method: "DELETE" });
+            if (!response.ok) return;
+            setThreads(items => items.map(item => item.projectId === id ? { ...item, projectId: "" } : item));
+            if (activeProjectId === id) { setActiveProjectId(""); await refreshThreadState(activeThreadId); }
+            await refreshProjects();
+          }}
+          onView={(view) => {
+            if (view === "studio") { setLeftTab("memory"); return; }
+            setLeftTab(view === "research" ? "research" : "chat");
+            setShowVisualizer(true);
+            setVisualizerPin(view === "code" ? "coding" : view === "tasks" ? "tasks" : view === "research" ? "research" : "ring");
+          }}
+        /> : null}
+        {showVisualizer && !narrowLayout ? (
+          <div className="visualizer-pane">
+            {/* Mode Indicator Tabs */}
             <div style={{
-              display: "flex",
-              gap: 8,
-              padding: "6px 8px",
+              display: "none",
+              gap: 0,
+              padding: 0,
               justifyContent: "center",
               alignItems: "center",
-              background: "linear-gradient(135deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.02) 100%)",
-              borderRadius: "20px",
-              border: "1px solid rgba(255,255,255,0.1)",
-              boxShadow: "inset 0 1px 1px rgba(255,255,255,0.15), 0 4px 12px rgba(0,0,0,0.3)",
+              background: "rgba(10, 12, 16, 0.85)",
+              borderRadius: "4px",
+              border: "1px solid rgba(255,255,255,0.12)",
+              boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
               backdropFilter: "blur(20px)",
               WebkitBackdropFilter: "blur(20px)",
               margin: "12px auto 8px auto",
               width: "fit-content",
               zIndex: 10,
+              overflow: "hidden",
             }}>
               {(["ring", "research", "coding", "tasks"] as const).map((m) => {
                 const effectiveMode = visualizerPin || (agentMode === "research" ? "research" : agentMode === "coding" ? "coding" : "ring");
                 const isActive = effectiveMode === m;
                 const isPinned = visualizerPin === m;
-                const labels: Record<string, { icon: string; text: string }> = {
-                  ring: { icon: "🤖", text: "Avatar" },
-                  research: { icon: "🔍", text: "Research" },
-                  coding: { icon: "💻", text: "Code" },
-                  tasks: { icon: "📋", text: "Tasks" }
+                const icons: Record<string, React.ReactNode> = {
+                  ring: (
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3" y="3" width="18" height="18" rx="3" />
+                      <circle cx="9" cy="10" r="1.5" fill="currentColor" stroke="none" />
+                      <circle cx="15" cy="10" r="1.5" fill="currentColor" stroke="none" />
+                      <path d="M9 15c0 0 1 1.5 3 1.5s3-1.5 3-1.5" />
+                    </svg>
+                  ),
+                  research: (
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <circle cx="11" cy="11" r="7" />
+                      <path d="M21 21l-4.35-4.35" />
+                    </svg>
+                  ),
+                  coding: (
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="16 18 22 12 16 6" />
+                      <polyline points="8 6 2 12 8 18" />
+                    </svg>
+                  ),
+                  tasks: (
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="9 11 12 14 22 4" />
+                      <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+                    </svg>
+                  ),
+                };
+                const labels: Record<string, string> = {
+                  ring: "Avatar",
+                  research: "Research",
+                  coding: "Code",
+                  tasks: "Tasks",
                 };
                 return (
                   <button
@@ -5052,37 +6147,44 @@ export const Dashboard: React.FC = () => {
                     style={{
                       display: "flex",
                       alignItems: "center",
-                      gap: "6px",
-                      padding: "8px 16px",
-                      borderRadius: "14px",
+                      gap: "7px",
+                      padding: "13px 20px",
+                      borderRadius: "0px",
                       fontSize: 13,
                       fontWeight: 600,
                       cursor: "pointer",
-                      border: isActive ? "1px solid rgba(255,255,255,0.2)" : "1px solid transparent",
-                      background: isActive ? "linear-gradient(135deg, rgba(255,255,255,0.15) 0%, rgba(255,255,255,0.05) 100%)" : "transparent",
-                      color: isActive ? "#ffffff" : "rgba(255,255,255,0.6)",
-                      transition: "all 0.25s cubic-bezier(0.4, 0, 0.2, 1)",
-                      boxShadow: isActive ? "inset 0 1px 1px rgba(255,255,255,0.3), 0 2px 8px rgba(0,0,0,0.2)" : "none",
-                      textDecoration: isPinned ? "underline" : "none",
+                      border: "none",
+                      borderRight: m === "tasks" ? "none" : "1px solid rgba(255,255,255,0.08)",
+                      background: isActive
+                        ? "linear-gradient(180deg, rgba(255,255,255,0.13) 0%, rgba(255,255,255,0.03) 100%)"
+                        : "transparent",
+                      color: isActive ? "#ffffff" : "rgba(255,255,255,0.4)",
+                      transition: "all 0.2s ease-in-out",
+                      boxShadow: isActive ? "inset 0 -2px 0 rgba(140,180,255,0.85)" : "none",
+                      textDecoration: "none",
+                      letterSpacing: "0.01em",
                     }}
                   >
-                    <span style={{ fontSize: "16px", filter: "brightness(0) invert(1)", opacity: isActive ? 1 : 0.7 }}>
-                      {labels[m].icon}
+                    <span style={{ opacity: isActive ? 1 : 0.65, display: "flex" }}>
+                      {icons[m]}
                     </span>
-                    <span style={{ textShadow: isActive ? "0 0 8px rgba(255,255,255,0.4)" : "none" }}>{labels[m].text}</span>
+                    <span style={{ textShadow: isActive ? "0 0 10px rgba(255,255,255,0.35)" : "none" }}>
+                      {labels[m]}
+                    </span>
                   </button>
                 );
               })}
             </div>
-            {/* Visualizer Content */}
+            {/* Visualizer Content — workspace modes fill the cell; avatar stays centered */}
             {(() => {
               const effectiveMode = visualizerPin || (agentMode === "research" ? "research" : agentMode === "coding" ? "coding" : "ring");
+              const isAvatar = effectiveMode === "ring";
               return (
-                <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", overflow: effectiveMode === "ring" ? "visible" : "hidden" }}>
+                <div className={`visualizer-pane-body ${isAvatar ? "is-avatar" : "is-workspace"}`}>
                   {(() => {
                     if (effectiveMode === "research") {
                       return (
-                        <div style={{ width: "100%", height: "100%", padding: "0 20px 20px", overflowY: "auto", display: "flex", flexDirection: "column", gap: 12 }}>
+                        <div style={{ width: "100%", height: "100%", minHeight: 0, minWidth: 0, padding: "12px 16px 16px", overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", gap: 12, boxSizing: "border-box" }}>
                           <div style={{ fontSize: 13, fontWeight: 700, color: "rgba(255,255,255,0.5)", textTransform: "uppercase", letterSpacing: 1.5, padding: "8px 0" }}>
                             🔍 Research Feed
                           </div>
@@ -5149,121 +6251,28 @@ export const Dashboard: React.FC = () => {
                     }
                     if (effectiveMode === "coding") {
                       return (
-                        <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
-                          {/* Tab bar: always show Files tab + any code session tabs */}
-                          <div style={{
-                            display: "flex",
-                            gap: 2,
-                            padding: "8px 12px 0",
-                            overflowX: "auto",
-                            scrollbarWidth: "none",
-                            flexShrink: 0,
-                          }}>
-                            <button
-                              onClick={() => setActiveCodeTab(-1)}
-                              style={{
-                                padding: "6px 14px",
-                                borderRadius: "8px 8px 0 0",
-                                fontSize: 11,
-                                fontWeight: 600,
-                                fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-                                cursor: "pointer",
-                                border: "none",
-                                background: (activeCodeTab === -1 || codeSessions.length === 0) ? "rgba(255,255,255,0.08)" : "transparent",
-                                color: (activeCodeTab === -1 || codeSessions.length === 0) ? "#e2e8f0" : "rgba(255,255,255,0.3)",
-                                borderBottom: (activeCodeTab === -1 || codeSessions.length === 0) ? "2px solid rgba(139,92,246,0.7)" : "2px solid transparent",
-                                transition: "all 0.2s",
-                                whiteSpace: "nowrap",
-                              }}
-                            >
-                              📂 Files
-                            </button>
-                            {codeSessions.map((session, i) => (
-                              <button
-                                key={session.filename}
-                                onClick={() => setActiveCodeTab(i)}
-                                style={{
-                                  padding: "6px 14px",
-                                  borderRadius: "8px 8px 0 0",
-                                  fontSize: 11,
-                                  fontWeight: 600,
-                                  fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-                                  cursor: "pointer",
-                                  border: "none",
-                                  background: i === activeCodeTab ? "rgba(255,255,255,0.08)" : "transparent",
-                                  color: i === activeCodeTab ? "#e2e8f0" : "rgba(255,255,255,0.3)",
-                                  borderBottom: i === activeCodeTab ? "2px solid rgba(139,92,246,0.7)" : "2px solid transparent",
-                                  transition: "all 0.2s",
-                                  whiteSpace: "nowrap",
-                                }}
-                              >
-                                {session.language === "bash" ? "⬛ Terminal" : `📄 ${session.filename.split("/").pop()}`}
-                              </button>
-                            ))}
-                          </div>
-                          {/* Content area */}
-                          {(activeCodeTab === -1 || codeSessions.length === 0) ? (
-                            <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", gap: 10, padding: "0 12px 12px" }}>
-                              <div style={{ flex: "0 0 auto", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, background: "rgba(255,255,255,0.03)", padding: 12 }}>
-                                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 8 }}>
-                                  <div>
-                                    <div style={{ fontSize: 12, fontWeight: 800, color: "#e2e8f0" }}>Coding readiness</div>
-                                    <div style={{ fontSize: 11, color: "rgba(255,255,255,0.45)" }}>
-                                      Inspect, plan, implement, verify, summarize.
-                                    </div>
-                                  </div>
-                                  <button
-                                    type="button"
-                                    className="icon-button"
-                                    onClick={refreshCodingReadiness}
-                                    style={{ height: 28, padding: "0 10px", fontSize: 11 }}
-                                  >
-                                    {codingReadinessLoading ? "..." : "Check"}
-                                  </button>
-                                </div>
-                                {codingReadiness ? (
-                                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
-                                    <div style={{ fontSize: 11, color: codingReadiness.provider?.ready ? "#22c55e" : "#f59e0b" }}>
-                                      Provider: {codingReadiness.provider?.message || codingReadiness.provider?.name || "unknown"}
-                                    </div>
-                                    <div style={{ fontSize: 11, color: codingReadiness.blocked_tools.length || codingReadiness.missing_tools.length ? "#f59e0b" : "#22c55e" }}>
-                                      Tools: {codingReadiness.tools.filter(t => t.allowed).length}/{codingReadiness.tools.length} ready
-                                    </div>
-                                    <div style={{ fontSize: 11, color: "rgba(255,255,255,0.5)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                                      Root: {codingReadiness.file_roots?.root || "unset"}
-                                    </div>
-                                  </div>
-                                ) : (
-                                  <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>Run the check before testing a coding request.</div>
-                                )}
-                              </div>
-                              <WorkspaceExplorer apiBase={apiBase} />
-                            </div>
-                          ) : (
-                            <div style={{
-                              flex: 1,
-                              margin: "0 12px 12px",
-                              borderRadius: "0 0 12px 12px",
-                              background: activeCodeSession?.language === "bash" ? "#0d1117" : "#1a1b26",
-                              border: "1px solid rgba(255,255,255,0.06)",
-                              overflow: "auto",
-                              position: "relative",
-                            }}>
-                              {activeCodeSession ? (
-                                <InlineCodeDiff
-                                  session={activeCodeSession}
-                                  onAccept={activeCodeSession.pendingConfirmation ? () => sendText("confirm") : undefined}
-                                  onDecline={activeCodeSession.pendingConfirmation ? () => sendText("cancel") : undefined}
-                                />
-                              ) : null}
-                            </div>
-                          )}
+                        <div style={{ flex: 1, width: "100%", height: "100%", minHeight: 0, minWidth: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+                          <CodeWorkspace
+                            apiBase={apiBase}
+                            threadId={activeThreadId || "default"}
+                            liveTerminal={liveTerminal}
+                            liveChanges={liveFileChanges}
+                            codeSessions={codeSessions}
+                            pendingConfirmPath={
+                              pendingApproval?.has_pending && pendingApproval?.action?.tool === "file_write"
+                                ? String(pendingApproval?.action?.kwargs?.path || "")
+                                : undefined
+                            }
+                            onConfirmSave={() => sendText("confirm")}
+                            onCancelSave={() => sendText("cancel")}
+                            refreshToken={codeRefreshToken}
+                          />
                         </div>
                       );
                     }
                     if (effectiveMode === "tasks") {
                       return (
-                        <div style={{ width: "100%", height: "100%", overflow: "hidden" }}>
+                        <div style={{ flex: 1, width: "100%", height: "100%", minHeight: 0, minWidth: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
                           <TodoPanel apiBase={apiBase} colors={colors} variant="visualizer" />
                         </div>
                       );
@@ -5298,7 +6307,7 @@ export const Dashboard: React.FC = () => {
                     const pendingConfirm =
                       agentActivity.pendingConfirmation || Boolean(pendingApproval?.has_pending);
                     return (
-                      <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", transform: "translateY(-7px) scale(1)", transformOrigin: "center center" }}>
+                      <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", transformOrigin: "center center" }}>
                         <SquareAvatarVisual
                           speaking={speaking}
                           backendOnline={backendOnline}
@@ -5327,7 +6336,7 @@ export const Dashboard: React.FC = () => {
             <div className="title">
               <img src="/logo.png" alt="Logo" style={{ width: 14, height: 14, borderRadius: 2 }} />
               <span>EchoSpeak</span>
-              {activeProjectId && leftTab === "chat" && (
+              {activeProjectId && leftTab === "chat" && threadState?.mode === "coding" && (
                 <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6, background: "linear-gradient(135deg, rgba(34,197,94,0.15), rgba(34,197,94,0.05))", border: "1px solid rgba(34,197,94,0.25)", color: "#22c55e", fontWeight: 600, marginLeft: 8 }}>
                   📁 {projects.find(p => p.id === activeProjectId)?.name || "Project Active"}
                 </span>
@@ -5347,6 +6356,7 @@ export const Dashboard: React.FC = () => {
                 }}
                 title={studioOpen ? "Close Studio" : "Open Studio"}
                 style={{
+                  display: "none",
                   height: 32,
                   padding: "0 12px",
                   fontSize: 12,
@@ -5368,6 +6378,7 @@ export const Dashboard: React.FC = () => {
                 onClick={() => setSpeechEnabled(!speechEnabled)}
                 title={speechEnabled ? "Mute Speech" : "Unmute Speech"}
                 style={{
+                  display: "none",
                   color: "#fff",
                   background: speechEnabled ? "#222" : "transparent",
                   border: `1px solid ${colors.line}`,
@@ -5386,6 +6397,7 @@ export const Dashboard: React.FC = () => {
                 onClick={() => setShowVisualizer((v) => !v)}
                 title={showVisualizer ? "Hide visualizer" : "Show visualizer"}
                 style={{
+                  display: "none",
                   color: "#fff",
                   background: showVisualizer ? "#222" : "transparent",
                   border: `1px solid ${colors.line}`,
@@ -5581,15 +6593,49 @@ export const Dashboard: React.FC = () => {
                         )
                       )}
                     </AnimatePresence>
+                    {/* Current-turn plan only — always under latest tools, never mid-history */}
+                    {liveTaskPlan && liveTaskPlan.plan.tasks.length > 0 ? (
+                      <div
+                        key={`live-plan-${liveTaskPlan.id}`}
+                        style={{ width: "100%", padding: "4px 4px 6px" }}
+                      >
+                        <TaskChecklist plan={liveTaskPlan.plan} />
+                      </div>
+                    ) : null}
+                    {pendingApproval?.has_pending && pendingApproval.action ? (
+                      <div style={{ width: "100%", padding: "2px 4px 4px" }}>
+                        <OperationalStateCard
+                          state={threadState}
+                          approval={{
+                            ...pendingApproval.action,
+                            policy_flags: pendingApproval.policy_flags || pendingApproval.action.policy_flags,
+                            session_permissions: pendingApproval.session_permissions || pendingApproval.action.session_permissions,
+                          }}
+                          busy={approvalDecisionBusy}
+                          onDecision={decideApproval}
+                          compact
+                        />
+                      </div>
+                    ) : null}
+                    {!pendingApproval?.has_pending && threadState && threadState.mode !== "chat" &&
+                    messages[messages.length - 1]?.operation?.executionId !== threadState.last_execution_id ? (
+                      <div style={{ width: "100%", padding: "2px 4px 4px" }}>
+                        <OperationalStateCard state={threadState} compact />
+                      </div>
+                    ) : null}
                     {streaming && liveReplyDraft ? (
-                      <div style={{ display: "flex", justifyContent: "flex-start", padding: "10px 4px 8px", width: "100%" }}>
+                      <div style={{ display: "flex", justifyContent: "flex-start", padding: "10px 4px 8px", width: "100%", minWidth: 0, boxSizing: "border-box" }}>
                         <div
                           className="chat-flat chat-line-assistant"
                           style={{
                             width: "100%",
+                            maxWidth: "100%",
+                            minWidth: 0,
                             fontSize: 15,
                             lineHeight: 1.65,
                             whiteSpace: "pre-wrap",
+                            overflowWrap: "anywhere",
+                            wordBreak: "break-word",
                           }}
                         >
                           {liveReplyDraft}
@@ -5633,169 +6679,178 @@ export const Dashboard: React.FC = () => {
                     <div ref={chatBottomRef} style={{ height: 1 }} />
                   </div>
                   <div className="input-bar">
+                    {/* Row 1: session strip stacked on input (same column width) + context + send */}
                     <div className="input-row">
-                      <div className="input-side-tools">
+                      <div className="composer-input-stack">
+                        <div
+                          className={"session-folder-strip" + (folderDropActive ? " is-drop-active" : "")}
+                          aria-label="Session and Project folder attachment. Drop a local folder here to create or select its Project."
+                          onDragEnter={(event) => { event.preventDefault(); setFolderDropActive(true); }}
+                          onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "link"; setFolderDropActive(true); }}
+                          onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setFolderDropActive(false); }}
+                          onDrop={(event) => { event.preventDefault(); setFolderDropActive(false); const path = folderPathFromDrop(event); if (path) void attachFolder(path); else void attachFolder(); }}
+                        >
+                          <span style={{ whiteSpace: "nowrap" }}>
+                            Session: <b style={{ color: "rgba(255,255,255,.8)" }}>{threads.find(t => t.id === activeThreadId)?.name || activeThreadId}</b>
+                          </span>
+                          {(() => {
+                            const folderFull =
+                              String(threadState?.workspace_root || threadState?.project_path || "").trim();
+                            const folderName = folderFull
+                              ? folderFull.replace(/[\\/]+$/, "").split(/[/\\]/).filter(Boolean).pop() || folderFull
+                              : "";
+                            const gitBranch = projects.find(project => project.id === activeProjectId)?.git_metadata?.is_repository
+                              ? String(projects.find(project => project.id === activeProjectId)?.git_metadata?.branch || "repository")
+                              : "";
+                            return (
+                              <button
+                                type="button"
+                                onClick={() => void attachFolder()}
+                                title={
+                                  folderFull
+                                    ? folderFull
+                                    : "Choose or drop a local folder; folders become Projects automatically"
+                                }
+                                style={{
+                                  border: 0,
+                                  background: "transparent",
+                                  color: "inherit",
+                                  padding: 0,
+                                  font: "inherit",
+                                  cursor: "pointer",
+                                  textAlign: "left",
+                                  whiteSpace: "nowrap",
+                                }}
+                              >
+                                Folder:{" "}
+                                <b style={{ color: "rgba(255,255,255,.8)" }}>
+                                  {folderName || "drop folder to start Project"}
+                                  {gitBranch ? ` · git:${gitBranch}` : ""}
+                                </b>
+                              </button>
+                            );
+                          })()}
+                          {(threadState?.workspace_root || threadState?.project_path) && (
+                            <button
+                              type="button"
+                              aria-label="Remove folder from this Session"
+                              title="Remove folder from this Session"
+                              onClick={async () => {
+                                const response = await fetch(`${apiBase}/projects/deactivate?thread_id=${encodeURIComponent(activeThreadId)}`, { method: "POST" });
+                                if (!response.ok) return;
+                                const data = await response.json();
+                                setActiveProjectId(""); setThreadState(data.thread_state || null);
+                                setThreads(items => items.map(item => item.id === activeThreadId ? { ...item, projectId: "" } : item));
+                              }}
+                              style={{ width: 18, height: 18, border: 0, background: "transparent", color: "rgba(255,255,255,.65)", borderRadius: 2, cursor: "pointer", lineHeight: 1, flexShrink: 0 }}
+                            >
+                              ×
+                            </button>
+                          )}
+                        </div>
+                        <textarea
+                          ref={textareaRef}
+                          className="input-field"
+                          value={input}
+                          rows={1}
+                          onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => {
+                            updateComposerInput(e.target.value);
+                          }}
+                          onKeyDown={(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+                            if (e.key === "Enter" && !e.shiftKey) {
+                              e.preventDefault();
+                              sendText();
+                            }
+                          }}
+                          placeholder="Ask Echo anything..."
+                          aria-label="Ask Echo anything"
+                        />
+                      </div>
+                      <div className="composer-trailing">
+                        <ContextMeter messages={messages} contextWindow={providerInfo?.context_window || 0} />
+                        <button
+                          className="send-button"
+                          onClick={() => sendText()}
+                          type="button"
+                          title="Send"
+                          aria-label="Send message"
+                        >
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden>
+                            <path d="M5 12L19 12M19 12L13 6M19 12L13 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                    {/* Row 2: mic mon viz | Provider | Model */}
+                    <div className="controls-row">
+                      <div className="composer-tools-slot" role="group" aria-label="Input tools">
                         <button
                           className={`mic-button ${listening ? "active" : ""}`}
                           type="button"
-                          onClick={() => listening ? (stop(), setListening(false), setStreaming(false)) : start()}
+                          title={listening ? "Stop microphone" : "Start microphone"}
+                          aria-label={listening ? "Stop microphone" : "Start microphone"}
+                          onClick={() =>
+                            listening
+                              ? (stop(), setListening(false), setStreaming(false))
+                              : start()
+                          }
                         >
-                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden>
                             <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" fill="currentColor" />
                             <path d="M19 10v2a7 7 0 0 1-14 0v-2" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
                           </svg>
                         </button>
                         <button
-                          className={`mic-button ${monitoring ? "active" : ""}`}
+                          className={`composer-square ${monitoring ? "active" : ""}`}
                           type="button"
-                          onClick={() => setMonitoring(v => { const n = !v; if (n) refreshMonitor(); return n; })}
+                          title={monitoring ? "Stop screen monitor" : "Screen monitor"}
+                          aria-label={monitoring ? "Stop screen monitor" : "Screen monitor"}
+                          onClick={() =>
+                            setMonitoring((v) => {
+                              const n = !v;
+                              if (n) refreshMonitor();
+                              return n;
+                            })
+                          }
                         >
-                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden>
                             <rect x="2" y="4" width="20" height="12" rx="2" stroke="currentColor" strokeWidth="2" />
                             <path d="M12 16v4M8 20h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
                           </svg>
                         </button>
-                      </div>
-                      <textarea
-                        ref={textareaRef}
-                        className="input-field"
-                        value={input}
-                        rows={1}
-                        onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => {
-                          updateComposerInput(e.target.value);
-                        }}
-                        onKeyDown={(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-                          if (e.key === "Enter" && !e.shiftKey) {
-                            e.preventDefault();
-                            sendText();
-                          }
-                        }}
-                        placeholder="Ask Echo anything..."
-                      />
-                      <ContextMeter messages={messages} contextWindow={providerInfo?.context_window || 0} />
-                      <button className="send-button" onClick={() => sendText()} type="button">
-                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                          <path d="M5 12L19 12M19 12L13 6M19 12L13 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                        </svg>
-                      </button>
-                    </div>
-                    <div className="controls-row">
-                      <div className="control-slot session-slot" data-label="Session">
                         <button
+                          className={`composer-square ${showVisualizer && !narrowLayout ? "active" : ""}`}
                           type="button"
-                          className={"toolbar-button" + (showSessions ? " active-rail" : "")}
-                          onClick={() => setShowSessions(!showSessions)}
-                          title="Sessions"
+                          title={showVisualizer && !narrowLayout ? "Hide visualizer" : "Show visualizer"}
+                          aria-label={showVisualizer && !narrowLayout ? "Hide visualizer" : "Show visualizer"}
+                          onClick={() => setShowVisualizer((v) => !v)}
                         >
-                          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                            {threads.find(t => t.id === activeThreadId)?.name || "default"}
-                          </span>
-                          <span style={{ fontSize: 9, opacity: 0.45, flexShrink: 0 }}>{showSessions ? "▲" : "▼"}</span>
+                          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                            <rect x="3.5" y="5" width="17" height="14" rx="2" />
+                            <path d="M12 5v14" />
+                            <path d="M3.5 12h8.5" />
+                          </svg>
                         </button>
-
-                        <AnimatePresence>
-                          {showSessions && (
-                            <motion.div
-                              className="session-menu"
-                              initial={{ opacity: 0, y: 6 }}
-                              animate={{ opacity: 1, y: 0 }}
-                              exit={{ opacity: 0, y: 6 }}
-                              transition={{ duration: 0.15 }}
-                            >
-                              <div className="session-menu-label">Sessions</div>
-                              <div style={{ maxHeight: 260, overflowY: "auto", display: "flex", flexDirection: "column", gap: 1 }}>
-                                {threads.map((t) => (
-                                  <div
-                                    key={t.id}
-                                    onClick={() => {
-                                      switchThread(t.id);
-                                      setShowSessions(false);
-                                    }}
-                                    style={{
-                                      padding: "8px 10px",
-                                      borderRadius: 2,
-                                      background: t.id === activeThreadId ? "rgba(255,255,255,0.07)" : "transparent",
-                                      cursor: "pointer",
-                                      display: "flex",
-                                      justifyContent: "space-between",
-                                      alignItems: "center",
-                                    }}
-                                    onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.05)")}
-                                    onMouseLeave={(e) => (e.currentTarget.style.background = t.id === activeThreadId ? "rgba(255,255,255,0.07)" : "transparent")}
-                                  >
-                                    <div style={{ display: "flex", flexDirection: "column", gap: 2, overflow: "hidden", minWidth: 0 }}>
-                                      <span style={{ fontSize: 12, fontFamily: "'JetBrains Mono', ui-monospace, monospace", fontWeight: t.id === activeThreadId ? 600 : 400, color: t.id === activeThreadId ? colors.text : "rgba(255,255,255,0.55)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                                        {t.name}
-                                      </span>
-                                      <span style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", fontFamily: "'JetBrains Mono', ui-monospace, monospace" }}>{new Date(t.at).toLocaleDateString()}</span>
-                                    </div>
-                                    {threads.length > 1 && (
-                                      <button
-                                        onClick={(e) => deleteThread(t.id, e)}
-                                        style={{
-                                          background: "transparent",
-                                          border: "none",
-                                          color: "rgba(255,255,255,0.35)",
-                                          cursor: "pointer",
-                                          padding: 4,
-                                          display: "flex",
-                                          alignItems: "center",
-                                          justifyContent: "center",
-                                        }}
-                                        onMouseEnter={(e) => (e.currentTarget.style.color = colors.danger)}
-                                        onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(255,255,255,0.35)")}
-                                      >
-                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
-                                      </button>
-                                    )}
-                                  </div>
-                                ))}
-                              </div>
-                              <div style={{ height: 1, background: "rgba(255,255,255,0.08)", margin: "6px 0" }} />
-                              <button
-                                onClick={() => {
-                                  createNewThread();
-                                  setShowSessions(false);
-                                }}
-                                style={{
-                                  padding: "9px 10px",
-                                  borderRadius: 2,
-                                  background: "transparent",
-                                  border: "1px solid rgba(255,255,255,0.12)",
-                                  color: colors.text,
-                                  cursor: "pointer",
-                                  fontSize: 11,
-                                  fontWeight: 600,
-                                  letterSpacing: "0.06em",
-                                  textTransform: "uppercase",
-                                  fontFamily: "'JetBrains Mono', ui-monospace, monospace",
-                                  display: "flex",
-                                  alignItems: "center",
-                                  justifyContent: "center",
-                                  gap: 8,
-                                }}
-                              >
-                                + New
-                              </button>
-                            </motion.div>
-                          )}
-                        </AnimatePresence>
-                      </div>
-                      <div className="control-slot mode-slot" data-label="Mode">
-                        <select
-                          className="mode-picker"
-                          value={workspaceMode}
-                          onChange={(e) => {
-                            const v = (e.target.value || "auto") as WorkspaceMode;
-                            setWorkspaceMode(v);
-                            try { localStorage.setItem("echospeak_workspace_mode", v); } catch { }
-                          }}
-                          title="Mode"
+                        <button
+                          className={`composer-square ${!speechEnabled ? "active" : ""}`}
+                          type="button"
+                          title={speechEnabled ? "Sound on · click to mute" : "Sound off · click to unmute"}
+                          aria-label={speechEnabled ? "Mute sound" : "Unmute sound"}
+                          onClick={() => setSpeechEnabled(!speechEnabled)}
                         >
-                          {workspaceModes.map(m => (
-                            <option key={m} value={m}>{m}</option>
-                          ))}
-                        </select>
+                          {speechEnabled ? (
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                              <path d="M4.5 10.5h3l4-3.5v10l-4-3.5h-3z" />
+                              <path d="M15.5 9.5a4 4 0 0 1 0 5" />
+                              <path d="M17.5 7.5a7 7 0 0 1 0 9" />
+                            </svg>
+                          ) : (
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                              <path d="M4.5 10.5h3l4-3.5v10l-4-3.5h-3z" />
+                              <path d="M16 9.5 20 14.5M20 9.5 16 14.5" />
+                            </svg>
+                          )}
+                        </button>
                       </div>
                       <div className="control-slot provider-slot" data-label="Provider">
                         <div className="inline-switcher">
@@ -5804,13 +6859,28 @@ export const Dashboard: React.FC = () => {
                             value={providerDraft.provider}
                             onChange={(e) => {
                               const p = e.target.value;
-                              setProviderDraft(d => ({ ...d, provider: p, model: p === "openai" ? openaiModelOptions[0] : p === "gemini" ? geminiModelOptions[0] : (providerModels[0] || d.model) }));
+                              setProviderDraft((d) => ({
+                                ...d,
+                                provider: p,
+                                model:
+                                  p === "openai"
+                                    ? openaiModelOptions[0]
+                                    : p === "gemini"
+                                      ? geminiModelOptions[0]
+                                      : providerModels[0] || d.model,
+                              }));
                             }}
                             disabled={switchingProvider || lmStudioOnly}
+                            title="Model provider"
+                            aria-label="Model provider"
                           >
                             {(providerInfo?.available_providers || fallbackProviders)
-                              .filter(p => !lmStudioOnly || p.id === "lmstudio")
-                              .map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                              .filter((p) => !lmStudioOnly || p.id === "lmstudio")
+                              .map((p) => (
+                                <option key={p.id} value={p.id}>
+                                  {p.name}
+                                </option>
+                              ))}
                           </select>
                         </div>
                       </div>
@@ -5820,12 +6890,16 @@ export const Dashboard: React.FC = () => {
                           value={modelPickerValue}
                           onChange={(e) => {
                             if (!showModelPicker) return;
-                            setProviderDraft(d => ({ ...d, model: e.target.value }));
+                            setProviderDraft((d) => ({ ...d, model: e.target.value }));
                           }}
                           disabled={switchingProvider || !showModelPicker}
+                          title="Model"
+                          aria-label="Model"
                         >
-                          {modelPickerOptions.map(m => (
-                            <option key={m} value={m}>{m}</option>
+                          {modelPickerOptions.map((m) => (
+                            <option key={m} value={m}>
+                              {m}
+                            </option>
                           ))}
                         </select>
                       </div>
@@ -5834,13 +6908,16 @@ export const Dashboard: React.FC = () => {
                 </>
               )}
 
-              {studioOpen && (
+              {studioOpen && createPortal(
                 <motion.div
                   className="studio-shell"
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
                   exit={{ opacity: 0 }}
                   transition={{ duration: 0.2 }}
+                  role="dialog"
+                  aria-modal="true"
+                  aria-label="EchoSpeak Studio"
                 >
                   <div className="studio-top">
                     <div className="studio-brand">
@@ -5881,22 +6958,7 @@ export const Dashboard: React.FC = () => {
                     </div>
                   </div>
 
-                  <div className="studio-dock" title={agentActivity.label}>
-                    <div style={{ transform: "scale(0.185)", transformOrigin: "top left", width: 320, height: 320 }}>
-                      <SquareAvatarVisual
-                        speaking={speaking}
-                        backendOnline={backendOnline}
-                        isThinking={agentActivity.streaming || agentActivity.phase !== "idle"}
-                        thinkingText={agentActivity.label}
-                        activeToolName={agentActivity.activeToolName || undefined}
-                        toolCategory={toolCategoryFromPhase(agentActivity.phase) as ToolCategory}
-                        pendingConfirmation={agentActivity.pendingConfirmation || Boolean(pendingApproval?.has_pending)}
-                        reaction={echoReaction}
-                        onReactionDone={() => setEchoReaction(null)}
-                        avatarConfig={avatarConfig}
-                      />
-                    </div>
-                  </div>
+
 
                   <div className="studio-body">
                     <div className="studio-column">
@@ -5909,7 +6971,7 @@ export const Dashboard: React.FC = () => {
               {/* Memory Tab */}
               {leftTab === "memory" && (
                 <>
-                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: -12, flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
                     <button
                       className="icon-button"
                       style={{ height: 32, padding: "0 12px", fontSize: 14, flex: 1 }}
@@ -6195,7 +7257,7 @@ export const Dashboard: React.FC = () => {
               {/* Documents Tab */}
               {leftTab === "docs" && (
                 <>
-                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: -12 }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
                     <button
                       className="icon-button"
                       style={{ height: 32, padding: "0 12px", fontSize: 14, flex: 1 }}
@@ -7350,47 +8412,7 @@ export const Dashboard: React.FC = () => {
                           }}>
                             <div style={{ fontSize: 12, fontWeight: 600, color: colors.accent, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 12 }}>Web Search</div>
                             <div style={{ fontSize: 11, color: colors.textDim, marginBottom: 12, lineHeight: 1.5 }}>
-                              Web search uses DuckDuckGo (free, no API key required) as the default. You can optionally configure Tavily for enhanced results.
-                            </div>
-                            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
-                              <div style={{ flex: "2 1 340px" }}>
-                                <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>
-                                  Tavily API key (optional)
-                                </label>
-                                <div style={{ display: "flex", gap: 8 }}>
-                                  <input
-                                    type="password"
-                                    className="input-field"
-                                    value={String(settingsDraft.tavily_api_key || "")}
-                                    placeholder="tvly-..."
-                                    onChange={(e) => {
-                                      const next = e.target.value;
-                                      updateDraft("tavily_api_key", next);
-                                      setSettingsTests((m) => ({ ...m, tavily: null }));
-                                      setSettingsTestedKeys((m) => {
-                                        const copy = { ...m };
-                                        delete (copy as any).tavily;
-                                        return copy;
-                                      });
-                                    }}
-                                    style={{ flex: 1, padding: "10px 14px", fontSize: 14, borderColor: isError("tavily_api_key") ? colors.danger : undefined }}
-                                  />
-                                  <button
-                                    className="icon-button"
-                                    style={{ padding: "0 12px", fontSize: 12 }}
-                                    type="button"
-                                    onClick={() => runSettingsTest("tavily")}
-                                    disabled={Boolean(settingsTesting.tavily)}
-                                  >
-                                    {settingsTesting.tavily ? "..." : "Test"}
-                                  </button>
-                                </div>
-                                {settingsTests.tavily ? (
-                                  <div className="research-snippet" style={{ marginTop: 4, color: settingsTests.tavily.ok ? colors.textDim : colors.danger, fontSize: 11 }}>
-                                    {settingsTests.tavily.message}
-                                  </div>
-                                ) : null}
-                              </div>
+                              Web search uses DuckDuckGo by default, with Brave as an optional keyed provider.
                             </div>
                             <div style={{ display: "flex", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
                               <div style={{ flex: "1 1 180px" }}>
@@ -7404,26 +8426,14 @@ export const Dashboard: React.FC = () => {
                                 />
                               </div>
                               <div style={{ flex: "1 1 180px" }}>
-                                <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>Tavily depth</label>
-                                <select
-                                  className="input-field"
-                                  value={String(settingsDraft.tavily_search_depth || "advanced")}
-                                  onChange={(e) => updateDraft("tavily_search_depth", e.target.value)}
-                                  style={{ width: "100%", padding: "10px 14px", fontSize: 14 }}
-                                >
-                                  <option value="basic">basic</option>
-                                  <option value="advanced">advanced</option>
-                                </select>
-                              </div>
-                              <div style={{ flex: "1 1 180px" }}>
-                                <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>Tavily max results</label>
+                                <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>Search max results</label>
                                 <input
                                   type="number"
                                   className="input-field"
-                                  value={Number(settingsDraft.tavily_max_results ?? 8)}
+                                  value={Number(settingsDraft.web_search_max_results ?? 8)}
                                   min={1}
                                   max={10}
-                                  onChange={(e) => updateDraft("tavily_max_results", Number(e.target.value || 0))}
+                                  onChange={(e) => updateDraft("web_search_max_results", Number(e.target.value || 0))}
                                   style={{ width: "100%", padding: "10px 14px", fontSize: 14 }}
                                 />
                               </div>
@@ -7456,44 +8466,11 @@ export const Dashboard: React.FC = () => {
                             padding: "20px",
                             marginBottom: "20px"
                           }}>
-                            <div style={{ fontSize: 12, fontWeight: 600, color: colors.accent, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 12 }}>Memory & Planning</div>
+                            <div style={{ fontSize: 12, fontWeight: 600, color: colors.accent, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 12 }}>Memory</div>
                             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: "8px 24px", marginBottom: 12 }}>
-                              <Toggle label="Action Plan" checked={Boolean(settingsDraft.action_plan_enabled)} onChange={(v) => updateDraft("action_plan_enabled", v)} />
-                              <Toggle label="Action Parser" checked={Boolean(settingsDraft.action_parser_enabled)} onChange={(v) => updateDraft("action_parser_enabled", v)} />
-                              <Toggle label="Multi-task Planner" checked={Boolean(settingsDraft.multi_task_planner_enabled)} onChange={(v) => updateDraft("multi_task_planner_enabled", v)} />
-                              <Toggle label="Web Reflection / Retry" checked={Boolean(settingsDraft.web_task_reflection_enabled)} onChange={(v) => updateDraft("web_task_reflection_enabled", v)} />
-                              <Toggle label="File Memory" checked={Boolean(settingsDraft.file_memory_enabled)} onChange={(v) => updateDraft("file_memory_enabled", v)} />
-                              <Toggle label="Memory Flush" checked={Boolean(settingsDraft.memory_flush_enabled)} onChange={(v) => updateDraft("memory_flush_enabled", v)} />
-                              <Toggle label="Memory Partitioning" checked={Boolean(settingsDraft.memory_partition_enabled)} onChange={(v) => updateDraft("memory_partition_enabled", v)} />
-                              <Toggle label="Store Raw Conversation Turns" checked={Boolean(settingsDraft.memory_auto_store_conversations)} onChange={(v) => updateDraft("memory_auto_store_conversations", v)} />
-                              <Toggle label="Memory Importance Auto-save" checked={Boolean(settingsDraft.memory_importance_enabled)} onChange={(v) => updateDraft("memory_importance_enabled", v)} />
-                              <Toggle label="Log Raw Memory Conversations" checked={Boolean(settingsDraft.file_memory_log_conversations)} onChange={(v) => updateDraft("file_memory_log_conversations", v)} />
+                              <Toggle label="Session Memory" checked={Boolean(settingsDraft.session_memory_enabled)} onChange={(v) => updateDraft("session_memory_enabled", v)} />
                             </div>
                             <div style={{ display: "flex", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
-                              <div style={{ flex: "1 1 180px" }}>
-                                <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>Web max retries</label>
-                                <input
-                                  type="number"
-                                  className="input-field"
-                                  value={Number(settingsDraft.web_task_max_retries ?? 2)}
-                                  min={0}
-                                  max={5}
-                                  onChange={(e) => updateDraft("web_task_max_retries", Number(e.target.value || 0))}
-                                  style={{ width: "100%", padding: "10px 14px", fontSize: 14 }}
-                                />
-                              </div>
-                            </div>
-                            <div style={{ display: "flex", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
-                              <div style={{ flex: "2 1 280px" }}>
-                                <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>File memory dir</label>
-                                <input
-                                  type="text"
-                                  className="input-field"
-                                  value={String(settingsDraft.file_memory_dir || "")}
-                                  onChange={(e) => updateDraft("file_memory_dir", e.target.value)}
-                                  style={{ width: "100%", padding: "10px 14px", fontSize: 14 }}
-                                />
-                              </div>
                               <div style={{ flex: "1 1 180px" }}>
                                 <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>Summary trigger</label>
                                 <input
@@ -7514,13 +8491,15 @@ export const Dashboard: React.FC = () => {
                                   style={{ width: "100%", padding: "10px 14px", fontSize: 14 }}
                                 />
                               </div>
-                              <div style={{ flex: "1 1 220px" }}>
-                                <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>File memory max chars</label>
+                              <div style={{ flex: "1 1 180px" }}>
+                                <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>Web max retries</label>
                                 <input
                                   type="number"
                                   className="input-field"
-                                  value={Number(settingsDraft.file_memory_max_chars ?? 2000)}
-                                  onChange={(e) => updateDraft("file_memory_max_chars", Number(e.target.value || 0))}
+                                  value={Number(settingsDraft.web_task_max_retries ?? 2)}
+                                  min={0}
+                                  max={5}
+                                  onChange={(e) => updateDraft("web_task_max_retries", Number(e.target.value || 0))}
                                   style={{ width: "100%", padding: "10px 14px", fontSize: 14 }}
                                 />
                               </div>
@@ -7731,7 +8710,7 @@ export const Dashboard: React.FC = () => {
                             padding: "20px",
                             marginBottom: "20px"
                           }}>
-                            <div style={{ fontSize: 12, fontWeight: 600, color: colors.accent, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 12 }}>System & Tracing</div>
+                            <div style={{ fontSize: 12, fontWeight: 600, color: colors.accent, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 12 }}>Advanced / Experimental</div>
                             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: "8px 24px", marginBottom: 12 }}>
                               <Toggle label="Enable Trace" checked={Boolean(settingsDraft.trace_enabled)} onChange={(v) => updateDraft("trace_enabled", v)} />
                               <Toggle label="Multi-agent pool" checked={Boolean(settingsDraft.multi_agent_enabled)} onChange={(v) => updateDraft("multi_agent_enabled", v)} />
@@ -7984,10 +8963,20 @@ export const Dashboard: React.FC = () => {
                               <div style={{ fontSize: 14, fontWeight: 600 }}>{capabilitiesData.provider || "Unknown"}</div>
                             </div>
                             <div style={{ background: "linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01))", padding: 12, borderRadius: 12, border: "1px solid rgba(255,255,255,0.1)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", boxShadow: "0 4px 16px -4px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.05)" }}>
-                              <div style={{ fontSize: 11, color: colors.textDim, marginBottom: 4 }}>WORKSPACE</div>
-                              <div style={{ fontSize: 14, fontWeight: 600 }}>{capabilitiesData.workspace?.name || capabilitiesData.workspace?.id || "Default"}</div>
+                              <div style={{ fontSize: 11, color: colors.textDim, marginBottom: 4 }}>PROJECT</div>
+                              <div style={{ fontSize: 14, fontWeight: 600 }}>
+                                {capabilitiesData.workspace?.project_attached
+                                  ? (capabilitiesData.workspace?.workspace_name || capabilitiesData.workspace?.name || capabilitiesData.workspace?.project_id || "attached")
+                                  : "none"}
+                              </div>
+                              <div style={{ fontSize: 11, color: colors.textDim, marginTop: 6 }}>
+                                Mode: {capabilitiesData.workspace?.interaction_mode || "chat"}
+                                {capabilitiesData.workspace?.project_id ? ` · id ${String(capabilitiesData.workspace.project_id).slice(0, 8)}…` : ""}
+                              </div>
                             </div>
                           </div>
+
+                          <CapabilityRegistryGroups registry={capabilitiesData.capability_registry} />
 
                           {/* Coding Readiness */}
                           <div style={{ background: "linear-gradient(135deg, rgba(34,197,94,0.08), rgba(255,255,255,0.01))", padding: 12, borderRadius: 12, border: "1px solid rgba(34,197,94,0.18)", marginBottom: 16 }}>
@@ -8204,14 +9193,14 @@ export const Dashboard: React.FC = () => {
                   {pendingApproval?.has_pending && pendingApproval.action ? (
                     <div style={{ marginBottom: 14 }}>
                       <ConfirmationCard
-                        action={{ tool: pendingApproval.action.tool, kwargs: pendingApproval.action.kwargs }}
+                        action={pendingApproval.action}
                         riskLevel={pendingApproval.risk_level || pendingApproval.action.risk_level}
                         riskColor={pendingApproval.risk_color || undefined}
                         policyFlags={pendingApproval.policy_flags || pendingApproval.action.policy_flags}
                         sessionPermissions={pendingApproval.session_permissions || pendingApproval.action.session_permissions}
                         dryRunAvailable={Boolean(pendingApproval.dry_run_available)}
-                        onConfirm={() => sendText("confirm")}
-                        onCancel={() => sendText("cancel")}
+                        onConfirm={() => pendingApproval.approval_id && decideApproval(pendingApproval.approval_id, "confirm")}
+                        onCancel={() => pendingApproval.approval_id && decideApproval(pendingApproval.approval_id, "cancel")}
                       />
                     </div>
                   ) : (
@@ -8339,7 +9328,7 @@ export const Dashboard: React.FC = () => {
                     </div>
                     <div style={{ fontSize: 10, color: colors.textDim, marginTop: 4 }}>Active project context is injected into every AI response via the system prompt.</div>
                   </div>
-                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: -12, flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
                     <button
                       className="icon-button"
                       style={{ height: 32, padding: "0 12px", fontSize: 14, flex: 1 }}
@@ -8493,7 +9482,7 @@ export const Dashboard: React.FC = () => {
                     </div>
                     <div style={{ fontSize: 10, color: colors.textDim, marginTop: 4 }}>Routines fire through process_query() — full tool access, safety gating, and memory recording.</div>
                   </div>
-                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: -12, flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
                     <button
                       className="icon-button"
                       style={{ height: 32, padding: "0 12px", fontSize: 14, flex: 1 }}
@@ -8969,7 +9958,7 @@ I am EchoSpeak, a personal AI assistant...
                     </div>
                   </div>
                 </motion.div>
-              )}
+              , document.body)}
             </div>
           </div>
         </div>

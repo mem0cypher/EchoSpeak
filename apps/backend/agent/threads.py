@@ -9,6 +9,8 @@ history lives in LangGraph checkpoints and the memory system.
 from __future__ import annotations
 
 import json
+import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -85,10 +87,12 @@ class ThreadManager:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             data = {tid: t.to_dict() for tid, t in self._threads.items()}
-            self._path.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
+            temp = self._path.with_suffix(self._path.suffix + ".tmp")
+            with temp.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, self._path)
         except Exception as exc:
             logger.warning(f"Failed to save threads: {exc}")
 
@@ -107,7 +111,7 @@ class ThreadManager:
             now = time.time()
             thread = ThreadInfo(
                 thread_id=tid,
-                title=title or f"Thread {len(self._threads) + 1}",
+                title=(title or "New Session").strip() or "New Session",
                 created_at=now,
                 last_active_at=now,
                 message_count=0,
@@ -151,6 +155,36 @@ class ThreadManager:
                 if increment_messages:
                     thread.message_count += 1
                 self._save()
+
+    def record_user_message(self, thread_id: str, message: str) -> Optional[ThreadInfo]:
+        """Touch a Session and derive its initial title without another model call."""
+        with self._lock:
+            thread = self._threads.get(thread_id)
+            if thread is None:
+                return None
+            if thread.message_count == 0 and self._is_placeholder_title(thread.title):
+                thread.title = self._title_from_message(message)
+            thread.message_count += 1
+            thread.last_active_at = time.time()
+            self._save()
+            return ThreadInfo.from_dict(thread.to_dict())
+
+    @staticmethod
+    def _is_placeholder_title(title: str) -> bool:
+        value = str(title or "").strip()
+        return not value or bool(re.fullmatch(r"(?:new|default)?\s*(?:session|thread)(?:\s+\d+)?", value, re.I))
+
+    @staticmethod
+    def _title_from_message(message: str) -> str:
+        text = re.sub(r"[`#>*_]+", " ", str(message or ""))
+        text = re.sub(r"\s+", " ", text).strip(" .,:;-\t\r\n")
+        if not text:
+            return "New Session"
+        words = text.split()
+        title = " ".join(words[:9])
+        if len(title) > 64:
+            title = title[:64].rsplit(" ", 1)[0] or title[:64]
+        return title + ("…" if len(words) > 9 or len(text) > len(title) else "")
 
     def update_thread(
         self,

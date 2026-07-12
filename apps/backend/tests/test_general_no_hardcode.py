@@ -179,6 +179,473 @@ def test_weather_place_structural_not_city_list():
     assert "weather" in bare.lower()
 
 
+def test_active_work_persists_across_agent_reinit():
+    """Desktop project open must leave durable fingerprint; new agent restores it."""
+    import tempfile
+    from agent.core import EchoSpeakAgent
+    from agent.active_work import ActiveWorkStore, looks_like_desktop_relist, goal_looks_incomplete
+    from pathlib import Path
+
+    tid = "test-aw-persist-" + tempfile.mkdtemp()[-8:]
+    a = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    a._current_thread_id = tid
+    q = "start 2d-shooter-game on my desktop"
+    assert a._is_local_filesystem_intent(q) is True
+    scan = a._run_local_project_deep_scan(q)
+    if not (Path.home() / "Desktop" / "2d-shooter-game").is_dir():
+        return
+    assert "2d-shooter" in str(scan.get("path") or "").lower()
+    aw = a._load_active_work()
+    assert aw is not None and aw.is_active()
+    assert "2d-shooter" in aw.project_path.lower().replace("_", "-")
+    assert aw.files_known
+    stall = "Looks like you got a folder. What kind of game is it? I gotta see what's in there."
+    assert a._local_scan_answer_is_hollow(q, stall) is True
+    assert looks_like_desktop_relist(stall) is True
+    # Fresh agent instance (simulates process/pool re-init)
+    b = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    b._current_thread_id = tid
+    aw2 = b._load_active_work()
+    assert aw2.project_path == aw.project_path
+    ctx = b._active_work_context_block()
+    assert "Do NOT re-list" in ctx
+    assert aw.project_name in ctx or "2d-shooter" in ctx.lower()
+    # Continuity recovery must replace hollow stall without re-asking (no live LLM)
+    b._invoke_visible_llm = lambda prompt: (
+        "Project at Desktop/2d-shooter-game with game.js, index.html, style.css. "
+        "Canvas shooter already has player/enemies. Next: edit game.js for score."
+    )
+    b._synthesize_local_project_brief = lambda ui: (
+        "Scanned 2d-shooter-game: game.js, index.html, style.css. Ready to edit."
+    )
+    fixed = b._ensure_active_work_continuity(q, stall)
+    assert fixed
+    flow = fixed.lower()
+    assert "what kind of game" not in flow
+    assert "gotta see what" not in flow
+    assert len(fixed) > 60
+    # Hydrate seeds pin + samples
+    assert b._hydrate_from_active_work() is True
+    assert "2d-shooter" in str(getattr(b, "_last_local_project_path", "")).lower()
+
+
+def test_active_work_replan_on_incomplete_implement_goal():
+    """Mid-task implement goals must replan from fingerprint, not re-list Desktop."""
+    import tempfile
+    from agent.core import EchoSpeakAgent
+    from agent.active_work import ActiveWorkState, ActiveWorkStore, goal_looks_incomplete
+    from pathlib import Path
+
+    desk = Path.home() / "Desktop" / "2d-shooter-game"
+    if not desk.is_dir():
+        return
+    tid = "test-aw-replan-" + tempfile.mkdtemp()[-8:]
+    store = ActiveWorkStore()
+    state = ActiveWorkState(
+        thread_id=tid,
+        kind="coding_project",
+        phase="implement",
+        project_path=str(desk),
+        project_name="2d-shooter-game",
+        goal="add score when enemies die and despawn on player hit",
+        next_step="Implement in project files: add score when enemies die",
+        files_known=["game.js", "index.html", "style.css"],
+        listing="game.js\nindex.html\nstyle.css\n",
+        code_digest="### game.js\n// player enemies score collision\nfunction update() {}\n",
+    )
+    store.save(state)
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    agent._current_thread_id = tid
+    agent._hydrate_from_active_work()
+    stall = (
+        "File list done — content='2d-shooter-game/ EchoSpeak/ Win11Debloat... "
+        "What kind of game is it? I gotta see what's in there before I can try."
+    )
+    aw = agent._load_active_work()
+    assert goal_looks_incomplete(aw, stall, tools_ran=["file_list"]) is True
+    agent._invoke_visible_llm = lambda prompt: (
+        "Resuming 2d-shooter-game. Goal: add score on enemy kill and despawn on player hit. "
+        "Next edit: game.js collision + score counter. Not re-listing Desktop."
+    )
+    out = agent._ensure_active_work_continuity(
+        "can we add a score everytime we kill one of the enemies",
+        stall,
+    )
+    low = out.lower()
+    assert "what kind of game" not in low
+    assert "win11debloat" not in low
+    assert "game.js" in low or "score" in low or "resuming" in low or "continuing" in low
+    assert len(out) > 40
+    # Partial tool restore must include active_work_restore
+    tools = [tr.get("tool") for tr in (agent._partial_tool_results or [])]
+    assert "active_work_restore" in tools
+
+
+def test_new_app_request_never_resumes_unrelated_shooter_project():
+    """CRITICAL: to-do list must not reuse 2d-shooter-game pin/path."""
+    import tempfile
+    from pathlib import Path
+    from agent.core import EchoSpeakAgent
+    from agent.active_work import (
+        ActiveWorkState,
+        ActiveWorkStore,
+        request_continues_project,
+        infer_new_project_slug,
+    )
+
+    desk = Path.home() / "Desktop" / "2d-shooter-game"
+    if not desk.is_dir():
+        return
+    tid = "test-aw-newproj-" + tempfile.mkdtemp()[-8:]
+    store = ActiveWorkStore()
+    store.save(
+        ActiveWorkState(
+            thread_id=tid,
+            kind="coding_project",
+            phase="implement",
+            project_path=str(desk),
+            project_name="2d-shooter-game",
+            goal="health and scoreboard for shooter",
+            next_step="Continue shooter",
+            files_known=["game.js", "index.html", "style.css"],
+            listing="game.js\nindex.html\nstyle.css",
+            code_digest="### game.js\n// canvas shooter enemies\n",
+            features_present=["health", "score"],
+            file_mtimes={"game.js": 1.0},
+        )
+    )
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    agent._current_thread_id = tid
+    aw = agent._load_active_work()
+    q_new = "build me a brand new to-do list app on my desktop"
+    assert request_continues_project(q_new, aw) is False
+    assert agent._active_work_is_relevant(q_new, aw) is False
+    path = agent._resolve_coding_project_path(q_new)
+    assert path
+    assert "2d-shooter" not in path.lower().replace("_", "-")
+    assert "todo" in path.lower().replace("_", "-") or "to-do" in path.lower() or "list" in path.lower()
+    # slug helper sanity
+    slug = infer_new_project_slug(q_new)
+    assert "todo" in slug or "list" in slug
+    assert "desktop" not in slug
+
+    # Continuity gate on the *shooter* fingerprint (in-memory), independent of overwrite
+    q_cont = "also add a pause button to the shooter game"
+    assert request_continues_project(q_cont, aw) is True
+    # Restore shooter state on a fresh thread and confirm path resolves to shooter
+    tid2 = "test-aw-cont-" + tempfile.mkdtemp()[-8:]
+    store.save(
+        ActiveWorkState(
+            thread_id=tid2,
+            kind="coding_project",
+            phase="implement",
+            project_path=str(desk),
+            project_name="2d-shooter-game",
+            goal="health and scoreboard for shooter",
+            next_step="Continue shooter",
+            files_known=["game.js", "index.html", "style.css"],
+            listing="game.js\nindex.html\nstyle.css",
+            code_digest="### game.js\n// canvas shooter enemies\n" + ("x" * 100),
+            features_present=["health", "score"],
+            file_mtimes={"game.js": 1.0},
+        )
+    )
+    agent2 = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    agent2._current_thread_id = tid2
+    path2 = agent2._resolve_coding_project_path(q_cont)
+    assert "2d-shooter" in path2.lower().replace("_", "-")
+
+
+def test_coding_followup_reuses_active_work_skips_full_rescan():
+    """Case 2: state stored but was ignored — follow-up must resume, not cold-scan all files."""
+    import tempfile
+    from pathlib import Path
+    from agent.core import EchoSpeakAgent
+    from agent.active_work import ActiveWorkState, ActiveWorkStore
+
+    desk = Path.home() / "Desktop" / "2d-shooter-game"
+    if not desk.is_dir():
+        return
+    tid = "test-aw-followup-" + tempfile.mkdtemp()[-8:]
+    store = ActiveWorkStore()
+    # Simulate prior turn wrote usable project fingerprint
+    digest = (
+        "### game.js\nconst player={hp:100}; function damagePlayer(){}\n"
+        "### index.html\n<div id='healthBar'></div>\n"
+        "### style.css\n.health-bar{}\n"
+    )
+    mtimes = {}
+    for name in ("game.js", "index.html", "style.css"):
+        p = desk / name
+        if p.is_file():
+            mtimes[name] = float(p.stat().st_mtime)
+    store.save(
+        ActiveWorkState(
+            thread_id=tid,
+            kind="coding_project",
+            phase="implement",
+            project_path=str(desk),
+            project_name="2d-shooter-game",
+            goal="health and scoreboard",
+            next_step="Continue implementation",
+            files_known=["game.js", "index.html", "style.css"],
+            listing="game.js\nindex.html\nstyle.css",
+            code_digest=digest,
+            features_present=["health", "score"],
+            file_mtimes=mtimes,
+        )
+    )
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    agent._current_thread_id = tid
+    aw = agent._load_active_work()
+    assert aw is not None and aw.has_usable_scan()
+    assert aw.same_project(str(desk))
+    # Follow-up should classify as implement + same project resume
+    q = "also make enemies drop a powerup when killed"
+    assert agent._is_coding_implement_intent(q) is True
+    # Relevant files should prefer js for gameplay ask
+    files = agent._coding_project_source_files(str(desk))
+    rel = agent._files_relevant_to_request(q, files)
+    assert any(Path(f).name == "game.js" for f in rel)
+    # Stale check: matching mtimes => not stale
+    for f in files:
+        if Path(f).name in mtimes:
+            assert agent._file_is_stale_vs_active_work(f, aw) is False
+    # Digest parses back into files without needing disk re-read of all three
+    parsed = agent._parse_code_digest_to_files(digest, str(desk))
+    assert any("game.js" in k.replace("\\", "/") for k in parsed)
+
+
+def test_coding_implement_intent_uses_plan_state_hooks():
+    """Feature edits on Desktop game must be recognized as implement + plan-worthy."""
+    import tempfile
+    from pathlib import Path
+    from agent.core import EchoSpeakAgent
+
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    q = (
+        "lets work on 2d-shooter-game on my desktop and add a health bar "
+        "and scoreboard and a you died screen with restart"
+    )
+    assert agent._is_coding_implement_intent(q) is True
+    assert agent._task_planner.needs_planning(q) is True
+    desk = Path.home() / "Desktop" / "2d-shooter-game"
+    if not desk.is_dir():
+        return
+    path = agent._resolve_coding_project_path(q)
+    assert path and "2d-shooter" in path.lower().replace("_", "-")
+    files = agent._coding_project_source_files(path)
+    names = {Path(f).name for f in files}
+    assert "game.js" in names
+    # Scan/open-only should NOT be implement (brief path stays)
+    assert agent._is_coding_implement_intent("start 2d-shooter-game on my desktop") is False
+
+
+def test_active_work_store_disk_roundtrip():
+    """ActiveWorkStore is the continuity layer independent of agent instance."""
+    import tempfile
+    from pathlib import Path
+    from agent.active_work import ActiveWorkState, ActiveWorkStore, next_step_for_phase
+
+    root = Path(tempfile.mkdtemp())
+    store = ActiveWorkStore(root=root)
+    tid = "disk-roundtrip"
+    s = ActiveWorkState(
+        thread_id=tid,
+        kind="coding_project",
+        phase="ready",
+        project_path=r"C:\Users\me\Desktop\my-app",
+        project_name="my-app",
+        goal="open and understand my-app",
+        next_step=next_step_for_phase("ready", has_samples=True, goal="open and understand my-app"),
+        files_known=["main.py", "readme.md"],
+        listing="main.py\nreadme.md\n",
+        code_digest="### main.py\nprint('hi')\n",
+    )
+    store.save(s)
+    loaded = store.load(tid)
+    assert loaded.is_active()
+    assert loaded.project_path == s.project_path
+    assert "main.py" in loaded.files_known
+    block = store.context_block(tid)
+    assert "ACTIVE WORK" in block
+    assert "Do NOT re-list" in block
+    assert "my-app" in block
+
+
+def test_coding_score_enemy_never_forces_web_search():
+    """Live: 'add score when kill enemies' must not become live sports web_search."""
+    from agent.core import EchoSpeakAgent
+    import tempfile
+
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    q = (
+        "can we add a score everytime we kill one of the enimies and also make sure "
+        "that if they hit the player they disapear"
+    )
+    assert agent._is_software_game_coding_context(q) is True
+    assert agent._needs_live_web_fulfillment(q) is False
+    tools = agent._allowed_lc_tool_names(q)
+    agent._current_allowed_tools = tools
+    agent._partial_tool_results = [{"tool": "file_read", "output": "game.js ok"}]
+    out = agent._ensure_live_web_search(q, "I'll edit game.js for score and collision.")
+    assert "Unreal" not in out and "Unity" not in out
+    assert "I'll edit game.js" in out
+    assert "web_search" not in tools
+
+
+def test_file_edit_resolves_desktop_project_not_echospeak_root():
+    """index.html edit during shooter work must hit Desktop/2d-shooter-game, not EchoSpeak."""
+    from pathlib import Path
+    from agent.tools import set_active_project_root, get_active_project_root, _desktop_root
+
+    desk = _desktop_root()
+    proj = desk / "2d-shooter-game"
+    if not proj.is_dir():
+        return  # skip if not present
+    set_active_project_root(str(proj))
+    assert get_active_project_root() is not None
+    from agent.tools import _candidate_file_path, _file_tool_root
+
+    p = _candidate_file_path("index.html", _file_tool_root())
+    assert "2d-shooter-game" in str(p).replace("\\", "/")
+    assert "echospeak" not in str(p).lower() or "2d-shooter" in str(p).lower()
+    assert p.name == "index.html"
+
+
+def test_reflector_does_not_retry_accepted_grounded_packet():
+    """Log bug: accepted=true still triggered reflector attempts 1 and 2."""
+    from agent.core import EchoSpeakAgent, WebTaskReflector
+    import tempfile
+
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    refl = WebTaskReflector(agent)
+    packet = (
+        "[GROUNDED_SEARCH] accepted=true query=FIFA World Cup matches today\n"
+        "France vs Morocco 4:00 PM ET\n"
+        "evidence ok"
+    )
+    calls = {"n": 0}
+    orig = agent._grounded_web_search
+
+    def _spy(*a, **k):
+        calls["n"] += 1
+        return packet
+
+    agent._grounded_web_search = _spy  # type: ignore
+    out = refl.reflect_and_retry(
+        {
+            "index": "t1",
+            "tool": "web_search",
+            "params": {"q": "FIFA World Cup matches today", "silent": True},
+        },
+        "web_search",
+        packet,
+        tools=[],
+        callbacks=None,
+    )
+    assert out == packet
+    assert calls["n"] == 0, "must not re-call grounded search after accepted=true"
+
+
+def test_search_fingerprint_dedupes_tz_word_order():
+    from agent.core import EchoSpeakAgent
+    import tempfile
+
+    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    a = "FIFA World Cup today full match list kickoff ET and mnt convert timezone"
+    b = "FIFA World Cup today full match list kickoff ET and et mnt convert timezone"
+    c = "FIFA World Cup today full match list kickoff ET and mnt et convert timezone"
+    fa, fb, fc = (
+        agent._search_query_fingerprint(a),
+        agent._search_query_fingerprint(b),
+        agent._search_query_fingerprint(c),
+    )
+    assert fa == fb == fc
+    # Grounded re-entry reuses packet without counting as new storms
+    agent._request_grounded_results = {}
+    agent._request_grounded_count = 0
+    agent._request_search_cache = {}
+    agent._request_grounded_results[fa] = "[GROUNDED_SEARCH]\naccepted=true\nFrance vs Morocco 4pm"
+    out = agent._grounded_web_search(b, original_request=b, emit_tool_events=False)
+    assert "France" in out or "4pm" in out
+    assert agent._request_grounded_count == 0  # suppressed, did not increment
+
+
+def test_search_query_quality_gate_rejects_fragments():
+    """Utterance fragments must not become searches; multi keeps entity-rich queries only."""
+    from agent.research import (
+        is_viable_search_query,
+        quality_gate_search_queries,
+        resolve_web_search_queries,
+    )
+
+    parent = "what time does the fifa game with france and maracoo start today? pelsae check"
+    assert is_viable_search_query("pelsae check", parent=parent) is False
+    assert is_viable_search_query("please check", parent=parent) is False
+    assert is_viable_search_query("maracoo start today", parent=parent) is False
+    good = "FIFA World Cup france maracoo kickoff time ET today"
+    assert is_viable_search_query(good, parent=parent) is True
+
+    gated = quality_gate_search_queries(
+        [
+            "FIFA World Cup match list kickoff times ET each game schedule fixtures",
+            "maracoo start today",
+            "pelsae check",
+        ],
+        parent,
+    )
+    assert len(gated) >= 1
+    assert not any("pelsae" in g.lower() for g in gated)
+    assert not any(g.lower() == "maracoo start today" for g in gated)
+    # Prefer queries that keep the matchup when present
+    rjoin = " ".join(gated).lower()
+    assert "fifa" in rjoin or "world cup" in rjoin or "france" in rjoin
+
+    # Real multi still fans out cleanly
+    multi = (
+        "weather in Osaka tomorrow and what matches are happening for the world cup tomorrow"
+    )
+    resolved = resolve_web_search_queries(multi, multi, use_decomposition=True)
+    assert len(resolved) >= 2
+    rjoin2 = " ".join(resolved).lower()
+    assert "osaka" in rjoin2 or "weather" in rjoin2
+    assert "fifa" in rjoin2 or "world cup" in rjoin2 or "match" in rjoin2
+    assert not any("please" in x.lower() and len(x.split()) <= 3 for x in resolved)
+
+
+def test_fifa_matchup_single_query_not_junk_split():
+    """Live: France/maracoo + 'pelsae check' must be ONE sports query, not 3 junk ones."""
+    from agent.research import (
+        resolve_web_search_queries,
+        looks_like_multi_intent,
+        _extract_vs_sides,
+        _normalize_sports_query,
+        _prep_search_work_text,
+    )
+
+    q = "what time does the fifa game with france and maracoo start today? pelsae check"
+    prep = _prep_search_work_text(q)
+    assert "pelsae" not in prep.lower()
+    assert "please check" not in prep.lower()
+    assert looks_like_multi_intent(q) is False
+    sides = _extract_vs_sides(q)
+    assert "france" in sides.lower()
+    assert "maracoo" in sides.lower() or "morocco" in sides.lower()
+    sports = _normalize_sports_query(q)
+    assert "france" in sports.lower()
+    assert "fifa" in sports.lower() or "world cup" in sports.lower()
+    assert "kickoff" in sports.lower() or "time" in sports.lower()
+    resolved = resolve_web_search_queries(q, q, use_decomposition=True)
+    assert len(resolved) == 1, resolved
+    r0 = resolved[0].lower()
+    assert "france" in r0
+    assert "maracoo" in r0 or "morocco" in r0
+    assert "pelsae" not in r0
+    assert r0 != "maracoo start today"
+    assert "pelsae check" not in r0
+
+
 def test_local_scan_reloops_into_project_not_stall():
     """After listing Desktop, must enter 2d-shooter-game and not ask 'what first?'."""
     from pathlib import Path
@@ -240,10 +707,24 @@ def test_desktop_project_never_forces_web_search():
     assert "web_search" not in tools
     assert "file_list" in tools or "file_read" in tools
 
-    # Stage 3 must not return a web-search shortcut result
+    # Stage 3: local Desktop intent returns a project brief — never a web-search fan-out
     ctx = ContextBundle(extracted_input=q, resolved_input=q, allowed_tool_names=tools)
     sc = agent._pq_shortcut_queries(q, ctx, None)
-    assert sc is None
+    # Either forced local brief (preferred) or None fall-through — never multi-web packet
+    if sc is not None:
+        assert sc[1] is True
+        body = (sc[0] or "").lower()
+        assert "tavily" not in body
+        assert "web_search blocked" not in body
+        # Real project substance when Desktop folder exists
+        from pathlib import Path as _P
+        if (_P.home() / "Desktop" / "2d-shooter-game").is_dir():
+            assert (
+                "2d-shooter" in body
+                or "game.js" in body
+                or "index.html" in body
+                or "scanned" in body
+            )
 
     # Even if something calls grounded web_search, it must refuse and stay local
     blocked = agent._grounded_web_search(q, original_request=q, emit_tool_events=False)

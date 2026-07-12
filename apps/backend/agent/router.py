@@ -431,6 +431,7 @@ class IntentRouter:
         return False
 
     def needs_time_context(self, query_lower: str) -> bool:
+        """Whether a date stamp helps. Prefer silent datetime; get_system_time is clock-only."""
         q = re.sub(r"\s+", " ", str(query_lower or "").strip().lower())
         if not q:
             return False
@@ -438,11 +439,17 @@ class IntentRouter:
             return False
         if self.is_direct_time_question(q):
             return True
+        # Timezone / "my time" — still a clock question family
+        if re.search(r"\b(timezone|time zone|my time|local time)\b", q):
+            return True
+        # Live sports/web: silent stamp only (core uses silent path; not get_system_time ToolRun)
         fast_triggers = [
-            "right now", "currently", "today", "tonight", "tomorrow",
-            "this week", "this weekend", "this month", "as of",
+            "right now", "currently", "tonight", "tomorrow",
+            "this week", "this weekend", "this month", "as of", "today",
         ]
-        if any(t in q for t in [t for t in fast_triggers if t != "today"]):
+        if any(t in q for t in fast_triggers) and (
+            self.is_live_web_intent(q) or self.has_live_info_subject(q)
+        ):
             return True
         schedule_terms = [
             "game", "match", "fixture", "schedule", "event", "concert",

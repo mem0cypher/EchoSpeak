@@ -469,10 +469,6 @@ def _validate_settings_effective(effective: dict) -> list[dict]:
         if access and not access_secret:
             issues.append({"key": "twitter_access_token_secret", "message": "Twitter/X access token is set but TWITTER_ACCESS_TOKEN_SECRET is empty.", "severity": "error"})
 
-    tavily_key = str(s.get("tavily_api_key") or "").strip()
-    if not tavily_key:
-        issues.append({"key": "tavily_api_key", "message": "Tavily is the active web search integration and requires TAVILY_API_KEY.", "severity": "error"})
-
     if str(s.get("default_cloud_provider") or "").strip().lower() == "gemini" and bool(s.get("gemini_use_langgraph")):
         issues.append({"key": "gemini_use_langgraph", "message": "Gemini LangGraph tool-calling is enabled. If tool calls fail, turn this off to use AgentExecutor instead.", "severity": "warning"})
 
@@ -510,6 +506,8 @@ def _sanitize_incoming_settings(patch: dict) -> dict:
         "openai": set(getattr(config.openai, "model_dump")().keys()),
         "gemini": set(getattr(config.gemini, "model_dump")().keys()),
         "local": set(getattr(config.local, "model_dump")().keys()),
+        "research_model": set(getattr(config.research_model, "model_dump")().keys()),
+        "patches": set(getattr(config.patches, "model_dump")().keys()),
         "embedding": set(getattr(config.embedding, "model_dump")().keys()),
         "voice": set(getattr(config.voice, "model_dump")().keys()),
         "personaplex": set(getattr(config.personaplex, "model_dump")().keys()),
@@ -766,7 +764,10 @@ def get_document_store():
 def _apply_thread_scope(agent, thread_id: Optional[str], workspace_override: Optional[str] = None) -> dict[str, Any]:
     store = get_state_store()
     normalized_thread_id = _normalize_thread_id(thread_id)
-    setattr(agent, "_current_thread_id", normalized_thread_id)
+    if hasattr(agent, "select_thread_runtime"):
+        agent.select_thread_runtime(normalized_thread_id)
+    else:
+        setattr(agent, "_current_thread_id", normalized_thread_id)
     state = store.get_thread_state(normalized_thread_id)
 
     workspace_value = str(workspace_override or "").strip()
@@ -782,11 +783,28 @@ def _apply_thread_scope(agent, thread_id: Optional[str], workspace_override: Opt
         agent.configure_workspace(workspace_id or None)
 
     project_id = str(state.active_project_id or "").strip()
-    agent.activate_project(project_id or None)
+    # The agent instance is shared, but Project scope is Session-owned. Never
+    # copy the previously selected Session's Project into a fresh Session.
+    if project_id:
+        if project_id != str(getattr(agent, "_active_project_id", None) or ""):
+            agent.activate_project(project_id)
+    else:
+        # Full detach transaction — do not leave soft path / ActiveWork / preview.
+        if str(getattr(agent, "_active_project_id", None) or "") or str(state.project_path or ""):
+            if hasattr(agent, "_clear_session_project_scope"):
+                agent._clear_session_project_scope(
+                    thread_id=normalized_thread_id,
+                    reason="Session has no attached Project",
+                )
+            else:
+                setattr(agent, "_active_project_id", None)
+        else:
+            setattr(agent, "_active_project_id", None)
+    updated = store.get_thread_state(normalized_thread_id)
+    # Keep workspace_id / provider stamps without re-writing a cleared project id.
     updated = store.update_thread_state(
         normalized_thread_id,
-        workspace_id=str(getattr(agent, "_workspace_id", None) or ""),
-        active_project_id=str(getattr(agent, "_active_project_id", None) or ""),
+        workspace_id=str(getattr(agent, "_workspace_id", None) or updated.workspace_id or ""),
         runtime_provider=str(getattr(getattr(agent, "llm_provider", None), "value", getattr(agent, "llm_provider", "")) or ""),
     )
     return updated.model_dump()
@@ -1062,9 +1080,9 @@ class _StreamingHandler(BaseCallbackHandler):
                     if not text:
                         text = str(self._preamble_fn(tool_name or "tool", tool_input or "") or "").strip()
                 except Exception as exc:
-                    logger.warning("Preamble generator failed: %s", exc)
+                    logger.warning("Preamble generator failed: {}", exc)
             except Exception as exc:
-                logger.warning("Preamble generator failed: %s", exc)
+                logger.warning("Preamble generator failed: {}", exc)
 
         if not self._is_usable_preamble(text):
             # Last-resort variety — never say the raw tool id ("web search").
@@ -1210,6 +1228,21 @@ class _StreamingHandler(BaseCallbackHandler):
     def on_tool_start(self, serialized: dict, input_str: str, run_id: str, parent_run_id: Optional[str] = None, **kwargs):
         tool_name = (serialized or {}).get("name") or (serialized or {}).get("id") or "tool"
         call_id = str(run_id)
+        try:
+            agent = getattr(self, "_agent_ref", None)
+            if agent is not None:
+                if str(tool_name or "") == "web_search":
+                    if hasattr(agent, "_set_outer_web_search_id"):
+                        agent._set_outer_web_search_id(call_id)
+                    else:
+                        agent._lc_outer_web_search_id = call_id
+                        agent._grounded_fanout_count = 0
+                if hasattr(agent, "_register_tool_run"):
+                    agent._register_tool_run(str(tool_name or ""), call_id)
+                if hasattr(agent, "_ensure_durable_tool_run_started"):
+                    agent._ensure_durable_tool_run_started(str(tool_name or ""), call_id, str(input_str or ""))
+        except Exception:
+            pass
         raw_input = input_str if isinstance(input_str, str) else str(input_str)
         # Deterministic beat only for user-facing tools — never for silent injects
         # like get_system_time (that was firing "Checking that now." then skipping weather).
@@ -1238,7 +1271,7 @@ class _StreamingHandler(BaseCallbackHandler):
                 "at": time.time(),
                 "request_id": self._request_id,
             })
-            logger.warning("No-progress detected: tool '%s' called %d times with identical input", tool_name, repeat_count)
+            logger.warning("No-progress detected: tool '{}' called {} times with identical input", tool_name, repeat_count)
 
         inp = raw_input
         # Coding tools need full path/content for the Code visualizer — do not collapse to 600 chars.
@@ -1282,7 +1315,50 @@ class _StreamingHandler(BaseCallbackHandler):
         started = self._tool_started_at.pop(call_id, None)
         if started is not None:
             _record_tool_latency((time.perf_counter() - started) * 1000.0)
+        # Multi-intent fan-out already closed the outer LC web_search row (UI + durable)
+        # and emitted per-intent children — drop the outer tool_end to avoid a third row.
+        try:
+            agent = getattr(self, "_agent_ref", None)
+            fanout = int(getattr(agent, "_grounded_fanout_count", 0) or 0) if agent is not None else 0
+            if agent is not None and hasattr(agent, "_get_outer_web_search_id"):
+                outer = str(agent._get_outer_web_search_id() or "")
+            else:
+                outer = str(getattr(agent, "_lc_outer_web_search_id", "") or "") if agent is not None else ""
+            # Also skip if outer was already cleared after _close_outer_web_search_tool_run
+            # but this LC end still fires with the original outer call_id.
+            if tool_name == "web_search" and fanout > 1 and (call_id == outer or (
+                agent is not None
+                and call_id
+                and not outer
+                and hasattr(agent, "get_tool_outcome")
+                and agent.get_tool_outcome(call_id) is not None
+                and str((agent.get_tool_outcome(call_id).output or "")).startswith("(expanded")
+            )):
+                if agent is not None and hasattr(agent, "_dequeue_tool_run"):
+                    agent._dequeue_tool_run(call_id, "web_search")
+                if agent is not None:
+                    agent._grounded_fanout_count = 0
+                    if hasattr(agent, "_clear_outer_web_search_id"):
+                        agent._clear_outer_web_search_id(call_id)
+                    else:
+                        agent._lc_outer_web_search_id = ""
+                self._q.put({
+                    "type": "status",
+                    "agent_mode": "thinking",
+                    "at": time.time(),
+                    "request_id": self._request_id,
+                })
+                return
+        except Exception:
+            pass
         event = {"type": "tool_end", "id": call_id, "name": tool_name, "output": out, "at": time.time(), "request_id": self._request_id}
+        try:
+            agent = getattr(self, "_agent_ref", None)
+            outcome = agent.get_tool_outcome(call_id) if agent is not None and hasattr(agent, "get_tool_outcome") else None
+            if outcome is not None:
+                event["outcome"] = outcome.model_dump()
+        except Exception:
+            pass
         research_run = build_research_run(run_id=call_id, tool_name=tool_name, tool_input=raw_input, output=output if isinstance(output, str) else str(output), at=event["at"])
         if research_run is not None:
             event["research"] = research_run
@@ -1342,7 +1418,9 @@ def _start_agent_thread(
                 handler.set_on_partial(lambda text: agent.record_turn_partial_beat(text))
             except Exception:
                 pass
-            thread_state = _apply_thread_scope(agent, thread_id, workspace)
+            # Scope was persisted before this worker started; process_query restores
+            # it once under the agent request lock.
+            thread_state = get_state_store().get_thread_state(thread_id).model_dump()
             memory_before = int(getattr(agent.memory, "memory_count", 0) or 0)
             response, success = agent.process_query(
                 message,
@@ -1354,6 +1432,13 @@ def _start_agent_thread(
             state_store = get_state_store()
             latest_state = state_store.get_thread_state(thread_id).model_dump()
             execution = state_store.get_execution(latest_state.get("last_execution_id") or "") if latest_state.get("last_execution_id") else None
+            response_render = None
+            try:
+                exec_meta = execution.metadata if execution is not None else {}
+                if isinstance(exec_meta, dict):
+                    response_render = exec_meta.get("response_render")
+            except Exception:
+                response_render = None
             spoken_text = ""
             try:
                 spoken_text = str(agent.get_last_tts_text() or "")
@@ -1391,6 +1476,7 @@ def _start_agent_thread(
                     "memory_count": memory_after,
                     "doc_sources": doc_sources,
                     "research": handler.research_runs,
+                    "response_render": response_render,
                     "spoken_text": spoken_text if not handler.partial_replies else (final_response or spoken_text),
                     "partial_replies": list(handler.partial_replies),
                     "execution_id": execution.id if execution else None,
@@ -1927,18 +2013,53 @@ class QueryResponse(BaseModel):
 
 class ThreadSessionStateResponse(BaseModel):
     thread_id: str
+    session_id: str = ""
+    title: str = ""
     workspace_id: str = ""
     active_project_id: str = ""
+    workspace_root: str = ""
+    project_path: str = ""
+    objective: str = ""
+    current_subject: str = ""
+    mode: str = "chat"
+    phase: str = ""
+    required_capabilities: List[str] = Field(default_factory=list)
+    available_capabilities: List[str] = Field(default_factory=list)
+    allowed_tool_names: List[str] = Field(default_factory=list)
+    permissions: Dict[str, bool] = Field(default_factory=dict)
+    constraints: List[str] = Field(default_factory=list)
+    decisions: List[str] = Field(default_factory=list)
+    completed_actions: List[Dict[str, Any]] = Field(default_factory=list)
+    pending_actions: List[Dict[str, Any]] = Field(default_factory=list)
+    failed_actions: List[Dict[str, Any]] = Field(default_factory=list)
+    plan_steps: List[Dict[str, Any]] = Field(default_factory=list)
+    retry_target: Dict[str, Any] = Field(default_factory=dict)
+    last_tool_outcome: Dict[str, Any] = Field(default_factory=dict)
+    operation_details: Dict[str, Any] = Field(default_factory=dict)
+    continuity_notice: str = ""
+    execution_status: str = "ready"
+    safest_next_action: str = ""
+    current_execution_id: str = ""
+    active_turn_id: str = ""
+    selected_model_id: str = ""
+    model_profile: Dict[str, Any] = Field(default_factory=dict)
+    context_budget: Dict[str, Any] = Field(default_factory=dict)
+    unfinished_workflow: Dict[str, Any] = Field(default_factory=dict)
     pending_approval_id: str = ""
     last_execution_id: str = ""
     last_trace_id: str = ""
     runtime_provider: str = ""
+    ledger: List[Dict[str, Any]] = Field(default_factory=list)
     updated_at: float = 0.0
 
 
 class ApprovalResponse(BaseModel):
     id: str
     thread_id: str
+    session_id: str = "default"
+    project_id: str = ""
+    original_turn_id: str = ""
+    tool_run_id: str = ""
     execution_id: Optional[str] = None
     status: str
     tool: str
@@ -1948,6 +2069,15 @@ class ApprovalResponse(BaseModel):
     summary: str = ""
     risk_level: str = "safe"
     policy_flags: List[str] = Field(default_factory=list)
+    permission_level: str = "modify"
+    constraints: List[str] = Field(default_factory=list)
+    policy_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    retry_count: int = 0
+    execution_context: Dict[str, Any] = Field(default_factory=dict)
+    action_id: str = ""
+    plan_id: str = ""
+    canonical_arguments_hash: str = ""
+    required_capabilities: List[str] = Field(default_factory=list)
     session_permissions: Dict[str, bool] = Field(default_factory=dict)
     dry_run_available: bool = False
     source: str = "web"
@@ -1964,17 +2094,36 @@ class ApprovalListResponse(BaseModel):
     count: int
 
 
+class ApprovalDecisionResponse(BaseModel):
+    approval: ApprovalResponse
+    success: bool
+    response: str = ""
+    execution_id: Optional[str] = None
+    thread_state: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ExecutionResponse(BaseModel):
     id: str
     request_id: str
     kind: str
     thread_id: str
+    session_id: str = "default"
+    project_id: str = ""
     source: str
     status: str
     query: str
     workspace_id: str = ""
     active_project_id: str = ""
     runtime_provider: str = ""
+    model_id: str = ""
+    model_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    context_budget: Dict[str, Any] = Field(default_factory=dict)
+    intent: str = ""
+    mode: str = "chat"
+    phase: str = ""
+    constraints: List[str] = Field(default_factory=list)
+    verification: Dict[str, Any] = Field(default_factory=dict)
+    terminal_status: str = "started"
     created_at: float
     updated_at: float
     completed_at: Optional[float] = None
@@ -2001,7 +2150,7 @@ class SettingsResponse(BaseModel):
 
 
 class SettingsTestRequest(BaseModel):
-    target: str = Field(..., description="openai | gemini | tavily | local | ollama | openai_compat")
+    target: str = Field(..., description="openai | gemini | local | ollama | openai_compat")
     base_url: Optional[str] = None
     api_key: Optional[str] = None
 
@@ -2083,33 +2232,6 @@ def settings_test(request: SettingsTestRequest):
                 except Exception:
                     count = 0
                 return SettingsTestResponse(ok=True, target=target, message=f"OK (models={count})", latency_ms=ms)
-            return SettingsTestResponse(ok=False, target=target, message=f"HTTP {code}", latency_ms=ms)
-
-        if target == "tavily":
-            key = api_key or (getattr(config, "tavily_api_key", "") or "").strip()
-            if not key or key == "***":
-                return SettingsTestResponse(ok=False, target=target, message="Missing Tavily API key.")
-            code, data = _http_post_json(
-                "https://api.tavily.com/search",
-                {
-                    "api_key": key,
-                    "query": "EchoSpeak settings connectivity test",
-                    "search_depth": "basic",
-                    "max_results": 1,
-                    "include_answer": False,
-                    "include_raw_content": False,
-                },
-                timeout_s=6.0,
-            )
-            ok = 200 <= code < 300
-            ms = (time.perf_counter() - started) * 1000.0
-            if ok:
-                count = 0
-                try:
-                    count = len((data or {}).get("results") or [])
-                except Exception:
-                    count = 0
-                return SettingsTestResponse(ok=True, target=target, message=f"OK (results={count})", latency_ms=ms)
             return SettingsTestResponse(ok=False, target=target, message=f"HTTP {code}", latency_ms=ms)
 
         if target in {"local", "openai_compat"}:
@@ -2348,9 +2470,12 @@ class ScreenCaptureResponse(BaseModel):
 
 
 class HistoryResponse(BaseModel):
-    """Response model for conversation history."""
-    history: list
-    count: int
+    """Conversation history + durable Turn timeline for page-refresh hydration."""
+    history: list = Field(default_factory=list)
+    count: int = 0
+    session: Dict[str, Any] = Field(default_factory=dict)
+    session_id: str = ""
+    turns: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class MemoryItem(BaseModel):
@@ -2434,6 +2559,7 @@ class ProviderInfoResponse(BaseModel):
     ready: bool = True
     readiness_message: str = ""
     readiness_detail: str = ""
+    model_profile: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SwitchProviderRequest(BaseModel):
@@ -2453,6 +2579,8 @@ class CapabilitiesResponse(BaseModel):
     features: Dict[str, Any]
     skills: List[Dict[str, Any]] = []
     trust: Dict[str, Any] = Field(default_factory=dict)
+    capability_registry: Dict[str, Any] = Field(default_factory=dict)
+    thread_context: Dict[str, Any] = Field(default_factory=dict)
 
 
 class CodingReadinessResponse(BaseModel):
@@ -2509,7 +2637,7 @@ async def query(request: QueryRequest):
     _metric_inc("requests", 1)
     try:
         logger.debug(
-            "Query request_id=%s thread_id=%s include_memory=%s msg_len=%s",
+            "Query request_id={} thread_id={} include_memory={} msg_len={}",
             request_id,
             _normalize_thread_id(request.thread_id),
             bool(request.include_memory),
@@ -2519,7 +2647,7 @@ async def query(request: QueryRequest):
             readiness = _check_provider_readiness()
             if not bool(readiness.get("ok")):
                 logger.warning(
-                    "Provider preflight failed for /query request_id=%s provider=%s detail=%s",
+                    "Provider preflight failed for /query request_id={} provider={} detail={}",
                     request_id,
                     readiness.get("provider"),
                     readiness.get("detail"),
@@ -2536,8 +2664,11 @@ async def query(request: QueryRequest):
                     trace_id=None,
                     thread_state=None,
                 )
+        _record_session_message(request.thread_id, request.message)
         agent = get_agent(request.thread_id)
-        thread_state = _apply_thread_scope(agent, request.thread_id, request.workspace)
+        # process_query restores Session scope under its request lock. Query
+        # payloads do not override backend-selected workspace/mode.
+        thread_state = get_state_store().get_thread_state(request.thread_id).model_dump()
         q: queue.Queue = queue.Queue()
         handler = _StreamingHandler(q, request_id)
         response, success = agent.process_query(
@@ -2655,10 +2786,15 @@ async def compact_memory(
 async def capabilities(thread_id: Optional[str] = Query(default=None)):
     try:
         agent = get_agent(thread_id)
+        # Bind the exact active Session Project before reporting tool readiness.
+        # Without this, the shared agent keeps a stale skill-workspace ("chat")
+        # and never activates the folder attached to this thread_id.
+        _apply_thread_scope(agent, thread_id)
         report = agent.get_doctor_report() or {}
-        # Compute per-tool allow/deny status.
-        allowlist = agent._tool_allowlist_override  # type: ignore[attr-defined]
-        allowset = set(allowlist) if isinstance(allowlist, (set, frozenset)) else None
+        # Skill-workspace TOOLS.txt is not a hard allowlist. Availability uses
+        # registration + policy + Project scope (see coding readiness).
+        allowlist = None
+        allowset = None
 
         # Import tool metadata
         from agent.tools import TOOL_METADATA
@@ -2708,15 +2844,16 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
             blocked_by_policy_flags: List[str] = []
             if is_action:
                 try:
-                    allowed_by_policy = bool(agent._action_allowed(name))  # type: ignore[attr-defined]
+                    allowed_by_policy = bool(agent._action_configured(name))  # type: ignore[attr-defined]
                 except Exception:
                     allowed_by_policy = False
                 if not allowed_by_policy:
-                    blocked_reason = "Blocked by system action permissions"
+                    blocked_reason = "Blocked by EchoSpeak role or configuration"
                     # Get specific policy flags that are missing
                     meta = TOOL_METADATA.get(name, {})
                     for flag in meta.get("policy_flags", []):
-                        blocked_by_policy_flags.append(flag)
+                        if not bool(getattr(config, str(flag).lower(), False)):
+                            blocked_by_policy_flags.append(flag)
 
             # Get tool metadata
             meta = TOOL_METADATA.get(name, {})
@@ -2811,12 +2948,49 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
             except Exception:
                 pass
 
-        ws = (report.get("workspace") or {}) if isinstance(report.get("workspace"), dict) else {}
         tools = (report.get("tools") or {}) if isinstance(report.get("tools"), dict) else {}
         features = (report.get("features") or {}) if isinstance(report.get("features"), dict) else {}
         provider = str(report.get("provider") or {}).strip() if isinstance(report.get("provider"), str) else ""
         if not provider:
             provider = str(getattr(agent, "llm_provider", "") or "")
+
+        scope = agent.project_scope_report(thread_id)
+        # Annotate project-scoped tools with scope/policy readiness for the panel.
+        project_read = {"project_status", "file_list", "file_read"}
+        project_write = {"file_write", "file_mkdir", "file_move", "file_copy", "file_delete", "artifact_write", "notepad_write"}
+        project_term = {"terminal_run"}
+        for it in items:
+            name = str(it.get("name") or "")
+            if name in project_read:
+                if not scope.get("project_attached"):
+                    it["allowed"] = False
+                    it["allowed_by_workspace"] = False
+                    it["blocked_reason"] = it.get("blocked_reason") or "No Project attached to this Session."
+                else:
+                    it["allowed_by_workspace"] = True
+                    it["allowed"] = bool(it.get("allowed_by_policy", True))
+            elif name in project_write:
+                if not scope.get("project_attached"):
+                    it["allowed"] = False
+                    it["allowed_by_workspace"] = False
+                    it["blocked_reason"] = it.get("blocked_reason") or "No Project attached to this Session."
+                elif not (scope.get("permissions") or {}).get("filesystem_write"):
+                    it["allowed"] = False
+                    it["allowed_by_policy"] = False
+                    it["blocked_reason"] = it.get("blocked_reason") or "Write permission is disabled."
+                else:
+                    it["allowed_by_workspace"] = True
+            elif name in project_term:
+                if not scope.get("project_attached"):
+                    it["allowed"] = False
+                    it["allowed_by_workspace"] = False
+                    it["blocked_reason"] = it.get("blocked_reason") or "No Project attached to this Session."
+                elif not (scope.get("permissions") or {}).get("terminal"):
+                    it["allowed"] = False
+                    it["allowed_by_policy"] = False
+                    it["blocked_reason"] = it.get("blocked_reason") or "Terminal permission is disabled."
+                else:
+                    it["allowed_by_workspace"] = True
 
         # Build skills list with type indicators
         skills_list = []
@@ -2841,10 +3015,12 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
         return CapabilitiesResponse(
             ok=bool(report.get("ok", True)),
             provider=str(getattr(agent, "llm_provider", "") or ""),
-            workspace=ws,
+            workspace=scope,
             tools={"count": len(items), "items": items, "allowlist": tools.get("allowlist")},
             features=features,
             skills=skills_list,
+            capability_registry=agent._capability_registry(),
+            thread_context=get_state_store().get_thread_state(thread_id).model_dump(),
             trust={
                 "risk_counts": risk_counts,
                 "origin_counts": origin_counts,
@@ -2852,6 +3028,7 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
                 "recommendations": [
                     "Treat local/MCP tools as executable capability. Keep exact commands, risk, and confirmation visible before use.",
                     "Prefer built-in read-only tools for inspection; require explicit approval for writes, terminal commands, desktop actions, and MCP actions.",
+                    "Project scope and permissions are independent of chat/research/coding interaction mode.",
                 ],
             },
         )
@@ -2867,10 +3044,13 @@ async def coding_readiness(thread_id: Optional[str] = Query(default=None)):
         agent = get_agent(thread_id)
         _apply_thread_scope(agent, thread_id)
         readiness = _check_provider_readiness()
+        scope = agent.project_scope_report(thread_id)
+        project_attached = bool(scope.get("project_attached"))
+        perms = dict(scope.get("permissions") or {})
         required = ["project_status", "file_list", "file_read", "file_write", "file_mkdir", "artifact_write", "terminal_run"]
+        read_tools = {"project_status", "file_list", "file_read"}
+        write_tools = {"file_write", "file_mkdir", "artifact_write"}
         loaded = {str(getattr(t, "name", "") or "") for t in (getattr(agent, "tools", []) or [])}
-        allowlist = getattr(agent, "_tool_allowlist_override", None)
-        allowset = set(allowlist) if isinstance(allowlist, (set, frozenset)) else None
         from agent.tools import TOOL_METADATA
 
         tool_rows: list[dict[str, Any]] = []
@@ -2878,18 +3058,34 @@ async def coding_readiness(thread_id: Optional[str] = Query(default=None)):
         missing: list[str] = []
         for name in required:
             exists = name in loaded
-            allowed_by_workspace = True if allowset is None else name in allowset
+            # Project attachment — not skill-workspace mode — gates filesystem tools.
+            allowed_by_scope = True
+            scope_reason = ""
+            if name in read_tools | write_tools | {"terminal_run"}:
+                if not project_attached:
+                    allowed_by_scope = False
+                    scope_reason = "No Project attached to this Session."
+                elif name in write_tools and not perms.get("filesystem_write"):
+                    allowed_by_scope = False
+                    scope_reason = "Write permission is disabled."
+                elif name == "terminal_run" and not perms.get("terminal"):
+                    allowed_by_scope = False
+                    scope_reason = "Terminal permission is disabled."
             try:
-                allowed_by_policy = bool(agent._action_allowed(name)) if agent._is_action_tool(name) else True  # type: ignore[attr-defined]
+                # project_status / file_list / file_read are safe reads (not action-gated).
+                if name in read_tools:
+                    allowed_by_policy = True
+                else:
+                    allowed_by_policy = bool(agent._action_configured(name))  # type: ignore[attr-defined]
             except Exception:
                 allowed_by_policy = False
-            allowed = bool(exists and allowed_by_workspace and allowed_by_policy)
+            allowed = bool(exists and allowed_by_scope and allowed_by_policy)
             reason = ""
             if not exists:
                 reason = "Tool is not loaded."
                 missing.append(name)
-            elif not allowed_by_workspace:
-                reason = "Blocked by the active workspace tool list."
+            elif not allowed_by_scope:
+                reason = scope_reason or "Blocked by Project scope or permissions."
                 blocked.append(name)
             elif not allowed_by_policy:
                 reason = "Blocked by runtime system-action settings."
@@ -2900,7 +3096,7 @@ async def coding_readiness(thread_id: Optional[str] = Query(default=None)):
                     "name": name,
                     "loaded": exists,
                     "allowed": allowed,
-                    "allowed_by_workspace": allowed_by_workspace,
+                    "allowed_by_workspace": allowed_by_scope,
                     "allowed_by_policy": allowed_by_policy,
                     "risk_level": meta.get("risk_level", "safe"),
                     "requires_confirmation": bool(meta.get("requires_confirmation", False)),
@@ -2915,14 +3111,15 @@ async def coding_readiness(thread_id: Optional[str] = Query(default=None)):
         if not provider_ready:
             warnings.append(str(readiness.get("message") or "Model provider is not ready."))
             recommendations.append("Start or configure the selected model provider before testing coding requests.")
+        if not project_attached:
+            warnings.append("No Project is attached to this Session.")
+            recommendations.append("Attach a Project folder to this Session to enable project_status, file tools, and project-local terminal.")
         if blocked or missing:
-            warnings.append("One or more coding tools are missing or blocked.")
-            recommendations.append("Enable system actions, file write, terminal access, and the coding workspace only as needed for local coding.")
+            warnings.append("One or more project tools are missing or blocked.")
+            if project_attached:
+                recommendations.append("Enable system actions, file write, and terminal access as needed for write/verify steps.")
         if not bool(getattr(config, "allow_terminal_commands", False)):
             recommendations.append("Terminal verification is disabled; Echo can still edit files but cannot run build/test checks.")
-        if not str(getattr(config, "file_tool_root", "") or "").strip():
-            warnings.append("FILE_TOOL_ROOT is empty.")
-            recommendations.append("Set FILE_TOOL_ROOT to the folder where Echo should create and inspect project files.")
 
         sandbox_info: Dict[str, Any] = {}
         try:
@@ -2950,8 +3147,6 @@ async def coding_readiness(thread_id: Optional[str] = Query(default=None)):
         if not warnings:
             recommendations.append("Coding lifecycle is ready: inspect, plan, implement, verify, summarize.")
 
-        report = agent.get_doctor_report() or {}
-        workspace = report.get("workspace") if isinstance(report.get("workspace"), dict) else {}
         coding_loop_state: Dict[str, Any] = {}
         try:
             coding_loop_state = agent.get_coding_loop_state() if hasattr(agent, "get_coding_loop_state") else {}
@@ -2962,15 +3157,19 @@ async def coding_readiness(thread_id: Optional[str] = Query(default=None)):
                 f"Coding loop phase: {coding_loop_state.get('phase')} "
                 f"(exit={coding_loop_state.get('exit_status')}, verify={coding_loop_state.get('verify_status')})."
             )
+        # Read tools ready when Project is attached; writes/terminal still need perms.
+        read_ready = project_attached and not missing and all(
+            row.get("allowed") for row in tool_rows if row.get("name") in read_tools
+        )
         return CodingReadinessResponse(
-            ok=provider_ready and not missing and not blocked,
+            ok=provider_ready and read_ready and not missing,
             provider={
                 "name": str(readiness.get("provider") or getattr(agent, "llm_provider", "") or ""),
                 "ready": provider_ready,
                 "message": str(readiness.get("message") or ""),
                 "detail": str(readiness.get("detail") or ""),
             },
-            workspace=workspace,
+            workspace=scope,
             file_roots={
                 "root": str(getattr(config, "file_tool_root", "") or ""),
                 "extra_roots": list(getattr(config, "file_tool_extra_roots", []) or []),
@@ -3062,6 +3261,12 @@ async def get_thread_state(thread_id: str):
     return ThreadSessionStateResponse(**store.get_thread_state(thread_id).model_dump())
 
 
+@app.get("/sessions/{session_id}/runtime")
+async def get_session_runtime(session_id: str):
+    """Current activity is isolated from historical Turns by construction."""
+    return get_state_store().runtime_projection(session_id)
+
+
 @app.get("/approvals", response_model=ApprovalListResponse)
 async def list_approvals(
     thread_id: Optional[str] = Query(default=None),
@@ -3073,34 +3278,51 @@ async def list_approvals(
     return ApprovalListResponse(items=[ApprovalResponse(**item.model_dump()) for item in items], count=len(items))
 
 
-@app.post("/approvals/{approval_id}/confirm", response_model=ApprovalResponse)
+@app.post("/approvals/{approval_id}/confirm", response_model=ApprovalDecisionResponse)
 async def confirm_approval(approval_id: str):
     store = get_state_store()
     approval = store.get_approval(approval_id)
     if approval is None:
         raise HTTPException(status_code=404, detail="Approval not found")
+    state = store.get_thread_state(approval.thread_id)
+    if approval.status != "pending" or state.pending_approval_id != approval_id:
+        raise HTTPException(status_code=409, detail="Approval is stale or is not the current pending action")
     agent = get_agent(approval.thread_id)
-    _apply_thread_scope(agent, approval.thread_id, approval.workspace_id or None)
-    agent.process_query("confirm", include_memory=False, thread_id=approval.thread_id)
+    agent._requested_approval_id = approval_id
+    response, success = agent.process_query("confirm", include_memory=False, thread_id=approval.thread_id)
     updated = store.get_approval(approval_id)
     if updated is None:
         raise HTTPException(status_code=500, detail="Approval missing after confirm")
-    return ApprovalResponse(**updated.model_dump())
+    thread_state = store.get_thread_state(approval.thread_id)
+    return ApprovalDecisionResponse(
+        approval=ApprovalResponse(**updated.model_dump()),
+        success=bool(success),
+        response=str(response or ""),
+        execution_id=thread_state.last_execution_id or None,
+        thread_state=thread_state.model_dump(),
+    )
 
 
-@app.post("/approvals/{approval_id}/cancel", response_model=ApprovalResponse)
+@app.post("/approvals/{approval_id}/cancel", response_model=ApprovalDecisionResponse)
 async def cancel_approval(approval_id: str):
     store = get_state_store()
     approval = store.get_approval(approval_id)
     if approval is None:
         raise HTTPException(status_code=404, detail="Approval not found")
-    agent = get_agent(approval.thread_id)
-    _apply_thread_scope(agent, approval.thread_id, approval.workspace_id or None)
-    agent.process_query("cancel", include_memory=False, thread_id=approval.thread_id)
-    updated = store.get_approval(approval_id)
+    state = store.get_thread_state(approval.thread_id)
+    if approval.status != "pending" or state.pending_approval_id != approval_id:
+        raise HTTPException(status_code=409, detail="Approval is stale or is not the current pending action")
+    updated = store.update_approval(approval_id, status="canceled", outcome_summary="Canceled by user")
     if updated is None:
         raise HTTPException(status_code=500, detail="Approval missing after cancel")
-    return ApprovalResponse(**updated.model_dump())
+    thread_state = store.get_thread_state(approval.thread_id)
+    return ApprovalDecisionResponse(
+        approval=ApprovalResponse(**updated.model_dump()),
+        success=True,
+        response=f"Canceled: {updated.summary or updated.tool}.",
+        execution_id=thread_state.last_execution_id or None,
+        thread_state=thread_state.model_dump(),
+    )
 
 
 @app.get("/executions", response_model=ExecutionListResponse)
@@ -3143,6 +3365,14 @@ class ProjectResponse(BaseModel):
     context_prompt: Optional[str] = ""
     tags: List[str] = []
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    workspace_root: str = ""
+    trust_state: str = "untrusted"
+    git_root: str = ""
+    git_metadata: Dict[str, Any] = Field(default_factory=dict)
+    instructions: str = ""
+    verified_facts: List[Dict[str, Any]] = Field(default_factory=list)
+    archived: bool = False
+    preferred_model_profile: Optional[Dict[str, Any]] = None
 
 
 class ProjectListResponse(BaseModel):
@@ -3156,6 +3386,15 @@ class ProjectCreateRequest(BaseModel):
     context_prompt: Optional[str] = ""
     tags: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
+    workspace_root: str = ""
+    trust_state: str = "untrusted"
+
+
+class ProjectAttachFolderRequest(BaseModel):
+    path: str
+    name: str = ""
+    trust_state: str = "trusted"
+    session_id: str = ""
 
 
 class ProjectUpdateRequest(BaseModel):
@@ -3200,8 +3439,49 @@ async def create_project(request: ProjectCreateRequest):
         context_prompt=request.context_prompt,
         tags=request.tags,
         metadata=request.metadata,
+        workspace_root=request.workspace_root,
+        trust_state=request.trust_state,
     )
     return ProjectResponse(**project.model_dump())
+
+
+@app.post("/projects/attach-folder", response_model=ProjectResponse)
+async def attach_project_folder(request: ProjectAttachFolderRequest):
+    from agent.projects import get_project_manager
+    try:
+        project = get_project_manager().attach_folder(request.path, name=request.name, trust_state=request.trust_state)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if request.session_id:
+        agent = get_agent(request.session_id)
+        with agent._request_lock:
+            _apply_thread_scope(agent, request.session_id)
+            if not agent.activate_project(project.id):
+                raise HTTPException(status_code=409, detail="Folder attached but Project activation failed")
+    return ProjectResponse(**project.model_dump())
+
+
+@app.post("/projects/pick-folder")
+async def pick_project_folder():
+    """Open the native Windows folder dialog for the local desktop deployment."""
+    def choose() -> str:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            try:
+                return str(filedialog.askdirectory(title="Add EchoSpeak Project folder", mustexist=True) or "")
+            finally:
+                root.destroy()
+        except Exception as exc:
+            raise RuntimeError(f"Native folder picker is unavailable: {exc}") from exc
+    try:
+        path = await asyncio.to_thread(choose)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"path": path, "cancelled": not bool(path)}
 
 
 @app.put("/projects/{project_id}", response_model=ProjectResponse)
@@ -3224,21 +3504,43 @@ async def update_project(project_id: str, request: ProjectUpdateRequest):
 
 @app.delete("/projects/{project_id}")
 async def delete_project(project_id: str):
-    """Delete a project."""
+    """Delete a project and clear live agent scope for every detached Session."""
     from agent.projects import get_project_manager
     manager = get_project_manager()
     success = manager.delete_project(project_id)
     if not success:
         raise HTTPException(status_code=404, detail="Project not found")
-    return {"ok": True, "deleted": project_id}
+    store = get_state_store()
+    # Snapshot sessions before detach so we can clear live agent memory.
+    affected = [
+        st.thread_id
+        for st in store.list_thread_states()
+        if str(st.active_project_id or "") == str(project_id)
+    ]
+    detached_sessions = store.detach_project(project_id)
+    for tid in affected:
+        try:
+            agent = get_existing_agent(tid) or get_agent(tid)
+            with agent._request_lock:
+                if hasattr(agent, "_clear_session_project_scope"):
+                    agent._clear_session_project_scope(
+                        thread_id=tid,
+                        reason="Project deleted",
+                    )
+                else:
+                    agent.activate_project(None)
+        except Exception:
+            pass
+    return {"ok": True, "deleted": project_id, "detached_sessions": detached_sessions}
 
 
 @app.post("/projects/{project_id}/activate")
 async def activate_project(project_id: str, thread_id: Optional[str] = Query(default=None)):
     """Activate a project, injecting its context into the agent's system prompt."""
     agent = get_agent(thread_id)
-    _apply_thread_scope(agent, thread_id)
-    success = agent.activate_project(project_id)
+    with agent._request_lock:
+        _apply_thread_scope(agent, thread_id)
+        success = agent.activate_project(project_id)
     if not success:
         raise HTTPException(status_code=404, detail="Project not found")
     return {"ok": True, "activated": project_id, "thread_state": get_state_store().get_thread_state(thread_id).model_dump()}
@@ -3248,9 +3550,329 @@ async def activate_project(project_id: str, thread_id: Optional[str] = Query(def
 async def deactivate_project(thread_id: Optional[str] = Query(default=None)):
     """Deactivate the current project."""
     agent = get_agent(thread_id)
-    _apply_thread_scope(agent, thread_id)
-    agent.activate_project(None)
+    with agent._request_lock:
+        _apply_thread_scope(agent, thread_id)
+        agent.activate_project(None)
     return {"ok": True, "deactivated": True, "thread_state": get_state_store().get_thread_state(thread_id).model_dump()}
+
+
+# === Code workspace (project-scoped Preview / Files / Terminal / Changes) ===
+
+@app.get("/code/workspace")
+async def code_workspace(thread_id: Optional[str] = Query(default=None)):
+    """Project-aware workspace snapshot for the Code view.
+
+    Source of truth: attached Project + Session thread state. Never invents a project.
+    """
+    from agent.code_workspace import (
+        build_file_tree,
+        detect_project,
+        get_preview_manager,
+        resolve_project_context,
+    )
+    from pathlib import Path as _Path
+
+    tid = _normalize_thread_id(thread_id)
+    ctx = resolve_project_context(tid)
+    root_str = str(ctx.get("root") or "").strip()
+    if not root_str:
+        return {
+            "ok": False,
+            "attached": False,
+            "thread_id": tid,
+            "project_id": ctx.get("project_id") or "",
+            "project_name": "",
+            "root": "",
+            "display_name": "",
+            "files": [],
+            "detection": {
+                "kind": "none",
+                "label": "No project attached",
+                "preview_available": False,
+                "reason": "Attach a Project folder to this Session to use the Code workspace.",
+                "entrypoints": [],
+                "preview_strategy": "none",
+                "preview_command": "",
+                "run_command_hint": "",
+                "signals": [],
+            },
+            "preview": get_preview_manager().status(tid),
+            "mode": ctx.get("mode") or "",
+            "phase": ctx.get("phase") or "",
+            "objective": ctx.get("objective") or "",
+            "writable": bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_file_write", False)),
+            "terminal_enabled": bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_terminal_commands", False)),
+            "message": "No project attached to this session.",
+        }
+
+    root = _Path(root_str)
+    if not root.exists() or not root.is_dir():
+        return {
+            "ok": False,
+            "attached": True,
+            "thread_id": tid,
+            "project_id": ctx.get("project_id") or "",
+            "project_name": ctx.get("project_name") or root.name,
+            "root": root_str,
+            "display_name": ctx.get("project_name") or root.name,
+            "files": [],
+            "detection": {
+                "kind": "missing",
+                "label": "Missing project folder",
+                "preview_available": False,
+                "reason": f"Project root does not exist: {root_str}",
+                "entrypoints": [],
+                "preview_strategy": "none",
+                "preview_command": "",
+                "run_command_hint": "",
+                "signals": [],
+            },
+            "preview": get_preview_manager().status(tid),
+            "mode": ctx.get("mode") or "",
+            "phase": ctx.get("phase") or "",
+            "objective": ctx.get("objective") or "",
+            "writable": bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_file_write", False)),
+            "terminal_enabled": bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_terminal_commands", False)),
+            "message": f"Project root missing on disk: {root_str}",
+        }
+
+    detection = detect_project(root)
+    files = build_file_tree(root, max_depth=3, max_items=250)
+    preview = get_preview_manager().status(tid)
+    # Drop stale preview if it points at a different project root
+    if preview.get("running") and preview.get("project_root"):
+        try:
+            if os.path.normcase(str(preview.get("project_root"))) != os.path.normcase(str(root.resolve())):
+                get_preview_manager().stop(tid)
+                preview = get_preview_manager().status(tid)
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "attached": True,
+        "thread_id": tid,
+        "project_id": ctx.get("project_id") or "",
+        "project_name": ctx.get("project_name") or root.name,
+        "root": str(root.resolve()),
+        "display_name": ctx.get("project_name") or root.name,
+        "files": files,
+        "detection": detection.as_dict(),
+        "preview": preview,
+        "mode": ctx.get("mode") or "",
+        "phase": ctx.get("phase") or "",
+        "objective": ctx.get("objective") or "",
+        "current_subject": ctx.get("current_subject") or "",
+        "execution_status": ctx.get("execution_status") or "",
+        "active_turn_id": ctx.get("active_turn_id") or "",
+        "writable": bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_file_write", False)),
+        "terminal_enabled": bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_terminal_commands", False)),
+        "message": "",
+    }
+
+
+@app.get("/code/file")
+async def code_file(
+    path: str = Query(..., description="Relative path within the attached project"),
+    thread_id: Optional[str] = Query(default=None),
+):
+    """Read a real file from the attached project root only."""
+    from agent.code_workspace import read_text_file, resolve_project_context, resolve_under_root
+    from pathlib import Path as _Path
+
+    tid = _normalize_thread_id(thread_id)
+    ctx = resolve_project_context(tid)
+    root_str = str(ctx.get("root") or "").strip()
+    if not root_str:
+        raise HTTPException(status_code=404, detail="No project attached to this session")
+    root = _Path(root_str)
+    if not root.exists():
+        raise HTTPException(status_code=404, detail="Project root not found on disk")
+    target = resolve_under_root(root, path)
+    if target is None:
+        raise HTTPException(status_code=403, detail="Path is outside the attached project")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail="Path is not a file")
+    try:
+        content, meta = read_text_file(target)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    try:
+        rel = str(target.relative_to(root.resolve())).replace("\\", "/")
+    except Exception:
+        rel = path
+    return {
+        "ok": True,
+        "thread_id": tid,
+        "root": str(root.resolve()),
+        "path": rel,
+        "name": target.name,
+        "content": content,
+        "binary": bool(meta.get("binary")),
+        "truncated": bool(meta.get("truncated")),
+        "size": meta.get("size") or 0,
+        "mtime": meta.get("mtime") or 0,
+    }
+
+
+@app.get("/code/activity")
+async def code_activity(
+    thread_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=60, ge=1, le=200),
+):
+    """Session-scoped terminal ToolRuns and file change ToolRuns (no cross-session bleed)."""
+    from agent.code_workspace import build_session_activity
+
+    tid = _normalize_thread_id(thread_id)
+    return build_session_activity(tid, limit=limit)
+
+
+@app.get("/code/preview")
+async def code_preview_status(thread_id: Optional[str] = Query(default=None)):
+    from agent.code_workspace import get_preview_manager
+
+    tid = _normalize_thread_id(thread_id)
+    return get_preview_manager().status(tid)
+
+
+@app.post("/code/preview/start")
+async def code_preview_start(thread_id: Optional[str] = Query(default=None)):
+    """Launch a project-local preview when detection says it is possible."""
+    from agent.code_workspace import detect_project, get_preview_manager, resolve_project_context
+    from pathlib import Path as _Path
+
+    tid = _normalize_thread_id(thread_id)
+    ctx = resolve_project_context(tid)
+    root_str = str(ctx.get("root") or "").strip()
+    if not root_str:
+        raise HTTPException(status_code=404, detail="No project attached to this session")
+    root = _Path(root_str)
+    if not root.exists() or not root.is_dir():
+        raise HTTPException(status_code=404, detail="Project root not found on disk")
+    detection = detect_project(root)
+    result = get_preview_manager().start(tid, root, detection)
+    result["detection"] = detection.as_dict()
+    result["thread_id"] = tid
+    result["root"] = str(root.resolve())
+    if not result.get("ok"):
+        # Honest non-2xx for unavailable, but keep body useful
+        return result
+    return result
+
+
+@app.post("/code/preview/stop")
+async def code_preview_stop(thread_id: Optional[str] = Query(default=None)):
+    from agent.code_workspace import get_preview_manager
+
+    tid = _normalize_thread_id(thread_id)
+    result = get_preview_manager().stop(tid)
+    result["thread_id"] = tid
+    result["preview"] = get_preview_manager().status(tid)
+    return result
+
+
+@app.get("/code/diff")
+async def code_diff(
+    path: str = Query(..., description="Absolute or project-relative file path"),
+    thread_id: Optional[str] = Query(default=None),
+):
+    """Diff current file against the latest checkpoint for this session/project when available."""
+    from agent.code_workspace import resolve_project_context, resolve_under_root, read_text_file
+    from agent.checkpoints import _load_index
+    from pathlib import Path as _Path
+    import difflib
+
+    tid = _normalize_thread_id(thread_id)
+    ctx = resolve_project_context(tid)
+    root_str = str(ctx.get("root") or "").strip()
+    if not root_str:
+        raise HTTPException(status_code=404, detail="No project attached")
+    root = _Path(root_str)
+    raw = str(path or "").strip()
+    target: Optional[_Path] = None
+    try:
+        p = _Path(raw)
+        if p.is_absolute() and p.exists():
+            # must stay under root
+            if os.path.commonpath([os.path.normcase(str(root.resolve())), os.path.normcase(str(p.resolve()))]) == os.path.normcase(str(root.resolve())):
+                target = p.resolve()
+    except Exception:
+        target = None
+    if target is None:
+        target = resolve_under_root(root, raw)
+    if target is None or not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found in project")
+
+    current, meta = read_text_file(target)
+    if meta.get("binary"):
+        return {
+            "ok": True,
+            "path": str(target),
+            "has_checkpoint": False,
+            "binary": True,
+            "original": "",
+            "current": "",
+            "unified_diff": "",
+            "message": "Binary file — no text diff.",
+        }
+
+    original = ""
+    checkpoint_meta = None
+    try:
+        for entry in reversed(_load_index()):
+            if str(entry.get("thread_id") or "legacy") not in {tid, "legacy"}:
+                continue
+            orig = str(entry.get("original_path") or "")
+            try:
+                if os.path.normcase(str(_Path(orig).resolve())) != os.path.normcase(str(target)):
+                    continue
+            except Exception:
+                if orig.replace("\\", "/").lower() != str(target).replace("\\", "/").lower():
+                    continue
+            bak = _Path(str(entry.get("backup_path") or ""))
+            if bak.is_file():
+                original = bak.read_text(encoding="utf-8", errors="replace")
+                checkpoint_meta = entry
+                break
+    except Exception:
+        pass
+
+    if not original:
+        return {
+            "ok": True,
+            "path": str(target),
+            "has_checkpoint": False,
+            "binary": False,
+            "original": current,
+            "current": current,
+            "unified_diff": "",
+            "message": "No checkpoint for this file in this session — showing current contents only.",
+            "size": meta.get("size") or 0,
+        }
+
+    diff_lines = list(
+        difflib.unified_diff(
+            original.splitlines(),
+            current.splitlines(),
+            fromfile=f"a/{target.name}",
+            tofile=f"b/{target.name}",
+            lineterm="",
+        )
+    )
+    return {
+        "ok": True,
+        "path": str(target),
+        "has_checkpoint": True,
+        "binary": False,
+        "original": original,
+        "current": current,
+        "unified_diff": "\n".join(diff_lines),
+        "checkpoint": checkpoint_meta,
+        "size": meta.get("size") or 0,
+        "message": "",
+    }
 
 
 # === Routine Management Endpoints ===
@@ -3808,6 +4430,7 @@ class ThreadCreateRequest(BaseModel):
     title: str = Field(default="", description="Thread title")
     source: str = Field(default="web", description="Source: web, discord, telegram, whatsapp, api")
     workspace_id: str = Field(default="", description="Optional workspace ID")
+    project_id: str = Field(default="", description="Optional containing Project")
 
 class ThreadUpdateRequest(BaseModel):
     title: Optional[str] = Field(default=None, description="New title")
@@ -3824,6 +4447,24 @@ class ThreadResponse(BaseModel):
     workspace_id: str = ""
     pinned: bool = False
     archived: bool = False
+    project_id: str = ""
+
+
+def _thread_response(thread) -> ThreadResponse:
+    payload = thread.to_dict()
+    payload["project_id"] = get_state_store().get_thread_state(thread.thread_id).active_project_id
+    return ThreadResponse(**payload)
+
+
+def _record_session_message(thread_id: Optional[str], message: str) -> None:
+    tid = _normalize_thread_id(thread_id)
+    if not tid:
+        return
+    from agent.threads import get_thread_manager
+    manager = get_thread_manager()
+    if manager.get_thread(tid) is None:
+        manager.create_thread(thread_id=tid, source="web")
+    manager.record_user_message(tid, message)
 
 
 @app.get("/threads")
@@ -3836,7 +4477,7 @@ async def list_threads(
     from agent.threads import get_thread_manager
     tm = get_thread_manager()
     threads = tm.list_threads(include_archived=include_archived, source=source, limit=limit)
-    return [ThreadResponse(**t.to_dict()) for t in threads]
+    return [_thread_response(t) for t in threads]
 
 
 @app.post("/threads", response_model=ThreadResponse)
@@ -3849,7 +4490,14 @@ async def create_thread(request: ThreadCreateRequest):
         source=request.source,
         workspace_id=request.workspace_id,
     )
-    return ThreadResponse(**thread.to_dict())
+    if request.project_id:
+        agent = get_agent(thread.thread_id)
+        with agent._request_lock:
+            _apply_thread_scope(agent, thread.thread_id)
+            if not agent.activate_project(request.project_id):
+                tm.delete_thread(thread.thread_id)
+                raise HTTPException(status_code=404, detail="Project not found")
+    return _thread_response(thread)
 
 
 @app.get("/threads/{thread_id}", response_model=ThreadResponse)
@@ -3860,7 +4508,7 @@ async def get_thread(thread_id: str):
     thread = tm.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
-    return ThreadResponse(**thread.to_dict())
+    return _thread_response(thread)
 
 
 @app.patch("/threads/{thread_id}", response_model=ThreadResponse)
@@ -3876,7 +4524,7 @@ async def update_thread(thread_id: str, request: ThreadUpdateRequest):
     )
     if not thread:
         raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
-    return ThreadResponse(**thread.to_dict())
+    return _thread_response(thread)
 
 
 @app.delete("/threads/{thread_id}")
@@ -4113,7 +4761,7 @@ async def query_stream(request: QueryRequest):
     _metric_inc("requests", 1)
 
     logger.debug(
-        "QueryStream request_id=%s thread_id=%s include_memory=%s msg_len=%s",
+        "QueryStream request_id={} thread_id={} include_memory={} msg_len={}",
         request_id,
         _normalize_thread_id(request.thread_id),
         bool(request.include_memory),
@@ -4124,7 +4772,7 @@ async def query_stream(request: QueryRequest):
         readiness = _check_provider_readiness()
         if not bool(readiness.get("ok")):
             logger.warning(
-                "Provider preflight failed for /query/stream request_id=%s provider=%s detail=%s",
+                "Provider preflight failed for /query/stream request_id={} provider={} detail={}",
                 request_id,
                 readiness.get("provider"),
                 readiness.get("detail"),
@@ -4144,8 +4792,8 @@ async def query_stream(request: QueryRequest):
 
             return StreamingResponse(unavailable_gen(), media_type="application/x-ndjson")
 
+    _record_session_message(request.thread_id, request.message)
     agent = get_agent(request.thread_id)
-    _apply_thread_scope(agent, request.thread_id, request.workspace)
 
     _start_agent_thread(
         agent=agent,
@@ -4708,7 +5356,6 @@ async def trigger_webhook(req: Request):
         include_memory = bool(include_memory)
 
     agent = get_agent(thread_id)
-    _apply_thread_scope(agent, thread_id, payload.get("workspace"))
     response, success = agent.process_query(
         message,
         include_memory=include_memory,
@@ -4721,71 +5368,98 @@ async def trigger_webhook(req: Request):
 @app.get("/history", response_model=HistoryResponse)
 def get_history(thread_id: Optional[str] = Query(default=None)):
     """
-    Get conversation history.
+    Complete Session history for page refresh.
 
     Returns:
-        List of conversation messages.
+      - turns: durable Turn projections (messages, ToolRuns, research, approvals, verification)
+      - history: legacy Human/Assistant strings (backward compatible)
     """
     try:
+        store = get_state_store()
+        session_id = _normalize_thread_id(thread_id)
         agent = get_existing_agent(thread_id)
-        if agent is None:
-            return HistoryResponse(history=[], count=0)
-        _apply_thread_scope(agent, thread_id)
-        history = agent.get_history()
+        if agent is not None:
+            with agent._request_lock:
+                _apply_thread_scope(agent, thread_id)
 
-        def _history_content(item: Any) -> str:
-            if isinstance(item, dict):
-                return str(item.get("content") or "")
-            return str(item or "")
+        timeline = store.session_timeline(session_id, limit=80)
+        turns = list(timeline.get("turns") or [])
 
-        def _history_role(item: Any) -> str:
-            if isinstance(item, dict):
-                return str(item.get("role") or "").strip().lower()
-            text = str(item or "")
-            if text.startswith("Human:"):
-                return "human"
-            if text.startswith("Assistant:"):
-                return "ai"
-            return ""
-
-        def _is_internal_background_turn(item: Any) -> bool:
-            role = _history_role(item)
-            if role != "human":
-                return False
-            low = _history_content(item).lower()
-            markers = [
-                "check your memory for any pending follow-ups",
-                "review your recent conversation memories",
-                "based on everything you know about the user, generate one brief",
-                "if something is overdue or coming up, prepare a brief notification",
-                "otherwise reply no_action",
-                "reply no_action",
-            ]
-            return any(marker in low for marker in markers)
-
+        # Legacy string history from durable Turn messages (prefer durable over ephemeral agent memory).
         normalized_history: list[str] = []
-        skip_next_ai = False
-        for item in history:
-            if _is_internal_background_turn(item):
-                skip_next_ai = True
-                continue
-            role = _history_role(item)
-            content = _history_content(item).strip()
-            if not content:
-                continue
-            if skip_next_ai and role == "ai":
-                skip_next_ai = False
-                continue
-            if role == "human":
-                normalized_history.append(f"Human: {content}")
-            elif role == "ai":
-                normalized_history.append(f"Assistant: {content}")
-            else:
-                normalized_history.append(content)
+        for turn in turns:
+            for msg in list(turn.get("messages") or []):
+                role = str(msg.get("role") or "").strip().lower()
+                text = str(msg.get("text") or "").strip()
+                if not text:
+                    continue
+                if role == "user":
+                    normalized_history.append(f"Human: {text}")
+                elif role == "assistant":
+                    normalized_history.append(f"Assistant: {text}")
+
+        # Fallback: agent conversation buffer when no durable turns yet.
+        if not normalized_history and agent is not None:
+            try:
+                history = agent.get_history()
+            except Exception:
+                history = []
+
+            def _history_content(item: Any) -> str:
+                if isinstance(item, dict):
+                    return str(item.get("content") or "")
+                return str(item or "")
+
+            def _history_role(item: Any) -> str:
+                if isinstance(item, dict):
+                    return str(item.get("role") or "").strip().lower()
+                text = str(item or "")
+                if text.startswith("Human:"):
+                    return "human"
+                if text.startswith("Assistant:"):
+                    return "ai"
+                return ""
+
+            def _is_internal_background_turn(item: Any) -> bool:
+                role = _history_role(item)
+                if role != "human":
+                    return False
+                low = _history_content(item).lower()
+                markers = [
+                    "check your memory for any pending follow-ups",
+                    "review your recent conversation memories",
+                    "based on everything you know about the user, generate one brief",
+                    "if something is overdue or coming up, prepare a brief notification",
+                    "otherwise reply no_action",
+                    "reply no_action",
+                ]
+                return any(marker in low for marker in markers)
+
+            skip_next_ai = False
+            for item in history:
+                if _is_internal_background_turn(item):
+                    skip_next_ai = True
+                    continue
+                role = _history_role(item)
+                content = _history_content(item).strip()
+                if not content:
+                    continue
+                if skip_next_ai and role == "ai":
+                    skip_next_ai = False
+                    continue
+                if role == "human":
+                    normalized_history.append(f"Human: {content}")
+                elif role == "ai":
+                    normalized_history.append(f"Assistant: {content}")
+                else:
+                    normalized_history.append(content)
 
         return HistoryResponse(
             history=normalized_history,
-            count=len(normalized_history)
+            count=len(normalized_history),
+            session=dict(timeline.get("session") or {}),
+            session_id=str(timeline.get("session_id") or session_id),
+            turns=turns,
         )
     except Exception as e:
         logger.error(f"History error: {e}")
@@ -5028,40 +5702,25 @@ async def get_provider_info():
         Current provider details and available providers.
     """
     from agent.core import list_available_providers
+    from agent.model_runtime import resolve_model_profile
 
     providers = list_available_providers()
-    def _estimate_context_window(prov: ModelProvider, model_name: str) -> tuple[int, int]:
-        """Return (context_window, max_output_tokens) for known models."""
-        m = (model_name or "").lower()
-        if prov == ModelProvider.OPENAI:
-            if "gpt-4.1" in m:
-                return (1047576, 32768)
-            if "gpt-4o" in m:
-                return (128000, 16384)
-            if "gpt-4-turbo" in m:
-                return (128000, 4096)
-            if "gpt-4" in m:
-                return (8192, 4096)
-            if "gpt-3.5" in m:
-                return (16385, 4096)
-            if "o1" in m or "o3" in m or "o4" in m:
-                return (200000, 100000)
-            return (128000, 4096)
-        if prov == ModelProvider.GEMINI:
-            if "pro" in m:
-                return (1048576, 8192)
-            if "flash" in m:
-                return (1048576, 8192)
-            return (1048576, 8192)
-        # Local providers: use config (default 32k to match LM Studio / local setups)
-        ctx = int(getattr(config.local, "context_length", 0) or 0) or 32768
-        out = int(getattr(config.local, "max_tokens", 0) or 0) or 4096
-        return (ctx, out)
+    def _profile_for(prov: ModelProvider, model_name: str) -> dict[str, Any]:
+        registry = dict(getattr(config, "model_capability_profiles", {}) or {})
+        overrides = dict(registry.get(f"{prov.value}:{model_name}") or registry.get(model_name) or {})
+        # Real configured window for every provider — no local 32k / hosted 128k guess.
+        trim = int(getattr(config, "llm_trim_max_tokens", 0) or 0)
+        ctx_len = int(getattr(config.local, "context_length", 0) or 0)
+        real_window = trim or ctx_len
+        if real_window > 0:
+            overrides.setdefault("context_limit", real_window)
+        return resolve_model_profile(prov.value, model_name, overrides).as_dict()
 
     if _is_lmstudio_only_enabled():
         _force_lmstudio_config()
         providers = [p for p in providers if p.get("id") == ModelProvider.LM_STUDIO.value]
-        ctx_w, max_out = _estimate_context_window(ModelProvider.LM_STUDIO, config.local.model_name)
+        model_profile = _profile_for(ModelProvider.LM_STUDIO, config.local.model_name)
+        ctx_w, max_out = int(model_profile["context_limit"]), int(getattr(config.local, "max_tokens", 0) or 4096)
         readiness = _check_provider_readiness(ModelProvider.LM_STUDIO)
         return ProviderInfoResponse(
             provider=ModelProvider.LM_STUDIO.value,
@@ -5074,6 +5733,7 @@ async def get_provider_info():
             ready=bool(readiness.get("ok")),
             readiness_message=str(readiness.get("message") or ""),
             readiness_detail=str(readiness.get("detail") or ""),
+            model_profile=model_profile,
         )
 
     # Do not instantiate the agent here; provider can be misconfigured (e.g. missing deps)
@@ -5087,7 +5747,14 @@ async def get_provider_info():
     else:
         model = config.local.model_name
     base_url = None if provider in (ModelProvider.OPENAI, ModelProvider.GEMINI, ModelProvider.LLAMA_CPP) else config.local.base_url
-    ctx_w, max_out = _estimate_context_window(provider, model)
+    model_profile = _profile_for(provider, model)
+    ctx_w = int(model_profile["context_limit"])
+    max_out = int(
+        getattr(config.openai, "max_tokens", 0) if provider == ModelProvider.OPENAI
+        else getattr(config.gemini, "max_tokens", 0) if provider == ModelProvider.GEMINI
+        else getattr(config.local, "max_tokens", 0)
+        or 4096
+    )
     readiness = _check_provider_readiness(provider)
 
     return ProviderInfoResponse(
@@ -5101,6 +5768,7 @@ async def get_provider_info():
         ready=bool(readiness.get("ok")),
         readiness_message=str(readiness.get("message") or ""),
         readiness_detail=str(readiness.get("detail") or ""),
+        model_profile=model_profile,
     )
 
 

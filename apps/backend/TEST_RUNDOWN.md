@@ -1,9 +1,9 @@
 # EchoSpeak Complete Test Rundown
 
-**Updated:** 2026-07-08 (v7.4.6)  
-**Automated suite (this machine):** backend **248 passed**, web **12 passed**  
+**Updated:** 2026-07-12 (v7.6.10 runtime contracts — **implemented partial; pending live validation**)  
 **Eval board:** E1–E12 in `tests/test_eval_harness_e1_e10.py`  
-**Default model path:** Gemma 4 via LM Studio (native tool-calling / Stage 4)
+**Default model path:** Gemma 4 via LM Studio (native tool-calling / Stage 4)  
+**Contracts:** `docs/RUNTIME_CONTRACTS.md` + `docs/LIFECYCLE_TRUTHFULNESS.md` — unit pass ≠ release closed; live gates Lifecycle §11 + Runtime §K
 
 This is the **master checklist** for verifying EchoSpeak end-to-end — not only recent fixes. Use it in order: automated → smoke → deep capabilities → integrations.
 
@@ -14,6 +14,9 @@ This is the **master checklist** for verifying EchoSpeak end-to-end — not only
 ```powershell
 # Backend (from apps/backend)
 python -m pytest tests/ -q
+
+# Lifecycle honesty (recovery / confirm / corruption)
+python -m pytest tests/test_recovery_confirm_resume.py tests/test_runtime_ownership.py tests/test_search_dedup.py -q
 
 # Eval board only
 python -m pytest tests/test_eval_harness_e1_e10.py -v
@@ -27,6 +30,10 @@ npx vitest run
 
 | Suite | What it covers |
 |-------|----------------|
+| `test_recovery_confirm_resume.py` | Unit coverage for lifecycle honesty helpers (not live acceptance) |
+| `test_runtime_ownership.py` | Equal tool access, ToolRun / ownership boundaries |
+| `test_search_dedup.py` | Canonical search emission |
+| `test_grounding_guard.py` | Ungrounded numbers / odds strip |
 | `test_eval_harness_e1_e10.py` | E1–E12 product board (file write, live score, schedule, odds, subject, terminal, provider, coding, weak evidence, context budget, long memory, social preamble, **search query normalize**) |
 | `test_reliability_architecture.py` | SearchGrounder, context budget, session memory, telemetry, LC tool wrap, partial tools |
 | `test_reflection.py` | Reflection engine + task planner |
@@ -76,6 +83,15 @@ npx vitest run
 ## C. Live smoke (~15–20 min) — core product must work
 
 Run in **Web UI** with streaming visible (partial_reply, Search done, final).
+
+### C0. Runtime / lifecycle live gate (v7.6.10)
+
+**Authoritative checklists:**
+
+1. `docs/LIFECYCLE_TRUTHFULNESS.md` §11 (L1–L8)  
+2. `docs/RUNTIME_CONTRACTS.md` §K (equal access, Project, hydrate, search, explicit-file, approval survival, Session switch)
+
+Unit tests are not a substitute. Until both pass, release docs stay pending live validation.
 
 ### C1. Chat & multi-beat
 

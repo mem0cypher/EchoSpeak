@@ -1,5 +1,10 @@
 # Search & live-data infrastructure (v7.6.2)
 
+**Contracts (v7.6.10):** one canonical search ToolRun, sports isolation from
+unrelated intents, utility tools not classified as research —
+`docs/RUNTIME_CONTRACTS.md` §E and `docs/LIFECYCLE_TRUTHFULNESS.md` §5.
+Status: implemented partial; pending live validation.
+
 ## Category mismatch (important)
 
 | Need | Right tool | Wrong tool |

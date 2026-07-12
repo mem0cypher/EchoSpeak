@@ -108,12 +108,12 @@ export function InlineCodeDiff({ session, onAccept, onDecline }: InlineCodeDiffP
           : "Read";
 
   const statusColors = session.pendingConfirmation
-    ? { bg: "rgba(250,204,21,0.18)", border: "rgba(250,204,21,0.35)", text: "#fde68a" }
+    ? { bg: "rgba(255,68,68,0.14)", border: "rgba(255,68,68,0.35)", text: "#ff8888" }
     : session.status === "saved"
-      ? { bg: "rgba(34,197,94,0.18)", border: "rgba(34,197,94,0.35)", text: "#86efac" }
+      ? { bg: "rgba(255,255,255,0.08)", border: "rgba(255,255,255,0.18)", text: "#e8e8e8" }
       : session.status === "draft"
-        ? { bg: "rgba(96,165,250,0.18)", border: "rgba(96,165,250,0.35)", text: "#93c5fd" }
-        : { bg: "rgba(255,255,255,0.05)", border: "rgba(255,255,255,0.08)", text: "rgba(255,255,255,0.75)" };
+        ? { bg: "rgba(255,255,255,0.06)", border: "rgba(255,255,255,0.14)", text: "#cccccc" }
+        : { bg: "rgba(255,255,255,0.04)", border: "rgba(255,255,255,0.08)", text: "rgba(255,255,255,0.75)" };
 
   return (
     <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -141,8 +141,8 @@ export function InlineCodeDiff({ session, onAccept, onDecline }: InlineCodeDiffP
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
           {hasDiff ? (
             <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, fontWeight: 700 }}>
-              <span style={{ color: "#4ade80" }}>+{stats.added}</span>
-              <span style={{ color: "#f87171" }}>-{stats.removed}</span>
+              <span style={{ color: "#ffffff" }}>+{stats.added}</span>
+              <span style={{ color: "#ff4444" }}>-{stats.removed}</span>
             </div>
           ) : null}
           <div style={{
@@ -222,32 +222,32 @@ export function InlineCodeDiff({ session, onAccept, onDecline }: InlineCodeDiffP
 
       {/* Full file diff body */}
       <div style={{ flex: 1, overflow: "auto" }}>
-        <div style={{ minWidth: "100%", fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace", fontSize: 12, lineHeight: 1.7, color: "#c9d1d9" }}>
+        <div style={{ minWidth: "100%", fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace", fontSize: 12, lineHeight: 1.7, color: "rgba(255,255,255,0.78)" }}>
           {rows.map((row, index) => {
             const isAdded = row.kind === "added";
             const isRemoved = row.kind === "removed";
 
             const rowBg = isAdded
-              ? "rgba(34,197,94,0.15)"
+              ? "rgba(255,255,255,0.06)"
               : isRemoved
-                ? "rgba(239,68,68,0.15)"
+                ? "rgba(255,68,68,0.12)"
                 : "transparent";
             const borderColor = isAdded
-              ? "#4ade80"
+              ? "rgba(255,255,255,0.45)"
               : isRemoved
-                ? "#f87171"
+                ? "#ff4444"
                 : "transparent";
             const textColor = isAdded
-              ? "#bbf7d0"
+              ? "#f0f0f0"
               : isRemoved
-                ? "#fecaca"
-                : "#c9d1d9";
+                ? "#ffb3b3"
+                : "rgba(255,255,255,0.72)";
             const sign = isAdded ? "+" : isRemoved ? "−" : " ";
-            const signColor = isAdded ? "#4ade80" : isRemoved ? "#f87171" : "rgba(255,255,255,0.12)";
+            const signColor = isAdded ? "#ffffff" : isRemoved ? "#ff4444" : "rgba(255,255,255,0.12)";
             const gutterBg = isAdded
-              ? "rgba(34,197,94,0.08)"
+              ? "rgba(255,255,255,0.03)"
               : isRemoved
-                ? "rgba(239,68,68,0.08)"
+                ? "rgba(255,68,68,0.06)"
                 : "transparent";
 
             return (

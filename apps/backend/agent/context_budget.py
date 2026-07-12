@@ -7,6 +7,34 @@ from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
 
+_UNTRUSTED_INSTRUCTION_LINE = re.compile(
+    r"(?i)^\s*(?:"
+    r"ignore (?:all |any )?(?:previous|prior|system|developer) instructions?|"
+    r"disregard (?:all |any )?(?:previous|prior|system|developer) instructions?|"
+    r"(?:system|developer|assistant)\s*(?:message|prompt)?\s*:|"
+    r"you are now\b|act as\b|"
+    r"(?:call|invoke|execute|run) (?:the )?(?:tool|command|shell)\b|"
+    r"reveal (?:the )?(?:system prompt|secret|credentials?|tokens?)\b"
+    r")"
+)
+
+
+def sanitize_untrusted_context(text: str) -> str:
+    """Redact instruction-shaped lines from files, pages, memories, and tool output.
+
+    This is a deterministic boundary, not a semantic prompt-injection detector.
+    User requests and explicitly pinned/profile memory are intentionally handled
+    elsewhere and are not passed through this function.
+    """
+    lines: List[str] = []
+    for line in str(text or "").splitlines():
+        if _UNTRUSTED_INSTRUCTION_LINE.search(line):
+            lines.append("[potential instruction from untrusted content redacted]")
+        else:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def estimate_tokens(text: str) -> int:
     """Cheap cross-provider token estimate: roughly 4 chars per token."""
     s = str(text or "")

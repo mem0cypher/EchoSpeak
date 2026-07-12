@@ -19,7 +19,9 @@
   <a href="CHANGES.md">Changelog</a> ·
   <a href="ROADMAP.md">Roadmap</a> ·
   <a href="docs/AGENT.md">Agent Guide</a> ·
-  <a href="docs/INTEGRATIONS.md">Integrations</a>
+  <a href="docs/INTEGRATIONS.md">Integrations</a> ·
+  <a href="docs/RUNTIME_CONTRACTS.md">Runtime contracts</a> ·
+  <a href="docs/LIFECYCLE_TRUTHFULNESS.md">Lifecycle honesty</a>
 </p>
 
 ---
@@ -73,7 +75,8 @@ On Arch/CachyOS with PEP 668, use `./.venv/bin/python -m pip install -r requirem
 - **Any model** — Google Gemini, OpenAI, Ollama, LM Studio, LocalAI, vLLM, llama.cpp.
 - **Multi-channel** — Web UI, Discord, Telegram, Twitter/X, Twitch, Go TUI, Python CLI, A2A protocol.
 - **Persistent memory** — deterministic profile facts, curated durable memories, FAISS vector search, document RAG.
-- **Governed tools** — 30+ tools with confirmation gates, workspace allowlists, and layered safety.
+- **Governed tools** — 30+ tools with confirmation gates, Project path scope, permission flags, and layered safety.
+- **Runtime contracts** — equal model access, Project scope, hydration, ToolRun truth (`docs/RUNTIME_CONTRACTS.md` + `docs/LIFECYCLE_TRUTHFULNESS.md`; v7.6.10 pending live validation).
 - **Skills + plugins** — drop-in skill bundles with custom tools and pipeline hooks.
 - **Customizable soul** — define personality, voice, and boundaries via `SOUL.md`.
 - **Proactive agent** — heartbeat system pulse, scheduled routines, autonomous Twitter presence.
@@ -113,7 +116,7 @@ On Arch/CachyOS with PEP 668, use `./.venv/bin/python -m pip install -r requirem
 
 - **Web search** — Tavily-powered with reflection and recency filtering.
 - **File operations** — read, write (SEARCH/REPLACE blocks), grep, workspace browsing.
-- **Terminal** — allowlisted shell commands with confirmation.
+- **Terminal** — denylisted dangerous commands with confirmation (not a narrow allowlist).
 - **Browser** — Playwright-driven page control, screenshots, form filling.
 - **Email** — send and compose via SMTP integration.
 - **Routines** — cron-scheduled, webhook-triggered, or manual agent actions.
@@ -124,7 +127,7 @@ On Arch/CachyOS with PEP 668, use `./.venv/bin/python -m pip install -r requirem
 
 - **Layered config** — `.env` (static) → `settings.json` (runtime) → `settings.secrets.json` (credentials).
 - **Confirmation gates** — all side-effect tools pause for `confirm`/`cancel`.
-- **Workspace allowlists** — restrict which tools are available per context.
+- **Project + permission gates** — path scope and `ALLOW_*` flags (skill `TOOLS.txt` is soft guidance only; see runtime contracts).
 - **Approval records** — persisted approval state tied to threads and executions.
 - **Role-based access** — Discord users resolve to OWNER / TRUSTED / PUBLIC with scoped permissions.
 - **Observability** — real-time tool metrics, latency tracking, error aggregation.
@@ -169,7 +172,7 @@ EchoSpeak/
 │   │   ├── agent/           # Core pipeline (16 modules)
 │   │   ├── api/             # FastAPI server
 │   │   ├── skills/          # Drop-in skill bundles
-│   │   ├── workspaces/      # Tool allowlists
+│   │   ├── workspaces/      # Skill prompts + soft tool preference lists
 │   │   ├── discord_bot.py   # Discord integration
 │   │   ├── telegram_bot.py  # Telegram integration
 │   │   ├── twitter_bot.py   # Twitter/X (autonomous + mentions)
@@ -179,6 +182,8 @@ EchoSpeak/
 │   ├── tui/                 # Go terminal UI
 │   └── onboard-tui/         # Setup wizard
 ├── docs/                    # Documentation
+│   ├── RUNTIME_CONTRACTS.md # Equal models, Project, hydration, Known limitations
+│   └── LIFECYCLE_TRUTHFULNESS.md  # Recovery, confirm, ToolRun truth
 ├── ARCHITECTURE.md
 ├── CHANGES.md               # Full changelog
 ├── ROADMAP.md
@@ -199,10 +204,12 @@ Most settings can be changed from the **Web UI Settings tab** without editing fi
 ## Safety model
 
 1. **Environment flags** — master switches (`ENABLE_SYSTEM_ACTIONS`, `ALLOW_FILE_WRITE`, etc.)
-2. **Workspace allowlists** — define which tools are available per context
-3. **Skill restrictions** — skills can only narrow tool access, never widen
+2. **Project path scope** — filesystem tools only under the attached Project / allowed roots
+3. **Registration + policy** — tools must be registered; skill workspaces do not invent a hard allowlist ceiling
 4. **Approval records** — side effects persist as approval objects tied to thread + execution
-5. **User confirmation** — all action tools require explicit `confirm` / `cancel`
+5. **User confirmation** — action tools require explicit confirm (types A–D: `docs/LIFECYCLE_TRUTHFULNESS.md` §4)
+
+Full contracts: `docs/RUNTIME_CONTRACTS.md`.
 
 ## Documentation
 

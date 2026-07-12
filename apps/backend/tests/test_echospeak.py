@@ -225,17 +225,13 @@ class TestTools:
         assert len(tools) > 0
 
     def test_web_search_timeout_returns_timeout_message(self, monkeypatch):
-        """Timeouts should surface as provider errors, not empty results.
-
-        Tavily is tried first when an API key is set; DuckDuckGo must also fail
-        so the timeout is not masked by a successful free fallback.
-        """
+        """Configured HTTP-provider timeouts should surface as provider errors."""
         import builtins
         import requests
         from agent.tools import web_search
         from config import config
 
-        def fake_post(*args, **kwargs):
+        def fake_get(*args, **kwargs):
             raise requests.exceptions.Timeout()
 
         real_import = builtins.__import__
@@ -245,15 +241,16 @@ class TestTools:
                 raise ImportError("blocked in unit test")
             return real_import(name, globals, locals, fromlist, level)
 
-        monkeypatch.setattr(config, "tavily_api_key", "tvly-test", raising=False)
+        monkeypatch.setattr(config, "web_search_provider", "brave", raising=False)
+        monkeypatch.setattr(config, "brave_search_api_key", "bsa-test", raising=False)
+        monkeypatch.setattr(config, "searxng_base_url", "", raising=False)
         monkeypatch.setattr(config, "web_search_timeout", 7, raising=False)
-        monkeypatch.setattr(requests, "post", fake_post, raising=False)
+        monkeypatch.setattr(requests, "get", fake_get, raising=False)
         monkeypatch.setattr(builtins, "__import__", guarded_import)
 
         out = web_search.invoke({"query": "Edmonton Oilers score right now"})
 
         assert "timed out after 7s" in str(out).lower()
-
 
 class TestActionParser:
     def test_action_parser_file_write_python_script(self, monkeypatch):
@@ -274,6 +271,7 @@ class TestActionParser:
                 return '{"action":"file_write","confidence":0.9,"path":"hello.py","content":"print(\\"Hello, world!\\")","append":false}'
 
         agent.llm_wrapper = StubLLM()
+        agent.research_llm_wrapper = None
 
         resp, _ok = agent.process_query("create a python script that prints hello world", include_memory=False)
         assert "pending action" in resp.lower() or "reply 'confirm'" in resp.lower()
@@ -281,30 +279,32 @@ class TestActionParser:
 
 
 class TestDiscordHardening:
-    def test_discord_server_source_limits_tools(self, tmp_path):
+    def test_discord_server_source_requires_bound_turn_authority(self, tmp_path):
         from agent.core import EchoSpeakAgent
 
-        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        agent = EchoSpeakAgent(memory_path=str(tmp_path), manage_background_services=False)
         agent._current_source = "discord_bot"
         agent._tool_allowlist_override = None
 
-        assert agent._tool_allowed("web_search") is True
-        assert agent._tool_allowed("get_system_time") is True
-        assert agent._tool_allowed("calculate") is True
+        assert agent._tool_allowed("web_search") is False
+        assert agent._tool_allowed("get_system_time") is False
+        assert agent._tool_allowed("calculate") is False
         assert agent._tool_allowed("file_read") is False
         assert agent._tool_allowed("discord_send_channel") is False
+        # Query selection may identify a candidate; execution still requires
+        # the bound mode/context checked above.
         assert agent._allowed_lc_tool_names("search for the weather") == frozenset({"web_search"})
         assert agent._allowed_lc_tool_names('post in #announcements "hi"') == frozenset()
 
-    def test_discord_dm_source_can_still_use_broader_allowlist(self, tmp_path):
+    def test_discord_dm_allowlist_does_not_replace_bound_turn_authority(self, tmp_path):
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
         agent._current_source = "discord_bot_dm"
         agent._tool_allowlist_override = {"file_read", "web_search"}
 
-        assert agent._tool_allowed("file_read") is True
-        assert agent._tool_allowed("web_search") is True
+        assert agent._tool_allowed("file_read") is False
+        assert agent._tool_allowed("web_search") is False
 
     def test_public_discord_dm_does_not_expose_channel_tools(self, tmp_path, monkeypatch):
         from agent.core import EchoSpeakAgent
@@ -316,7 +316,7 @@ class TestDiscordHardening:
         agent._current_source = "discord_bot_dm"
         agent._current_user_role = DiscordUserRole.PUBLIC
 
-        assert agent._tool_available_in_current_context("web_search") is True
+        assert agent._tool_available_in_current_context("web_search") is False
         assert agent._tool_available_in_current_context("discord_read_channel") is False
         assert agent._tool_available_in_current_context("discord_send_channel") is False
         assert agent._allowed_lc_tool_names("what are people saying in #general?") == frozenset()
@@ -448,7 +448,7 @@ class TestDiscordHardening:
 
         agent._pq_build_context(wrapped, include_memory=True, callbacks=None, thread_id="discord_1_2")
 
-        assert seen["query"] == "No because of kernel level anti cheat"
+        assert seen["query"] == "task: No because of kernel level anti cheat"
         assert seen["thread_id"] == "discord_1_2"
 
     def test_referential_followup_uses_current_subject(self, tmp_path):
@@ -698,7 +698,7 @@ class TestDiscordHardening:
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
-        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
             '|TOOL| terminal_run {"command":"echo hello","cwd":"."}',
@@ -716,7 +716,7 @@ class TestDiscordHardening:
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
-        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
             '<execute_tool>file_write(path="index.html", content="<h1>Hello</h1>", append=False)</execute_tool>',
@@ -733,7 +733,7 @@ class TestDiscordHardening:
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
-        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
             '<execute_tool> file_write(file_path="index.html", '
@@ -752,7 +752,7 @@ class TestDiscordHardening:
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
-        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
             '<tool_call>{"tool":"terminal_run","args":{"command":"npm test","cwd":"."}}</tool_call>',
@@ -768,7 +768,7 @@ class TestDiscordHardening:
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
-        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
             '<|tool_call>call:file_write{path:<|"|>index.html<|"|>, '
@@ -787,7 +787,7 @@ class TestDiscordHardening:
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
-        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
             '<|tool_call>call:file_write{content:<|"|><!DOCTYPE html>\\n<html></html><|"|>}',
@@ -803,7 +803,7 @@ class TestDiscordHardening:
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
-        monkeypatch.setattr(agent, "_action_allowed", lambda _name: True)
+        monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
             '<tool_code> file_write(path="movement_demo/index.html", content="""<html></html>""") '
@@ -1223,13 +1223,14 @@ class TestConversationAndResearchRouting:
         from agent.core import EchoSpeakAgent
         from agent.core import Tool
 
-        agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        agent = EchoSpeakAgent(memory_path=str(tmp_path), manage_background_services=False)
 
         class StubLLM:
             def invoke(self, text: str) -> str:
                 return "SUMMARY"
 
         agent.llm_wrapper = StubLLM()
+        agent.research_llm_wrapper = None
 
         captured: list[str] = []
 
@@ -1431,7 +1432,7 @@ class TestConversationAndResearchRouting:
 
 class TestNoSearchOnSocialIntro:
     def test_social_intro_does_not_trigger_web_search(self, tmp_path, monkeypatch):
-        from agent.core import EchoSpeakAgent
+        from agent.core import EchoSpeakAgent, Tool
         from config import config
 
         monkeypatch.setattr(config, "enable_system_actions", True, raising=False)
@@ -1447,7 +1448,7 @@ class TestNoSearchOnSocialIntro:
 
         for i, t in enumerate(list(agent.tools)):
             if getattr(t, "name", "") == "web_search":
-                agent.tools[i] = type(t)("web_search", fake_web_search, getattr(t, "description", ""))
+                agent.tools[i] = Tool("web_search", fake_web_search, getattr(t, "description", ""))
                 break
 
         agent.process_query("i have friend named max! he's currently watching you! say hi! remember my friend max!", include_memory=False)

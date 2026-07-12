@@ -5,6 +5,11 @@ This file is for developers extending EchoSpeak’s agent.
 ---
 
 ## Recent Updates
+- **Runtime contracts / lifecycle (v7.6.10)**: **Implemented (partial); pending live validation.**  
+  - Full wave index: **`docs/RUNTIME_CONTRACTS.md`** (equal models, Project lifecycle, hydration, search/utility, coding targets, streaming, approval scope, Known limitations).  
+  - Truthfulness contracts: **`docs/LIFECYCLE_TRUTHFULNESS.md`** (recovery I.1, confirm I.2, evidence I.3, ToolRuns, projection, corruption).  
+  - Do not restate full rules here. Live gates: Lifecycle §11 + Runtime §K.
+- **Deterministic mode system**: `mode_controller.py` classifies each turn once (Chat / Task Research / Coding + `intent_relation`); execution gated by path roots, permissions, and approvals. See `docs/MODE_SYSTEM.md`.
 - **Continuity + verifier-first reflection (v7.3.0)**: `ContextBundle` now carries explicit current-subject state for referential follow-ups, execution metadata records the Stage 4 tool-calling branch, and `ReflectionEngine` uses deterministic checks for terminal/file/JSON results before asking the LLM to self-grade.
 - **Coding loop + trust surfaces (v7.3.0)**: Added `GET /coding/readiness`, surfaced Memory Doctor in the Web UI, and extended the Tools panel with coding readiness plus tool-origin/trust metadata. The coding workspace prompt now guides Echo through inspect -> plan -> implement -> verify -> summarize.
 - **Provider readiness + memory doctor (v7.2.0)**: `/query` and `/query/stream` now preflight the configured model provider before starting the agent loop, returning a clear `provider_unavailable` response when LM Studio/Ollama/LocalAI/vLLM/API keys are not ready. `GET /provider` includes readiness metadata, and `GET /memory/doctor` reports duplicate memory groups, type coverage, pinned/profile counts, and raw conversation auto-store status.
@@ -12,7 +17,7 @@ This file is for developers extending EchoSpeak’s agent.
 - **Agentic tool loop hardening (v7.1.2)**: Terminal execution now uses a denylist, coding/project prompts auto-promote into the coding workspace, `Desktop/...` resolves through configured extra file roots, and operational lessons can be injected into the system prompt without saving every conversation as memory.
 - **Transparent reasoning trace (v7.1.2)**: Thinking/reasoning and task-plan UI render as transparent chat timeline activity with clearer live tool text, while internal five-stage pipeline logging stays out of the user-facing reasoning stream.
 - **Inline code diff (v7.1.0)**: New `InlineCodeDiff.tsx` component renders a unified one-pane diff in the Code panel with green additions and red deletions. Per-file session model (`codeSessions`) replaces the old `codeBlocks` snapshot array. Accept/Decline buttons appear in the diff header when a `file_write` is pending confirmation.
-- **Efficient SEARCH/REPLACE editing (v7.1.0)**: File-edit pipeline now prompts the LLM for targeted `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` blocks instead of full-file rewrites, saving 80–95% of output tokens. Automatic fallback to full-file if parsing fails. Exact-match + fuzzy whitespace fallback matching.
+- **Efficient SEARCH/REPLACE editing (v7.1.0)**: Targeted SEARCH/REPLACE blocks vs full-file rewrites. Corruption / marker rules: **`docs/LIFECYCLE_TRUTHFULNESS.md` §7**.
 - **Context Ring (v7.1.0)**: Circular SVG token-usage gauge in the chat input bar with color-coded thresholds (blue/amber/red) and hover tooltip.
 - **Workspace Explorer (v7.1.0)**: New `WorkspaceExplorer.tsx` component renders a file tree of `FILE_TOOL_ROOT` in the Code panel. Permanent "📂 Files" tab with folder expansion, file icons, permission badges (WRITE/TERM), "cd" button to change working directory at runtime, and refresh. New `GET/POST /workspace` + `GET /workspace/browse` API endpoints.
 - **Reflection loop (v7.0.0)**: General-purpose `ReflectionEngine` (`agent/reflection.py`) evaluates tool results between steps in multi-task plans. Per-step reflection ("Does this result satisfy what we need?") and post-plan reflection ("Did the overall execution match user intent?"). Anti-loop guards: max 2 cycles, trivial-tool skip, substantial-result bypass. Integrated into `TaskPlanner.execute_next_task()` with retry-on-reject via `get_retry_params()`.
@@ -44,6 +49,11 @@ This file is for developers extending EchoSpeak’s agent.
 
 - `apps/backend/agent/core.py`
   - `LLMWrapper`: provider abstraction (OpenAI, Google Gemini, Ollama, **LM Studio (GGUF direct)**, LocalAI, llama.cpp, vLLM)
+  - binds deterministic turn mode and enforces mode-scoped tool access
+- `apps/backend/agent/mode_controller.py`
+  - deterministic Chat / Task Research / Coding classifier and tool mask source of truth
+- `apps/backend/agent/mode_executor.py`
+  - executor profiles for allowed behavior, failure handling, and logging scope
   - `EchoSpeakAgent`: routing + tool usage + memory + safety gating
   - `ContextBundle`: explicit turn context including `current_subject` and resolved follow-up input for chat continuity
 - `apps/backend/io_module/personaplex_client.py`
@@ -83,27 +93,23 @@ This file is for developers extending EchoSpeak’s agent.
 
 ### Approval / confirmation flow
 
-Action tools must follow:
+Action tools are never free-form “yes = write.” Separate intents (prepare offer,
+exact mutation approval, continue unfinished work, retry) are defined only in:
 
-1. Agent proposes action
-2. Agent persists an approval record linked to the current execution and thread state
-3. User must reply `confirm` or `cancel`
-4. Only then do we execute
+→ **`docs/LIFECYCLE_TRUTHFULNESS.md` §4**
 
-This logic lives in:
+Minimum implementation map:
 
-- `apps/backend/agent/core.py`
-  - `_set_pending_action()`
-  - `_hydrate_pending_action_from_state()`
-  - `_begin_execution_record()` / `_finalize_execution_record()`
-  - `_is_action_tool()`
-  - `_action_allowed()`
-  - `_format_pending_action()`
-  - `process_query()` confirmation handling
-- `apps/backend/agent/state.py`
-  - `ApprovalRecord`
-  - `ExecutionRecord`
-  - `ThreadSessionState`
+- `core.py`: `_set_pending_action`, `_hydrate_pending_action_from_state`,
+  offered-action extract/resolve, honesty gates, `_finalize_execution_record`,
+  Stage 1 confirm/cancel
+- `mode_controller.py`: `_intent_relation`
+- `state.py`: `ApprovalRecord`, `ExecutionRecord`, `ThreadSessionState`
+
+### Recovery, ToolRuns, completion, corruption, equal access, Project scope
+
+- Truthfulness: **`docs/LIFECYCLE_TRUTHFULNESS.md`**  
+- Equal models, Project/Code lifecycle, hydration, explicit-file targets, approval identity, Known limitations: **`docs/RUNTIME_CONTRACTS.md`**
 
 ### Multi-step task plans + approvals
 
@@ -416,10 +422,12 @@ Action Parser:
 
 - `ACTION_PARSER_ENABLED`
 
-### Workspaces + skills allowlist semantics
+### Workspaces + skills + Project scope (v7.6.10)
 
-- Workspaces define the tool allowlist ceiling for the session.
-- Skills can only further restrict tool access; skills must not expand tools beyond what the workspace allows.
+- Skill workspaces (`chat` / `coding` / `research`) provide prompts and soft `TOOLS.txt` preference lists — **not** a hard tool ceiling.
+- Execution gates: registration + Project path scope + env `ALLOW_*` / role policy + confirmations.
+- Attached Projects stay available even in chat interaction mode; `/capabilities?thread_id=` must bind that Session.
+- Full rules: **`docs/RUNTIME_CONTRACTS.md` §B**. Historical notes that said “workspace is the ceiling” are superseded by this contract.
 
 ---
 
@@ -438,25 +446,23 @@ Examples:
 
 ### web_search quality upgrades
 
-The `web_search` tool was upgraded to return more useful context and higher-quality results without adding heavy dependencies.
+The `web_search` tool routes through `agent/web_search_providers.py`.
 
 Behavior:
 
+- Provider cascade:
+  - `WEB_SEARCH_PROVIDER=searxng` uses the configured self-hosted SearXNG instance first, then DuckDuckGo fallback.
+  - `WEB_SEARCH_PROVIDER=auto` prefers SearXNG only when `SEARXNG_BASE_URL` is explicitly set, then Brave when configured, then DuckDuckGo.
+  - `WEB_SEARCH_PROVIDER=duckduckgo` forces the free DuckDuckGo path.
+- Query safety:
+  - Queries are normalized with the same typo/framing cleanup used by research planning.
+  - Vague searches with no concrete subject are rejected before providers run.
 - Multi-query support:
   - Separate queries with newlines (recommended) OR use `OR`.
-  - Example:
-    - `best budget mic 2026\nusb mic podcast`
-    - `best budget mic 2026 OR usb mic podcast`
 - Aggregation + dedupe:
-  - Results are merged across queries.
-  - URLs are deduped so you don’t get the same page repeated.
-- Retrieve-more then rerank:
-  - The tool collects more candidates (up to ~20 unique URLs) and then applies a lightweight keyword-based rerank.
-  - Scoring uses title/snippet/page_title/extract text.
-- Tavily-only retrieval:
-  - `web_search` is the only active web-search tool.
-  - Tavily response content is compressed toward the most query-relevant sentences so the agent gets “signal”, not walls of text.
-
+  - Results are merged across queries and duplicate URLs are removed.
+- Free-path enrichment:
+  - DuckDuckGo uses text/news variants, simplified retry, authority `site:` variants, and thin-snippet extraction.
 ---
 
 ## Action tools
@@ -490,13 +496,15 @@ Locations:
 
 ## Diagnostics: capabilities report
 
-The backend exposes a capabilities endpoint that reports tool availability and why a tool might be blocked (workspace allowlist vs system action policy).
+The backend exposes a capabilities endpoint that reports tool availability and why a tool might be blocked (policy, Project scope, flags — not a hard `TOOLS.txt` ceiling). Always pass the Session id so Project scope is bound:
 
 - `GET /capabilities?thread_id=...`
 
 Location:
 
-- `apps/backend/api/server.py`
+- `apps/backend/api/server.py` (`_apply_thread_scope` before report)
+
+See **`docs/RUNTIME_CONTRACTS.md` §B**.
 
 ---
 

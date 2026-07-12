@@ -15,6 +15,8 @@ export type AgentPhase =
   | "error"
   | "task_running";
 
+export type OpenToolEntry = { id: string; name: string };
+
 export type AgentActivityState = {
   phase: AgentPhase;
   streaming: boolean;
@@ -22,6 +24,9 @@ export type AgentActivityState = {
   replyDraft: string;
   activeToolName: string;
   activeToolId: string;
+  openToolIds: string[];
+  /** Parallel name map so concurrent tools re-bind phase correctly on tool_end. */
+  openTools: OpenToolEntry[];
   openToolCount: number;
   pendingConfirmation: boolean;
   lastError: string;
@@ -35,6 +40,8 @@ export const initialAgentActivity = (): AgentActivityState => ({
   replyDraft: "",
   activeToolName: "",
   activeToolId: "",
+  openToolIds: [],
+  openTools: [],
   openToolCount: 0,
   pendingConfirmation: false,
   lastError: "",
@@ -90,15 +97,6 @@ function withLabel(state: Omit<AgentActivityState, "label">): AgentActivityState
   return { ...state, label: labelFor(state) };
 }
 
-export function isConfirmPromptText(text: string): boolean {
-  const low = (text || "").toLowerCase();
-  return (
-    low.includes("reply 'confirm'") ||
-    low.includes('reply "confirm"') ||
-    (low.includes("confirm") && low.includes("cancel") && (low.includes("pending") || low.includes("i can do this")))
-  );
-}
-
 export type ActivityAction =
   | { type: "stream_start" }
   | { type: "stream_end" }
@@ -109,7 +107,7 @@ export type ActivityAction =
   | { type: "tool_error"; id: string; message?: string }
   | { type: "status_mode"; mode: string; tool?: string }
   | { type: "task_step"; status: string }
-  | { type: "final"; response: string }
+  | { type: "final"; response: string; executionStatus?: string; success?: boolean }
   | { type: "error"; message: string }
   | { type: "reset" };
 
@@ -130,6 +128,8 @@ export function agentActivityReducer(state: AgentActivityState, action: Activity
         ...state,
         streaming: false,
         openToolCount: 0,
+        openToolIds: [],
+        openTools: [],
         activeToolName: "",
         activeToolId: "",
         phase: state.pendingConfirmation ? "awaiting_confirm" : state.phase === "error" ? "error" : "idle",
@@ -157,9 +157,16 @@ export function agentActivityReducer(state: AgentActivityState, action: Activity
     }
 
     case "tool_start": {
-      const openToolCount = state.openToolCount + 1;
+      const already = state.openTools.some((t) => t.id === action.id);
+      const openTools = already
+        ? state.openTools.map((t) => (t.id === action.id ? { id: action.id, name: action.name } : t))
+        : [...state.openTools, { id: action.id, name: action.name }];
+      const openToolIds = openTools.map((t) => t.id);
+      const openToolCount = openTools.length;
       return withLabel({
         ...state,
+        openTools,
+        openToolIds,
         openToolCount,
         activeToolName: action.name,
         activeToolId: action.id,
@@ -168,15 +175,20 @@ export function agentActivityReducer(state: AgentActivityState, action: Activity
     }
 
     case "tool_end": {
-      const openToolCount = Math.max(0, state.openToolCount - 1);
+      const openTools = state.openTools.filter((t) => t.id !== action.id);
+      const openToolIds = openTools.map((t) => t.id);
+      const openToolCount = openTools.length;
+      const next = openToolCount > 0 ? openTools[openTools.length - 1] : null;
       return withLabel({
         ...state,
+        openTools,
+        openToolIds,
         openToolCount,
-        activeToolName: openToolCount > 0 ? state.activeToolName : "",
-        activeToolId: openToolCount > 0 ? state.activeToolId : "",
+        activeToolName: next?.name || "",
+        activeToolId: next?.id || "",
         phase:
           openToolCount > 0
-            ? phaseFromTool(state.activeToolName)
+            ? phaseFromTool(next?.name || "")
             : state.replyDraft
               ? "streaming_reply"
               : state.streaming
@@ -186,14 +198,19 @@ export function agentActivityReducer(state: AgentActivityState, action: Activity
     }
 
     case "tool_error": {
-      const openToolCount = Math.max(0, state.openToolCount - 1);
+      const openTools = state.openTools.filter((t) => t.id !== action.id);
+      const openToolIds = openTools.map((t) => t.id);
+      const openToolCount = openTools.length;
+      const next = openToolCount > 0 ? openTools[openTools.length - 1] : null;
       return withLabel({
         ...state,
+        openTools,
+        openToolIds,
         openToolCount,
         lastError: action.message || "Tool failed",
-        phase: openToolCount > 0 ? phaseFromTool(state.activeToolName) : "error",
-        activeToolName: openToolCount > 0 ? state.activeToolName : "",
-        activeToolId: openToolCount > 0 ? state.activeToolId : "",
+        phase: openToolCount > 0 ? phaseFromTool(next?.name || "") : "error",
+        activeToolName: next?.name || "",
+        activeToolId: next?.id || "",
       });
     }
 
@@ -229,16 +246,20 @@ export function agentActivityReducer(state: AgentActivityState, action: Activity
     }
 
     case "final": {
-      const pendingConfirmation = isConfirmPromptText(action.response || "");
+      const executionStatus = String(action.executionStatus || "").toLowerCase();
+      const pendingConfirmation = ["needs_permission", "needs_approval"].includes(executionStatus);
+      const failed = action.success === false || ["failed", "blocked", "retryable"].includes(executionStatus);
       return withLabel({
         ...state,
         streaming: false,
         openToolCount: 0,
+        openToolIds: [],
+        openTools: [],
         activeToolName: "",
         activeToolId: "",
         replyDraft: "",
         pendingConfirmation,
-        phase: pendingConfirmation ? "awaiting_confirm" : "idle",
+        phase: pendingConfirmation ? "awaiting_confirm" : failed ? "error" : "idle",
       });
     }
 
@@ -249,12 +270,33 @@ export function agentActivityReducer(state: AgentActivityState, action: Activity
         lastError: action.message || "Error",
         phase: "error",
         openToolCount: 0,
+        openToolIds: [],
+        openTools: [],
         activeToolName: "",
+        activeToolId: "",
       });
 
     default:
       return state;
   }
+}
+
+/**
+ * Whether a stream event should mutate the *visible* chat for the active Session.
+ * Aborted streams must not append messages/tools to a new Session — but callers
+ * should still reset the activity machine (see sendText finally).
+ */
+export function isStreamEventCurrent(
+  originatingThreadId: string,
+  activeThreadId: string,
+  aborted: boolean,
+): boolean {
+  return !aborted && Boolean(originatingThreadId) && originatingThreadId === activeThreadId;
+}
+
+/** Thread still matches; used when we must finish cleanup even if the stream was aborted. */
+export function isStreamThreadCurrent(originatingThreadId: string, activeThreadId: string): boolean {
+  return Boolean(originatingThreadId) && originatingThreadId === activeThreadId;
 }
 
 export function toolCategoryFromPhase(phase: AgentPhase): string {

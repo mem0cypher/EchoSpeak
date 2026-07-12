@@ -2,6 +2,11 @@
 
 This guide will get you running in 5 minutes.
 
+**Product contracts (developers / advanced):** after you are running, reliability
+rules for Projects, ToolRuns, confirmations, and recovery live in
+`docs/RUNTIME_CONTRACTS.md` and `docs/LIFECYCLE_TRUTHFULNESS.md` (v7.6.10 —
+implemented partial; pending live validation).
+
 ---
 
 ## Prerequisites
@@ -184,7 +189,7 @@ Useful fast-path examples:
 - `what changed recently?` (uses the shared update-context layer to return grounded repo info)
 - `what's new with EchoSpeak?` (same — deterministic, not memory-dependent)
 
-EchoSpeak can also handle multi-part requests in a single message by executing a short multi-step plan. You'll see a **live task checklist** in the chat showing each step's progress (○ pending, ● running, ✓ done, ✗ failed). For any tool that causes side effects (file writes, terminal commands, Discord sends, browser/desktop automation), EchoSpeak will pause and ask you to reply `confirm` or `cancel`. The agent also **reflects** on each tool result — if a search comes back empty, it automatically retries with a refined query (up to 2 retries max).
+EchoSpeak can also handle multi-part requests in a single message by executing a short multi-step plan. You'll see a **live task checklist** in the chat showing each step's progress (○ pending, ● running, ✓ done, ✗ failed). For side-effect tools (file writes, terminal, Discord sends, browser/desktop automation), Echo pauses for approval. A plain **yes is not automatic write permission**. Product contracts: **`docs/RUNTIME_CONTRACTS.md`** and **`docs/LIFECYCLE_TRUTHFULNESS.md`**. The agent also **reflects** on tool results and may retry weak searches (up to 2 retries).
 
 Multi-step examples:
 - `search for a cat meme and post it in Discord general`
@@ -303,9 +308,12 @@ cd apps/backend && python app.py --mode text
 ### "Tool not allowed"
 
 Check:
-1. Workspace `TOOLS.txt` includes the tool
-2. `ENABLE_SYSTEM_ACTIONS=true`
-3. Specific `ALLOW_*` flag is enabled
+1. Tool is registered and `GET /capabilities?thread_id=` shows it for **this** Session (attach Project if the tool is project-scoped)
+2. `ENABLE_SYSTEM_ACTIONS=true` for system actions
+3. Specific `ALLOW_*` flag is enabled (writes, terminal, browser, etc.)
+4. Path is inside the attached Project / allowed roots (Project scope ≠ permission flags)
+
+Workspace `TOOLS.txt` is soft skill guidance only — not a hard ceiling. See `docs/RUNTIME_CONTRACTS.md` §B.
 
 ### "Actions disabled"
 

@@ -1,15 +1,22 @@
 # EchoSpeak Architecture Audit
 
 **Generated:** 2025-01-20  
-**Updated:** 2026-07-04 (v7.1.2 agentic tool loop, transparent reasoning trace, safety cleanup)  
-**Version:** 7.1.2  
-**Auditor:** Cascade AI
+**Updated:** 2026-07-12 (v7.6.10 runtime contracts — **implemented partial; pending live validation**)  
+**Version:** 7.6.10 (pre-acceptance)  
+**Auditor:** Cascade AI / session repair wave
 
 ---
 
 ## Executive Summary
 
 EchoSpeak is a local-first agent platform with a strong backend foundation and an increasingly governed control plane. Phase 1 fixed foundational control-plane and onboarding issues, Phase 2 promoted research into a first-class backend/web contract with explicit evidence objects and recency-aware rendering, and Phase 3 matured runtime state into a persisted control plane for approvals, executions, traces, and thread-scoped session state. The latest post-v6.5.0 hardening pass also corrected a major latency/routing regression by pushing ordinary chat/help/memory-save prompts back onto deterministic fast paths instead of defaulting them into broad tool-enabled LangGraph runs. The Web UI shell is still large, but the critical approval and trace lifecycle is no longer trapped inside ad hoc local state.
+
+**v7.6.10 runtime contracts** are **not** closed. Canonical specs:
+
+- `docs/RUNTIME_CONTRACTS.md` — equal models; Mode/Project/permissions; Project+Code lifecycle; refresh hydration; search/utility/references; coding targets; streaming/concurrency; approval-scope identity; **Known limitations**
+- `docs/LIFECYCLE_TRUTHFULNESS.md` — recovery evidence (I.1), proposal/confirm types (I.2), incomplete evidence (I.3), ToolRuns, projection status, corruption, finals
+
+**Documented gaps include:** explicit-file mutation retarget (`index.html` → `game.js`); approval invalidation on non-scope events; dual search stacks; ToolOutcome→text; `core.py` control-plane size. Live acceptance: Lifecycle §11 + Runtime §K.
 
 **Key Features:**
 - Multi-provider LLM support (OpenAI, Gemini, Ollama, LM Studio, LocalAI, vLLM)
@@ -442,14 +449,14 @@ Skills provide behavior guidance and can now bring their own tools and pipeline 
 apps/backend/skills/<skill_name>/
 ├── SKILL.md      # Behavior instructions
 ├── skill.json    # Metadata (name, description, tools)
-├── TOOLS.txt     # Tool allowlist (optional)
+├── TOOLS.txt     # Soft tool preference list (optional; not a hard ceiling — v7.6.10)
 ├── tools.py      # Custom tools (optional, v5.3.0)
 └── plugin.py     # Pipeline plugin (optional, v5.3.0)
 ```
 
 **Skill → Tool Bridge (v5.3.0):**
 
-If a skill includes `tools.py`, functions decorated with `@ToolRegistry.register(...)` are auto-loaded when the workspace is configured. New tools appear in the agent's capabilities and allowlists automatically.
+If a skill includes `tools.py`, functions decorated with `@ToolRegistry.register(...)` are auto-loaded when the workspace is configured. New tools appear in the agent's capabilities via registration (execution still gated by Project scope + policy; see `docs/RUNTIME_CONTRACTS.md` §B).
 
 **Plugin Pipeline (v5.3.0):**
 
@@ -475,13 +482,17 @@ If a skill includes `plugin.py`, `PipelinePlugin` subclasses registered via `Plu
 
 ### 6.2 Workspaces
 
-Workspaces define hard limits on available tools and skills.
+Workspaces provide skill prompts and soft tool/skill preference lists. They are
+**not** a hard execution ceiling as of the v7.6.10 runtime contracts
+(`docs/RUNTIME_CONTRACTS.md` §B). Real gates: registration, Project path scope,
+permission flags, approvals.
 
 **Structure:**
 ```
 apps/backend/workspaces/<workspace_name>/
-├── TOOLS.txt     # Allowed tools (one per line)
-└── SKILLS.txt    # Allowed skills (one per line)
+├── WORKSPACE.md  # Behavior prompt
+├── TOOLS.txt     # Soft tool preference list (one per line)
+└── SKILLS.txt    # Soft skill list (one per line)
 ```
 
 ### 6.3 Workspace Modes
@@ -489,7 +500,7 @@ apps/backend/workspaces/<workspace_name>/
 | Workspace | Purpose | Typical Tools |
 |-----------|---------|---------------|
 | `auto` | General purpose | All tools |
-| `chat` | Conversation focus | Minimal tools |
+| `chat` | Conversation focus | Prefer chat; Project tools still available when a Project is attached |
 | `coding` | Development | Terminal, file tools |
 | `research` | Information gathering | Search, browse tools |
 
