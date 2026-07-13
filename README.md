@@ -20,6 +20,7 @@
   <a href="ROADMAP.md">Roadmap</a> ·
   <a href="docs/AGENT.md">Agent Guide</a> ·
   <a href="docs/INTEGRATIONS.md">Integrations</a> ·
+  <a href="docs/UNIFIED_COORDINATION.md">Coordination</a> ·
   <a href="docs/RUNTIME_CONTRACTS.md">Runtime contracts</a> ·
   <a href="docs/LIFECYCLE_TRUTHFULNESS.md">Lifecycle honesty</a>
 </p>
@@ -76,6 +77,7 @@ On Arch/CachyOS with PEP 668, use `./.venv/bin/python -m pip install -r requirem
 - **Multi-channel** — Web UI, Discord, Telegram, Twitter/X, Twitch, Go TUI, Python CLI, A2A protocol.
 - **Persistent memory** — deterministic profile facts, curated durable memories, FAISS vector search, document RAG.
 - **Governed tools** — 30+ tools with confirmation gates, Project path scope, permission flags, and layered safety.
+- **Unified coordination** — one request lifecycle and one owner per concept so subsystems plug in without special-case “guesses” (`docs/UNIFIED_COORDINATION.md`).
 - **Runtime contracts** — equal model access, Project scope, hydration, ToolRun truth (`docs/RUNTIME_CONTRACTS.md` + `docs/LIFECYCLE_TRUTHFULNESS.md`; v7.6.10 pending live validation).
 - **Skills + plugins** — drop-in skill bundles with custom tools and pipeline hooks.
 - **Customizable soul** — define personality, voice, and boundaries via `SOUL.md`.
@@ -182,7 +184,8 @@ EchoSpeak/
 │   ├── tui/                 # Go terminal UI
 │   └── onboard-tui/         # Setup wizard
 ├── docs/                    # Documentation
-│   ├── RUNTIME_CONTRACTS.md # Equal models, Project, hydration, Known limitations
+│   ├── UNIFIED_COORDINATION.md   # One lifecycle; no guessing; easy next subsystem
+│   ├── RUNTIME_CONTRACTS.md      # Equal models, Project, hydration, Known limitations
 │   └── LIFECYCLE_TRUTHFULNESS.md  # Recovery, confirm, ToolRun truth
 ├── ARCHITECTURE.md
 ├── CHANGES.md               # Full changelog
@@ -209,7 +212,7 @@ Most settings can be changed from the **Web UI Settings tab** without editing fi
 4. **Approval records** — side effects persist as approval objects tied to thread + execution
 5. **User confirmation** — action tools require explicit confirm (types A–D: `docs/LIFECYCLE_TRUTHFULNESS.md` §4)
 
-Full contracts: `docs/RUNTIME_CONTRACTS.md`.
+Full contracts: `docs/UNIFIED_COORDINATION.md`, `docs/RUNTIME_CONTRACTS.md`.
 
 ## Documentation
 

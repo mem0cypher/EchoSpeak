@@ -179,15 +179,16 @@ def test_allow_llm_tool_calling_is_equal_across_providers(monkeypatch):
     monkeypatch.setattr(config, "disable_native_tool_calling", False, raising=False)
 
 
-def test_effective_context_window_prefers_configured_length(monkeypatch):
+def test_effective_context_window_prefers_explicit_profile_then_trim(monkeypatch):
     from agent.core import EchoSpeakAgent
-    from config import config
+    from config import ModelProvider, config
 
     agent = object.__new__(EchoSpeakAgent)
+    agent.llm_provider = ModelProvider.OLLAMA
     agent._active_model_profile = resolve_model_profile("ollama", "x", {"context_limit": 8192})
     monkeypatch.setattr(config, "llm_trim_max_tokens", 0, raising=False)
     monkeypatch.setattr(config.local, "context_length", 65536, raising=False)
-    assert agent._resolve_effective_context_window() == 65536
+    assert agent._resolve_effective_context_window() == 8192
     monkeypatch.setattr(config, "llm_trim_max_tokens", 100000, raising=False)
     assert agent._resolve_effective_context_window() == 100000
 
@@ -217,3 +218,35 @@ def test_projects_bind_exact_folders_and_read_only_git_scope(tmp_path: Path):
     if a.git_metadata.get("is_repository"):
         assert a.git_metadata.get("root")
     assert b.workspace_root.endswith("b")
+
+
+def test_query_message_recording_never_creates_a_session(tmp_path: Path, monkeypatch):
+    import agent.threads as threads_mod
+    from agent.threads import ThreadManager
+    from api.server import _record_session_message
+
+    manager = ThreadManager(tmp_path / "threads.json")
+    monkeypatch.setattr(threads_mod, "_thread_manager", manager)
+    _record_session_message("missing-session", "hello")
+    assert manager.get_thread("missing-session") is None
+
+    manager.create_thread(thread_id="explicit-session", title="New Session", source="web")
+    _record_session_message("explicit-session", "real first message")
+    recorded = manager.get_thread("explicit-session")
+    assert recorded is not None
+    assert recorded.message_count == 1
+    assert recorded.title == "real first message"
+
+
+def test_schema_invalid_runtime_authority_is_quarantined_and_fails_closed(tmp_path: Path):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    source = root / "approvals.json"
+    source.write_text(json.dumps({"approval-1": {"id": "approval-1"}}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="recovery guide"):
+        StateStore(root)
+    assert json.loads(source.read_text(encoding="utf-8")) == {"approval-1": {"id": "approval-1"}}
+    recovery_dirs = list((root / "corrupt-state").iterdir())
+    assert recovery_dirs
+    assert (recovery_dirs[0] / "approvals.json").exists()
+    assert (recovery_dirs[0] / "RECOVERY.txt").exists()

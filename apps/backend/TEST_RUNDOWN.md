@@ -38,6 +38,8 @@ npx vitest run
 | `test_reliability_architecture.py` | SearchGrounder, context budget, session memory, telemetry, LC tool wrap, partial tools |
 | `test_reflection.py` | Reflection engine + task planner |
 | `test_phase1_integrity.py` | Routes, readiness, memory doctor, terminal denylist, MCP trust honesty, settings |
+| `test_coding_readiness_final.py` | Authoritative coding readiness, raw failure classification, lossless/truncated reads, safe project status and preview |
+| `test_video_editor_foundation.py` | Rational timeline operations, exact-once revisions, undo/redo, corruption quarantine, ffprobe metadata |
 | `test_phase2_research.py` | Research run parse |
 | `test_router.py` | Intent routing (chat vs search vs Discord vs time vs vision) |
 | `test_echospeak.py` | Config, memory, tools, Discord hardening, coding workspace, TTS, voice/vision stubs, API smoke |
@@ -343,7 +345,7 @@ Calculator / Notepad / screenshot QA.
 |------|---------|---------------------|
 | **MCP runtime** | **v7.6.0 real stdio client** — list/call work; HTTP/SSE not yet | Configure `MCP_SERVERS`; check `/capabilities` trust summary; mock fixture in `tests/fixtures/mock_mcp_server.py` |
 | **MCP chat E2E** | Tools register into agent; full chat polish is v7.6.1 | Manually: enable a trusted mock/time server, ask the agent to use it |
-| **API bind host** | Default still `0.0.0.0` | For local-only, prefer `API_HOST=127.0.0.1`; enable `API_AUTH_*` if LAN-exposed |
+| **API bind host** | Default is loopback-only (`127.0.0.1`) | Set a network-facing `API_HOST` only intentionally; enable `API_AUTH_*` if LAN-exposed |
 | **Skill tools** | Spotify/Notion/GitHub/etc. are skills — may need separate enablement | Check `/capabilities` and skill folders |
 | **Live search quality** | Depends on Tavily + grounding | Always verify **query string** in logs/tool input, not only the spoken answer |
 | **core.py size** | Very large; high regression risk | Prefer eval board + this rundown over ad-hoc only |

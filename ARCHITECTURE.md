@@ -1,5 +1,10 @@
 # EchoSpeak Architecture
 
+The first-class hybrid video-editor domain, its authority owners, rational-time
+schemas, operation/revision engine, media ingest, approval path, adapters, and
+deferred render/generation phases are canonical in
+[`docs/VIDEO_EDITOR_ARCHITECTURE.md`](docs/VIDEO_EDITOR_ARCHITECTURE.md).
+
 This document explains how EchoSpeak works internally.
 
 ---
@@ -66,8 +71,14 @@ EchoSpeak has three conceptual layers that work together:
 └─────────────────────────────────────────────────────────────┘
 ```
 
+**Top-to-bottom system map (code-aligned):** `docs/SYSTEM_ARCHITECTURE.md`  
+(ownership table, lifecycle, tools/skills/memory/video, known limitations).
+
 Hard product contracts (equal models, Project vs mode, ToolRuns, hydration):
 `docs/RUNTIME_CONTRACTS.md` + `docs/LIFECYCLE_TRUTHFULNESS.md`.
+
+**Coordination north-star** (one lifecycle, one owner per concept, no guessing;
+next subsystem easy to plug in): `docs/UNIFIED_COORDINATION.md`.
 
 ---
 

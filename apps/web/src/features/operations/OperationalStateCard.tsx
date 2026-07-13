@@ -167,13 +167,18 @@ export const OperationalStateCard: React.FC<Props & { executionId?: string | nul
     const key = permissionKey(flag);
     return approval?.session_permissions && approval.session_permissions[key] === false;
   });
-  const canApprove = Boolean(approval && approval.status === "pending" && !missingFlags.length && onDecision && !busy);
+  const approvalId = String(approval?.id || "").trim();
+  const canApprove = Boolean(
+    approval && approvalId && approval.status === "pending" && !missingFlags.length && onDecision && !busy,
+  );
   const sectionGap = compact ? 4 : 10;
   const innerGap = compact ? 3 : 5;
 
   return (
     <section
       aria-label="Task operational state"
+      data-testid="operational-state-card"
+      data-approval-id={approvalId || undefined}
       style={{
         marginTop: compact ? 0 : 12,
         marginBottom: 0,
@@ -181,6 +186,8 @@ export const OperationalStateCard: React.FC<Props & { executionId?: string | nul
         border: "1px solid rgba(255,255,255,0.1)",
         borderRadius: compact ? 6 : 10,
         background: "rgba(255,255,255,0.025)",
+        position: "relative",
+        zIndex: approval ? 15 : 1,
       }}
     >
       <div role="status" aria-live="polite" style={{ display: "flex", gap: 10, alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap" }}>
@@ -202,10 +209,31 @@ export const OperationalStateCard: React.FC<Props & { executionId?: string | nul
             </div>
           ) : null}
           <div style={{ display: "flex", gap: 8, marginTop: sectionGap }}>
-            <button type="button" disabled={!canApprove} onClick={() => approval && onDecision?.(approval.id, "confirm")} aria-label={`Approve ${approval.tool}`}>
+            <button
+              type="button"
+              data-testid="approval-confirm-button"
+              data-approval-id={approvalId}
+              disabled={!canApprove}
+              onClick={() => {
+                if (!canApprove || !approvalId) return;
+                onDecision?.(approvalId, "confirm");
+              }}
+              aria-label={`Approve ${approval.tool}`}
+              aria-busy={busy}
+            >
               {busy ? "Working…" : "Approve"}
             </button>
-            <button type="button" disabled={busy || approval.status !== "pending"} onClick={() => onDecision?.(approval.id, "cancel")} aria-label={`Decline ${approval.tool}`}>
+            <button
+              type="button"
+              data-testid="approval-cancel-button"
+              data-approval-id={approvalId}
+              disabled={busy || !approvalId || approval.status !== "pending"}
+              onClick={() => {
+                if (busy || !approvalId) return;
+                onDecision?.(approvalId, "cancel");
+              }}
+              aria-label={`Decline ${approval.tool}`}
+            >
               Decline
             </button>
           </div>

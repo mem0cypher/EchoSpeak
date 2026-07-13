@@ -1,5 +1,11 @@
 # Echo Search v1
 
+> **Experimental/test-only.** This workflow is not wired into the production
+> agent. Production search is owned by `EchoSpeakAgent._grounded_web_search` and
+> every production wrapper converges there. Do not instantiate
+> `EchoSearchWorkflow` from a production route unless the canonical owner is
+> deliberately replaced and its Turn/ToolRun integration is completed.
+
 Echo Search v1 is a deterministic, single-agent search workflow. The model
 does not issue raw searches. It first returns a structured `SearchPlan`; the
 harness executes that plan through bounded mode-specific behavior.

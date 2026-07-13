@@ -54,6 +54,19 @@ def _save_index(index: List[Dict[str, Any]]) -> None:
         logger.warning("Failed to save checkpoints index: {}", exc)
 
 
+def get_last_checkpoint(thread_id: str = "default", project_root: str = "") -> Optional[Dict[str, Any]]:
+    """Return a copy of the checkpoint undo would consume, without mutating it."""
+    wanted_thread = str(thread_id or "default")
+    wanted_root = str(project_root or "").strip()
+    for candidate in reversed(_load_index()):
+        if str(candidate.get("thread_id") or "legacy") != wanted_thread:
+            continue
+        if wanted_root and str(candidate.get("project_root") or "").strip() != wanted_root:
+            continue
+        return dict(candidate)
+    return None
+
+
 def create_checkpoint(file_path: str, reason: str = "before_write") -> Optional[str]:
     """Create a backup checkpoint of a file before it is modified or deleted.
 

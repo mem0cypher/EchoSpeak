@@ -488,6 +488,19 @@ class PreviewManager:
                 "port": 0,
                 "command": "",
             }
+        if detection.preview_strategy != "static_http":
+            return {
+                "ok": False,
+                "running": False,
+                "status": "approval_required",
+                "error": (
+                    "Automatic preview does not execute package scripts on the host. "
+                    "Run the suggested command through the approval-gated terminal sandbox."
+                ),
+                "url": "",
+                "port": 0,
+                "command": detection.run_command_hint or detection.preview_command,
+            }
         with self._lock:
             # Restart if already running for this session
             existing = self._by_session.get(session_id)
@@ -662,8 +675,6 @@ def resolve_project_context(thread_id: str) -> Dict[str, Any]:
     # Path-only "soft projects" without a Project id must not keep FS/preview authority.
     if project_id and project and project.workspace_root:
         root_str = str(project.workspace_root).strip()
-    if not root_str and project_id:
-        root_str = str(state.project_path or state.workspace_root or "").strip()
 
     root: Optional[Path] = None
     if root_str:
@@ -833,7 +844,7 @@ def build_session_activity(thread_id: str, *, limit: int = 80) -> Dict[str, Any]
                 "created_at": run.created_at,
                 "completed_at": run.completed_at,
             })
-        elif name in FILE_CHANGE_TOOLS:
+        elif name in FILE_CHANGE_TOOLS and name != "file_read" and success:
             path = extract_path_from_args(args)
             if not path and output:
                 m = re.search(r"(?:Wrote|Appended|Read|Deleted|Moved|Copied).+?(?:to|from)\s+(.+?)(?:\n|$)", output, re.I)
@@ -858,7 +869,7 @@ def build_session_activity(thread_id: str, *, limit: int = 80) -> Dict[str, Any]
                 "summary": (output.split("\n")[0] if output else name)[:200],
                 "output_preview": output[:400],
                 "verification": verification,
-                "verified": bool(verification.get("verified") or verification.get("ok") or success),
+                "verified": bool(verification.get("verified") or verification.get("ok")),
                 "created_at": run.created_at,
                 "completed_at": run.completed_at,
             })

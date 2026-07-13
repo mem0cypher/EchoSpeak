@@ -28,8 +28,8 @@ def test_normalize_execution_mode():
     assert normalize_execution_mode("docker") == "docker"
     assert normalize_execution_mode("sandbox") == "docker"
     assert normalize_execution_mode("container") == "docker"
-    assert normalize_execution_mode("") == "host"
-    assert normalize_execution_mode(None) == "host"
+    assert normalize_execution_mode("") == "docker"
+    assert normalize_execution_mode(None) == "docker"
 
 
 def test_mount_plan_only_file_tool_roots(monkeypatch, tmp_path):
@@ -188,33 +188,39 @@ def test_terminal_run_docker_mode_no_host_fallback(monkeypatch, tmp_path):
 def test_coding_readiness_includes_sandbox(monkeypatch):
     import asyncio
     from api import server as server_mod
-    from config import config, ModelProvider
+    from agent import coding_readiness as readiness_mod
 
     class FakeAgent:
-        tools = []
-        _tool_allowlist_override = None
-        llm_provider = ModelProvider.OPENAI
-
-        def _is_action_tool(self, name):
-            return name in {"file_write", "terminal_run"}
-
-        def _action_allowed(self, name):
-            return True
-
-        def get_doctor_report(self):
-            return {"workspace": {"id": "coding"}}
+        def get_coding_loop_state(self):
+            return {"active": False}
 
     monkeypatch.setattr(server_mod, "get_agent", lambda thread_id=None: FakeAgent(), raising=True)
     monkeypatch.setattr(server_mod, "_apply_thread_scope", lambda agent, thread_id=None: None, raising=True)
-    monkeypatch.setattr(
-        server_mod,
-        "_check_provider_readiness",
-        lambda provider=None: {"ok": True, "provider": "openai", "message": "", "detail": ""},
-        raising=True,
-    )
-    monkeypatch.setattr(config, "terminal_execution_mode", "host", raising=False)
-    monkeypatch.setattr(config, "allow_terminal_commands", True, raising=False)
-    monkeypatch.setattr(config, "file_tool_root", "C:/tmp", raising=False)
+    monkeypatch.setattr(readiness_mod, "build_coding_readiness", lambda *_args, **_kwargs: {
+        "schema_version": 2,
+        "session_id": "default",
+        "ok": True,
+        "ready_for_reading": True,
+        "ready_for_editing": True,
+        "project": {"attached": True},
+        "model": {"provider": "openai", "ready": True, "tool_call_path": "native"},
+        "provider": {"provider": "openai", "ready": True, "message": "", "detail": ""},
+        "workspace": {},
+        "file_roots": {},
+        "tools": {"file_list": "available", "file_read": "available", "file_write": "available", "terminal_run": "available"},
+        "tool_details": {},
+        "tool_rows": [],
+        "permissions": {"read": True, "write": True, "terminal": True},
+        "approval": {"writes_require_confirmation": True},
+        "terminal": {"mode": "host", "enabled": True, "available": True, "required_for_file_editing": False},
+        "blockers": [],
+        "warnings": [],
+        "blocked_tools": [],
+        "missing_tools": [],
+        "recommended_loop": [],
+        "recommendations": [],
+        "sandbox": {"mode": "host", "ready": True},
+    })
 
     resp = asyncio.run(server_mod.coding_readiness(thread_id=None))
     payload = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)

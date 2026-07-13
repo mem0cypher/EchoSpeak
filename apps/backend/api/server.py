@@ -26,6 +26,9 @@ from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import URLError, HTTPError
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+# Avoid Tk/matplotlib GUI backends on worker threads (Tcl_AsyncDelete process death).
+os.environ.setdefault("MPLBACKEND", "Agg")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from fastapi import FastAPI, HTTPException, Query, Response, Request, UploadFile, File, WebSocket, WebSocketDisconnect, Header, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -222,6 +225,42 @@ def _check_provider_readiness(provider: Optional["ModelProvider"] = None, timeou
             with urlopen(req, timeout=timeout) as resp:
                 status = int(getattr(resp, "status", 200) or 200)
                 if 200 <= status < 300:
+                    if not hasattr(resp, "read"):
+                        return {"ok": True, "provider": p.value, "message": "", "detail": ""}
+                    payload_bytes = resp.read(512_001)
+                    if len(payload_bytes) > 512_000:
+                        raise ValueError("Provider model inventory exceeded 512 KB")
+                    payload = json.loads(payload_bytes.decode("utf-8")) if payload_bytes else {}
+                    rows = payload.get("models") if p == ModelProvider.OLLAMA else payload.get("data")
+                    if not isinstance(rows, list):
+                        rows = []
+                    available_ids = {
+                        str((item or {}).get("id") or (item or {}).get("name") or (item or {}).get("model") or "").strip().lower()
+                        for item in rows
+                        if isinstance(item, dict)
+                    }
+                    available_ids.discard("")
+                    configured_model = str(getattr(getattr(config, "local", None), "model_name", "") or "").strip().lower()
+                    model_loaded = bool(
+                        configured_model
+                        and any(
+                            candidate == configured_model
+                            or candidate.endswith("/" + configured_model)
+                            or configured_model.endswith("/" + candidate)
+                            for candidate in available_ids
+                        )
+                    )
+                    if configured_model and not model_loaded:
+                        detail = (
+                            f"Configured model is not loaded: {configured_model}. "
+                            f"Provider reported {len(available_ids)} model(s)."
+                        )
+                        return {
+                            "ok": False,
+                            "provider": p.value,
+                            "message": _provider_recovery_message(p, detail),
+                            "detail": detail,
+                        }
                     return {"ok": True, "provider": p.value, "message": "", "detail": ""}
                 detail = f"HTTP {status} from {url}"
         except HTTPError as exc:
@@ -248,6 +287,31 @@ def _should_preflight_provider(message: str) -> bool:
     if low in {"confirm", "cancel", "yes", "no", "approve", "reject"}:
         return False
     return True
+
+
+def _coding_preflight_requirement(agent: Any, message: str) -> str:
+    """Return ``read``/``write`` only for an unambiguous Project coding turn."""
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    try:
+        coding = bool(agent._is_coding_project_intent(text))  # type: ignore[attr-defined]
+        writing = bool(agent._is_coding_implement_intent(text))  # type: ignore[attr-defined]
+    except Exception:
+        coding = bool(re.search(r"(?i)\b(?:read|edit|change|fix|update|modify|refactor)\b.*\.[a-z0-9]{1,8}\b", text))
+        writing = bool(re.search(r"(?i)\b(?:edit|change|fix|update|modify|rewrite|refactor|add|remove)\b", text))
+    return "write" if writing else "read" if coding else ""
+
+
+def _coding_preflight_payload(agent: Any, thread_id: Optional[str], message: str) -> tuple[dict[str, Any], str]:
+    requirement = _coding_preflight_requirement(agent, message)
+    if not requirement:
+        return {}, ""
+    from agent.coding_readiness import build_coding_readiness, first_coding_blocker
+
+    _apply_thread_scope(agent, thread_id)
+    report = build_coding_readiness(agent, thread_id, _check_provider_readiness())
+    return report, first_coding_blocker(report, require_write=requirement == "write")
 
 
 def _provider_unavailable_payload(request_id: str, readiness: dict[str, Any]) -> dict[str, Any]:
@@ -375,6 +439,7 @@ def _validate_settings_effective(effective: dict) -> list[dict]:
         "allow_terminal_commands",
         "allow_open_application",
         "allow_self_modification",
+        "allow_video_agent_edits",
         "allow_discord_webhook",
     ]
     if not enable_system_actions:
@@ -400,8 +465,8 @@ def _validate_settings_effective(effective: dict) -> list[dict]:
     api_auth_key = str(s.get("api_auth_key") or "").strip()
     if api_auth_enabled and not api_auth_key:
         issues.append({"key": "api_auth_key", "message": "API auth is enabled but API_AUTH_KEY is empty.", "severity": "error"})
-    if api_host in {"0.0.0.0", "::", "[::]"} and not api_auth_enabled:
-        issues.append({"key": "api_auth_enabled", "message": "API_HOST is network-facing. Enable API_AUTH_ENABLED before remote or multi-device use.", "severity": "warning"})
+    if api_host in {"0.0.0.0", "::", "[::]"} and (not api_auth_enabled or not api_auth_key):
+        issues.append({"key": "api_auth_enabled", "message": "API_HOST is network-facing. API authentication and a non-empty key are required.", "severity": "error"})
 
     if bool(s.get("webhook_enabled")):
         secret = str(s.get("webhook_secret") or "").strip()
@@ -468,9 +533,6 @@ def _validate_settings_effective(effective: dict) -> list[dict]:
             issues.append({"key": "twitter_bearer_token", "message": "Twitter/X is enabled but no bearer or access token is configured.", "severity": "error"})
         if access and not access_secret:
             issues.append({"key": "twitter_access_token_secret", "message": "Twitter/X access token is set but TWITTER_ACCESS_TOKEN_SECRET is empty.", "severity": "error"})
-
-    if str(s.get("default_cloud_provider") or "").strip().lower() == "gemini" and bool(s.get("gemini_use_langgraph")):
-        issues.append({"key": "gemini_use_langgraph", "message": "Gemini LangGraph tool-calling is enabled. If tool calls fail, turn this off to use AgentExecutor instead.", "severity": "warning"})
 
     if bool(s.get("allow_calendar")) and not str(s.get("google_calendar_credentials_path") or "").strip():
         issues.append({"key": "google_calendar_credentials_path", "message": "Calendar integration is enabled but GOOGLE_CALENDAR_CREDENTIALS_PATH is empty.", "severity": "error"})
@@ -921,6 +983,7 @@ class _StreamingHandler(BaseCallbackHandler):
     def __init__(self, q: queue.Queue, request_id: str):
         self._q = q
         self._request_id = request_id
+        self._event_seq = 0
         self._tool_run_map: dict = {}
         self._tool_started_at: dict = {}
         self._tool_input_map: dict = {}
@@ -941,7 +1004,18 @@ class _StreamingHandler(BaseCallbackHandler):
         self._on_partial = None  # type: ignore[assignment]
         # No-progress detection: track repeated tool call signatures
         self._tool_call_signatures: dict[str, int] = {}  # hash -> count
+        self._visible_tool_keys: dict[str, str] = {}
+        self._hidden_duplicate_tool_ids: set[str] = set()
         self._loop_warning_sent = False
+
+    def _put(self, event: dict) -> None:
+        """Emit a stream event with monotonic seq for reconnect/reorder guards."""
+        self._event_seq += 1
+        payload = dict(event or {})
+        payload.setdefault("request_id", self._request_id)
+        payload["seq"] = self._event_seq
+        payload.setdefault("at", time.time())
+        self._q.put(payload)
 
     @property
     def research_runs(self) -> list[dict[str, Any]]:
@@ -1025,7 +1099,7 @@ class _StreamingHandler(BaseCallbackHandler):
                 self._on_partial(text)
         except Exception:
             pass
-        self._q.put(
+        self._put(
             {
                 "type": "partial_reply",
                 "response": text,
@@ -1134,7 +1208,7 @@ class _StreamingHandler(BaseCallbackHandler):
         # NOTE: do NOT reset _preamble_done_this_request — second ReAct tool loops
         # must not emit another "Doing good — checking…" spoken beat.
         # Reliable phase signal for avatar/chat (was only set on tool_start before).
-        self._q.put({
+        self._put({
             "type": "status",
             "agent_mode": "thinking",
             "at": time.time(),
@@ -1178,7 +1252,7 @@ class _StreamingHandler(BaseCallbackHandler):
                 current_header = "### Model Thoughts"
             blocks.append(f"{current_header}\n{self._current_reasoning}")
             
-            self._q.put({
+            self._put({
                 "type": "thinking",
                 "content": "\n\n".join(blocks),
                 "at": time.time(),
@@ -1189,7 +1263,7 @@ class _StreamingHandler(BaseCallbackHandler):
         # Buffer per generation so we can seal a partial spoken beat before tools.
         if visible_token and not self._in_think_block and not reasoning:
             self._visible_gen += visible_token
-            self._q.put({
+            self._put({
                 "type": "agent_token",
                 "data": visible_token,
                 "at": time.time(),
@@ -1228,6 +1302,16 @@ class _StreamingHandler(BaseCallbackHandler):
     def on_tool_start(self, serialized: dict, input_str: str, run_id: str, parent_run_id: Optional[str] = None, **kwargs):
         tool_name = (serialized or {}).get("name") or (serialized or {}).get("id") or "tool"
         call_id = str(run_id)
+        raw_input = input_str if isinstance(input_str, str) else str(input_str)
+        normalized_input = re.sub(r"\s+", " ", raw_input).strip().casefold()
+        if str(tool_name) == "file_list":
+            normalized_input = re.sub(r"['\"]?limit['\"]?\s*[:=]\s*\d+\s*,?", "", normalized_input)
+            normalized_input = re.sub(r"\s+", " ", normalized_input).strip(" {},")
+        visible_key = str(tool_name) if str(tool_name) == "web_search" else f"{tool_name}:{normalized_input}"
+        if str(tool_name) in {"web_search", "file_list"} and visible_key in self._visible_tool_keys:
+            self._hidden_duplicate_tool_ids.add(call_id)
+        else:
+            self._visible_tool_keys[visible_key] = call_id
         try:
             agent = getattr(self, "_agent_ref", None)
             if agent is not None:
@@ -1243,10 +1327,9 @@ class _StreamingHandler(BaseCallbackHandler):
                     agent._ensure_durable_tool_run_started(str(tool_name or ""), call_id, str(input_str or ""))
         except Exception:
             pass
-        raw_input = input_str if isinstance(input_str, str) else str(input_str)
         # Deterministic beat only for user-facing tools — never for silent injects
         # like get_system_time (that was firing "Checking that now." then skipping weather).
-        if self._tool_requires_preamble(str(tool_name or "")):
+        if call_id not in self._hidden_duplicate_tool_ids and self._tool_requires_preamble(str(tool_name or "")):
             self._flush_partial_reply(
                 "tool_start",
                 tool_name=str(tool_name or ""),
@@ -1265,7 +1348,7 @@ class _StreamingHandler(BaseCallbackHandler):
         repeat_count = self._tool_call_signatures[sig]
         if repeat_count >= 3 and not self._loop_warning_sent:
             self._loop_warning_sent = True
-            self._q.put({
+            self._put({
                 "type": "thinking",
                 "content": f"### ⚠️ Loop Detected\nThe model has called `{tool_name}` with the same arguments {repeat_count} times. The agent will be stopped after the current iteration to prevent infinite looping.",
                 "at": time.time(),
@@ -1284,7 +1367,8 @@ class _StreamingHandler(BaseCallbackHandler):
             inp = " ".join((inp or "").split())
             if len(inp) > 600:
                 inp = inp[:600] + "…"
-        self._q.put(
+        if call_id not in self._hidden_duplicate_tool_ids:
+            self._put(
             {
                 "type": "tool_start",
                 "id": call_id,
@@ -1296,13 +1380,17 @@ class _StreamingHandler(BaseCallbackHandler):
         )
         # Emit agent_mode status for visualizer
         mode = _classify_agent_mode(tool_name)
-        self._q.put({"type": "status", "agent_mode": mode, "tool": tool_name, "at": time.time(), "request_id": self._request_id})
+        self._put({"type": "status", "agent_mode": mode, "tool": tool_name, "at": time.time(), "request_id": self._request_id})
 
     def on_tool_end(self, output: str, run_id: str, parent_run_id: Optional[str] = None, **kwargs):
         call_id = str(run_id)
         out = output if isinstance(output, str) else str(output)
         tool_name = self._tool_run_map.get(call_id, "")
         raw_input = self._tool_input_map.pop(call_id, "")
+        if call_id in self._hidden_duplicate_tool_ids:
+            self._hidden_duplicate_tool_ids.discard(call_id)
+            self._tool_started_at.pop(call_id, None)
+            return
         # File/terminal payloads must reach the Code visualizer intact
         if tool_name in {"file_read", "file_write", "artifact_write", "notepad_write", "terminal_run"}:
             max_len = 120_000
@@ -1342,7 +1430,7 @@ class _StreamingHandler(BaseCallbackHandler):
                         agent._clear_outer_web_search_id(call_id)
                     else:
                         agent._lc_outer_web_search_id = ""
-                self._q.put({
+                self._put({
                     "type": "status",
                     "agent_mode": "thinking",
                     "at": time.time(),
@@ -1363,9 +1451,9 @@ class _StreamingHandler(BaseCallbackHandler):
         if research_run is not None:
             event["research"] = research_run
             self._research_runs.append(research_run)
-        self._q.put(event)
+        self._put(event)
         # After a tool completes, return to thinking so UI does not stick on last tool mode.
-        self._q.put({
+        self._put({
             "type": "status",
             "agent_mode": "thinking",
             "at": time.time(),
@@ -1379,8 +1467,8 @@ class _StreamingHandler(BaseCallbackHandler):
         if started is not None:
             _record_tool_latency((time.perf_counter() - started) * 1000.0)
         tool_name = self._tool_run_map.get(call_id, "")
-        self._q.put({"type": "tool_error", "id": call_id, "name": tool_name, "error": str(error), "at": time.time(), "request_id": self._request_id})
-        self._q.put({
+        self._put({"type": "tool_error", "id": call_id, "name": tool_name, "error": str(error), "at": time.time(), "request_id": self._request_id})
+        self._put({
             "type": "status",
             "agent_mode": "thinking",
             "at": time.time(),
@@ -1421,7 +1509,7 @@ def _start_agent_thread(
             # Scope was persisted before this worker started; process_query restores
             # it once under the agent request lock.
             thread_state = get_state_store().get_thread_state(thread_id).model_dump()
-            memory_before = int(getattr(agent.memory, "memory_count", 0) or 0)
+            memory_before = int(agent.memory.count_items(thread_id=thread_id) or 0)
             response, success = agent.process_query(
                 message,
                 include_memory=include_memory,
@@ -1432,6 +1520,8 @@ def _start_agent_thread(
             state_store = get_state_store()
             latest_state = state_store.get_thread_state(thread_id).model_dump()
             execution = state_store.get_execution(latest_state.get("last_execution_id") or "") if latest_state.get("last_execution_id") else None
+            turn_projection = state_store.turn_projection(execution.id) if execution is not None else None
+            execution_projection = dict((turn_projection or {}).get("execution_projection") or {})
             response_render = None
             try:
                 exec_meta = execution.metadata if execution is not None else {}
@@ -1465,8 +1555,8 @@ def _start_agent_thread(
                 elif leftover_gen:
                     final_response = leftover_gen
                 # else keep original response (better than empty)
-            memory_after = int(getattr(agent.memory, "memory_count", 0) or 0)
-            if memory_after > memory_before:
+            memory_after = int(agent.memory.count_items(thread_id=thread_id) or 0)
+            if memory_after > memory_before or bool(execution_projection.get("memory_records")):
                 q.put({"type": "memory_saved", "memory_count": memory_after, "at": time.time(), "request_id": request_id})
             q.put(
                 {
@@ -1482,6 +1572,7 @@ def _start_agent_thread(
                     "execution_id": execution.id if execution else None,
                     "trace_id": execution.trace_id if execution else None,
                     "thread_state": latest_state or thread_state,
+                    "execution_projection": execution_projection,
                     "request_id": request_id,
                     "at": time.time(),
                 }
@@ -1684,6 +1775,15 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+from api.video_editor import router as video_editor_router
+
+app.include_router(video_editor_router)
+# Ensure video ToolRegistry entries are loaded even if agent import order varies.
+try:
+    import agent.video_editor.tools  # noqa: F401
+except Exception:
+    pass
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -1731,16 +1831,22 @@ def _extract_api_auth_key_from_headers(headers: Any) -> str:
 
 
 def _api_auth_required_for_host(host: str) -> bool:
-    if not bool(getattr(config, "api_auth_enabled", False)):
-        return False
-    if bool(getattr(config, "api_auth_localhost_bypass", True)) and _is_local_client(host):
-        return False
-    return True
+    local = _is_local_client(host)
+    if not local:
+        # Defense in depth for alternate ASGI launchers/proxies that bypass
+        # start_server's bind-time check.
+        return True
+    return bool(
+        getattr(config, "api_auth_enabled", False)
+        and not bool(getattr(config, "api_auth_localhost_bypass", True))
+    )
 
 
 def _api_auth_ok(headers: Any, host: str) -> bool:
     if not _api_auth_required_for_host(host):
         return True
+    if not bool(getattr(config, "api_auth_enabled", False)):
+        return False
     expected = _configured_api_auth_key()
     if not expected:
         return False
@@ -1841,18 +1947,63 @@ _restart_requested = False
 _restart_lock = threading.Lock()
 
 # Rate limiting
+# Interactive desktop use + hydration + dense live harnesses need more headroom
+# than 100/min when every poll, state refresh, and mutation shares one IP.
 _rate_limit_lock = threading.Lock()
 _rate_limits: dict[str, list[float]] = defaultdict(list)
-RATE_LIMIT_REQUESTS = 100  # requests per window
-RATE_LIMIT_WINDOW = 60.0  # seconds
+RATE_LIMIT_REQUESTS = int(os.getenv("ECHOSPEAK_RATE_LIMIT_REQUESTS", "240") or 240)
+RATE_LIMIT_WINDOW = float(os.getenv("ECHOSPEAK_RATE_LIMIT_WINDOW", "60") or 60.0)
+# Safe reads / hydration / diagnostics do not consume the mutation budget.
+# Mutations and expensive model routes still count.
+_RATE_LIMIT_EXEMPT_PREFIXES = (
+    "/health",
+    "/metrics",
+    "/favicon.ico",
+    "/gateway/ws",
+)
+_RATE_LIMIT_SAFE_GET_PREFIXES = (
+    "/threads",
+    "/pending-action",
+    "/approvals",
+    "/executions",
+    "/traces",
+    "/provider",
+    "/settings",
+    "/memory",
+    "/projects",
+    "/video/",
+    "/history",
+    "/soul",
+)
 
 
 def _get_client_ip(request: Request) -> str:
-    """Extract client IP from request, considering X-Forwarded-For."""
+    """Extract client IP, trusting proxy headers only when explicitly configured."""
     forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
+    if forwarded and bool(getattr(config, "api_trust_proxy_headers", False)):
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+def _rate_limit_exempt(path: str, method: str) -> bool:
+    """Return True only for inexpensive, read-only, non-model routes.
+
+    Never exempt:
+    - POST/PUT/PATCH/DELETE (mutations, model calls, workers)
+    - /query, /approvals/*/confirm
+    - rebuild/compact endpoints
+    """
+    p = str(path or "")
+    m = str(method or "GET").upper()
+    if p in {"/health", "/metrics", "/favicon.ico"} or p.startswith("/gateway/"):
+        return True
+    if m != "GET":
+        return False
+    if p.startswith("/query") or "/confirm" in p or p.endswith("/rebuild-index") or p.endswith("/compact"):
+        return False
+    if any(p == pref.rstrip("/") or p.startswith(pref) for pref in _RATE_LIMIT_SAFE_GET_PREFIXES):
+        return True
+    return False
 
 
 def _check_rate_limit(client_ip: str) -> tuple[bool, int]:
@@ -1872,22 +2023,34 @@ def _check_rate_limit(client_ip: str) -> tuple[bool, int]:
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    """Rate limit requests per client IP."""
-    # Skip rate limiting for health checks and static assets
-    if request.url.path in ["/health", "/metrics", "/favicon.ico"]:
-        return await call_next(request)
-    
+    """Rate limit requests per client IP.
+
+    Safe GET hydration paths are exempt so a completed mutation is never
+    misreported as failed solely because a follow-up state read was limited.
+    Mutations still count and must not be blindly retried by clients.
+    """
+    path = request.url.path
+    method = request.method
+    if _rate_limit_exempt(path, method):
+        response = await call_next(request)
+        response.headers["X-RateLimit-Policy"] = "safe-get-exempt"
+        return response
+
     client_ip = _get_client_ip(request)
     allowed, remaining = _check_rate_limit(client_ip)
-    
+
     if not allowed:
+        retry_after = max(1, int(RATE_LIMIT_WINDOW))
         return Response(
-            content='{"detail":"Rate limit exceeded. Try again later."}',
+            content='{"detail":"Rate limit exceeded. Try again later.","code":"rate_limited"}',
             status_code=429,
             media_type="application/json",
-            headers={"Retry-After": str(int(RATE_LIMIT_WINDOW))}
+            headers={
+                "Retry-After": str(retry_after),
+                "X-RateLimit-Remaining": "0",
+            },
         )
-    
+
     response = await call_next(request)
     response.headers["X-RateLimit-Remaining"] = str(remaining)
     return response
@@ -1996,6 +2159,12 @@ class QueryRequest(BaseModel):
     include_memory: bool = Field(default=True, description="Include conversation memory")
     thread_id: Optional[str] = Field(default=None, description="Conversation thread id for LangGraph persistence")
     workspace: Optional[str] = Field(default=None, description="Optional workspace/mode override (ex: auto|chat|coding|research)")
+    # Optional Video Editor binding for chat Turns (selection + revision).
+    video_document_id: str = Field(default="", description="Active video document for this Turn")
+    video_selection: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Structured editor selection (clip ids, playhead, revision)",
+    )
 
 
 class QueryResponse(BaseModel):
@@ -2485,6 +2654,21 @@ class MemoryItem(BaseModel):
     metadata: dict = Field(default_factory=dict)
     memory_type: Optional[str] = None
     pinned: Optional[bool] = None
+    owner_id: str = ""
+    scope: str = "account"
+    source_session_id: str = ""
+    source_execution_id: str = ""
+    source_item_id: str = ""
+    updated_at: Optional[str] = None
+    index_state: str = "pending"
+    supersedes: str = ""
+    # Curated Studio projection fields (same canonical records.json source)
+    subject: Optional[str] = None
+    confidence: Optional[float] = None
+    explicit: Optional[bool] = None
+    structured_attributes: Optional[dict] = None
+    source_text: Optional[str] = None
+    active: bool = True
 
 
 class MemoryUpdateRequest(BaseModel):
@@ -2521,6 +2705,11 @@ class MemoryDoctorResponse(BaseModel):
     duplicate_groups: List[Dict[str, Any]]
     warnings: List[str]
     recommendations: List[str]
+    # Canonical projection audit (same records.json as Studio)
+    active_semantic_samples: List[Dict[str, Any]] = Field(default_factory=list)
+    superseded_count: int = 0
+    session_only_count: int = 0
+    pending_confirmation: Optional[Dict[str, Any]] = None
 
 
 class MemoryDeleteRequest(BaseModel):
@@ -2584,15 +2773,27 @@ class CapabilitiesResponse(BaseModel):
 
 
 class CodingReadinessResponse(BaseModel):
+    schema_version: int = 2
+    session_id: str
     ok: bool
+    ready_for_reading: bool
+    ready_for_editing: bool
+    project: Dict[str, Any]
+    model: Dict[str, Any]
     provider: Dict[str, Any]
     workspace: Dict[str, Any]
     file_roots: Dict[str, Any]
-    tools: List[Dict[str, Any]]
+    tools: Dict[str, str]
+    tool_details: Dict[str, str] = Field(default_factory=dict)
+    tool_rows: List[Dict[str, Any]] = Field(default_factory=list)
+    permissions: Dict[str, bool]
+    approval: Dict[str, Any]
+    terminal: Dict[str, Any]
+    blockers: List[Dict[str, str]] = Field(default_factory=list)
+    warnings: List[Dict[str, str]] = Field(default_factory=list)
     blocked_tools: List[str]
     missing_tools: List[str]
     recommended_loop: List[str]
-    warnings: List[str]
     recommendations: List[str]
     # v7.5.0: terminal sandbox status (host vs docker; never implies available if probe fails)
     sandbox: Dict[str, Any] = Field(default_factory=dict)
@@ -2664,10 +2865,31 @@ async def query(request: QueryRequest):
                     trace_id=None,
                     thread_state=None,
                 )
-        _record_session_message(request.thread_id, request.message)
         agent = get_agent(request.thread_id)
+        _coding_report, coding_blocker = _coding_preflight_payload(agent, request.thread_id, request.message)
+        if coding_blocker:
+            return QueryResponse(
+                response=coding_blocker,
+                success=False,
+                memory_count=0,
+                request_id=request_id,
+                doc_sources=[],
+                research=[],
+                execution_id=None,
+                trace_id=None,
+                thread_state=get_state_store().get_thread_state(request.thread_id).model_dump(),
+            )
+        _record_session_message(request.thread_id, request.message)
         # process_query restores Session scope under its request lock. Query
         # payloads do not override backend-selected workspace/mode.
+        # Optional video editor binding for this Turn (selection + revision).
+        try:
+            agent._video_turn_binding = {
+                "document_id": str(getattr(request, "video_document_id", "") or ""),
+                "selection": dict(getattr(request, "video_selection", None) or {}) or None,
+            }
+        except Exception:
+            pass
         thread_state = get_state_store().get_thread_state(request.thread_id).model_dump()
         q: queue.Queue = queue.Queue()
         handler = _StreamingHandler(q, request_id)
@@ -2816,32 +3038,42 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
         except Exception:
             manager_status = {}
 
-        # Union agent.tools + registry MCP entries (agent may not have merged yet)
+        # Canonical inventory: ToolRegistry is the single tool owner for capability
+        # reporting. agent.tools / lc_tools may be subsets; never under-report
+        # video/skill tools that are registered and executable via the invoke path.
         seen_tool_names: set = set()
-        tool_objs = list(getattr(agent, "tools", []) or [])
-        for name, entry in ToolRegistry._entries.items():
-            if getattr(entry, "category", "") == "mcp" or str(name).startswith("mcp__"):
-                if not any(str(getattr(t, "name", "") or "") == name for t in tool_objs):
-                    tool_objs.append(entry.func if hasattr(entry.func, "name") else entry)
-
-        # NOTE: `lc_tools` intentionally excludes many action/system tools.
-        # For the Capabilities & Permissions UI, we want to show the full registered tool set.
-        for t in tool_objs:
-            name = str(getattr(t, "name", "") or "").strip()
+        tool_names: list[str] = []
+        try:
+            tool_names = sorted(ToolRegistry.get_names())
+        except Exception:
+            tool_names = []
+        if not tool_names:
+            # Fallback only if registry empty (tests)
+            for t in list(getattr(agent, "tools", []) or []):
+                n = str(getattr(t, "name", "") or "").strip()
+                if n:
+                    tool_names.append(n)
+        for name in tool_names:
             if not name or name in seen_tool_names:
                 continue
             seen_tool_names.add(name)
             allowed_by_workspace = True
             if allowset is not None:
                 allowed_by_workspace = name in allowset
+            entry = ToolRegistry.get(name)
             is_action = False
             try:
                 is_action = bool(agent._is_action_tool(name))  # type: ignore[attr-defined]
             except Exception:
-                is_action = False
+                is_action = bool(getattr(entry, "is_action", False)) if entry else False
+            if entry is not None and getattr(entry, "is_action", False):
+                is_action = True
             allowed_by_policy = True
             blocked_reason = ""
             blocked_by_policy_flags: List[str] = []
+            # Prefer ToolRegistry policy_flags; fall back to TOOL_METADATA.
+            meta = TOOL_METADATA.get(name, {})
+            policy_flags = list(getattr(entry, "policy_flags", None) or meta.get("policy_flags") or [])
             if is_action:
                 try:
                     allowed_by_policy = bool(agent._action_configured(name))  # type: ignore[attr-defined]
@@ -2849,24 +3081,19 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
                     allowed_by_policy = False
                 if not allowed_by_policy:
                     blocked_reason = "Blocked by EchoSpeak role or configuration"
-                    # Get specific policy flags that are missing
-                    meta = TOOL_METADATA.get(name, {})
-                    for flag in meta.get("policy_flags", []):
+                    for flag in policy_flags:
                         if not bool(getattr(config, str(flag).lower(), False)):
                             blocked_by_policy_flags.append(flag)
 
-            # Get tool metadata
-            meta = TOOL_METADATA.get(name, {})
-            risk_level = meta.get("risk_level", "safe")
-            requires_confirmation = meta.get("requires_confirmation", False)
-            policy_flags = meta.get("policy_flags", [])
-            entry = ToolRegistry.get(name)
-            if entry is not None:
-                if not meta.get("risk_level"):
-                    risk_level = getattr(entry, "risk_level", None) or risk_level
-                if getattr(entry, "is_action", False):
-                    is_action = True
-                    requires_confirmation = True
+            risk_level = str(
+                (getattr(entry, "risk_level", None) if entry else None)
+                or meta.get("risk_level")
+                or "safe"
+            )
+            requires_confirmation = bool(
+                is_action
+                or meta.get("requires_confirmation", False)
+            )
             category = str(getattr(entry, "category", "") or "")
             origin = "mcp" if category == "mcp" or name.startswith("mcp__") else "local"
             mcp_server = ""
@@ -2992,18 +3219,52 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
                 else:
                     it["allowed_by_workspace"] = True
 
-        # Build skills list with type indicators
+        # Skills list: SkillsRegistry is the selection/executable owner; workspace
+        # _active_skill_defs remain prompt projection. Surface both without forking.
         skills_list = []
         skills_dir = Path(getattr(config, "skills_dir", "") or "").expanduser()
+        seen_skill_ids: set = set()
+        try:
+            from agent.skills_registry import SkillsRegistry
+
+            SkillsRegistry.refresh()
+            for man in SkillsRegistry.list_manifests() or []:
+                sid = str(getattr(man, "id", "") or "").strip()
+                if not sid or sid in seen_skill_ids:
+                    continue
+                seen_skill_ids.add(sid)
+                skills_list.append(
+                    {
+                        "id": sid,
+                        "name": str(getattr(man, "name", "") or sid),
+                        "description": str(getattr(man, "description", "") or "")[:100],
+                        "status": str(getattr(getattr(man, "status", None), "value", getattr(man, "status", "")) or ""),
+                        "executable": bool(getattr(man, "executable", False)),
+                        "origin": str(getattr(getattr(man, "origin", None), "value", getattr(man, "origin", "")) or ""),
+                        "has_tools": bool(getattr(man, "required_tools", None) or getattr(man, "tools_reachable", None)),
+                        "has_plugin": False,
+                    }
+                )
+        except Exception:
+            pass
         for skill_def in getattr(agent, "_active_skill_defs", []):
-            skill_path = skills_dir / skill_def.id
-            skills_list.append({
-                "id": skill_def.id,
-                "name": skill_def.name,
-                "description": skill_def.description[:100] if skill_def.description else "",
-                "has_tools": (skill_path / "tools.py").exists() if skill_path.exists() else False,
-                "has_plugin": (skill_path / "plugin.py").exists() if skill_path.exists() else False,
-            })
+            sid = str(getattr(skill_def, "id", "") or "").strip()
+            if not sid or sid in seen_skill_ids:
+                continue
+            seen_skill_ids.add(sid)
+            skill_path = skills_dir / sid
+            skills_list.append(
+                {
+                    "id": sid,
+                    "name": skill_def.name,
+                    "description": skill_def.description[:100] if skill_def.description else "",
+                    "status": "workspace_active",
+                    "executable": False,
+                    "origin": "workspace",
+                    "has_tools": (skill_path / "tools.py").exists() if skill_path.exists() else False,
+                    "has_plugin": (skill_path / "plugin.py").exists() if skill_path.exists() else False,
+                }
+            )
 
         mcp_summary = _mcp_trust_summary(
             mcp_servers,
@@ -3043,148 +3304,14 @@ async def coding_readiness(thread_id: Optional[str] = Query(default=None)):
     try:
         agent = get_agent(thread_id)
         _apply_thread_scope(agent, thread_id)
-        readiness = _check_provider_readiness()
-        scope = agent.project_scope_report(thread_id)
-        project_attached = bool(scope.get("project_attached"))
-        perms = dict(scope.get("permissions") or {})
-        required = ["project_status", "file_list", "file_read", "file_write", "file_mkdir", "artifact_write", "terminal_run"]
-        read_tools = {"project_status", "file_list", "file_read"}
-        write_tools = {"file_write", "file_mkdir", "artifact_write"}
-        loaded = {str(getattr(t, "name", "") or "") for t in (getattr(agent, "tools", []) or [])}
-        from agent.tools import TOOL_METADATA
+        from agent.coding_readiness import build_coding_readiness
 
-        tool_rows: list[dict[str, Any]] = []
-        blocked: list[str] = []
-        missing: list[str] = []
-        for name in required:
-            exists = name in loaded
-            # Project attachment — not skill-workspace mode — gates filesystem tools.
-            allowed_by_scope = True
-            scope_reason = ""
-            if name in read_tools | write_tools | {"terminal_run"}:
-                if not project_attached:
-                    allowed_by_scope = False
-                    scope_reason = "No Project attached to this Session."
-                elif name in write_tools and not perms.get("filesystem_write"):
-                    allowed_by_scope = False
-                    scope_reason = "Write permission is disabled."
-                elif name == "terminal_run" and not perms.get("terminal"):
-                    allowed_by_scope = False
-                    scope_reason = "Terminal permission is disabled."
-            try:
-                # project_status / file_list / file_read are safe reads (not action-gated).
-                if name in read_tools:
-                    allowed_by_policy = True
-                else:
-                    allowed_by_policy = bool(agent._action_configured(name))  # type: ignore[attr-defined]
-            except Exception:
-                allowed_by_policy = False
-            allowed = bool(exists and allowed_by_scope and allowed_by_policy)
-            reason = ""
-            if not exists:
-                reason = "Tool is not loaded."
-                missing.append(name)
-            elif not allowed_by_scope:
-                reason = scope_reason or "Blocked by Project scope or permissions."
-                blocked.append(name)
-            elif not allowed_by_policy:
-                reason = "Blocked by runtime system-action settings."
-                blocked.append(name)
-            meta = TOOL_METADATA.get(name, {})
-            tool_rows.append(
-                {
-                    "name": name,
-                    "loaded": exists,
-                    "allowed": allowed,
-                    "allowed_by_workspace": allowed_by_scope,
-                    "allowed_by_policy": allowed_by_policy,
-                    "risk_level": meta.get("risk_level", "safe"),
-                    "requires_confirmation": bool(meta.get("requires_confirmation", False)),
-                    "policy_flags": list(meta.get("policy_flags", [])),
-                    "reason": reason,
-                }
-            )
-
-        warnings: list[str] = []
-        recommendations: list[str] = []
-        provider_ready = bool(readiness.get("ok"))
-        if not provider_ready:
-            warnings.append(str(readiness.get("message") or "Model provider is not ready."))
-            recommendations.append("Start or configure the selected model provider before testing coding requests.")
-        if not project_attached:
-            warnings.append("No Project is attached to this Session.")
-            recommendations.append("Attach a Project folder to this Session to enable project_status, file tools, and project-local terminal.")
-        if blocked or missing:
-            warnings.append("One or more project tools are missing or blocked.")
-            if project_attached:
-                recommendations.append("Enable system actions, file write, and terminal access as needed for write/verify steps.")
-        if not bool(getattr(config, "allow_terminal_commands", False)):
-            recommendations.append("Terminal verification is disabled; Echo can still edit files but cannot run build/test checks.")
-
-        sandbox_info: Dict[str, Any] = {}
+        report = build_coding_readiness(agent, thread_id, _check_provider_readiness())
         try:
-            from agent.sandbox import get_sandbox_status, normalize_execution_mode
-
-            sandbox_info = get_sandbox_status().as_dict()
-            mode = normalize_execution_mode(getattr(config, "terminal_execution_mode", "host"))
-            if mode == "docker" and not sandbox_info.get("ready"):
-                warnings.append("Terminal sandbox mode is docker/sandbox but Docker is not ready.")
-                recommendations.append(
-                    "Start Docker Engine/Desktop, or set TERMINAL_EXECUTION_MODE=host (unsandboxed). "
-                    "Echo will not silently fall back to host execution."
-                )
-            elif mode == "host":
-                recommendations.append(
-                    "Terminal runs on the host (default). Set TERMINAL_EXECUTION_MODE=docker for isolated runs."
-                )
-        except Exception as sandbox_exc:
-            sandbox_info = {
-                "mode": str(getattr(config, "terminal_execution_mode", "host") or "host"),
-                "ready": False,
-                "message": f"Sandbox status unavailable: {sandbox_exc}",
-            }
-
-        if not warnings:
-            recommendations.append("Coding lifecycle is ready: inspect, plan, implement, verify, summarize.")
-
-        coding_loop_state: Dict[str, Any] = {}
-        try:
-            coding_loop_state = agent.get_coding_loop_state() if hasattr(agent, "get_coding_loop_state") else {}
+            report["coding_loop"] = agent.get_coding_loop_state() if hasattr(agent, "get_coding_loop_state") else {}
         except Exception:
-            coding_loop_state = {"active": False}
-        if coding_loop_state.get("active"):
-            recommendations.append(
-                f"Coding loop phase: {coding_loop_state.get('phase')} "
-                f"(exit={coding_loop_state.get('exit_status')}, verify={coding_loop_state.get('verify_status')})."
-            )
-        # Read tools ready when Project is attached; writes/terminal still need perms.
-        read_ready = project_attached and not missing and all(
-            row.get("allowed") for row in tool_rows if row.get("name") in read_tools
-        )
-        return CodingReadinessResponse(
-            ok=provider_ready and read_ready and not missing,
-            provider={
-                "name": str(readiness.get("provider") or getattr(agent, "llm_provider", "") or ""),
-                "ready": provider_ready,
-                "message": str(readiness.get("message") or ""),
-                "detail": str(readiness.get("detail") or ""),
-            },
-            workspace=scope,
-            file_roots={
-                "root": str(getattr(config, "file_tool_root", "") or ""),
-                "extra_roots": list(getattr(config, "file_tool_extra_roots", []) or []),
-                "terminal_execution_mode": str(getattr(config, "terminal_execution_mode", "") or "host"),
-                "terminal_denylist": list(getattr(config, "terminal_command_denylist", []) or []),
-            },
-            tools=tool_rows,
-            blocked_tools=blocked,
-            missing_tools=missing,
-            recommended_loop=["inspect", "plan", "implement", "verify", "confirm", "summarize"],
-            warnings=warnings,
-            recommendations=recommendations,
-            sandbox=sandbox_info,
-            coding_loop=coding_loop_state,
-        )
+            report["coding_loop"] = {"active": False}
+        return CodingReadinessResponse(**report)
     except Exception as e:
         logger.error(f"Coding readiness error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -3279,14 +3406,37 @@ async def list_approvals(
 
 
 @app.post("/approvals/{approval_id}/confirm", response_model=ApprovalDecisionResponse)
-async def confirm_approval(approval_id: str):
+async def confirm_approval(
+    approval_id: str,
+    expected_session_id: Optional[str] = Query(default=None),
+):
     store = get_state_store()
     approval = store.get_approval(approval_id)
     if approval is None:
         raise HTTPException(status_code=404, detail="Approval not found")
+    if expected_session_id and str(expected_session_id) != str(approval.thread_id):
+        raise HTTPException(status_code=409, detail="Approval belongs to a different Session; nothing was executed")
     state = store.get_thread_state(approval.thread_id)
     if approval.status != "pending" or state.pending_approval_id != approval_id:
         raise HTTPException(status_code=409, detail="Approval is stale or is not the current pending action")
+    if approval.tool == "video_apply_transaction":
+        try:
+            from api.video_editor import consume_video_approval
+
+            result = consume_video_approval(approval)
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        updated = store.get_approval(approval_id)
+        if updated is None:
+            raise HTTPException(status_code=500, detail="Approval missing after video transaction")
+        thread_state = store.get_thread_state(approval.thread_id)
+        return ApprovalDecisionResponse(
+            approval=ApprovalResponse(**updated.model_dump()),
+            success=bool(result.get("success")),
+            response=str(result.get("response") or "Video transaction applied."),
+            execution_id=str(result.get("execution_id") or "") or None,
+            thread_state=thread_state.model_dump(),
+        )
     agent = get_agent(approval.thread_id)
     agent._requested_approval_id = approval_id
     response, success = agent.process_query("confirm", include_memory=False, thread_id=approval.thread_id)
@@ -3304,14 +3454,26 @@ async def confirm_approval(approval_id: str):
 
 
 @app.post("/approvals/{approval_id}/cancel", response_model=ApprovalDecisionResponse)
-async def cancel_approval(approval_id: str):
+async def cancel_approval(
+    approval_id: str,
+    expected_session_id: Optional[str] = Query(default=None),
+):
     store = get_state_store()
     approval = store.get_approval(approval_id)
     if approval is None:
         raise HTTPException(status_code=404, detail="Approval not found")
+    if expected_session_id and str(expected_session_id) != str(approval.thread_id):
+        raise HTTPException(status_code=409, detail="Approval belongs to a different Session; nothing was canceled")
     state = store.get_thread_state(approval.thread_id)
     if approval.status != "pending" or state.pending_approval_id != approval_id:
         raise HTTPException(status_code=409, detail="Approval is stale or is not the current pending action")
+    if approval.tool == "video_apply_transaction":
+        try:
+            from api.video_editor import cancel_video_approval
+
+            cancel_video_approval(approval)
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     updated = store.update_approval(approval_id, status="canceled", outcome_summary="Canceled by user")
     if updated is None:
         raise HTTPException(status_code=500, detail="Approval missing after cancel")
@@ -3342,6 +3504,103 @@ async def get_execution(execution_id: str):
     if execution is None:
         raise HTTPException(status_code=404, detail="Execution not found")
     return ExecutionResponse(**execution.model_dump())
+
+
+class ToolRunResponse(BaseModel):
+    """Canonical ToolRun projection for Session/Execution/Project hydration."""
+    id: str
+    project_id: str = ""
+    session_id: str = "default"
+    turn_id: str
+    item_id: str = ""
+    tool_name: str
+    action_id: str = ""
+    approval_id: str = ""
+    status: str = "started"
+    canonical_arguments: Dict[str, Any] = Field(default_factory=dict)
+    canonical_arguments_hash: str = ""
+    outcome: Dict[str, Any] = Field(default_factory=dict)
+    verification: Dict[str, Any] = Field(default_factory=dict)
+    retry_of: str = ""
+    parent_tool_run_id: str = ""
+    has_children: bool = False
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    completed_at: Optional[float] = None
+
+
+class ToolRunListResponse(BaseModel):
+    items: List[ToolRunResponse]
+    count: int
+    session_id: str = ""
+    execution_id: str = ""
+    project_id: str = ""
+
+
+def _project_tool_runs(
+    *,
+    session_id: str = "",
+    execution_id: str = "",
+    project_id: str = "",
+    limit: int = 120,
+) -> ToolRunListResponse:
+    store = get_state_store()
+    runs = store.query_tool_runs(
+        session_id=session_id,
+        execution_id=execution_id,
+        project_id=project_id,
+        limit=limit,
+    )
+    items = [ToolRunResponse(**store.project_tool_run(run)) for run in runs]
+    return ToolRunListResponse(
+        items=items,
+        count=len(items),
+        session_id=str(session_id or ""),
+        execution_id=str(execution_id or ""),
+        project_id=str(project_id or ""),
+    )
+
+
+@app.get("/tool-runs", response_model=ToolRunListResponse)
+async def list_tool_runs(
+    session_id: Optional[str] = Query(default=None, description="Session / thread id"),
+    thread_id: Optional[str] = Query(default=None, description="Alias for session_id"),
+    execution_id: Optional[str] = Query(default=None),
+    project_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=120, ge=1, le=500),
+):
+    """Canonical ToolRun list for refresh/restart hydration.
+
+    Filter by Session, Execution (Turn), and/or Project. Returns parent/child
+    identity (retry_of), terminal status, errors, verification, and approval_id.
+    """
+    sid = str(session_id or thread_id or "").strip()
+    eid = str(execution_id or "").strip()
+    pid = str(project_id or "").strip()
+    if not sid and not eid and not pid:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide session_id/thread_id, execution_id, and/or project_id",
+        )
+    return _project_tool_runs(session_id=sid, execution_id=eid, project_id=pid, limit=limit)
+
+
+@app.get("/executions/{execution_id}/tool-runs", response_model=ToolRunListResponse)
+async def list_execution_tool_runs(
+    execution_id: str,
+    limit: int = Query(default=120, ge=1, le=500),
+):
+    """ToolRuns for one Execution / Turn (alias of /tool-runs?execution_id=)."""
+    store = get_state_store()
+    execution = store.get_execution(execution_id)
+    if execution is None:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    return _project_tool_runs(
+        session_id=str(execution.thread_id or execution.session_id or ""),
+        execution_id=execution_id,
+        project_id=str(execution.project_id or execution.active_project_id or ""),
+        limit=limit,
+    )
 
 
 @app.get("/traces/{trace_id}")
@@ -4463,7 +4722,11 @@ def _record_session_message(thread_id: Optional[str], message: str) -> None:
     from agent.threads import get_thread_manager
     manager = get_thread_manager()
     if manager.get_thread(tid) is None:
-        manager.create_thread(thread_id=tid, source="web")
+        # Session creation belongs exclusively to POST /threads (the explicit
+        # New Session/+ UI). Query completion must never manufacture a sidebar
+        # Session from a missing/default/stale id.
+        logger.warning("Skipped message metadata for unknown Session {}; no Session was created", tid)
+        return
     manager.record_user_message(tid, message)
 
 
@@ -4792,8 +5055,32 @@ async def query_stream(request: QueryRequest):
 
             return StreamingResponse(unavailable_gen(), media_type="application/x-ndjson")
 
-    _record_session_message(request.thread_id, request.message)
     agent = get_agent(request.thread_id)
+    _coding_report, coding_blocker = _coding_preflight_payload(agent, request.thread_id, request.message)
+    if coding_blocker:
+        async def coding_unavailable_gen():
+            yield (json.dumps(
+                {
+                    "type": "final",
+                    "response": coding_blocker,
+                    "success": False,
+                    "request_id": request_id,
+                    "error_code": str(((_coding_report.get("blockers") or [{}])[0] or {}).get("code") or "coding_not_ready"),
+                    "coding_readiness": _coding_report,
+                    "at": time.time(),
+                },
+                ensure_ascii=False,
+            ) + "\n").encode("utf-8")
+
+        return StreamingResponse(coding_unavailable_gen(), media_type="application/x-ndjson")
+    _record_session_message(request.thread_id, request.message)
+    try:
+        agent._video_turn_binding = {
+            "document_id": str(getattr(request, "video_document_id", "") or ""),
+            "selection": dict(getattr(request, "video_selection", None) or {}) or None,
+        }
+    except Exception:
+        pass
 
     _start_agent_thread(
         agent=agent,
@@ -4965,7 +5252,7 @@ async def _spotify_playback_monitor():
 
 @app.websocket("/gateway/ws")
 async def gateway_ws(websocket: WebSocket):
-    client_host = websocket.client.host if websocket.client else "unknown"
+    client_host = _get_client_ip(websocket)
     if not _api_auth_ok(websocket.headers, client_host):
         await websocket.close(code=1008, reason="EchoSpeak API auth required")
         return
@@ -5481,6 +5768,110 @@ def clear_history(thread_id: Optional[str] = Query(default=None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/research/artifacts")
+async def list_research_artifacts_api(
+    project_id: str = Query(default=""),
+    session_id: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    from agent.research_artifacts import list_research_artifacts
+
+    rows = list_research_artifacts(project_id=project_id, session_id=session_id, limit=limit)
+    return {"items": [r.model_dump(mode="json") for r in rows], "count": len(rows)}
+
+
+@app.get("/research/artifacts/{artifact_id}")
+async def get_research_artifact_api(artifact_id: str):
+    from agent.research_artifacts import get_research_artifact
+
+    art = get_research_artifact(artifact_id)
+    if art is None:
+        raise HTTPException(status_code=404, detail="Research artifact not found")
+    return art.model_dump(mode="json")
+
+
+@app.post("/research/artifacts/lookup")
+async def lookup_research_artifact_api(payload: Dict[str, Any] = Body(default_factory=dict)):
+    from agent.research_artifacts import find_compatible_research_artifact
+
+    art = find_compatible_research_artifact(
+        project_id=str(payload.get("project_id") or ""),
+        session_id=str(payload.get("session_id") or ""),
+        objective=str(payload.get("objective") or ""),
+        require_project=bool(payload.get("require_project", True)),
+    )
+    if art is None:
+        return {"ok": False, "error_code": "not_found", "artifact": None}
+    return {"ok": True, "artifact": art.model_dump(mode="json")}
+
+
+@app.post("/research/artifacts/{artifact_id}/consume")
+async def consume_research_artifact_api(artifact_id: str, payload: Dict[str, Any] = Body(default_factory=dict)):
+    """Skill handoff: structured artifact only (never invent citations from prose)."""
+    from agent.research_artifacts import consume_research_artifact_for_skill
+
+    result = consume_research_artifact_for_skill(
+        artifact_id,
+        project_id=str(payload.get("project_id") or ""),
+        session_id=str(payload.get("session_id") or ""),
+        skill_id=str(payload.get("skill_id") or ""),
+        objective=str(payload.get("objective") or ""),
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@app.get("/skills/status")
+async def skills_status_api():
+    """Truthful skill executable classification (prompt-only never marked executable)."""
+    from agent.skill_status_audit import audit_all_skills
+
+    rows = audit_all_skills(
+        available_capabilities={"deterministic_editing", "approvals", "research"},
+        available_artifacts=set(),
+    )
+    return {
+        "items": rows,
+        "count": len(rows),
+        "executable_ids": [r["id"] for r in rows if r.get("executable")],
+        "prompt_only_ids": [r["id"] for r in rows if r.get("status") == "prompt_only"],
+        "blocked_ids": [
+            r["id"]
+            for r in rows
+            if str(r.get("status") or "").startswith("blocked") or r.get("status") in {"disabled", "invalid", "deprecated"}
+        ],
+    }
+
+
+@app.get("/diagnostics/tool-calling")
+async def tool_calling_diagnostics_api(thread_id: Optional[str] = Query(default=None)):
+    """Honest provider tool-calling capability matrix for operators."""
+    from agent.video_editor.deterministic_ops import provider_tool_capability_matrix
+
+    agent = get_existing_agent(thread_id) or get_agent(thread_id)
+    diag = agent._tool_calling_diagnostics() if hasattr(agent, "_tool_calling_diagnostics") else {}
+    matrix = provider_tool_capability_matrix(
+        provider=str(diag.get("provider") or getattr(agent, "llm_provider", "")),
+        native_tool_calling_enabled=bool(diag.get("native_tool_calling_enabled")),
+        langgraph_available=bool(diag.get("langgraph_available")),
+        agent_executor_available=bool(diag.get("agent_executor_available")),
+        lmstudio_tool_calling=bool(diag.get("lmstudio_tool_calling")),
+        disable_native_tool_calling=bool(diag.get("disable_native_tool_calling")),
+    )
+    return {"diagnostics": diag, "capability_matrix": matrix, "mode_label": agent._tool_calling_mode_label()}
+
+
+@app.post("/memory/rebuild-index")
+async def memory_rebuild_index():
+    """Rebuild FAISS from active canonical records only (forgotten stay out)."""
+    agent = get_agent(None)
+    if not hasattr(agent, "memory") or agent.memory is None:
+        raise HTTPException(status_code=503, detail="Memory store unavailable")
+    result = agent.memory.rebuild_faiss_from_canonical()
+    return result
+
+
 @app.get("/memory", response_model=MemoryListResponse)
 async def list_memory(
     offset: int = Query(default=0, ge=0),
@@ -5489,20 +5880,39 @@ async def list_memory(
 ):
     try:
         agent = get_agent(thread_id)
-        items = agent.memory.list_items(offset=offset, limit=limit)
+        items = agent.memory.list_items(offset=offset, limit=limit, thread_id=thread_id)
         out_items: List[MemoryItem] = []
         for i in items:
             payload = (i or {}) if isinstance(i, dict) else {}
             meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
             mt = str(meta.get("type") or "").strip() if isinstance(meta, dict) else ""
             pinned = meta.get("pinned") if isinstance(meta, dict) else None
-            mi = MemoryItem(**payload)
-            mi.memory_type = mt or None
+            mi = MemoryItem(**{k: v for k, v in payload.items() if k in MemoryItem.model_fields})
+            mi.memory_type = mt or str(meta.get("curator_type") or "") or None
             mi.pinned = bool(pinned) if pinned is not None else None
+            mi.owner_id = str(meta.get("owner_id") or "")
+            mi.scope = str(meta.get("scope") or "account")
+            mi.source_session_id = str(meta.get("source_session_id") or "")
+            mi.source_execution_id = str(meta.get("source_execution_id") or "")
+            mi.source_item_id = str(meta.get("source_item_id") or "")
+            mi.index_state = str(meta.get("index_state") or "pending")
+            mi.supersedes = str(meta.get("supersedes") or "")
+            mi.subject = str(meta.get("subject") or "") or None
+            conf = meta.get("confidence")
+            mi.confidence = float(conf) if conf is not None else None
+            mi.explicit = bool(meta.get("explicit")) if meta.get("explicit") is not None else None
+            attrs = meta.get("structured_attributes")
+            mi.structured_attributes = dict(attrs) if isinstance(attrs, dict) else None
+            mi.source_text = str(meta.get("source_text") or "") or None
+            mi.active = True
+            # Prefer curated semantic text for Studio cards
+            semantic = str(meta.get("semantic_text") or "").strip()
+            if semantic:
+                mi.text = semantic
             out_items.append(mi)
         return MemoryListResponse(
             items=out_items,
-            count=agent.memory.memory_count,
+            count=agent.memory.count_items(thread_id=thread_id),
             use_faiss=bool(getattr(agent.memory, "use_faiss", False)),
         )
     except Exception as e:
@@ -5540,17 +5950,33 @@ def _build_memory_doctor_report(agent, thread_id: Optional[str], max_scan: int =
     pinned_count = 0
     missing_type_count = 0
     duplicate_map: Dict[str, list[dict[str, Any]]] = {}
+    active_semantic_samples: List[Dict[str, Any]] = []
 
     for item in items:
         payload = item if isinstance(item, dict) else {}
-        text = str(payload.get("text") or "")
         meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-        mem_type = str(meta.get("type") or "").strip() or "unknown"
+        text = str(meta.get("semantic_text") or payload.get("text") or "")
+        mem_type = str(meta.get("curator_type") or meta.get("type") or "").strip() or "unknown"
         type_counts[mem_type] = type_counts.get(mem_type, 0) + 1
         if mem_type == "unknown":
             missing_type_count += 1
         if bool(meta.get("pinned")):
             pinned_count += 1
+        if len(active_semantic_samples) < 12:
+            active_semantic_samples.append(
+                {
+                    "id": str(payload.get("id") or ""),
+                    "text": text[:240],
+                    "type": mem_type,
+                    "scope": str(meta.get("scope") or "account"),
+                    "source_execution_id": str(meta.get("source_execution_id") or ""),
+                    "index_state": str(meta.get("index_state") or "pending"),
+                    "explicit": bool(meta.get("explicit")),
+                    "confidence": meta.get("confidence"),
+                    "active": True,
+                    "supersedes": str(meta.get("supersedes") or ""),
+                }
+            )
         norm = _normalize_memory_audit_text(text)
         if len(norm) >= 24:
             duplicate_map.setdefault(norm, []).append(
@@ -5561,6 +5987,34 @@ def _build_memory_doctor_report(agent, thread_id: Optional[str], max_scan: int =
                     "timestamp": payload.get("timestamp"),
                 }
             )
+
+    superseded_count = 0
+    try:
+        for rec in (getattr(memory, "_records", None) or {}).values():
+            if not bool(rec.get("active", True)) and str(rec.get("supersedes") or rec.get("deleted_at") or ""):
+                superseded_count += 1
+            elif not bool(rec.get("active", True)):
+                superseded_count += 1
+    except Exception:
+        superseded_count = 0
+
+    session_only_count = 0
+    pending_confirmation = None
+    try:
+        from agent.memory_curator import MemoryCurator
+
+        cur = MemoryCurator(memory)
+        sid = str(thread_id or "default")
+        session_only_count = len(cur.list_session_only(sid))
+        pending_confirmation = cur.get_pending_confirmation(sid)
+        if pending_confirmation:
+            pending_confirmation = {
+                "id": pending_confirmation.get("id"),
+                "status": pending_confirmation.get("status"),
+                "candidate_count": len(pending_confirmation.get("candidates") or []),
+            }
+    except Exception:
+        pass
 
     duplicate_groups = []
     for norm, group in duplicate_map.items():
@@ -5638,6 +6092,10 @@ def _build_memory_doctor_report(agent, thread_id: Optional[str], max_scan: int =
         duplicate_groups=duplicate_groups,
         warnings=warnings,
         recommendations=recommendations,
+        active_semantic_samples=active_semantic_samples,
+        superseded_count=superseded_count,
+        session_only_count=session_only_count,
+        pending_confirmation=pending_confirmation,
     )
 
 
@@ -6219,6 +6677,21 @@ def start_server(host: str = None, port: int = None):
     import uvicorn
     host = host or config.api.host
     port = port or config.api.port
+    import ipaddress
+    normalized_host = str(host or "").strip().strip("[]").lower()
+    try:
+        loopback = normalized_host == "localhost" or ipaddress.ip_address(normalized_host).is_loopback
+    except ValueError:
+        loopback = False
+    auth_ready = bool(
+        getattr(config, "api_auth_enabled", False)
+        and str(getattr(config, "api_auth_key", "") or "").strip()
+    )
+    if not loopback and not auth_ready:
+        raise RuntimeError(
+            f"Refusing unauthenticated non-loopback API bind to {host}. "
+            "Enable API_AUTH_ENABLED and set API_AUTH_KEY, or bind to 127.0.0.1/::1."
+            )
     logger.info(f"Starting server on {host}:{port}")
     uvicorn.run(app, host=host, port=port)
 
