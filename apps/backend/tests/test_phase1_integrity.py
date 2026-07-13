@@ -346,12 +346,46 @@ def test_terminal_denylist_allows_harmless_echo(monkeypatch):
 
 
 def test_coding_readiness_response_shape(monkeypatch):
-    """Contract: /coding/readiness returns provider + tools + denylist fields."""
+    """Contract: /coding/readiness returns the shared schema-v2 projection."""
 
     class FakeAgent:
         tools = []
         _tool_allowlist_override = None
         llm_provider = ModelProvider.OPENAI
+        provider_info = {"provider": "openai", "model": "fixture"}
+        llm_wrapper = object()
+        _current_thread_id = "default"
+
+        class Store:
+            @staticmethod
+            def get_thread_state(_thread_id):
+                return type("State", (), {
+                    "active_project_id": "",
+                    "project_path": "",
+                    "workspace_root": "",
+                    "mode": "chat",
+                })()
+
+            @staticmethod
+            def get_pending_approval(_thread_id):
+                return None
+
+        _state_store = Store()
+
+        def project_scope_report(self, _thread_id=None):
+            return {"interaction_mode": "chat", "project_attached": False, "permissions": {}}
+
+        def _registered_tool_names(self):
+            return set()
+
+        def _allow_llm_tool_calling(self):
+            return True
+
+        def _parse_action_json(self):
+            return None
+
+        def _infer_file_write_args(self):
+            return None
 
         def _is_action_tool(self, name):
             return name in {"file_write", "terminal_run", "file_mkdir", "artifact_write"}
@@ -382,7 +416,8 @@ def test_coding_readiness_response_shape(monkeypatch):
     assert "file_roots" in payload
     assert "terminal_denylist" in payload["file_roots"]
     assert "rm" in payload["file_roots"]["terminal_denylist"]
-    assert payload["recommended_loop"] == ["inspect", "plan", "implement", "verify", "confirm", "summarize"]
+    assert payload["schema_version"] == 2
+    assert payload["recommended_loop"] == ["inspect", "plan", "implement", "confirm", "verify", "summarize"]
 
 
 def test_memory_compact_accepts_query_params(monkeypatch):

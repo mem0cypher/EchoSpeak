@@ -57,10 +57,14 @@ class SkillEnableArgs(BaseModel):
 
 @ToolRegistry.register(
     name="skill_create",
-    description="Create a new EchoSpeak skill with SKILL.md and skill.json. The skill is available immediately via hot-reload.",
+    description=(
+        "Create a new EchoSpeak skill package as experimental and DISABLED. "
+        "Does not execute the skill. Requires separate skill_enable after review/registration approval."
+    ),
     category="self_mod",
     is_action=True,
     risk_level="moderate",
+    policy_flags=["ENABLE_SYSTEM_ACTIONS"],
 )
 @tool(args_schema=SkillCreateArgs)
 def skill_create(
@@ -69,49 +73,85 @@ def skill_create(
     prompt: str,
     tool_names: Optional[List[str]] = None,
 ) -> str:
-    """Create a new skill directory with SKILL.md and skill.json."""
+    """Create a skill package as experimental+disabled. Not executable until skill_enable."""
     try:
+        import uuid
+        from agent.skill_contract import SkillProposal
+        from agent.skill_execution import create_skill_proposal
+
         skills_dir = _skills_dir()
         skill_id = _slugify(name)
         skill_path = skills_dir / skill_id
 
-        # Check for duplicates
         if skill_path.exists():
-            return f"❌ Skill '{skill_id}' already exists at {skill_path}. Use a different name or modify the existing skill."
+            return (
+                f"Skill '{skill_id}' already exists at {skill_path}. "
+                "Use a different name, or skill_enable after review — do not re-create."
+            )
 
-        # Create directory
         skill_path.mkdir(parents=True, exist_ok=True)
 
-        # Write skill.json
         meta: dict = {
             "name": name.strip(),
             "description": description.strip(),
             "prompt_file": "SKILL.md",
+            "version": "0.1.0",
+            "status": "experimental",
+            "experimental": True,
+            "origin": "generated",
+            "owner": "generated",
         }
         if tool_names:
             meta["tools"] = [t.strip() for t in tool_names if t.strip()]
+            meta["required_tools"] = list(meta["tools"])
 
         (skill_path / "skill.json").write_text(
             json.dumps(meta, indent=4) + "\n", encoding="utf-8"
         )
-
-        # Write SKILL.md
-        (skill_path / "SKILL.md").write_text(
-            prompt.strip() + "\n", encoding="utf-8"
+        (skill_path / "SKILL.md").write_text(prompt.strip() + "\n", encoding="utf-8")
+        # Governed: not selectable/executable until explicit enable after review.
+        (skill_path / ".disabled").write_text(
+            "Created disabled. Enable only after registration review.\n",
+            encoding="utf-8",
         )
+        (skill_path / ".experimental").write_text("true\n", encoding="utf-8")
+        (skill_path / ".draft").write_text("awaiting_registration_approval\n", encoding="utf-8")
 
-        logger.info(f"Skill created: {skill_id} at {skill_path}")
+        proposal = SkillProposal(
+            id=str(uuid.uuid4()),
+            name=name.strip(),
+            description=description.strip(),
+            reason_created="Agent skill_create proposal",
+            insufficient_existing_skills=[],
+            accepted_intents=[name.strip().lower()],
+            required_tools=list(meta.get("tools") or []),
+            risks=["generated_skill", "not_reviewed"],
+            verification_rules=["skill_registered_before_execution", "skill_enable_separate_turn"],
+            files_created=[
+                str(skill_path / "skill.json"),
+                str(skill_path / "SKILL.md"),
+                str(skill_path / ".disabled"),
+            ],
+            version="0.1.0-draft",
+            status="registered_disabled",
+        )
+        create_skill_proposal(proposal)
+
+        logger.info(f"Skill proposed/created disabled: {skill_id} at {skill_path}")
         tools_list = ", ".join(meta.get("tools", [])) or "none"
         return (
-            f"✅ Skill **{name}** created successfully!\n"
+            f"Skill package **{name}** created as experimental and DISABLED.\n"
             f"- ID: `{skill_id}`\n"
             f"- Path: `{skill_path}`\n"
+            f"- Proposal ID: `{proposal.id}`\n"
             f"- Tool allowlist: {tools_list}\n"
-            f"- It will be active on the next query via hot-reload."
+            f"- NOT executable in this Turn.\n"
+            f"- Separate review + `skill_enable` required before use.\n"
+            f"- skill_create never grants permissions or installs dependencies."
         )
     except Exception as exc:
         logger.error(f"skill_create failed: {exc}")
-        return f"❌ Failed to create skill: {exc}"
+        return f"Failed to create skill proposal: {exc}"
 
 
 # ── skill_list ──────────────────────────────────────────────────────

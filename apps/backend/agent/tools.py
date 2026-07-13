@@ -12,6 +12,8 @@ import shutil
 import platform
 import re
 import time
+import hashlib
+import uuid
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
@@ -362,6 +364,104 @@ def _safe_file_path(path: str) -> Optional[Path]:
     return None
 
 
+def _mutation_path_version(target: Path, argument: str) -> Dict[str, Any]:
+    """Bounded, deterministic identity used at the actual mutation boundary."""
+    target = target.expanduser().resolve(strict=False)
+    item: Dict[str, Any] = {"argument": argument, "path": str(target), "exists": target.exists()}
+    if not item["exists"]:
+        item.update({"kind": "missing", "sha256": "", "size": 0})
+        return item
+    st = target.lstat()
+    if int(getattr(st, "st_file_attributes", 0) or 0) & 0x400:
+        raise ValueError(f"Reparse-point paths cannot be approval-versioned safely: {target}")
+    if target.is_symlink():
+        raise ValueError(f"Symlink paths cannot be approval-versioned safely: {target}")
+    if target.is_file():
+        digest = hashlib.sha256()
+        size = 0
+        with target.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                size += len(chunk)
+                if size > 1024 * 1024 * 1024:
+                    raise ValueError(f"File exceeds approval-version bound: {target}")
+        item.update({"kind": "file", "sha256": digest.hexdigest(), "size": size})
+        return item
+    if target.is_dir():
+        digest = hashlib.sha256()
+        count = 0
+        total = 0
+        for root, dirs, files in os.walk(target, followlinks=False):
+            dirs.sort(key=str.casefold)
+            files.sort(key=str.casefold)
+            root_path = Path(root)
+            for name in [*dirs, *files]:
+                child = root_path / name
+                child_st = child.lstat()
+                if int(getattr(child_st, "st_file_attributes", 0) or 0) & 0x400 or child.is_symlink():
+                    raise ValueError(f"Directory contains a reparse point: {child}")
+                rel = child.relative_to(target).as_posix().casefold()
+                digest.update(rel.encode("utf-8", errors="surrogatepass"))
+                if child.is_file():
+                    digest.update(b"F")
+                    with child.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                            total += len(chunk)
+                            if total > 1024 * 1024 * 1024:
+                                raise ValueError(f"Directory exceeds approval-version byte bound: {target}")
+                else:
+                    digest.update(b"D")
+                count += 1
+                if count > 20000:
+                    raise ValueError(f"Directory exceeds approval-version entry bound: {target}")
+        item.update({"kind": "directory", "sha256": digest.hexdigest(), "size": count})
+        return item
+    raise ValueError(f"Unsupported filesystem object for approval: {target}")
+
+
+def _mutation_precondition_denial(tool_name: str) -> str:
+    governed = {
+        "file_write", "file_delete", "file_move", "file_copy", "file_mkdir",
+        "artifact_write", "notepad_write", "checkpoint_undo",
+    }
+    if tool_name not in governed:
+        return ""
+    context = _tool_execution_context.get() or {}
+    expected = dict(context.get("mutation_precondition") or {})
+    if int(expected.get("version") or 0) < 2:
+        return "Mutation blocked: no versioned approval precondition reached the tool boundary."
+    try:
+        current_entries = [
+            _mutation_path_version(Path(str(entry.get("path") or "")), str(entry.get("argument") or "path"))
+            for entry in list(expected.get("entries") or [])
+        ]
+        # Content identity only. Approval freeze metadata (tool, path_basename,
+        # original_input_sha256, …) may sit on the same dict for audit identity
+        # but must not invalidate an unchanged filesystem source.
+        current: Dict[str, Any] = {"version": 2, "entries": current_entries}
+        expected_identity: Dict[str, Any] = {
+            "version": 2,
+            "entries": list(expected.get("entries") or []),
+        }
+        if "checkpoint" in expected:
+            from agent.checkpoints import get_last_checkpoint
+            checkpoint = get_last_checkpoint(
+                str(context.get("thread_id") or "default"), str(context.get("project_root") or "")
+            )
+            current["checkpoint"] = None if checkpoint is None else {
+                key: checkpoint.get(key) for key in ("timestamp", "original_path", "backup_path")
+            }
+            expected_identity["checkpoint"] = expected.get("checkpoint")
+        if json.dumps(current, sort_keys=True, separators=(",", ":")) != json.dumps(
+            expected_identity, sort_keys=True, separators=(",", ":")
+        ):
+            return "Mutation blocked: source or destination changed after approval."
+    except Exception as exc:
+        return f"Mutation blocked: precondition could not be checked completely ({exc})."
+    return ""
+
+
 def _format_file_tool_roots() -> str:
     return "; ".join(str(p) for p in _file_tool_roots())
 
@@ -438,9 +538,34 @@ def _collect_system_info() -> dict[str, str]:
 
 
 class WebSearchArgs(BaseModel):
+    """Object-shaped schema for provider tool calling and structured-action recovery.
+
+    Runtime owns Project/Session identity; the model only supplies search fields.
+    """
+
     query: str = Field(
-        ..., validation_alias=AliasChoices("query", "q", "search", "keywords"), description="Search query text."
+        ...,
+        validation_alias=AliasChoices(
+            "query", "q", "search", "keywords", "text", "prompt", "topic", "subject"
+        ),
+        description="Public search query text (compact factual string).",
     )
+    objective: str = Field(
+        default="",
+        validation_alias=AliasChoices("objective", "goal", "intent", "purpose"),
+        description="Optional research objective for logging (not required for execution).",
+    )
+    local_first: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("local_first", "localFirst", "prefer_local"),
+        description="When true, caller prefers local sources; runtime may skip public search.",
+    )
+    freshness: str = Field(
+        default="",
+        validation_alias=AliasChoices("freshness", "recency", "time_range"),
+        description="Optional freshness hint (e.g. latest, today). Informational only.",
+    )
+
 
 
 class AnalyzeScreenArgs(BaseModel):
@@ -625,17 +750,25 @@ def file_list(path: Optional[str] = ".", limit: int = 50) -> str:
         return f"Failed to list files: {str(e)}"
 
 
-def _echo_file_payload(path: Path | str, content: str, *, action: str = "read") -> str:
+def _echo_file_payload(
+    path: Path | str,
+    content: str,
+    *,
+    action: str = "read",
+    source_chars: Optional[int] = None,
+    source_truncated: bool = False,
+) -> str:
     """Structured payload so the Code visualizer can show real file text (not just summaries)."""
     p = str(path or "").replace("\\", "/")
     body = content if content is not None else ""
     # Cap stream payload size while keeping enough for real source files
     max_body = 120_000
-    truncated = False
+    truncated = bool(source_truncated)
     if len(body) > max_body:
         body = body[:max_body]
         truncated = True
-    header = f"<<<ECHO_FILE action={action} path={p} chars={len(content or '')}{' truncated=1' if truncated else ''}>>>"
+    original_chars = int(source_chars) if source_chars is not None else len(content or "")
+    header = f"<<<ECHO_FILE action={action} path={p} chars={original_chars}{' truncated=1' if truncated else ''}>>>"
     return f"{header}\n{body}\n<<<END_ECHO_FILE>>>"
 
 
@@ -653,7 +786,7 @@ def strip_echo_file_wrapper(text: str) -> str:
         return ""
     # Prefer ECHO_FILE body
     m = re.search(
-        r"<<<ECHO_FILE\b[^>]*>>>\s*\n?(.*?)\n?\s*<<<END_ECHO_FILE>>>",
+        r"<<<ECHO_FILE\b[^>]*>>>\r?\n(.*)\r?\n<<<END_ECHO_FILE>>>",
         raw,
         flags=re.DOTALL | re.IGNORECASE,
     )
@@ -708,14 +841,26 @@ def file_read(path: str, max_chars: int = 100000) -> str:
         data = target.read_bytes()
         if b"\x00" in data[:2000]:
             return "Binary file detected; text read skipped."
-        text = data.decode("utf-8", errors="ignore")
+        try:
+            text = data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return "Unsupported text encoding; UTF-8 read required for safe editing."
+        source_chars = len(text)
         limit = int(max_chars) if max_chars else 100000
+        truncated = bool(limit and len(text) > limit)
         if limit and len(text) > limit:
             text = text[:limit].rstrip() + "\n…(truncated)"
-        if not text.strip():
-            return _echo_file_payload(target, "(empty file)", action="read")
+        if not text:
+            return (
+                f"Read 0 of 0 chars from {target}\n"
+                f"{_echo_file_payload(target, '', action='read', source_chars=0, source_truncated=False)}"
+            )
         # Lead with human line + structured body for UI + model
-        return f"Read {len(text)} chars from {target}\n{_echo_file_payload(target, text, action='read')}"
+        return (
+            f"Read {len(text)} of {source_chars} chars from {target}"
+            f"{' (truncated)' if truncated else ''}\n"
+            f"{_echo_file_payload(target, text, action='read', source_chars=source_chars, source_truncated=truncated)}"
+        )
     except Exception as e:
         return f"Failed to read file: {str(e)}"
 
@@ -772,6 +917,8 @@ def file_write(path: str, content: str, append: bool = False) -> str:
             "Write the FULL working file content (not '// Implement …' placeholders). "
             f"Path was: {target}"
         )
+    if denial := _mutation_precondition_denial("file_write"):
+        return denial
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         # If writing into a new project dir, pin active project for later relative paths
@@ -793,15 +940,40 @@ def file_write(path: str, content: str, append: bool = False) -> str:
         except Exception:
             pass
         # Create checkpoint backup before modifying existing file
+        if denial := _mutation_precondition_denial("file_write"):
+            return denial
         try:
             from agent.checkpoints import create_checkpoint
             create_checkpoint(str(target), reason="file_write")
         except Exception as exc:
             logger.warning("Checkpoint creation failed: {}", exc)
 
-        mode = "a" if append else "w"
-        with open(target, mode, encoding="utf-8") as f:
-            f.write(body)
+        final_body = body
+        if append and target.exists():
+            try:
+                final_body = target.read_text(encoding="utf-8", errors="strict") + body
+            except UnicodeDecodeError:
+                return "Unsupported text encoding; UTF-8 append required for safe editing."
+        temp_target = target.with_name(f".{target.name}.echospeak-{uuid.uuid4().hex}.tmp")
+        try:
+            with open(temp_target, "x", encoding="utf-8", newline="") as f:
+                f.write(final_body)
+                f.flush()
+                os.fsync(f.fileno())
+            # Recheck the exact approval precondition at the final replacement
+            # boundary, after all potentially slow preparation work.
+            if denial := _mutation_precondition_denial("file_write"):
+                try:
+                    temp_target.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return denial
+            os.replace(temp_target, target)
+        finally:
+            try:
+                temp_target.unlink(missing_ok=True)
+            except Exception:
+                pass
         action = "Appended" if append else "Wrote"
         # Include file body so Code visualizer can show real source (not "Wrote N chars")
         return f"{action} {len(body)} chars to {target}\n{_echo_file_payload(target, body, action='write')}"
@@ -821,8 +993,14 @@ def file_move(src: str, dst: str, overwrite: bool = False) -> str:
         return "Path not allowed."
     if not src_p.exists():
         return "Source path not found."
+    if denial := _mutation_precondition_denial("file_move"):
+        return denial
     try:
         dst_p.parent.mkdir(parents=True, exist_ok=True)
+        # Parent preparation may be slow or externally observable. Revalidate
+        # the approved source and destination immediately before replacement.
+        if denial := _mutation_precondition_denial("file_move"):
+            return denial
         if dst_p.exists():
             if not overwrite:
                 return "Destination already exists. Set overwrite=true to replace."
@@ -848,19 +1026,41 @@ def file_copy(src: str, dst: str, overwrite: bool = False) -> str:
         return "Path not allowed."
     if not src_p.exists():
         return "Source path not found."
+    if denial := _mutation_precondition_denial("file_copy"):
+        return denial
     try:
         dst_p.parent.mkdir(parents=True, exist_ok=True)
+        # Copying can overwrite a destination and traverse a large source.
+        # Revalidate after preparation and before the first destructive step.
+        if denial := _mutation_precondition_denial("file_copy"):
+            return denial
         if dst_p.exists():
             if not overwrite:
                 return "Destination already exists. Set overwrite=true to replace."
-            if dst_p.is_dir():
-                shutil.rmtree(dst_p)
+        temp_dst = dst_p.with_name(f".{dst_p.name}.echospeak-copy-{uuid.uuid4().hex}.tmp")
+        try:
+            if src_p.is_dir():
+                shutil.copytree(src_p, temp_dst)
             else:
-                dst_p.unlink()
-        if src_p.is_dir():
-            shutil.copytree(src_p, dst_p)
-        else:
-            shutil.copy2(src_p, dst_p)
+                shutil.copy2(src_p, temp_dst)
+            # A large source may change while it is copied. Validate the exact
+            # approved source/destination again before publishing the temp copy.
+            if denial := _mutation_precondition_denial("file_copy"):
+                return denial
+            if dst_p.exists():
+                if dst_p.is_dir():
+                    shutil.rmtree(dst_p)
+                else:
+                    dst_p.unlink()
+            os.replace(temp_dst, dst_p)
+        finally:
+            try:
+                if temp_dst.is_dir():
+                    shutil.rmtree(temp_dst)
+                else:
+                    temp_dst.unlink(missing_ok=True)
+            except Exception:
+                pass
         return f"Copied {src_p} -> {dst_p}"
     except Exception as e:
         return f"Failed to copy: {str(e)}"
@@ -877,7 +1077,11 @@ def file_delete(path: str, recursive: bool = False) -> str:
         return "Path not allowed."
     if not target.exists():
         return "Path not found."
+    if denial := _mutation_precondition_denial("file_delete"):
+        return denial
     try:
+        if denial := _mutation_precondition_denial("file_delete"):
+            return denial
         if target.is_dir():
             if not recursive:
                 return "Path is a directory. Set recursive=true to delete folders."
@@ -889,6 +1093,8 @@ def file_delete(path: str, recursive: bool = False) -> str:
                 create_checkpoint(str(target), reason="file_delete")
             except Exception as exc:
                 logger.warning("Checkpoint creation failed: {}", exc)
+            if denial := _mutation_precondition_denial("file_delete"):
+                return denial
             target.unlink()
         return f"Deleted {target}"
     except Exception as e:
@@ -904,7 +1110,11 @@ def file_mkdir(path: str, parents: bool = True, exist_ok: bool = True) -> str:
     target = _safe_file_path(path)
     if target is None:
         return f"Path not allowed. Allowed roots: {_format_file_tool_roots()}"
+    if denial := _mutation_precondition_denial("file_mkdir"):
+        return denial
     try:
+        if denial := _mutation_precondition_denial("file_mkdir"):
+            return denial
         target.mkdir(parents=bool(parents), exist_ok=bool(exist_ok))
         # Pin coding project so later bare "index.html" / "game.js" resolve here
         try:
@@ -1015,19 +1225,19 @@ def terminal_run(command: str, cwd: Optional[str] = ".", timeout: Optional[int] 
         timeout_s = default_timeout
     timeout_s = max(1, min(120, timeout_s))
 
-    # v7.5.0: host (default) vs docker/sandbox — never silent-fallback from docker to host.
+    # Docker/sandbox is default; host requires explicit configuration. Never fall back.
     try:
         from agent.sandbox import normalize_execution_mode, run_sandboxed_terminal
     except Exception:
         normalize_execution_mode = None  # type: ignore
         run_sandboxed_terminal = None  # type: ignore
 
-    mode = "host"
+    mode = "docker"
     if callable(normalize_execution_mode):
-        mode = normalize_execution_mode(getattr(config, "terminal_execution_mode", "host"))
+        mode = normalize_execution_mode(getattr(config, "terminal_execution_mode", "docker"))
     else:
-        raw_mode = str(getattr(config, "terminal_execution_mode", "host") or "host").strip().lower()
-        mode = "docker" if raw_mode in {"docker", "sandbox", "container"} else "host"
+        raw_mode = str(getattr(config, "terminal_execution_mode", "docker") or "docker").strip().lower()
+        mode = "host" if raw_mode == "host" else "docker"
 
     if mode == "docker":
         if not callable(run_sandboxed_terminal):
@@ -1046,7 +1256,7 @@ def terminal_run(command: str, cwd: Optional[str] = ".", timeout: Optional[int] 
         )
         return result.format()
 
-    # ---- host path (unchanged default behavior) ----
+    # ---- explicitly selected host path ----
     cmd: list[str]
     if os.name == "nt":
         cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
@@ -1131,8 +1341,12 @@ def artifact_write(filename: Optional[str] = None, content: str = "") -> str:
     root = _artifacts_root()
     fname = _safe_artifact_filename(filename)
     target = root / fname
+    if denial := _mutation_precondition_denial("artifact_write"):
+        return denial
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
+        if denial := _mutation_precondition_denial("artifact_write"):
+            return denial
         target.write_text(data, encoding="utf-8")
         return str(target)
     except Exception as e:
@@ -1230,7 +1444,11 @@ def notepad_write(content: str, filename: Optional[str] = None) -> str:
     root = _artifacts_root()
     fname = _safe_artifact_filename(filename)
     artifact_path = root / fname
+    if denial := _mutation_precondition_denial("notepad_write"):
+        return denial
     try:
+        if denial := _mutation_precondition_denial("notepad_write"):
+            return denial
         artifact_path.write_text(data, encoding="utf-8")
     except Exception as e:
         return f"Failed to write artifact: {str(e)}"
@@ -1783,7 +2001,12 @@ def sports_live(query: str) -> str:
 
 
 @tool(args_schema=WebSearchArgs, description="Search the web for current information.")
-def web_search(query: str) -> str:
+def web_search(
+    query: str,
+    objective: str = "",
+    local_first: bool = False,
+    freshness: str = "",
+) -> str:
     """Search the web via pluggable providers (DuckDuckGo default; optional Tavily/Brave).
 
     Free-path engineering: news channel, query variants, empty-result retry,
@@ -4047,6 +4270,80 @@ class SelfRollbackArgs(BaseModel):
     steps: int = Field(default=1, ge=1, le=10, description="Number of commits to roll back")
 
 
+def _git_repo_precondition(cwd: Path) -> Optional[dict]:
+    """Return None when git identity is usable; else structured fail-closed payload.
+
+    Self-edit/rollback must never invent commit history, restore claims, or
+    mutate when HEAD/index/worktree identity cannot be established.
+    """
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if top.returncode != 0:
+            return {
+                "ok": False,
+                "error_code": "missing_precondition",
+                "error": "Not a git repository or git is unavailable.",
+                "retryable": False,
+            }
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if head.returncode != 0 or not str(head.stdout or "").strip():
+            return {
+                "ok": False,
+                "error_code": "missing_precondition",
+                "error": "Git HEAD is unavailable; cannot bind self-edit/rollback identity.",
+                "retryable": False,
+            }
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-b"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if status.returncode != 0:
+            return {
+                "ok": False,
+                "error_code": "missing_precondition",
+                "error": "Git status could not be read; refusing self-edit/rollback.",
+                "retryable": False,
+            }
+        return None
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "error_code": "unavailable_adapter",
+            "error": "git executable not found.",
+            "retryable": False,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error_code": "missing_precondition",
+            "error": f"Git precondition check failed: {exc}",
+            "retryable": False,
+        }
+
+
+def _self_mod_json_err(code: str, message: str, **extra: Any) -> str:
+    return json.dumps(
+        {"ok": False, "error_code": code, "error": message, "applied": False, **extra},
+        ensure_ascii=False,
+        default=str,
+    )
+
+
 @tool(args_schema=SelfEditArgs, description="Edit EchoSpeak's own code with automatic git commit for rollback. USE WITH CAUTION.")
 def self_edit(file_path: str, old_content: str, new_content: str, commit_message: str = "self_edit: automated change") -> str:
     """
@@ -4057,31 +4354,42 @@ def self_edit(file_path: str, old_content: str, new_content: str, commit_message
     - Creates a git commit before each change
     - Only works if ALLOW_SELF_MODIFICATION is enabled
     - File must be within project root
+    - Requires resolvable git HEAD/index precondition (fail closed otherwise)
     """
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_self_modification", False):
-        return "Self-modification is disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_SELF_MODIFICATION=true"
-    
+        return _self_mod_json_err(
+            "permission_denied",
+            "Self-modification is disabled. To enable: set ENABLE_SYSTEM_ACTIONS=true and ALLOW_SELF_MODIFICATION=true",
+        )
+
+    pre = _git_repo_precondition(PROJECT_ROOT)
+    if pre is not None:
+        return json.dumps(pre, ensure_ascii=False)
+
     # Resolve and validate path
     target = (PROJECT_ROOT / file_path).resolve()
     try:
         target.relative_to(PROJECT_ROOT)
     except ValueError:
-        return f"Path must be within project root. Got: {file_path}"
+        return _self_mod_json_err("validation_failed", f"Path must be within project root. Got: {file_path}")
     
     if not target.exists():
-        return f"File not found: {file_path}"
+        return _self_mod_json_err("validation_failed", f"File not found: {file_path}")
     
     # Read current content
     try:
         current = target.read_text(encoding="utf-8")
     except Exception as e:
-        return f"Failed to read file: {str(e)}"
+        return _self_mod_json_err("tool_failed", f"Failed to read file: {str(e)}")
     
     # Verify old_content matches
     if old_content not in current:
         # Show a snippet to help debug
         snippet = current[:500] if len(current) > 500 else current
-        return f"old_content not found in file. File starts with:\n{snippet}"
+        return _self_mod_json_err(
+            "stale_source",
+            f"old_content not found in file (source may have changed). File starts with:\n{snippet}",
+        )
     
     # Create git commit for rollback
     try:
@@ -4105,18 +4413,29 @@ def self_edit(file_path: str, old_content: str, new_content: str, commit_message
             check=True
         )
     except subprocess.CalledProcessError as e:
-        return f"Failed to create backup commit: {e.stderr or str(e)}"
+        return _self_mod_json_err(
+            "missing_precondition",
+            f"Failed to create backup commit: {e.stderr or str(e)}",
+        )
     except Exception as e:
-        return f"Git error: {str(e)}"
+        return _self_mod_json_err("missing_precondition", f"Git error: {str(e)}")
     
     # Apply the edit
     try:
         new_text = current.replace(old_content, new_content, 1)
         target.write_text(new_text, encoding="utf-8")
     except Exception as e:
-        return f"Failed to write file: {str(e)}"
+        return _self_mod_json_err("persistence_failed", f"Failed to write file: {str(e)}")
     
-    return f"Edited {file_path}. Backup commit created. Use self_rollback to undo if needed."
+    return json.dumps(
+        {
+            "ok": True,
+            "applied": True,
+            "path": str(file_path),
+            "message": "Edited with backup commit. Use self_rollback to undo if needed.",
+        },
+        ensure_ascii=False,
+    )
 
 
 @tool(args_schema=SelfRollbackArgs, description="Roll back recent self-modification commits. Restores previous code state.")
@@ -4129,7 +4448,11 @@ def self_rollback(steps: int = 1) -> str:
         steps: Number of commits to roll back (1-10)
     """
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_self_modification", False):
-        return "Self-modification is disabled."
+        return _self_mod_json_err("permission_denied", "Self-modification is disabled.")
+
+    pre = _git_repo_precondition(PROJECT_ROOT)
+    if pre is not None:
+        return json.dumps(pre, ensure_ascii=False)
     
     try:
         # Get list of recent commits
@@ -4143,9 +4466,27 @@ def self_rollback(steps: int = 1) -> str:
         commits = result.stdout.strip().split("\n")
         
         if len(commits) <= steps:
-            return f"Not enough commits to roll back {steps} steps."
+            return _self_mod_json_err(
+                "missing_precondition",
+                f"Not enough commits to roll back {steps} steps.",
+            )
+
+        # Only roll back commits that look like self_edit backups — never invent history.
+        head_msg = subprocess.run(
+            ["git", "log", "-1", "--pretty=%s"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        subject = str(head_msg.stdout or "").strip()
+        if "[self_edit backup]" not in subject and "self_edit" not in subject.casefold():
+            return _self_mod_json_err(
+                "validation_failed",
+                f"HEAD is not a self_edit backup commit ({subject!r}); refusing hard reset.",
+            )
         
-        # Perform rollback (keep changes in working dir, don't commit)
+        # Perform rollback
         result = subprocess.run(
             ["git", "reset", "--hard", f"HEAD~{steps}"],
             cwd=PROJECT_ROOT,
@@ -4154,11 +4495,19 @@ def self_rollback(steps: int = 1) -> str:
             check=True
         )
         
-        return f"Rolled back {steps} commit(s). Code restored to previous state. Restart server to apply."
+        return json.dumps(
+            {
+                "ok": True,
+                "applied": True,
+                "steps": steps,
+                "message": f"Rolled back {steps} commit(s). Restart server to apply runtime code.",
+            },
+            ensure_ascii=False,
+        )
     except subprocess.CalledProcessError as e:
-        return f"Git rollback failed: {e.stderr or str(e)}"
+        return _self_mod_json_err("tool_failed", f"Git rollback failed: {e.stderr or str(e)}")
     except Exception as e:
-        return f"Rollback error: {str(e)}"
+        return _self_mod_json_err("tool_failed", f"Rollback error: {str(e)}")
 
 
 @tool(description="Show git status and recent commits for self-modification tracking.")
@@ -4168,7 +4517,11 @@ def self_git_status() -> str:
     Useful for seeing what changes have been made and can be rolled back.
     """
     if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_self_modification", False):
-        return "Self-modification is disabled."
+        return _self_mod_json_err("permission_denied", "Self-modification is disabled.")
+
+    pre = _git_repo_precondition(PROJECT_ROOT)
+    if pre is not None:
+        return json.dumps(pre, ensure_ascii=False)
     
     try:
         # Get status
@@ -4189,11 +4542,18 @@ def self_git_status() -> str:
             check=True
         )
         
-        return f"=== Git Status ===\n{status_result.stdout}\n=== Recent Commits ===\n{log_result.stdout}"
+        return json.dumps(
+            {
+                "ok": True,
+                "status": status_result.stdout,
+                "log": log_result.stdout,
+            },
+            ensure_ascii=False,
+        )
     except subprocess.CalledProcessError as e:
-        return f"Git error: {e.stderr or str(e)}"
+        return _self_mod_json_err("tool_failed", f"Git error: {e.stderr or str(e)}")
     except Exception as e:
-        return f"Error: {str(e)}"
+        return _self_mod_json_err("tool_failed", f"Error: {str(e)}")
 
 
 class SelfReadArgs(BaseModel):
@@ -4387,6 +4747,8 @@ def checkpoint_undo() -> str:
     context = get_tool_execution_context()
     if not context or not context.get("strict_scope"):
         return "Undo is blocked outside a bound thread execution context."
+    if denial := _mutation_precondition_denial("checkpoint_undo"):
+        return denial
     from agent.checkpoints import undo_last_change
 
     result = undo_last_change(
@@ -4398,21 +4760,21 @@ def checkpoint_undo() -> str:
 class ProjectStatusArgs(BaseModel):
     workspace_path: str = Field(
         default="",
-        description="Optional path to the workspace/project root to check. Defaults to the configured file_tool_root.",
+        description="Optional relative path inside the attached Project. Defaults to the attached Project root.",
     )
 
 
-@tool(args_schema=ProjectStatusArgs, description="Check the current project status: git changes, test results, todos, and build health. Use this to self-verify work, showcase finished projects, or diagnose issues.")
+@tool(args_schema=ProjectStatusArgs, description="Inspect attached-Project metadata, git working-tree state, todos, and available build scripts without executing project code.")
 def project_status(workspace_path: str = "") -> str:
+    """Inspect Project metadata and status without executing Project code."""
     if denied := _tool_scope_denial("project_status"):
         return denied
-    """
-    Comprehensive project health check and showcase report.
-    Checks git status, runs tests, reads todos, and produces a structured report.
-    """
     try:
-        # Resolve workspace path
-        ws_root = Path(workspace_path).resolve() if workspace_path else Path(getattr(config, "file_tool_root", ".") or ".").resolve()
+        # Project/session scope is authority. FILE_TOOL_ROOT is not an implicit
+        # attachment and arbitrary absolute paths are never accepted here.
+        ws_root = _safe_file_path(workspace_path or ".")
+        if ws_root is None:
+            return "Path not allowed by the attached Project scope."
 
         if not ws_root.exists():
             return f"Workspace path not found: {ws_root}"
@@ -4455,35 +4817,11 @@ def project_status(workspace_path: str = "") -> str:
             sections.append(f"## Git Status\nError: {e}\n")
 
         # ── 2. Test Results ──
-        test_dirs = ["tests", "test", "apps/backend/tests"]
-        test_found = False
-        for td in test_dirs:
-            test_path = ws_root / td
-            if test_path.exists():
-                test_found = True
-                try:
-                    test_result = subprocess.run(
-                        [sys.executable, "-m", "pytest", str(test_path), "--tb=short", "-q", "--no-header"],
-                        cwd=str(ws_root), capture_output=True, text=True, timeout=120
-                    )
-                    output = test_result.stdout.strip()
-                    # Extract summary line
-                    summary_lines = [l for l in output.split("\n") if "passed" in l or "failed" in l or "error" in l]
-                    summary = summary_lines[-1] if summary_lines else "No summary"
-                    status_emoji = "✅" if test_result.returncode == 0 else "❌"
-                    sections.append(f"## Tests {status_emoji}\n**Directory:** `{td}`\n**Result:** {summary}\n")
-                    if test_result.returncode != 0:
-                        # Show failed test details (limited)
-                        fail_lines = [l for l in output.split("\n") if "FAILED" in l][:10]
-                        if fail_lines:
-                            sections.append("**Failed:**\n" + "\n".join(f"  - `{l.strip()}`" for l in fail_lines) + "\n")
-                except subprocess.TimeoutExpired:
-                    sections.append(f"## Tests ⏱️\n**Directory:** `{td}`\nTests timed out (>120s).\n")
-                except Exception as e:
-                    sections.append(f"## Tests ⚠️\n**Directory:** `{td}`\nError running tests: {e}\n")
-                break
-        if not test_found:
-            sections.append("## Tests\nNo test directory found.\n")
+        # project_status is a safe read tool. Tests/builds execute Project code
+        # and therefore belong exclusively to approval-gated terminal_run.
+        sections.append(
+            "## Tests\nNot executed. Use the approval-gated terminal tool when verification is authorized.\n"
+        )
 
         # ── 3. Todo Status ──
         todo_paths = [ws_root / "data" / "todos.json", ws_root / "apps" / "backend" / "data" / "todos.json"]

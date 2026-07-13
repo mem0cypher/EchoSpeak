@@ -269,6 +269,11 @@ Public paths are intentionally tiny:
 ```
 
 Settings validation warns when `API_HOST` is network-facing and API auth is off.
+The default bind is loopback-only (`127.0.0.1`); network-facing binds must be
+chosen explicitly and should always enable shared-key authentication.
+`X-Forwarded-For` is ignored by default. Set `API_TRUST_PROXY_HEADERS=true`
+only behind a trusted reverse proxy that removes client-supplied forwarding
+headers and writes its own.
 
 Admin restart uses its own `ADMIN_API_KEY`.
 
@@ -1433,3 +1438,19 @@ The next reliability jump comes from four architectural subsystems:
 4. Failure-cluster-weighted verification
 
 Implement those in that order.
+
+## Safety-critical runtime defaults
+
+- API binds to `127.0.0.1` by default. Any non-loopback bind is rejected unless
+  API authentication is enabled with a non-empty key.
+- Terminal actions default to Docker isolation. `TERMINAL_EXECUTION_MODE=host`
+  is an explicit unsandboxed opt-in; Docker failure never falls back to host.
+- Malformed phase3 authoritative JSON fails startup closed and produces a
+  preserved copy plus recovery instructions under `phase3/corrupt-state/`.
+- Background heartbeat/routine routing does not send email or WhatsApp directly;
+  those external actions must pass through a Turn, ApprovalRecord, and ToolRun.
+- Video ingest uses bounded `ffprobe` argument arrays. `VIDEO_FFPROBE_PATH`
+  selects the executable and `VIDEO_FFPROBE_TIMEOUT_SECONDS` caps the probe.
+  Agent-proposed timeline transactions additionally require system actions and
+  `ALLOW_VIDEO_AGENT_EDITS=true`; the default is false. See
+  `docs/VIDEO_EDITOR_ARCHITECTURE.md`.

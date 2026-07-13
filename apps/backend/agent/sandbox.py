@@ -1,8 +1,8 @@
 """Terminal execution sandbox (v7.5.0–v7.5.1).
 
 Modes (config.terminal_execution_mode):
-  - host   (default): existing host-side PowerShell/shell path in tools.terminal_run
-  - docker / sandbox: isolated per-run container; never silently falls back to host
+  - docker / sandbox (default): isolated per-run container; never silently falls back to host
+  - host: explicitly selected unsandboxed PowerShell/shell execution
 
 Isolation rules (enforced here):
   - Mount only FILE_TOOL_ROOT + configured FILE_TOOL_EXTRA_ROOTS
@@ -94,11 +94,13 @@ class SandboxStatus:
 
 
 def normalize_execution_mode(raw: Optional[str] = None) -> str:
-    mode = str(raw if raw is not None else getattr(config, "terminal_execution_mode", "host") or "host")
+    mode = str(raw if raw is not None else getattr(config, "terminal_execution_mode", "docker") or "docker")
     mode = mode.strip().lower()
     if mode in {"docker", "sandbox", "container"}:
         return "docker"
-    return "host"
+    if mode == "host":
+        return "host"
+    return "docker"
 
 
 def _docker_bin() -> Optional[str]:
@@ -357,7 +359,7 @@ def _sandbox_user() -> str:
 
 def get_sandbox_status() -> SandboxStatus:
     """Status for readiness APIs — honest about docker vs host."""
-    requested = str(getattr(config, "terminal_execution_mode", "host") or "host")
+    requested = str(getattr(config, "terminal_execution_mode", "docker") or "docker")
     mode = normalize_execution_mode(requested)
     mounts = build_mount_plan()
     image = _sandbox_image()
@@ -372,7 +374,7 @@ def get_sandbox_status() -> SandboxStatus:
             non_root=False,
             mounts=[],
             ready=True,
-            message="Terminal runs on the host (default). Set TERMINAL_EXECUTION_MODE=docker to use the sandbox.",
+            message="Terminal is explicitly configured for unsandboxed host execution.",
         )
     ok, detail = probe_docker()
     ready = bool(ok and mounts)

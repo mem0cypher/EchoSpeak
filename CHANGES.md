@@ -1,5 +1,54 @@
 # Changes
 
+## Architecture note — unified coordination (docs)
+
+**Principle:** optimize for the next subsystem being easy to build, not for the
+next demo. Reduce places EchoSpeak must *guess* (status, permission, resume,
+completion). Capture: `docs/UNIFIED_COORDINATION.md` (linked from Runtime
+Contracts, ARCHITECTURE, README).
+
+---
+
+## v7.6.10+ - Coding reliability + Video Editor foundation (in progress)
+
+**Status: implemented in code + unit/frontend tests; pending browser acceptance.**
+Not closed until Lifecycle §11, Runtime §K, and **Runtime §K-video** pass.
+
+### File-count reconciliation (do not use “~20 files”)
+
+On branch `feature/v7.6.10-runtime-lifecycle-honesty` after this pass:
+
+- **30** tracked modified files  
+- **24** untracked files (expanded)  
+- **54** total change-set paths  
+- **40** porcelain lines (untracked dirs collapse children)
+
+Earlier “20 modified files” reports were incorrect under-counts.
+
+### Coding reliability (strengthened)
+- Exact named files win over stale heuristics; supporting reads ≠ write targets  
+- Reads fail closed (truncation, binary, wrappers, encoding)  
+- Write/copy/move/delete/mkdir preconditions; atomic write + read-back  
+- Approvals revalidate authority; Project roots not rewritten by ActiveWork  
+- Single coding-readiness owner; disposable fixture workflow tests  
+- Tests: `test_coding_fixture_workflow.py`, `test_coding_readiness_final.py`
+
+### Video Editor foundation (architecture + shells)
+- Domain: `agent/video_editor/*`, API `api/video_editor.py`, UI `features/video-editor/*`  
+- Models, rational time, Project-bound ingest, timeline ops, revisions, undo/redo  
+- Manual + agent-proposed ops; approval-bound mutations; parent/child ToolRuns  
+- Adapter registry + durable job shells — **generation not functional**  
+- Architecture: `docs/VIDEO_EDITOR_ARCHITECTURE.md`  
+- **Deferred:** real playback, WebCodecs preview, proxies, FFmpeg export, analysis,
+  captions, live generation, OTIO, C2PA, tracking/AI effects  
+
+### Next (product order)
+1. Browser K-video acceptance only (no new features)  
+2. Playback + proxies + FFmpeg preview/export  
+3. Generative adapters after ordinary footage path is solid  
+
+---
+
 ## v7.6.10 - Runtime contracts / lifecycle truthfulness (in progress)
 
 **Status: implemented in code (partial); pending live validation** — not closed

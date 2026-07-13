@@ -1,24 +1,41 @@
 """
-Skills and workspace registry helpers.
+Canonical skills and workspace registry for EchoSpeak.
+
+This module is the single package-skill owner. Video domain skills are bridged
+in via SkillsRegistry.refresh() — they do not form a competing production
+selection path. Prompt-only packages without reachable tools are marked invalid.
 """
 
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 
 from loguru import logger
+
+from agent.skill_contract import (
+    SkillManifest,
+    SkillOrigin,
+    SkillStatus,
+)
 
 
 @dataclass
 class SkillDefinition:
+    """Backward-compatible prompt skill projection used by core.py prompts."""
+
     id: str
     name: str
     description: str
     prompt: str
     tool_allowlist: List[str] = field(default_factory=list)
+    version: str = "1.0.0"
+    status: str = "installed"
+    executable: bool = True
+    validation_errors: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -73,36 +90,155 @@ def _derive_description(prompt: str) -> str:
     return ""
 
 
-def load_skills(skills_dir: Path) -> Dict[str, SkillDefinition]:
+def _registered_tool_names() -> set[str]:
+    try:
+        from agent.tool_registry import ToolRegistry
+
+        return set(ToolRegistry.get_names())
+    except Exception:
+        return set()
+
+
+def package_to_manifest(entry: Path, meta: Dict[str, object], prompt: str) -> SkillManifest:
+    """Build a validated SkillManifest from a filesystem skill package."""
+    skill_id = entry.name
+    disabled = (entry / ".disabled").exists()
+    experimental = (entry / ".experimental").exists() or bool(meta.get("experimental"))
+    draft = (entry / ".draft").exists() or str(meta.get("status") or "") == "draft"
+    tool_allowlist = [str(x).strip() for x in (meta.get("tools") or meta.get("required_tools") or []) if str(x).strip()]
+    if not tool_allowlist:
+        tool_allowlist = _read_list(entry / "TOOLS.txt")
+    optional_tools = [str(x).strip() for x in (meta.get("optional_tools") or []) if str(x).strip()]
+    accepted = [str(x).strip() for x in (meta.get("accepted_intents") or meta.get("intents") or []) if str(x).strip()]
+    modes = [str(x).strip() for x in (meta.get("supported_modes") or meta.get("modes") or []) if str(x).strip()]
+    if not modes:
+        # Infer domain from id / tools
+        if skill_id.startswith("video") or any(t.startswith("video_") for t in tool_allowlist):
+            modes = ["video", "chat"]
+        elif skill_id in {"web_search"} or "web_search" in tool_allowlist:
+            modes = ["chat", "research"]
+        else:
+            modes = ["chat"]
+
+    registered = _registered_tool_names()
+    missing = [t for t in tool_allowlist if t and t not in registered]
+    reachable = [t for t in tool_allowlist if t in registered]
+    has_impl = bool(prompt) or (entry / "tools.py").exists() or (entry / "plugin.py").exists()
+    errors: list[str] = []
+    if not prompt and not (entry / "tools.py").exists():
+        errors.append("missing_prompt_and_tools_module")
+    if tool_allowlist and not reachable and not skill_id.startswith("video"):
+        # Video tools may load after import of video_editor package.
+        errors.append("no_required_tools_registered")
+
+    if disabled:
+        status = SkillStatus.DISABLED
+    elif draft:
+        status = SkillStatus.DRAFT
+    elif experimental:
+        status = SkillStatus.EXPERIMENTAL
+    elif errors and "no_required_tools_registered" in errors:
+        status = SkillStatus.NEEDS_DEPENDENCY
+    elif errors:
+        status = SkillStatus.INVALID
+    elif meta.get("origin") == "built_in" or skill_id in {
+        "web_search", "soul", "video_editor", "skill_writer",
+    }:
+        status = SkillStatus.BUILT_IN
+    else:
+        status = SkillStatus.INSTALLED
+
+    executable = status in {
+        SkillStatus.BUILT_IN,
+        SkillStatus.INSTALLED,
+        SkillStatus.EXPERIMENTAL,
+    } and not errors and has_impl
+
+    # Skill packages that only provide prompts still guide the agent when tools
+    # are from the global inventory (e.g. web_search). Treat as executable if
+    # prompt exists and not disabled/draft.
+    if prompt and status in {SkillStatus.BUILT_IN, SkillStatus.INSTALLED, SkillStatus.EXPERIMENTAL}:
+        if not tool_allowlist or reachable or skill_id.startswith("video"):
+            executable = not disabled and not draft
+            if executable and "no_required_tools_registered" in errors:
+                errors = [e for e in errors if e != "no_required_tools_registered"]
+                if not errors and status == SkillStatus.NEEDS_DEPENDENCY:
+                    status = SkillStatus.INSTALLED
+
+    name = str(meta.get("name") or skill_id).strip() or skill_id
+    description = str(meta.get("description") or "").strip() or _derive_description(prompt)
+    return SkillManifest(
+        id=skill_id,
+        version=str(meta.get("version") or "1.0.0"),
+        status=status,
+        owner=str(meta.get("owner") or "echospeak"),
+        origin=SkillOrigin.PACKAGE,
+        name=name,
+        description=description,
+        accepted_intents=accepted or [name.lower()],
+        supported_modes=modes,
+        required_project_state=[str(x) for x in (meta.get("required_project_state") or [])],
+        required_context_fields=[str(x) for x in (meta.get("required_context_fields") or [])],
+        required_tools=tool_allowlist,
+        optional_tools=optional_tools,
+        required_capabilities=[str(x) for x in (meta.get("required_capabilities") or [])],
+        required_models=[str(x) for x in (meta.get("required_models") or [])],
+        required_artifacts=[str(x) for x in (meta.get("required_artifacts") or [])],
+        produced_artifacts=[str(x) for x in (meta.get("produced_artifacts") or [])],
+        job_types=[str(x) for x in (meta.get("job_types") or [])],
+        operation_templates=list(meta.get("operation_templates") or []),
+        permissions=[str(x) for x in (meta.get("permissions") or [])],
+        approval_policy=dict(meta.get("approval_policy") or meta.get("approval_rules") or {}),
+        verification_rules=[str(x) for x in (meta.get("verification_rules") or [])],
+        retry_policy=dict(meta.get("retry_policy") or {}),
+        resource_limits=dict(meta.get("resource_limits") or {}),
+        dependency_metadata=dict(meta.get("dependency_metadata") or {}),
+        license=str(meta.get("license") or ""),
+        compatibility_version=str(meta.get("compatibility_version") or "1"),
+        implementation_entry=str(meta.get("implementation_entry") or f"package:{skill_id}"),
+        prompt=prompt,
+        package_path=str(entry),
+        project_id=str(meta.get("project_id") or ""),
+        tools_reachable=reachable,
+        tools_missing=missing,
+        validation_errors=errors,
+        executable=executable,
+    )
+
+
+def load_skills(skills_dir: Path, *, include_disabled: bool = False) -> Dict[str, SkillDefinition]:
+    """Load package skills as SkillDefinition (prompt projection).
+
+    Disabled skills are excluded unless include_disabled=True (for admin listing).
+    """
     skills: Dict[str, SkillDefinition] = {}
     if not skills_dir.exists():
         return skills
     for entry in sorted(skills_dir.iterdir()):
         if not entry.is_dir():
             continue
-        # Skip disabled skills (created by skill_enable tool)
-        if (entry / ".disabled").exists():
+        if (entry / ".disabled").exists() and not include_disabled:
             logger.debug(f"Skipping disabled skill: {entry.name}")
             continue
         meta = _load_json(entry / "skill.json")
         prompt_file = str(meta.get("prompt_file") or "SKILL.md")
         prompt = _read_text(entry / prompt_file)
+        # restart/ has SKILL.md only — still load if prompt exists
+        if not prompt and not meta:
+            continue
         if not prompt:
             continue
-        skill_id = entry.name
-        name = str(meta.get("name") or skill_id).strip() or skill_id
-        description = str(meta.get("description") or "").strip()
-        if not description:
-            description = _derive_description(prompt)
-        tool_allowlist = [str(x).strip() for x in (meta.get("tools") or []) if str(x).strip()]
-        if not tool_allowlist:
-            tool_allowlist = _read_list(entry / "TOOLS.txt")
-        skills[skill_id] = SkillDefinition(
-            id=skill_id,
-            name=name,
-            description=description,
-            prompt=prompt,
-            tool_allowlist=tool_allowlist,
+        manifest = package_to_manifest(entry, meta, prompt)
+        skills[manifest.id] = SkillDefinition(
+            id=manifest.id,
+            name=manifest.name,
+            description=manifest.description,
+            prompt=manifest.prompt,
+            tool_allowlist=manifest.tool_allowlist(),
+            version=manifest.version,
+            status=manifest.status.value,
+            executable=manifest.executable,
+            validation_errors=list(manifest.validation_errors),
         )
     return skills
 
@@ -260,6 +396,168 @@ def load_skill_tools(skill_dir: Path) -> List[str]:
 
 
 _loaded_skill_plugin_modules: set[str] = set()
+
+
+class SkillsRegistry:
+    """Canonical in-process registry of SkillManifest rows.
+
+    Package skills (apps/backend/skills) + bridged video domain skills.
+    There is one selection owner: this registry + agent.skill_selection.
+    """
+
+    _lock = threading.RLock()
+    _manifests: Dict[str, SkillManifest] = {}
+    _loaded_root: str = ""
+
+    @classmethod
+    def clear(cls) -> None:
+        with cls._lock:
+            cls._manifests = {}
+            cls._loaded_root = ""
+
+    @classmethod
+    def refresh(cls, skills_dir: Optional[Path] = None) -> Dict[str, SkillManifest]:
+        with cls._lock:
+            if skills_dir is None:
+                try:
+                    from config import config
+
+                    skills_dir = Path(getattr(config, "skills_dir", "") or "").expanduser()
+                except Exception:
+                    skills_dir = Path("skills")
+            root = str(skills_dir.resolve()) if skills_dir.exists() else str(skills_dir)
+            manifests: Dict[str, SkillManifest] = {}
+            if skills_dir.exists():
+                for entry in sorted(skills_dir.iterdir()):
+                    if not entry.is_dir():
+                        continue
+                    meta = _load_json(entry / "skill.json")
+                    prompt_file = str(meta.get("prompt_file") or "SKILL.md")
+                    prompt = _read_text(entry / prompt_file)
+                    if not prompt and not meta:
+                        continue
+                    if not prompt:
+                        # Invalid package without prompt
+                        manifests[entry.name] = SkillManifest(
+                            id=entry.name,
+                            name=entry.name,
+                            description="Invalid skill package (missing SKILL.md)",
+                            status=SkillStatus.INVALID,
+                            origin=SkillOrigin.PACKAGE,
+                            validation_errors=["missing_prompt"],
+                            executable=False,
+                            package_path=str(entry),
+                        )
+                        continue
+                    manifests[entry.name] = package_to_manifest(entry, meta, prompt)
+
+            # Bridge video domain skills into the same registry (not a second owner).
+            try:
+                from agent.video_editor.skills import ensure_builtin_video_skills, VideoSkillRegistry
+
+                ensure_builtin_video_skills()
+                for vs in VideoSkillRegistry.list():
+                    if vs.id in manifests:
+                        # Enrich package skill with video domain metadata
+                        base = manifests[vs.id]
+                        manifests[vs.id] = base.model_copy(
+                            update={
+                                "accepted_intents": list(dict.fromkeys([*base.accepted_intents, *vs.accepted_intentions])),
+                                "required_tools": list(dict.fromkeys([*base.required_tools, *vs.required_tools])),
+                                "required_models": list(dict.fromkeys([*base.required_models, *vs.required_models])),
+                                "required_artifacts": list(dict.fromkeys([*base.required_artifacts, *vs.required_analysis])),
+                                "job_types": list(dict.fromkeys([*base.job_types, *vs.job_requirements])),
+                                "operation_templates": base.operation_templates or list(vs.operation_templates),
+                                "permissions": list(dict.fromkeys([*base.permissions, *vs.permissions])),
+                                "approval_policy": base.approval_policy or dict(vs.approval_rules),
+                                "verification_rules": list(dict.fromkeys([*base.verification_rules, *vs.verification_rules])),
+                                "resource_limits": base.resource_limits or dict(vs.resource_limits),
+                                "supported_modes": list(dict.fromkeys([*(base.supported_modes or []), "video", "chat"])),
+                            }
+                        )
+                        continue
+                    registered = _registered_tool_names()
+                    missing = [t for t in vs.required_tools if t not in registered]
+                    reachable = [t for t in vs.required_tools if t in registered]
+                    status = SkillStatus.BUILT_IN
+                    # Skills that require analysis/generation models stay built_in but
+                    # may be blocked at selection time when capabilities missing.
+                    manifests[vs.id] = SkillManifest(
+                        id=vs.id,
+                        version="1.0.0",
+                        status=status,
+                        owner="echospeak",
+                        origin=SkillOrigin.VIDEO_DOMAIN,
+                        name=vs.name,
+                        description=vs.description,
+                        accepted_intents=list(vs.accepted_intentions),
+                        supported_modes=["video", "chat"],
+                        required_tools=list(vs.required_tools),
+                        required_models=list(vs.required_models),
+                        required_capabilities=list(vs.required_models) + list(vs.required_analysis),
+                        required_artifacts=list(vs.required_analysis),
+                        produced_artifacts=[],
+                        job_types=list(vs.job_requirements),
+                        operation_templates=list(vs.operation_templates),
+                        permissions=list(vs.permissions),
+                        approval_policy=dict(vs.approval_rules),
+                        verification_rules=list(vs.verification_rules),
+                        resource_limits=dict(vs.resource_limits),
+                        implementation_entry=f"video_domain:{vs.id}",
+                        tools_reachable=reachable,
+                        tools_missing=missing,
+                        executable=True,
+                    )
+            except Exception as exc:
+                logger.debug(f"Video skill bridge skipped: {exc}")
+
+            cls._manifests = manifests
+            cls._loaded_root = root
+            return dict(manifests)
+
+    @classmethod
+    def get(cls, skill_id: str) -> Optional[SkillManifest]:
+        with cls._lock:
+            if not cls._manifests:
+                cls.refresh()
+            return cls._manifests.get(str(skill_id or "").strip())
+
+    @classmethod
+    def list_manifests(cls, *, include_disabled: bool = False) -> List[SkillManifest]:
+        with cls._lock:
+            if not cls._manifests:
+                cls.refresh()
+            rows = list(cls._manifests.values())
+        if not include_disabled:
+            rows = [m for m in rows if m.status != SkillStatus.DISABLED]
+        return sorted(rows, key=lambda m: m.id)
+
+    @classmethod
+    def list_skills(cls) -> List[dict[str, Any]]:
+        """A2A / API projection."""
+        return [
+            {
+                "name": m.name,
+                "description": m.description,
+                "id": m.id,
+                "version": m.version,
+                "status": m.status.value,
+                "tags": list(m.supported_modes),
+                "executable": m.executable,
+            }
+            for m in cls.list_manifests()
+        ]
+
+    @classmethod
+    def executable_manifests(cls, *, mode: str = "") -> List[SkillManifest]:
+        rows = [m for m in cls.list_manifests() if m.executable]
+        if mode:
+            rows = [m for m in rows if not m.supported_modes or mode in m.supported_modes]
+        return rows
+
+    def __init__(self, skills_dir: Optional[Path] = None):
+        # Instance API for a2a.py compatibility
+        self.refresh(skills_dir)
 
 
 def load_skill_plugin(skill_dir: Path) -> bool:

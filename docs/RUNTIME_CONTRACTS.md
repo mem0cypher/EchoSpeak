@@ -2,8 +2,13 @@
 
 **Master index of product contracts** for the 2026 lifecycle / reliability wave.
 
+**Platform north-star:** optimize for the **next subsystem being easy to plug
+in**, not for the next demo. Prefer one authoritative source of truth over
+guesses. See **`docs/UNIFIED_COORDINATION.md`**.
+
 | Document | Owns |
 |----------|------|
+| **`UNIFIED_COORDINATION.md`** | Unified lifecycle; capability system; ownership table; skills/jobs/integrations; frontend projection; how to extend |
 | **This file** | Equal models; Mode/Project/permissions; Project + Code workspace; refresh hydration; search/utility/references; coding execution targets; streaming/concurrency; explicit-file + approval-scope identity; **Known limitations** |
 | **`LIFECYCLE_TRUTHFULNESS.md`** | Recovery evidence statuses; confirmation types A–D; ToolRun identity (truthfulness); projection status language; corrupted-file policy; truthful final responses |
 
@@ -43,7 +48,11 @@
 
 ### Status
 
-**Implemented** for defaults and turn injection (`runtime_gates: disabled_equal_full_access`). **Pending live validation** across Gemma-local vs hosted Gemini/OpenAI sessions for identical tool reach and plan depth.
+**Implemented** for defaults and turn injection (`runtime_gates: disabled_equal_full_access`).
+Hosted providers no longer inherit `config.local.context_length`; explicit global
+trim/profile limits and local-provider physical limits remain distinct.
+**Pending live validation** across Gemma-local vs hosted Gemini/OpenAI sessions
+for identical tool reach, plan depth, and correct context budgets.
 
 ---
 
@@ -67,9 +76,23 @@
 3. **`project_status` is a registered safe read tool** when Project scope is active.
 4. **`TOOLS.txt` is not a hard allowlist.** Availability = registration + policy + Project/session scope (+ role denylists). Skill lists guide behavior only.
 
+### Capability inventory authority (closure)
+
+| Surface | Single owner |
+|---------|----------------|
+| Tool registration / `is_action` / policy flags | **`ToolRegistry`** |
+| `GET /capabilities` tool list | **Full `ToolRegistry` names** (not `agent.tools` alone) |
+| Coding readiness | `coding_readiness.build_coding_readiness` (intersection of registry + project + flags) |
+| Video domain adapters/jobs | `video_editor.capabilities` (domain projection; mutations still go through ToolRun/approval) |
+| Skill selection / executable status | **`SkillsRegistry` + `skill_selection`** |
+| Workspace skill prompts | `_active_skill_defs` (prompt only; not a second permission owner) |
+| Turn tool shrink (research/video) | `_bind_research_tool_inventory` / `_bind_video_turn_to_decision` on ModeDecision |
+
+Future Photo / Voice / Calendar: register tools in `ToolRegistry`, optional skill manifests in `SkillsRegistry`, domain stores for durable media — **no parallel approval or ToolRun system**.
+
 ### Status
 
-**Implemented** in `/capabilities` and tool inventory wiring. **Pending live validation** that CHAT mode + attached Project still shows path-bound file tools correctly.
+**Implemented** in `/capabilities` and tool inventory wiring (registry-first list + SkillsRegistry projection). **Pending live validation** that CHAT mode + attached Project still shows path-bound file tools correctly.
 
 ---
 
@@ -124,7 +147,10 @@ Rules:
 
 ### Status
 
-**Implemented** backend timeline + `/history` turns payload. **Pending live validation** of full UI restore (research panel, approvals, files, terminal, no zombie animations).
+**Implemented** backend timeline + `/history` turns payload. Historical
+nonterminal ToolRuns hydrate as interrupted/error rather than live or successful.
+**Pending live validation** of full UI restore (research panel, approvals, files,
+terminal, no zombie animations).
 
 ---
 
@@ -154,6 +180,13 @@ Rules:
 
 ### Contract
 
+`agent/coding_readiness.py` is the sole readiness projection for the endpoint,
+Tools diagnostics, and coding request preflight. It intersects ProjectManager,
+Session attachment, provider/model tool path, registered versus loaded tool
+inventory, current permissions/configuration, pending approval, and terminal
+runtime. Reading and editing readiness are separate; terminal is optional for
+ordinary file editing. See `SETTINGS_REQUIRED_FOR_ECHOSPEAK_CODING.md`.
+
 1. **Reject unresolved planner placeholders** (`{{first_relevant_file}}`, `${…}`, symbolic paths) at validation — never invoke tools with them.
 2. **Convert `file_list` results into exact `file_read` tasks** with real basenames under Project root when the user required scan/read-all or required files.
 3. **Derive required actions from user wording** (scan intent, named files, implement verbs) — not from optimistic “six tasks complete.”
@@ -169,11 +202,11 @@ Rules:
 | **Supporting reads ≠ write targets** | Reading `game.js` / `style.css` for context must not retarget the pending write or implement plan to those files. |
 | **Implement gaps** | Feature heuristics must not override an explicit filename from the current request. |
 
-**Live defect (post-doc-pass; contract required):** user asked for work on **`index.html`** but **`game.js`** became the edit target after supporting reads. Treat as **gap until live-fixed** — do not document as shipped-complete. Code has basename preference in `_files_relevant_to_request` / gap analysis for “add a comment to game.js” style asks; multi-file / implement paths still need live proof that supporting reads cannot steal the write target.
+**Reported live defect (post-doc-pass):** user asked for work on **`index.html`** but **`game.js`** became the edit target after supporting reads. The implement path now applies a final current-request basename pin after gap analysis, so supporting reads and ActiveWork heuristics cannot select another mutation target. A disposable Project fixture now proves the backend read/propose/confirm/cancel/stale-source/verification lifecycle and that `game.js` remains unchanged; the full browser flow remains pending live validation.
 
 ### Status
 
-Placeholder reject, list→read inject, projection honesty, marker/suspicious guards: **Implemented**. Explicit-file mutation pinning end-to-end: **Contract required / gap (live bug reported)**.
+Placeholder reject, list→read inject, projection honesty, marker/suspicious guards: **Implemented**. Explicit-file mutation pinning and removal of the untracked raw-read fallback: **implemented and covered by a disposable backend Project fixture; browser live validation remains pending**.
 
 ---
 
@@ -188,10 +221,22 @@ Placeholder reject, list→read inject, projection honesty, marker/suspicious gu
 3. **Synchronous Session-switch abort** — switching Session must stop applying stream events / tools for the previous Session’s in-flight request (no cross-Session animation or tool completion).
 4. **Single-writer process lock** for durable state (`StateStore` phase3 process lock) so two processes do not corrupt phase3 JSON.
 5. **Capability / status refreshes must not change another active Session’s** tool scope, pending approval, or project pin. Refresh always keys by `thread_id`.
+6. **Corrupt durable JSON fails closed.** Unreadable authoritative state is not
+   converted to an empty map and overwritten on the next persistence call. The
+   original remains untouched; startup creates `phase3/corrupt-state/<id>/`
+   with a byte-for-byte copy and `RECOVERY.txt` before reporting the failure.
+7. **One owner per durable fact.** ProjectManager owns Project metadata/root;
+   ThreadSessionState owns only thread attachment and its root projection.
+   ActiveWork owns resumable coding digest/goal, not Project scope. ApprovalRecord
+   owns approval identity/status; `_pending_action` is a cache. Durable ToolRuns
+   own execution lifecycle; callback/event queues are delivery projections only.
 
 ### Status
 
-**Implemented:** turn_bound, ToolRun ids, process lock, capabilities `thread_id` bind. **Pending live validation:** Session-switch abort under concurrent streams; capability refresh never canceling another Session’s pending approval (see §H).
+**Implemented:** turn_bound, ToolRun ids, process lock, corrupt-state fail-closed
+loading, capabilities `thread_id` bind. **Pending live validation:** Session-switch
+abort under concurrent streams; capability refresh never canceling another
+Session’s pending approval (see §H).
 
 ---
 
@@ -228,9 +273,76 @@ A pending write approval is valid only when these identities still match:
 
 ### Gap / live risk
 
-Current `_pending_action_matches_execution_context` also compares **objective**, **constraints**, **session_permissions**, and policy flags. Over-strict comparison can cancel a pending write when unrelated Session metadata or permission snapshot drift occurs (e.g. status refresh side effects).  
+`_pending_action_matches_execution_context` now compares stable Session/Project/path,
+origin execution, action/plan, tool, and canonical-arguments identities. Mutable
+objective/mode/capability/permission snapshots remain audit evidence; current
+constraints and action configuration are revalidated directly at execution.
+All filesystem mutations carry source/destination version preconditions. This
+includes write/patch-via-write, delete, move, copy, mkdir, artifact replacement,
+and checkpoint undo. The same precondition is checked once during approval
+consumption and again inside the tool immediately before the filesystem call.
+Directory identities are deterministic and bounded; reparse points, inaccessible
+entries, excessive size, or incomplete scans make the approval non-consumable.
+Approval consumption then freshly validates current policy, permissions,
+Project/root, canonical paths, registered tool inventory, and configuration.
+Approvals created by older versions without a frozen execution identity are
+readable but cannot be consumed; the user must request a fresh proposal.
 
-**Contract required:** narrow match to stable Project/session/path/args-hash identity; document any intentional invalidation. **Pending live validation** that Studio open + capabilities refresh leave pending approvals intact.
+**Implemented in code; pending live validation** that Studio open + capabilities
+refresh leave pending approvals intact and that a concurrent source edit blocks
+the stale write.
+
+### H.0.1 Production-closure approval identity (2026-07)
+
+Every mutation approval also binds:
+
+| Field | Notes |
+|-------|--------|
+| `canonical_arguments_hash` | Exact kwargs identity |
+| `source_precondition.entries[]` | Filesystem content identity (v2) |
+| Freeze fields (`path_basename`, `original_input_sha256`) | Audit aids only — **not** compared for stale-source denial |
+| Video: `document_revision` + `operation_hash` | Timeline identity |
+| Atomic claim | `claim_pending_approval` → `consuming`; second claim fails closed |
+| Video durable re-load | `consume_video_approval` re-fetches ApprovalRecord before status checks so stale client snapshots cannot re-apply |
+
+**Coding named-file pin:** `_explicit_files_named_in_request` + `_file_write_path_allowed_by_request` bind named basenames and exclusions through proposal and pending write; silent retarget to another project file is refused.
+
+**Orchestrator:** `ORCHESTRATION_ENABLED` defaults false. Normal production path is `process_query` only.
+
+**Research handoff:** durable `ResearchArtifact` records (not prose alone) with Project/Session ownership for skill consumption.
+
+**Skill truth:** `skill_status_audit.classify_skill` — prompt-only / blocked skills report `executable=false`.
+
+Regression suites: `tests/test_production_closure.py`, `tests/test_production_closure_lifecycle.py`, `tests/test_coding_fixture_workflow.py`. Disposable restart soak: `scripts/_restart_soak_once.py`.
+
+---
+
+## H.1 Authoritative personal memory
+
+`AgentMemory.records.json` is the durable owner for explicit long-term memory.
+FAISS is a rebuildable retrieval index, `profile.json` is a legacy compatibility
+projection, SessionMemory is a per-Session context cache, and Studio is an API
+projection. None may independently prove that a memory was saved.
+
+An explicit save is acknowledged only after an active record exists with a
+stable ID, owner, scope, normalized content, type, source Session/Turn/Item,
+timestamps, and index state. Account memories remain visible across Projects.
+Index failure leaves the durable record visible as `failed`/`unavailable` rather
+than deleting or hiding it. Corrections supersede the prior semantic preference;
+forgetting tombstones the record, removes or invalidates its index entry, clears
+its profile projection, and removes matching derived Session-cache facts.
+
+Legacy FAISS/profile items are imported once with explicit legacy provenance.
+They are not treated as newly user-confirmed facts.
+
+Thread-pooled agents sharing one memory path use one in-process `AgentMemory`
+owner, serialize canonical record access with a per-store lock, and refresh
+`records.json` before reads and mutations, so one Session cannot persist a stale
+record or vector-index snapshot over another. Account
+memory recall and explicit save/forget are owner-only; public/community adapter
+requests receive neither the owner's durable memory prompt context nor write
+authority. A completed memory-write Item triggers Studio refresh even when a
+correction keeps the active record count unchanged.
 
 ---
 
@@ -277,14 +389,21 @@ Do not mark these “done” because contracts exist.
 | Debt | Why it matters | Direction |
 |------|----------------|-----------|
 | **Structured `ToolOutcome` becomes text** on some planner paths | Planner/UI lose structured success/verification; harder projection | Keep structured outcomes through TaskPlanner → stream → hydrate |
-| **Duplicate search-stack architecture** | Grounder + Stage 3 + LC tool + thinking chrome can still multi-fire | One initiation owner; lifecycle §5 |
+| **Search-stack consolidation** | Production wrappers converge on `_grounded_web_search`; `EchoSearchWorkflow` remains experimental/test-only dead code | Remove the experimental stack or deliberately replace the canonical owner before production use |
 | **Large `core.py` control-plane overlap** | Mode, planner, honesty, search, coding in one module → regressions | Split only after live gates green |
 | **Unbound or direct tool bypasses** | Calls outside `_invoke_authorized_raw_tool` skip approval/path policy | Audit remaining invoke sites; plugins must not mutate externally |
-| **Exact approval-policy revalidation** | Over-strict snapshots cancel valid approvals; under-strict allows scope drift | §H stable identity; revalidate only material fields |
+| **Exact approval-policy revalidation** | Stable identity + current policy recheck are implemented; filesystem and video-timeline actions have version preconditions, while repository self-edit/rollback still lack one coherent HEAD/index/worktree precondition | Add a repository-aware frozen identity before treating self-edit/rollback as covered |
 | **Missing transition tests** | Mode/project/approval transitions not fully covered | Add matrix tests: attach/switch/detach, A/B confirm, Session switch mid-stream |
 | **Windows VSS / File History ToolRun** | Recovery correctly stays `not_checked` but product cannot check yet | Optional adapter later |
-| **Explicit-file write retarget** | `index.html` request → `game.js` write | §F contract; fix + live test |
+| **Explicit-file write retarget browser validation** | Disposable backend fixture passes; the reported browser interaction has not been rerun | §F live browser test |
 | **Equal-access + live multi-provider** | Defaults equal; not fully live-proven | §A live matrix |
+| **Video Editor is foundation-only** | Timeline ops + approvals + store work in unit tests; no real playback, proxies, FFmpeg export, or generation | Finish K-video browser pass first; then playback/proxies/export; generation last |
+| **`self_edit` / `self_rollback` Git preconditions** | Still lack one coherent HEAD/index/worktree freeze | Same as approval revalidation row for repo tools |
+| **Recursive directory mutations** | Cannot be perfectly atomic | Document fail modes; prefer file-level ops |
+| **Generic plugin / direct-tool authority debt** | Paths outside `_invoke_authorized_raw_tool` remain broader | Continue audit |
+| **Authenticated remote media preview tokens** | Secure token-delivery design not finalized | Design before remote asset preview |
+| **Historical zero-message Sessions** | Cannot always distinguish old phantoms from real empty Sessions | Prefer prevent new phantoms; migration optional |
+| **Real VFR / real provider generation / full browser lifecycle** | Not exercised | Product validation later |
 
 ---
 
@@ -304,6 +423,26 @@ Until these pass, release docs stay **pending live validation**:
 10. Pending approval survives Studio open + capabilities refresh on same Session  
 11. Session switch aborts previous stream application  
 
+### K-video — Video Editor foundation browser pass (before any new video feature)
+
+**Do not implement playback/proxies/export/generation until this is green.**
+
+1. Sidebar does **not** create phantom Sessions on ordinary navigation  
+2. Create one real Session; attach a **disposable** Project only  
+3. Open `/app/video` — no silent Session or video document creation  
+4. Explicitly create a video document  
+5. Import a tiny synthetic MP4 under the Project; metadata appears in media bin  
+6. Add a track; insert the clip manually  
+7. Split, trim, move, delete, undo, redo each advance revision correctly  
+8. Ask Echo / use proposal path for one of those ops; **confirm** → exactly one new revision + parent `video_apply_transaction` ToolRun (+ child op runs)  
+9. Refresh: document, timeline, revisions, history hydrate; no live re-animation of tools  
+10. No real user footage / unrelated Project is touched  
+
+**Automated proof today (not a substitute for K-video):**  
+`tests/test_video_editor_foundation.py` (store/ops/approvals path), frontend
+`features/video-editor/types.test.ts` (rational time helpers). Generation
+adapters remain declarations only (`agent/video_editor/adapters.py`).
+
 ---
 
 ## L. Code map (pointer)
@@ -318,8 +457,9 @@ Until these pass, release docs stay **pending live validation**:
 | Utility mode | `mode_controller.py` utility branch |
 | Offered action / claims | `core.py` offered-action + `_remember_assistant_factual_claim` |
 | Placeholders / list→read | `TaskPlanner` inject/validate in `core.py` |
-| Explicit files / gaps | `_files_relevant_to_request`, gap analysis |
-| Approval match | `_pending_action_matches_execution_context` |
+| Explicit files / gaps | bounded named-file path in `_pq_parse_and_preempt`; `_files_relevant_to_request`, gap analysis |
+| Coding readiness | `agent/coding_readiness.py`; `/coding/readiness`; query preflight |
+| Approval match / source precondition | `_pending_action_matches_execution_context`, `_capture_source_precondition` |
 | Process lock | `state.py` `_acquire_phase3_process_lock` |
 | turn_bound | `process_query` stream event |
 

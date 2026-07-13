@@ -127,6 +127,39 @@ class SessionMemoryDistiller:
             "summary_chars": len(state.summary or ""),
         }
 
+    def forget_matching(self, text: str) -> int:
+        """Remove a forgotten account fact from every derived Session cache."""
+        wanted = set(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+        if not wanted:
+            return 0
+        changed = 0
+        root = self.root / "session_memory"
+        for path in root.glob("*.json") if root.exists() else []:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    continue
+                touched = False
+                for key in ("durable_facts", "user_preferences"):
+                    values = list(data.get(key) or [])
+                    kept = []
+                    for value in values:
+                        tokens = set(re.findall(r"[a-z0-9]+", str(value).lower()))
+                        if len(wanted & tokens) >= max(2, min(len(wanted), 4)):
+                            touched = True
+                        else:
+                            kept.append(value)
+                    data[key] = kept
+                if touched:
+                    data["summary"] = ""
+                    temp = path.with_suffix(".json.tmp")
+                    temp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                    os.replace(temp, path)
+                    changed += 1
+            except Exception:
+                continue
+        return changed
+
     def _save(self, state: SessionMemoryState, thread_id: Optional[str]) -> None:
         path = self.path_for(thread_id)
         path.parent.mkdir(parents=True, exist_ok=True)

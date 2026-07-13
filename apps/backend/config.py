@@ -328,7 +328,7 @@ class SoulConfig(BaseModel):
 
 class APIConfig(BaseModel):
     """Configuration for API server."""
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8000
     workers: int = 1
 
@@ -469,7 +469,10 @@ class Config:
         )
 
         self.api = APIConfig(
-            host=os.getenv("API_HOST", "0.0.0.0"),
+            # Local-first must also mean local-only by default. Operators who
+            # intentionally expose EchoSpeak may still set API_HOST=0.0.0.0,
+            # but should pair that with API_AUTH_ENABLED=true.
+            host=os.getenv("API_HOST", "127.0.0.1"),
             port=int(os.getenv("API_PORT", "8000")),
             workers=int(os.getenv("API_WORKERS", "1"))
         )
@@ -570,6 +573,7 @@ class Config:
         self.memory_default_mode = os.getenv("MEMORY_DEFAULT_MODE", "general").strip() or "general"
 
         self.memory_partition_enabled = os.getenv("MEMORY_PARTITION_ENABLED", "false").lower() == "true"
+        self.memory_owner_id = os.getenv("MEMORY_OWNER_ID", "local-owner").strip() or "local-owner"
         self.memory_auto_store_conversations = os.getenv("MEMORY_AUTO_STORE_CONVERSATIONS", "false").lower() == "true"
 
         self.file_memory_enabled = os.getenv("FILE_MEMORY_ENABLED", "false").lower() == "true"
@@ -658,6 +662,9 @@ class Config:
         self.api_auth_enabled = os.getenv("API_AUTH_ENABLED", "false").lower() == "true"
         self.api_auth_key = os.getenv("API_AUTH_KEY", "").strip()
         self.api_auth_localhost_bypass = os.getenv("API_AUTH_LOCALHOST_BYPASS", "true").lower() == "true"
+        # Forwarded client-IP headers are attacker-controlled unless a trusted
+        # reverse proxy strips and rewrites them.
+        self.api_trust_proxy_headers = os.getenv("API_TRUST_PROXY_HEADERS", "false").lower() == "true"
 
         self.skills_dir = os.getenv("SKILLS_DIR", str(SKILLS_DIR)).strip() or str(SKILLS_DIR)
         self.workspaces_dir = os.getenv("WORKSPACES_DIR", str(WORKSPACES_DIR)).strip() or str(WORKSPACES_DIR)
@@ -671,13 +678,15 @@ class Config:
                 self.mcp_servers = {}
         else:
             self.mcp_servers = {}
-        # host = legacy PowerShell/shell on the machine (default until sandbox is proven)
-        # docker|sandbox = isolated container (v7.5); never silent-fallback to host
-        self.terminal_execution_mode = os.getenv("TERMINAL_EXECUTION_MODE", "host").strip().lower()
+        # docker|sandbox is the safe default; host execution requires explicit opt-in.
+        self.terminal_execution_mode = os.getenv("TERMINAL_EXECUTION_MODE", "docker").strip().lower()
         self.terminal_docker_image = os.getenv("TERMINAL_DOCKER_IMAGE", "python:3.12-slim").strip() or "python:3.12-slim"
         self.terminal_docker_memory = os.getenv("TERMINAL_DOCKER_MEMORY", "512m").strip() or "512m"
         self.terminal_docker_cpus = os.getenv("TERMINAL_DOCKER_CPUS", "1.0").strip() or "1.0"
         self.terminal_docker_user = os.getenv("TERMINAL_DOCKER_USER", "65534:65534").strip() or "65534:65534"
+        self.ffprobe_path = os.getenv("VIDEO_FFPROBE_PATH", "ffprobe").strip() or "ffprobe"
+        self.video_ffprobe_timeout_seconds = int(os.getenv("VIDEO_FFPROBE_TIMEOUT_SECONDS", "15") or 15)
+        self.allow_video_agent_edits = os.getenv("ALLOW_VIDEO_AGENT_EDITS", "false").lower() == "true"
         self.skill_curator_interval_minutes = int(os.getenv("SKILL_CURATOR_INTERVAL_MINUTES", "120") or 120)
         raw_notification_channels = os.getenv("NOTIFICATION_CHANNELS", "web")
         self.notification_channels = [
@@ -1166,6 +1175,9 @@ class Config:
             "terminal_docker_memory",
             "terminal_docker_cpus",
             "terminal_docker_user",
+            "ffprobe_path",
+            "video_ffprobe_timeout_seconds",
+            "allow_video_agent_edits",
             "skill_curator_interval_minutes",
         }
 

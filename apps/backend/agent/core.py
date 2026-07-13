@@ -7,6 +7,7 @@ Supports multiple LLM providers: OpenAI, Ollama, LM Studio, LocalAI, llama.cpp, 
 import importlib.util
 import hashlib
 import ast
+import difflib
 from dataclasses import asdict, dataclass, field, replace
 import json
 import os
@@ -304,7 +305,7 @@ from agent.context_budget import (
     estimate_tokens,
     sanitize_untrusted_context,
 )
-from agent.memory import AgentMemory
+from agent.memory import AgentMemory, get_agent_memory
 from agent.research import (
     SearchGrounder,
     format_grounded_tool_output,
@@ -2999,7 +3000,9 @@ class EchoSpeakAgent:
                 logger.info("[Dual-Model] Initialized local research model: {}", config.research_model.model_name)
             except Exception as exc:
                 logger.warning("[Dual-Model] Failed to initialize local research model: {}", exc)
-        self.memory = AgentMemory(memory_path)
+        # Thread-pooled agents share the one canonical in-process memory owner;
+        # per-agent vector-store snapshots could otherwise overwrite each other.
+        self.memory = get_agent_memory(memory_path)
         self.conversation_memory = ConversationMemory()
         self._thread_conversation_memories: Dict[str, ConversationMemory] = {
             "default": self.conversation_memory,
@@ -3097,6 +3100,11 @@ class EchoSpeakAgent:
         self._router: Optional[IntentRouter] = None  # Set after tools are built
         # Populate the global tool registry from the legacy lists (migration bridge)
         ToolRegistry.register_from_metadata(get_available_tools(), TOOL_METADATA)
+        # Video domain tools (ToolRegistry self-register on import)
+        try:
+            import agent.video_editor.tools  # noqa: F401
+        except Exception as video_tools_exc:
+            logger.debug("Video tool registration skipped: {}", video_tools_exc)
 
         # Load MCP dynamic tools via process-wide singleton (Trust Center + agent share state)
         self._mcp_manager = None
@@ -3516,14 +3524,6 @@ class EchoSpeakAgent:
                 previous_state = self._state_store.get_thread_state(self._thread_key())
                 prev_id = str(previous_state.active_project_id or "").strip()
                 next_id = str(project_id).strip()
-                # Switching projects or leaving soft path scope: clear old authority first.
-                if prev_id != next_id and (prev_id or previous_state.project_path or previous_state.pending_approval_id):
-                    self._clear_session_project_scope(
-                        reason="Invalidated because the active Project changed",
-                        stop_preview=True,
-                        clear_active_work=True,
-                    )
-                self._active_project_id = project_id
                 metadata = dict(project.metadata or {})
                 project_path = str(
                     project.workspace_root
@@ -3532,14 +3532,29 @@ class EchoSpeakAgent:
                     or metadata.get("path")
                     or ""
                 ).strip()
+                previous_path = str(previous_state.project_path or "").strip()
+                try:
+                    path_changed = bool(previous_path or project_path) and os.path.normcase(
+                        os.path.abspath(previous_path)
+                    ) != os.path.normcase(os.path.abspath(project_path))
+                except (OSError, ValueError):
+                    path_changed = previous_path != project_path
+                scope_changed = prev_id != next_id or path_changed
+                # ProjectManager owns Project identity/root. A real scope change
+                # invalidates projected session authority; an idempotent refresh
+                # must not discard approvals or retry state.
+                if scope_changed and (prev_id or previous_path or previous_state.pending_approval_id):
+                    self._clear_session_project_scope(
+                        reason="Invalidated because the active Project changed",
+                        stop_preview=True,
+                        clear_active_work=True,
+                    )
+                self._active_project_id = project_id
                 self._state_store.update_thread_state(
                     self._thread_key(),
                     active_project_id=project_id,
                     project_path=project_path,
                     workspace_root=project_path,
-                    pending_approval_id="",
-                    pending_actions=[],
-                    retry_target={},
                 )
                 try:
                     from agent.tools import set_active_project_root
@@ -3588,6 +3603,34 @@ class EchoSpeakAgent:
             )
             if aw_block:
                 parts.append(aw_block)
+        except Exception:
+            pass
+        # Video editor structured context — only on video-relevant Turns.
+        try:
+            package = getattr(self, "_video_turn_package", None)
+            if package is not None and getattr(package, "active", False) and getattr(package, "context_prompt_block", ""):
+                parts.append(sanitize_untrusted_context(str(package.context_prompt_block)))
+        except Exception:
+            pass
+        # Selective durable memory (not Session context; not all records).
+        try:
+            from agent.memory_curator import build_memory_context_for_turn
+
+            decision = getattr(self, "_current_mode_decision", None)
+            _mode_val = getattr(decision, "mode", None)
+            if hasattr(_mode_val, "value"):
+                _mode_val = _mode_val.value
+            mem_block = build_memory_context_for_turn(
+                self.memory,
+                objective=str(getattr(decision, "objective", "") or ""),
+                project_path=str(getattr(getattr(self, "_execution_context", None), "project_path", "") or ""),
+                mode=str(_mode_val or ""),
+                user_intent=str(getattr(decision, "user_text", "") or ""),
+                limit=8,
+                session_id=str(getattr(self, "_current_thread_id", "") or self._thread_key()),
+            )
+            if mem_block:
+                parts.append(mem_block)
         except Exception:
             pass
         execution_context = getattr(self, "_execution_context", None)
@@ -3990,6 +4033,7 @@ class EchoSpeakAgent:
         # Explicit research offers (not generic "let me know if you need anything").
         patterns = [
             r"(?i)\bi (?:can|could|will|would)\s+(?:look up|search|research|check|find out)\b(.{0,160})",
+            r"(?i)\bi (?:can|could|will|would)\s+look\s+(?:that|it)\s+up\b(.{0,160})",
             r"(?i)\bwant me to\s+(?:look up|search|research|check|find)\b(.{0,160})",
             r"(?i)\bwould you like me to\s+(?:look up|search|research|check|find)\b(.{0,160})",
             r"(?i)\bi can (?:pull|get|fetch)\s+(?:the\s+)?(?:latest|current|recent)?\s*(?:predictions?|odds|forecasts?|news|results?)\b(.{0,120})",
@@ -4006,8 +4050,12 @@ class EchoSpeakAgent:
         if not subject:
             return None
         # Prefer previous user subject when offer is vague ("that", "it").
-        if len(subject) < 24 and user_topic:
-            subject = f"{subject} regarding: {user_topic[:200]}"
+        if (len(subject) < 24 or re.search(r"(?i)\b(that|it)\b", subject)) and user_topic:
+            requested = re.search(
+                r"(?i)\b(?:search(?: online| the web)?(?: to see| for)?|look up|find out)\s+(.+)$",
+                user_topic,
+            )
+            subject = str(requested.group(1) if requested else user_topic[:280]).strip(" .!?\t")
         # Normalize "look up what people are predicting right now" style subjects.
         subject = re.sub(r"(?i)^(look up|search(?: the web)?(?: for)?|research|check|find out)\s+", "", subject).strip()
         if len(subject) < 8:
@@ -4221,6 +4269,19 @@ class EchoSpeakAgent:
             decision = replace(decision, verification_required=False, evidence_required=False)
         allowed = allowed_tools_for_mode(decision, self._all_lc_tool_names())
         decision = decision.with_allowed_tools(allowed)
+        # Canonical public-research Turns expose a minimal research inventory so
+        # weak models do not select approval-gated browse/youtube by default.
+        try:
+            decision = self._bind_research_tool_inventory(user_input, decision)
+        except Exception as research_bind_exc:
+            logger.debug("Research inventory bind failed: {}", research_bind_exc)
+        # Video tools/context only on video-relevant Turns (not a separate runtime).
+        try:
+            decision = self._bind_video_turn_to_decision(user_input, decision)
+            allowed = decision.allowed_tool_names
+        except Exception as video_bind_exc:
+            logger.debug("Video turn bind failed: {}", video_bind_exc)
+            self._video_turn_package = None
         profile = execution_profile_for(decision)
         self._current_mode_decision = decision
         self._current_mode_profile = profile
@@ -4237,6 +4298,387 @@ class EchoSpeakAgent:
         except Exception:
             pass
         return decision
+
+    def _bind_research_tool_inventory(self, user_input: str, decision: ModeDecision) -> ModeDecision:
+        """For public research Turns, prefer web_search over unrelated specialized tools.
+
+        Preserves youtube_transcript / browse_task when the user clearly requests them.
+        Does not empty the inventory for non-research modes.
+        """
+        mode_val = str(getattr(getattr(decision, "mode", None), "value", "") or "").lower()
+        if mode_val not in {"task_research", "research"}:
+            # Also tighten when natural-language research is detected in chat.
+            if not re.search(
+                r"(?i)\b(research|look\s+up|search\s+(the\s+)?(web|online)|latest\s+(info|news))\b",
+                user_input or "",
+            ):
+                return decision
+        text = str(user_input or "")
+        low = text.lower()
+        if re.search(
+            r"(?i)\b(local\s+(?:files?|project|sources?)|without\s+search(?:ing)?\s+the\s+web|"
+            r"do\s+not\s+search\s+the\s+web)\b",
+            text,
+        ):
+            # Local-first: keep file tools, drop public search tools.
+            keep = {
+                n
+                for n in (decision.allowed_tool_names or frozenset())
+                if n
+                in {
+                    "file_list",
+                    "file_read",
+                    "project_status",
+                    "system_info",
+                    "get_system_time",
+                    "calculate",
+                }
+            }
+            if keep:
+                return decision.with_allowed_tools(keep)
+            return decision
+
+        want_youtube = bool(re.search(r"(?i)\b(youtube|youtu\.be|transcript\s+of\s+this\s+video)\b", text))
+        want_browse = bool(
+            re.search(r"(?i)\b(browse|open\s+this\s+url|https?://|read\s+this\s+page)\b", text)
+        )
+        want_sports = bool(re.search(r"(?i)\b(score|odds|standings|moneyline|sports)\b", text))
+
+        core = {"web_search", "get_system_time", "calculate", "system_info"}
+        if want_sports:
+            core.add("sports_live")
+        if want_youtube:
+            core.add("youtube_transcript")
+        if want_browse:
+            core.add("browse_task")
+
+        available = set(decision.allowed_tool_names or frozenset()) or set(self._all_lc_tool_names())
+        filtered = available & core
+        # Always keep web_search when present in registry for public research.
+        if "web_search" in available:
+            filtered.add("web_search")
+        if not filtered:
+            return decision
+        return decision.with_allowed_tools(filtered)
+
+    def _bind_video_turn_to_decision(self, user_input: str, decision: ModeDecision) -> ModeDecision:
+        """Attach video tools/context only when Session has a video document or intent.
+
+        Non-video Turns must not receive video_* tools or video prompt material.
+        Does not create a separate video runtime or chat endpoint.
+        """
+        from agent.video_editor.chat_integration import (
+            build_video_turn_package,
+            filter_tools_for_turn,
+            is_video_edit_intent,
+        )
+        from agent.skills_registry import SkillsRegistry
+
+        thread_id = str(getattr(self, "_current_thread_id", "") or "default")
+        project_id = ""
+        try:
+            state = getattr(self, "_execution_context", None) or self._state_store.get_thread_state(thread_id)
+            project_id = str(getattr(state, "active_project_id", "") or "").strip()
+            self._execution_context = state
+        except Exception:
+            state = None
+
+        # Always strip video tools unless this Turn is video-relevant.
+        base_tools = set(decision.allowed_tool_names or self._all_lc_tool_names())
+        intent = is_video_edit_intent(user_input)
+        has_project = bool(project_id)
+
+        if not intent and not has_project:
+            filtered = filter_tools_for_turn(base_tools, video_turn=False)
+            self._video_turn_package = None
+            return decision.with_allowed_tools(filtered)
+
+        # Load canonical manifests (package + bridged video skills).
+        try:
+            SkillsRegistry.refresh()
+            manifests = SkillsRegistry.list_manifests()
+        except Exception:
+            manifests = []
+
+        prior_skill = ""
+        try:
+            from agent.skill_execution import list_skill_executions_for_session
+
+            for rec in list_skill_executions_for_session(thread_id, limit=8):
+                if rec.status.value in {"planned", "running", "pending_approval", "partial", "blocked"}:
+                    prior_skill = rec.skill_id
+                    break
+        except Exception:
+            prior_skill = ""
+
+        # Optional client binding: active document + structured selection/revision.
+        binding = dict(getattr(self, "_video_turn_binding", None) or {})
+        bound_doc = str(binding.get("document_id") or "").strip()
+        bound_selection = None
+        try:
+            raw_sel = binding.get("selection")
+            if isinstance(raw_sel, dict) and raw_sel:
+                from agent.video_editor.models import EditorSelectionContext
+
+                bound_selection = EditorSelectionContext.model_validate(raw_sel)
+        except Exception:
+            bound_selection = None
+
+        package = build_video_turn_package(
+            session_id=thread_id,
+            project_id=project_id,
+            user_text=user_input,
+            document_id=bound_doc,
+            selection=bound_selection,
+            thread_state=state,
+            config=config,
+            skill_manifests=manifests,
+            prior_unfinished_skill_id=prior_skill,
+        )
+        self._video_turn_package = package
+
+        if not package.active:
+            filtered = filter_tools_for_turn(base_tools, video_turn=False)
+            return decision.with_allowed_tools(filtered)
+
+        # Video-relevant Turn: keep full inventory including video tools.
+        filtered = filter_tools_for_turn(base_tools | set(package.allowed_video_tools), video_turn=True)
+        caps = set(decision.required_capabilities or frozenset())
+        caps.add("video_editor")
+        updated = decision.with_allowed_tools(filtered)
+        try:
+            from dataclasses import replace as _replace
+
+            updated = _replace(
+                updated,
+                required_capabilities=frozenset(caps),
+                objective=str(decision.objective or user_input)[:500],
+            )
+        except Exception:
+            pass
+
+        # Persist skill selection identity for this Turn when a skill was chosen.
+        try:
+            sel = package.skill_selection
+            if sel is not None and sel.skill_id and sel.outcome.value == "selected":
+                from agent.skill_execution import create_skill_execution
+                from agent.skill_contract import SkillExecutionStatus
+
+                exec_id = str(getattr(self, "_current_execution_id", "") or "")
+                if exec_id:
+                    create_skill_execution(
+                        execution_id=exec_id,
+                        skill_id=sel.skill_id,
+                        skill_version=sel.skill_version or "1.0.0",
+                        project_id=project_id,
+                        session_id=thread_id,
+                        turn_id=exec_id,
+                        input_context_identity={
+                            "document_id": package.document_id,
+                            "document_revision": (
+                                package.context.document_revision if package.context else None
+                            ),
+                            "selection_outcome": sel.outcome.value,
+                        },
+                        status=SkillExecutionStatus.PLANNED,
+                    )
+        except Exception as exc:
+            logger.debug("Skill execution record create failed: {}", exc)
+
+        # Ensure video_editor package skill prompt is available this Turn.
+        try:
+            self._ensure_video_skill_prompt_active()
+        except Exception:
+            pass
+
+        # Mark deterministic direct-tool eligibility for pre-LLM routing.
+        try:
+            from agent.video_editor.deterministic_ops import is_deterministic_video_intent
+            from dataclasses import replace as _pkg_replace
+
+            if is_deterministic_video_intent(user_input):
+                package = _pkg_replace(package, direct_tool="video_propose_operations")
+                self._video_turn_package = package
+        except Exception:
+            pass
+        return updated
+
+    def _try_deterministic_video_proposal(self, user_input: str) -> Optional[tuple]:
+        """Proposal-only direct routing when args are fully structured (no model tool call).
+
+        Never applies mutations. Returns (response, success) when handled, else None.
+        """
+        package = getattr(self, "_video_turn_package", None)
+        if package is None or not getattr(package, "active", False):
+            return None
+        if str(getattr(package, "direct_tool", "") or "") != "video_propose_operations":
+            return None
+        try:
+            from agent.video_editor.deterministic_ops import build_deterministic_operations
+            from agent.video_editor.models import EditOperation
+            from api.video_editor import ProposalRequest, propose_video_transaction_sync
+        except Exception:
+            return None
+
+        ctx = getattr(package, "context", None)
+        if ctx is None:
+            return None
+        selection = getattr(ctx, "selection", None)
+        clip_ids = list(getattr(selection, "selected_clip_ids", None) or []) if selection else []
+        playhead = getattr(selection, "playhead", None) if selection else None
+        ticks = str(getattr(playhead, "ticks", "") or "") if playhead is not None else ""
+        rev = int(getattr(ctx, "document_revision", 0) or 0)
+        built = build_deterministic_operations(
+            user_text=user_input,
+            document_revision=rev,
+            selected_clip_ids=clip_ids,
+            playhead_ticks=ticks,
+        )
+        if not built.get("ok"):
+            # Fail closed with honest reason — do not invent a proposal.
+            code = str(built.get("error_code") or "validation_failed")
+            reason = str(built.get("reason") or "Cannot derive exact video operation")
+            if code == "missing_selection":
+                response_text = (
+                    "I need a selected clip before I can propose that edit. "
+                    "Select a clip in the Video editor and try again."
+                )
+            elif code == "missing_playhead":
+                response_text = (
+                    "I need the playhead position to split the clip. "
+                    "Position the playhead on the selected clip and try again."
+                )
+            elif code == "not_deterministic":
+                return None  # let model / skill path handle creative work
+            else:
+                response_text = f"I cannot propose that edit yet ({reason})."
+            self._last_tts_text = self._clamp_tts_text(response_text)
+            self._record_turn(user_input, response_text)
+            return response_text, False
+
+        ops = []
+        try:
+            for raw in built.get("operations") or []:
+                ops.append(EditOperation.model_validate(raw))
+        except Exception as exc:
+            response_text = f"Could not build a valid video operation: {exc}"
+            self._last_tts_text = self._clamp_tts_text(response_text)
+            self._record_turn(user_input, response_text)
+            return response_text, False
+
+        session_id = str(package.session_id or self._thread_key())
+        project_id = str(package.project_id or "").strip()
+        if not project_id:
+            try:
+                st = self._state_store.get_thread_state(session_id)
+                project_id = str(getattr(st, "active_project_id", "") or "").strip()
+            except Exception:
+                project_id = ""
+        if not project_id:
+            response_text = (
+                "I cannot propose a video edit because no Project is attached to this Session. "
+                "Attach a Project and try again."
+            )
+            self._last_tts_text = self._clamp_tts_text(response_text)
+            self._record_turn(user_input, response_text)
+            return response_text, False
+
+        # One pending video/coding approval at a time — do not overwrite silently.
+        try:
+            st = self._state_store.get_thread_state(session_id)
+            existing_id = str(getattr(st, "pending_approval_id", "") or "").strip()
+            if existing_id:
+                existing = self._state_store.get_approval(existing_id)
+                if existing is not None and str(getattr(existing, "status", "") or "") == "pending":
+                    response_text = (
+                        f"There is already a pending approval for {existing.tool} "
+                        f"(approval {existing_id[:8]}…). "
+                        "Confirm or cancel it before proposing another video change. "
+                        "Nothing new was proposed."
+                    )
+                    self._last_tts_text = self._clamp_tts_text(response_text)
+                    self._record_turn(user_input, response_text)
+                    return response_text, False
+        except Exception:
+            pass
+
+        # Re-assert Session↔Project binding before proposal (kills stale detach races).
+        try:
+            self._state_store.update_thread_state(
+                session_id,
+                active_project_id=project_id,
+            )
+        except Exception:
+            pass
+
+        try:
+            proposed = propose_video_transaction_sync(
+                str(package.document_id or getattr(ctx, "document_id", "") or ""),
+                ProposalRequest(
+                    session_id=session_id,
+                    project_id=project_id,
+                    objective=str(user_input or "")[:500],
+                    operations=ops,
+                ),
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if "pending approval" in msg.lower():
+                response_text = (
+                    "There is already a pending approval in this Session. "
+                    "Confirm or cancel it before proposing another video change. "
+                    "Nothing new was proposed."
+                )
+            elif "not attached" in msg.lower() or "project" in msg.lower() and "session" in msg.lower():
+                response_text = (
+                    f"I could not create a video proposal (stale Project binding: {msg}). "
+                    "Nothing was applied to the timeline."
+                )
+            else:
+                response_text = (
+                    f"I could not create a video proposal ({msg}). "
+                    "Nothing was applied to the timeline."
+                )
+            self._last_tts_text = self._clamp_tts_text(response_text)
+            self._record_turn(user_input, response_text)
+            return response_text, False
+
+        approval = proposed.get("approval") or {}
+        aid = str(approval.get("id") or "")
+        n_ops = len(ops)
+        response_text = (
+            f"I prepared a proposal for {n_ops} video operation(s) "
+            f"(deterministic route: {built.get('reason')}). "
+            f"Nothing has been applied yet. "
+            f"Approve the pending action to commit a new revision"
+            + (f" (approval {aid[:8]}…)." if aid else ".")
+        )
+        self._last_tts_text = self._clamp_tts_text(response_text)
+        self._record_turn(user_input, response_text)
+        self._add_pipeline_reasoning(
+            "🎬 Deterministic video proposal",
+            f"Mapped intent → video_propose_operations without model tool call. "
+            f"Approval required. tool_run={proposed.get('tool_run_id')}",
+        )
+        return response_text, True
+
+    def _ensure_video_skill_prompt_active(self) -> None:
+        """Load video_editor package skill into active skill defs for this process Turn."""
+        skills_dir = Path(getattr(config, "skills_dir", "") or "").expanduser()
+        skills = load_skills(skills_dir)
+        video_pkg = skills.get("video_editor")
+        if video_pkg is None:
+            return
+        active = list(getattr(self, "_active_skill_defs", []) or [])
+        if any(getattr(s, "id", "") == "video_editor" for s in active):
+            return
+        active.append(video_pkg)
+        self._active_skill_defs = active
+        # Rebuild skills prompt fragment only (full compose happens later).
+        try:
+            self._skills_prompt = build_skills_prompt(active)
+        except Exception:
+            pass
 
     def _ensure_active_work_plan_for_mode(self, user_input: str) -> None:
         # Persist coding intent before any scaffold/write path can run.
@@ -5198,6 +5640,7 @@ class EchoSpeakAgent:
                 or Path(cached_path).resolve() != Path(durable_path).resolve()
             ):
                 from agent.active_work import ActiveWorkState
+                store.clear(self._active_work_thread())
                 return ActiveWorkState(thread_id=self._active_work_thread())
             return cached
         except Exception:
@@ -5291,9 +5734,21 @@ class EchoSpeakAgent:
             )
             if dirs and not any(d in state.files_known for d in dirs):
                 state.files_known = (dirs + state.files_known)[:30]
+            durable = self._state_store.get_thread_state(self._thread_key())
+            authoritative_path = str(durable.project_path or "").strip()
+            if durable.active_project_id and authoritative_path:
+                if os.path.normcase(os.path.abspath(authoritative_path)) != os.path.normcase(os.path.abspath(str(path))):
+                    logger.warning("Refused ActiveWork scan outside the active Project root: {}", path)
+                    return
+                state.project_path = authoritative_path
+                state.project_name = _P(authoritative_path).name
             store.save(state)
             self._state_store.update_thread_state(
-                self._thread_key(), project_path=str(path), workspace_root=str(path), objective=state.goal,
+                self._thread_key(),
+                objective=state.goal,
+                **({} if durable.active_project_id else {
+                    "project_path": str(path), "workspace_root": str(path)
+                }),
             )
             self._last_local_project_path = str(path)
             try:
@@ -5342,10 +5797,18 @@ class EchoSpeakAgent:
                     "implement", has_samples=bool(state.code_digest), goal=state.goal
                 )
             state.last_user_message = str(user_input or "")[:400]
+            durable = self._state_store.get_thread_state(self._thread_key())
+            if durable.active_project_id:
+                durable_path = str(durable.project_path or "").strip()
+                if not durable_path or os.path.normcase(os.path.abspath(durable_path)) != os.path.normcase(os.path.abspath(state.project_path)):
+                    store.clear(self._active_work_thread())
+                    return
             store.save(state)
             self._state_store.update_thread_state(
                 self._thread_key(), objective=state.goal,
-                project_path=state.project_path, workspace_root=state.project_path,
+                **({} if durable.active_project_id else {
+                    "project_path": state.project_path, "workspace_root": state.project_path
+                }),
             )
             # Restore pin + in-memory samples so Stage 4 does not re-list Desktop
             self._hydrate_from_active_work(state)
@@ -5952,7 +6415,7 @@ class EchoSpeakAgent:
 
         # Generate minimal multi-file starter under THIS path only
         try:
-            ctx_win = int(getattr(getattr(config, "local", None), "context_length", 0) or 4096)
+            ctx_win = self._resolve_effective_context_window()
         except Exception:
             ctx_win = 4096
         budget = max(600, min(2200, ctx_win // 2))
@@ -5983,7 +6446,7 @@ class EchoSpeakAgent:
                 msg = f"Could not scaffold {root.name}: {err[:200]}"
             self._last_tts_text = self._clamp_tts_text(msg)
             self._record_turn(user_input, msg)
-            return msg, True
+            return msg, False
 
         sections: Dict[str, str] = {}
         current = ""
@@ -6189,6 +6652,65 @@ class EchoSpeakAgent:
                     if Path(fp).suffix.lower() in {".html", ".css"} and fp not in picked:
                         picked.append(fp)
         return picked or list(files)[:1]
+
+    def _explicit_files_named_in_request(self, user_input: str, files: List[str]) -> List[str]:
+        """Return only files explicitly named by the current request.
+
+        Supporting reads, cached ActiveWork, and feature heuristics must never
+        become mutation targets when the user supplied an exact basename.
+        Explicit exclusions ("do not edit game.js") remove those basenames.
+        """
+        request = str(user_input or "").replace("\\", "/").casefold()
+        excluded: set[str] = set()
+        for m in re.finditer(
+            r"(?i)\b(?:do\s+not|don't|dont|never|without)\s+(?:edit|change|modify|touch|write|update)\s+"
+            r"(?:the\s+)?[`'\"]?([a-z0-9_.-]+\.[a-z0-9]+)[`'\"]?",
+            str(user_input or ""),
+        ):
+            excluded.add(m.group(1).casefold())
+        for m in re.finditer(
+            r"(?i)\b(?:except|excluding|not)\s+[`'\"]?([a-z0-9_.-]+\.[a-z0-9]+)[`'\"]?",
+            str(user_input or ""),
+        ):
+            excluded.add(m.group(1).casefold())
+        named: List[str] = []
+        for file_path in files:
+            basename = Path(file_path).name.casefold()
+            if not basename or basename in excluded:
+                continue
+            # \b allows "index.html." / "index.html," sentence punctuation after the name.
+            if re.search(rf"(?<![\w/\\]){re.escape(basename)}\b", request):
+                named.append(file_path)
+        return named
+
+    def _file_write_path_allowed_by_request(self, user_input: str, path: str, project_files: Optional[List[str]] = None) -> bool:
+        """True when path is allowed as a mutation target for this request."""
+        path_name = Path(str(path or "")).name.casefold()
+        if not path_name:
+            return False
+        low = str(user_input or "").casefold()
+        if re.search(
+            rf"(?i)\b(?:do\s+not|don't|dont|never)\s+(?:edit|change|modify|touch|write|update)\s+"
+            rf"(?:the\s+)?[`'\"]?{re.escape(path_name)}[`'\"]?",
+            str(user_input or ""),
+        ):
+            return False
+        files = list(project_files or [])
+        if files:
+            named = self._explicit_files_named_in_request(user_input, files)
+            if named:
+                allowed = {Path(f).name.casefold() for f in named}
+                return path_name in allowed
+        # No project file list: require basename mention if any filename is mentioned at all
+        mentioned = re.findall(r"(?i)\b([a-z0-9_.-]+\.[a-z0-9]{1,8})\b", str(user_input or ""))
+        if mentioned:
+            names = {m.casefold() for m in mentioned}
+            # If user named files and this path is among them
+            if path_name in names:
+                return True
+            # Path not named but other files were — refuse silent retarget
+            return False
+        return True
 
     def _content_has_unresolved_edit_markers(self, content: str) -> bool:
         """True when body still contains raw SEARCH/REPLACE or conflict chrome."""
@@ -6481,20 +7003,6 @@ class EchoSpeakAgent:
                     break
 
         if not read_contents:
-            try:
-                from agent.tools import file_read
-
-                for fp in files:
-                    try:
-                        read_contents[fp] = self._strip_tool_file_body(
-                            str(file_read.invoke({"path": fp}) or "")
-                        )
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        if not read_contents:
             # Empty new project path → scaffold, never write into a wrong old project
             if not files:
                 return self._scaffold_new_project_plan(user_input, project, callbacks)
@@ -6551,9 +7059,26 @@ class EchoSpeakAgent:
             self._record_turn(user_input, msg)
             return msg, True
 
-        target_files: List[str] = list(gaps.get("target_files") or [])
+        # Current-request explicit filenames are an immutable target pin. This
+        # override intentionally runs after gap analysis so supporting files
+        # read during inspection cannot steal the eventual write target.
+        pool = list(dict.fromkeys(list(read_contents.keys()) + list(gaps.get("target_files") or [])))
+        explicit_target_files = self._explicit_files_named_in_request(user_input, pool)
+        target_files: List[str] = explicit_target_files or list(gaps.get("target_files") or [])
         if not target_files:
             target_files = self._files_relevant_to_request(user_input, list(read_contents.keys()))[:2]
+        # Drop excluded / non-named files when the user named at least one target.
+        if explicit_target_files:
+            target_files = [fp for fp in target_files if Path(fp).name.casefold() in {
+                Path(x).name.casefold() for x in explicit_target_files
+            }]
+        # Final pin: never keep a write target the user forbade.
+        target_files = [
+            fp for fp in target_files
+            if self._file_write_path_allowed_by_request(user_input, fp, pool or list(read_contents.keys()))
+        ]
+        if not target_files and explicit_target_files:
+            target_files = list(explicit_target_files)
 
         # ── Phase B: adaptive apply (only files that need work) ──
         base = [dict(t) for t in self._task_planner.pending_tasks]
@@ -6602,7 +7127,7 @@ class EchoSpeakAgent:
 
         # Compact edit prompt — small context models (4k) cannot take full triple-file dumps
         try:
-            ctx_win = int(getattr(getattr(config, "local", None), "context_length", 0) or 0)
+            ctx_win = self._resolve_effective_context_window()
         except Exception:
             ctx_win = 0
         if ctx_win <= 0:
@@ -6697,13 +7222,24 @@ class EchoSpeakAgent:
             sections = {Path(target_files[0]).name: llm_out or ""}
 
         new_by_path: Dict[str, str] = {}
+        allowed_names = {Path(fp).name.casefold() for fp in target_files}
+        # Drop model sections for files outside the pin (e.g. game.js when user said index.html).
+        sections = {
+            k: v for k, v in sections.items()
+            if Path(str(k)).name.casefold() in allowed_names or not allowed_names
+        }
         for fp in target_files:
+            if not self._file_write_path_allowed_by_request(
+                user_input, fp, list(read_contents.keys())
+            ):
+                logger.warning("Blocked write retarget away from named file: {}", Path(fp).name)
+                continue
             original = self._strip_tool_file_body(read_contents.get(fp) or "")
             name = Path(fp).name
             section = sections.get(name) or sections.get(name.lower()) or ""
             if not section.strip():
                 for k, v in sections.items():
-                    if k.lower() == name.lower() or name.lower() in k.lower():
+                    if k.lower() == name.lower():
                         section = v
                         break
             if not section.strip():
@@ -6777,7 +7313,7 @@ class EchoSpeakAgent:
                     self._task_planner._emit_task_step(t, "failed", "No edit produced")
             self._last_tts_text = self._clamp_tts_text(brief)
             self._record_turn(user_input, brief)
-            return brief, True
+            return brief, False
 
         # Fill write task contents; mark unchanged files done
         for t in self._task_planner.pending_tasks:
@@ -6838,10 +7374,18 @@ class EchoSpeakAgent:
             self._note_active_work_after_turn(user_input, summary)
         except Exception:
             pass
+        terminal_plan_tasks = [
+            task for task in list(self._task_planner.pending_tasks)
+            if isinstance(task, dict)
+        ]
+        plan_success = bool(parts) and bool(terminal_plan_tasks) and all(
+            str(task.get("status") or "").lower() in {"complete", "completed", "done"}
+            for task in terminal_plan_tasks
+        )
         self._task_planner.reset()
         self._last_tts_text = self._clamp_tts_text(summary)
         self._record_turn(user_input, summary)
-        return summary, True
+        return summary, plan_success
 
     def _ensure_coding_loop(self, user_input: str = "") -> None:
         """Start or resume a coding loop when in coding workspace / coding intent."""
@@ -6930,28 +7474,46 @@ class EchoSpeakAgent:
             path = m.group(1).strip()
         elif name.startswith("file_") and raw_in and len(raw_in) < 260 and "\n" not in raw_in:
             path = raw_in.strip().strip("'\"")
-        # Pin project root when mkdir / write hits Desktop/<project>
+        # Pin project root when mkdir / write hits Desktop/<project>. Once a
+        # Project is attached, ProjectManager owns this root and callback text
+        # cannot re-scope the Session.
         if path and name in {"file_mkdir", "file_write", "file_read", "file_list"}:
             try:
                 from agent.tools import set_active_project_root
 
-                norm = path.replace("\\", "/")
-                mproj = re.search(r"(?i)(desktop/[^/]+)", norm)
-                if mproj:
-                    proj = mproj.group(1)
-                    set_active_project_root(proj)
-                    try:
-                        loop.state.project_folder = proj
-                    except Exception:
-                        pass
-                elif name == "file_mkdir" and "desktop" in norm.lower():
-                    set_active_project_root(norm)
-                    try:
-                        loop.state.project_folder = norm
-                    except Exception:
-                        pass
-                elif loop and str(getattr(loop.state, "project_folder", "") or "").strip():
-                    set_active_project_root(str(loop.state.project_folder))
+                thread_state = self._state_store.get_thread_state(self._thread_key())
+                active_project_id = str(thread_state.active_project_id or "").strip()
+                if active_project_id:
+                    from agent.projects import get_project_manager
+
+                    project_record = get_project_manager().get_project(active_project_id)
+                    project_root = str(
+                        getattr(project_record, "workspace_root", "") or ""
+                    ).strip()
+                    if project_root:
+                        set_active_project_root(project_root)
+                        try:
+                            loop.state.project_folder = project_root
+                        except Exception:
+                            pass
+                else:
+                    norm = path.replace("\\", "/")
+                    mproj = re.search(r"(?i)(desktop/[^/]+)", norm)
+                    if mproj:
+                        proj = mproj.group(1)
+                        set_active_project_root(proj)
+                        try:
+                            loop.state.project_folder = proj
+                        except Exception:
+                            pass
+                    elif name == "file_mkdir" and "desktop" in norm.lower():
+                        set_active_project_root(norm)
+                        try:
+                            loop.state.project_folder = norm
+                        except Exception:
+                            pass
+                    elif loop and str(getattr(loop.state, "project_folder", "") or "").strip():
+                        set_active_project_root(str(loop.state.project_folder))
             except Exception as exc:
                 logger.debug("set_active_project_root: {}", exc)
         if name == "terminal_run" and callable(parse_terminal_status_block):
@@ -7353,46 +7915,369 @@ class EchoSpeakAgent:
             )
         return text
 
+    def _durable_pending_mutation(self) -> Optional[Dict[str, Any]]:
+        """In-memory pending action or durable ApprovalRecord for a mutating tool."""
+        pending = getattr(self, "_pending_action", None)
+        if isinstance(pending, dict) and str(pending.get("tool") or ""):
+            return pending
+        try:
+            rec = self._state_store.get_pending_approval(self._thread_key())
+            if rec is not None and str(getattr(rec, "status", "") or "") == "pending":
+                return {
+                    "tool": str(getattr(rec, "tool", "") or ""),
+                    "kwargs": dict(getattr(rec, "kwargs", None) or {}),
+                    "approval_id": str(getattr(rec, "id", "") or ""),
+                }
+        except Exception:
+            pass
+        return None
+
+    def _user_requested_file_mutation(self, user_input: str) -> bool:
+        """True when the user clearly asked for a durable file mutation (not inspect-only)."""
+        text = str(user_input or "")
+        if not text.strip():
+            return False
+        # Explicit non-mutation / example / research / quote requests — never promote.
+        if re.search(
+            r"(?i)\b("
+            r"do\s+not\s+(change|edit|touch|modify|write|save)\b|"
+            r"don'?t\s+(change|edit|touch|modify|write|save)\b|"
+            r"fix\s+nothing|"
+            r"without\s+(changing|editing|modifying)|"
+            r"just\s+(explain|show|include|describe)|"
+            r"inspect\s+only|"
+            r"read[\s-]?only|"
+            r"show\s+me\s+an?\s+example|"
+            r"example\s+(html|code|page|snippet)|"
+            r"how\s+(?:i\s+)?could\s+(change|edit|update)|"
+            r"how\s+would\s+(?:i|you)\s+(change|edit)|"
+            r"research\b|"
+            r"quoted?\s+(?:html|code|from)|"
+            r"from\s+someone\s+else|"
+            r"sample\s+code|"
+            r"documentation|"
+            r"include\s+the\s+corrected\s+code"
+            r")",
+            text,
+        ):
+            return False
+        # "just include the corrected code" without apply intent
+        if re.search(r"(?i)\binclude\b.+\bcode\b", text) and not re.search(
+            r"(?i)\b(apply|save|write|update|change|edit)\b", text
+        ):
+            return False
+        files = re.findall(
+            r"(?i)\b((?:[\w./\\-]+/)?[\w.-]+\.(?:html?|js|jsx|ts|tsx|css|py|md|json|txt))\b",
+            text,
+        )
+        # Exactly one target file required for promotion eligibility at request level.
+        # "Change index.html, not game.js" still has two names — resolve via exclusion later.
+        has_edit = bool(
+            re.search(
+                r"(?i)\b(change|edit|fix|update|modify|rewrite|patch|tweak|set\s+the\s+title|"
+                r"rename|delete|create|write|apply)\b",
+                text,
+            )
+        )
+        if not has_edit:
+            return False
+        if not files:
+            # Ambiguous "update it" without a file name — not eligible for promotion
+            return False
+        return True
+
+    def _prose_promotion_coding_mode_active(self) -> bool:
+        decision = getattr(self, "_current_mode_decision", None)
+        mode = str(getattr(getattr(decision, "mode", None), "value", "") or "").lower()
+        if mode in {"coding", "task_coding", "code"}:
+            return True
+        # Mode enums may use TurnMode.CODING
+        mode_name = str(getattr(getattr(decision, "mode", None), "name", "") or "").lower()
+        return mode_name in {"coding", "task_coding"}
+
+    def _prose_promotion_project_attached(self) -> bool:
+        try:
+            pid = str(getattr(self, "_active_project_id", None) or "").strip()
+            if not pid:
+                st = self._state_store.get_thread_state(self._thread_key())
+                pid = str(getattr(st, "active_project_id", "") or "").strip()
+            return bool(pid)
+        except Exception:
+            return False
+
+    def _named_mutation_targets(self, user_input: str) -> list[str]:
+        """File basenames named as mutation targets (exclusions removed)."""
+        text = str(user_input or "")
+        all_files = re.findall(
+            r"(?i)\b((?:[\w./\\-]+/)?[\w.-]+\.(?:html?|js|jsx|ts|tsx|css|py|md|json|txt))\b",
+            text,
+        )
+        if not all_files:
+            return []
+        excluded: set[str] = set()
+        for m in re.finditer(
+            r"(?i)(?:do\s+not|don'?t|not)\s+(?:edit|touch|change|modify|update)\s+"
+            r"((?:[\w./\\-]+/)?[\w.-]+\.(?:html?|js|jsx|ts|tsx|css|py|md|json|txt))",
+            text,
+        ):
+            excluded.add(Path(m.group(1)).name.lower())
+        # "change X, not Y"
+        for m in re.finditer(
+            r"(?i),\s*not\s+((?:[\w./\\-]+/)?[\w.-]+\.(?:html?|js|jsx|ts|tsx|css|py|md|json|txt))",
+            text,
+        ):
+            excluded.add(Path(m.group(1)).name.lower())
+        targets = []
+        for f in all_files:
+            base = Path(f).name.lower()
+            if base in excluded:
+                continue
+            if base not in targets:
+                targets.append(base)
+        return targets
+
+    def _extract_prose_file_body(self, response_text: str) -> str:
+        """Pull a complete-file candidate from model output (not examples/docs)."""
+        text = str(response_text or "")
+        low = text.lower()
+        # Reject obvious non-apply framing around the block
+        if re.search(
+            r"(?i)\b(for\s+example|example\s*:|here\s+is\s+an?\s+example|"
+            r"sample\s+code|documentation|as\s+an?\s+illustration|"
+            r"you\s+could\s+write|might\s+look\s+like|"
+            r"quoted?\s+from|someone\s+else)\b",
+            low,
+        ):
+            return ""
+        fenced = re.search(
+            r"```(?:html|htm|css|js|javascript|typescript|json|python|py|markdown|md|txt)?\s*\n([\s\S]+?)```",
+            text,
+            re.IGNORECASE,
+        )
+        if fenced:
+            body = fenced.group(1).strip()
+            # Truncation / incomplete markers
+            if re.search(r"(?i)\b(truncated|snip|\.\.\.|…|TODO|FIXME)\b", body) and len(body) < 80:
+                return ""
+            if len(body) >= 20:
+                return body
+        # Bare HTML document dump only when it looks complete
+        bare = re.search(r"(<!DOCTYPE\s+html[\s\S]+</html\s*>)", text, re.IGNORECASE)
+        if bare and len(bare.group(1).strip()) >= 40:
+            return bare.group(1).strip()
+        return ""
+
+    def _file_inspected_this_turn(self, path_obj: Path) -> bool:
+        """True if file_read succeeded this Turn for this path basename."""
+        base = path_obj.name.lower()
+        try:
+            eid = str(getattr(self, "_current_execution_id", "") or "")
+            if not eid:
+                return False
+            for run in self._state_store.list_tool_runs(eid) or []:
+                if str(getattr(run, "tool_name", "") or "") != "file_read":
+                    continue
+                st = str(getattr(run, "status", "") or "").lower()
+                oc = run.outcome if isinstance(getattr(run, "outcome", None), dict) else {}
+                if st not in {"complete", "completed", "success"} and oc.get("success") is not True:
+                    continue
+                args = dict(getattr(run, "canonical_arguments", None) or {})
+                p = str(args.get("path") or args.get("file_path") or "")
+                if Path(p).name.lower() == base:
+                    return True
+        except Exception:
+            pass
+        # Tools-succeeded set without path detail — still require explicit name match via partials
+        try:
+            for name, payload in (getattr(self, "_partial_tool_inputs", None) or {}).items():
+                if "file_read" not in str(name):
+                    continue
+                if isinstance(payload, dict):
+                    p = str(payload.get("path") or "")
+                    if Path(p).name.lower() == base:
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _try_promote_prose_to_file_write_proposal(
+        self, user_input: str, response_text: str
+    ) -> Optional[str]:
+        """Promote complete-file prose to a pending file_write only under a strict contract.
+
+        Never a generic "code block means write it" path. Creates at most one pending
+        approval; never mutates disk. Final prose must say the change is not applied.
+        """
+        # --- Safety contract (all must hold) ---
+        if not self._user_requested_file_mutation(user_input):
+            return None
+        if not self._prose_promotion_coding_mode_active():
+            return None
+        if not self._prose_promotion_project_attached():
+            return None
+        if self._durable_pending_mutation():
+            return None
+        mutators = {
+            "file_write", "file_delete", "file_move", "file_copy", "file_mkdir",
+            "artifact_write", "terminal_run", "notepad_write",
+        }
+        if self._tools_succeeded_this_turn() & mutators:
+            return None
+
+        targets = self._named_mutation_targets(user_input)
+        if len(targets) != 1:
+            return None  # ambiguous multi-file or only exclusions
+
+        body = self._extract_prose_file_body(response_text)
+        if not body:
+            return None
+        if self._content_has_unresolved_edit_markers(body):
+            return None
+
+        filename = targets[0]
+        try:
+            path = self._normalize_coding_file_path(filename)
+        except Exception:
+            path = filename
+        path_obj = Path(path)
+        if not path_obj.is_absolute():
+            try:
+                from agent.tools import get_active_project_root
+
+                root = get_active_project_root()
+                if root is not None:
+                    path_obj = (root / Path(filename).name).resolve()
+            except Exception:
+                pass
+        if not path_obj.exists():
+            return None
+
+        # Target must be inspected this Turn (source-bound) — no blind overwrite of unread files.
+        if not self._file_inspected_this_turn(path_obj):
+            return None
+
+        try:
+            current = path_obj.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        if current.strip() == body.strip():
+            return None
+        # Reject unrelated wholesale replacements that barely share structure
+        if path_obj.suffix.lower() in {".html", ".htm"}:
+            if "<" not in body or not re.search(r"(?i)</?(html|head|body|title)", body):
+                return None
+        try:
+            if not self._file_write_path_allowed_by_request(user_input, str(path_obj)):
+                return None
+        except Exception:
+            return None
+        if not self._action_allowed("file_write", {"path": str(path_obj), "content": body}):
+            return None
+        try:
+            import difflib
+            import hashlib
+
+            source_hash = hashlib.sha256(current.encode("utf-8", errors="replace")).hexdigest()
+            diff_preview = "\n".join(
+                difflib.unified_diff(
+                    current.splitlines(),
+                    body.splitlines(),
+                    fromfile=f"a/{path_obj.name}",
+                    tofile=f"b/{path_obj.name}",
+                    lineterm="",
+                    n=3,
+                )
+            )[:12000]
+            if not diff_preview.strip():
+                return None
+            pending_action = {
+                "tool": "file_write",
+                "kwargs": {"path": str(path_obj), "content": body},
+                "original_input": user_input,
+                "diff_preview": diff_preview,
+                "prose_promotion": True,
+                "source_hash_at_promotion": source_hash,
+            }
+            self._set_pending_action(pending_action, diff_preview, user_input)
+            return (
+                f"I prepared an edit for {path_obj.name} ({len(body)} chars) from the model output. "
+                "The file has NOT been saved yet. Reply 'confirm' to write it or 'cancel' to discard."
+            )
+        except Exception as exc:
+            logger.debug("prose→proposal promotion rejected: {}", exc)
+            return None
+
     def _ensure_mutation_claim_honesty(self, user_input: str, response_text: str) -> str:
         """Mutation verbs in final prose require a successful mutating ToolRun this Turn."""
         text = str(response_text or "").strip()
         if not text:
             return text
         low = text.lower()
+        mutators = {
+            "file_write", "file_delete", "file_move", "file_copy", "file_mkdir",
+            "artifact_write", "terminal_run", "notepad_write",
+        }
+        durable = self._durable_pending_mutation()
+        durable_tool = str((durable or {}).get("tool") or "")
         # Empty / non-action confirmations ("Proceeding." with no write/approval)
         if re.fullmatch(r"(?i)\s*(proceeding\.?|okay\.?|sure\.?|on it\.?|got it\.?)\s*", text):
-            mutators = {
-                "file_write", "file_delete", "file_move", "file_mkdir",
-                "artifact_write", "terminal_run",
-            }
-            if not (self._tools_succeeded_this_turn() & mutators) and not getattr(
-                self, "_pending_action", None
-            ):
+            if not (self._tools_succeeded_this_turn() & mutators) and not durable:
                 return (
                     "I acknowledged the request, but no durable write or approval action was executed this Turn. "
                     "Please restate what to change so I can prepare a concrete edit for confirmation."
                 )
         claims_mutation = bool(
             re.search(
-                r"\b("
+                r"(?i)\b("
                 r"i(?:'ve| have)?\s+(?:added|changed|updated|fixed|created|deleted|renamed|"
                 r"implemented|edited|modified|wrote|saved|patched)|"
-                r"(?:successfully\s+)?(?:added|changed|updated|fixed|created|deleted|edited|modified)\b"
+                r"(?:successfully\s+)?(?:added|changed|updated|fixed|created|deleted|edited|modified)\b|"
+                r"the\s+(?:title|file|content|page)\s+(?:has\s+been|was)\s+(?:changed|updated|modified|set)|"
+                r"changes?\s+made\s+to\b|"
+                r"modified\s+[`'\"\w./\\-]"
                 r")",
                 low,
             )
         )
+        # Full-file dumps after an edit request imply the model is claiming the new content is applied.
+        if not claims_mutation and self._user_requested_file_mutation(user_input):
+            if self._extract_prose_file_body(text) or re.search(
+                r"(?i)<!doctype\s+html>|<title>[^<]+</title>", text
+            ):
+                claims_mutation = True
+        # Clear edit request with neither claim nor proposal → still must not leave silent success prose.
+        if not claims_mutation and self._user_requested_file_mutation(user_input):
+            succeeded_early = self._tools_succeeded_this_turn()
+            if not (succeeded_early & mutators) and not durable:
+                # Try to promote prose body first (below path after claims_mutation block)
+                promoted = self._try_promote_prose_to_file_write_proposal(user_input, text)
+                if promoted:
+                    return promoted
+                # Honest non-completion: no durable proposal was created.
+                if re.search(r"(?i)\b(updated|changed|modified|fixed|wrote|saved)\b", low) or len(text) > 80:
+                    # Only rewrite if response looks like it finished the task without authority.
+                    if not re.search(
+                        r"(?i)\b(not been saved|confirm|approval|prepared an edit|which file|"
+                        r"need a path|cannot|can't|blocked)\b",
+                        low,
+                    ):
+                        return (
+                            "I understood the edit request, but I did not create a durable write proposal "
+                            "or approval this Turn. Restate the change (file + desired content) so I can "
+                            "prepare a confirmable edit."
+                        )
+            return text
         if not claims_mutation:
             return text
-        mutators = {
-            "file_write", "file_delete", "file_move", "file_copy", "file_mkdir",
-            "artifact_write", "terminal_run", "notepad_write",
-        }
+        # Prefer promoting prose file bodies to a real pending approval before honesty rewrite.
+        promoted = self._try_promote_prose_to_file_write_proposal(user_input, text)
+        if promoted:
+            return promoted
         succeeded = self._tools_succeeded_this_turn()
-        pending = bool(getattr(self, "_pending_action", None))
+        pending = bool(durable) and durable_tool in mutators
         if succeeded & mutators:
             return text
-        if pending and str((getattr(self, "_pending_action", None) or {}).get("tool") or "") in mutators:
+        if pending:
             # Proposed but not applied — rewrite overconfident claims
             return (
                 re.sub(
@@ -7425,7 +8310,7 @@ class EchoSpeakAgent:
             )
         return (
             "I have not completed a verified file modification this Turn. "
-            "No successful write ToolRun was recorded, so I will not claim the change was applied."
+            "No successful write ToolRun or pending approval was recorded, so I will not claim the change was applied."
         )
 
     def _ensure_research_evidence_honesty(
@@ -7437,22 +8322,46 @@ class EchoSpeakAgent:
     ) -> str:
         """Research/sports turns must not invent facts without current-Turn ToolRun evidence."""
         decision = mode_decision or getattr(self, "_current_mode_decision", None)
-        if decision is None:
-            return response_text
-        mode_name = str(getattr(getattr(decision, "mode", None), "value", "") or "").lower()
-        reason = str(getattr(decision, "reason", "") or "")
-        needs_evidence = (
-            mode_name in {"task_research", "research"}
-            or bool(getattr(decision, "evidence_required", False))
-            or bool(getattr(decision, "verification_required", False))
-            or "referential double-check" in reason
-            or "research" in reason
+        mode_name = str(getattr(getattr(decision, "mode", None), "value", "") or "").lower() if decision else ""
+        reason = str(getattr(decision, "reason", "") or "") if decision else ""
+        user_low = str(user_input or "").lower()
+        local_first = bool(
+            re.search(
+                r"(?i)\b(local\s+(?:files?|project|sources?)|without\s+search(?:ing)?\s+the\s+web|"
+                r"do\s+not\s+search\s+the\s+web|use\s+local\s+(?:material|files?)\s+first)\b",
+                user_input or "",
+            )
         )
-        if not needs_evidence:
+        # Public research from mode OR natural-language research request.
+        researchish = (
+            mode_name in {"task_research", "research"}
+            or "referential double-check" in reason
+            or (
+                "research" in reason
+                and "local" not in reason
+                and "inspect" not in reason
+            )
+            or bool(
+                re.search(
+                    r"(?i)\b(research|look\s+up|search\s+(the\s+)?(web|online|public)|"
+                    r"latest\s+(info|information|news)|find\s+(sources?|citations?))\b",
+                    user_input or "",
+                )
+            )
+        )
+        if not researchish or local_first:
             return response_text
         if reason.startswith("utility tool request"):
             return response_text
-        research_tools = {"web_search", "sports_live", "browse_task"}
+        # Canonical public research evidence is web_search (or sports_live for scores).
+        # browse_task / youtube_transcript alone do not complete ordinary public research.
+        canonical_research_tools = {"web_search", "sports_live"}
+        specialized_ok = set()
+        if re.search(r"(?i)\b(youtube|youtu\.be)\b", user_input or ""):
+            specialized_ok.add("youtube_transcript")
+        if re.search(r"(?i)\b(https?://|browse|read\s+this\s+page)\b", user_input or ""):
+            specialized_ok.add("browse_task")
+        research_tools = canonical_research_tools | specialized_ok
         succeeded = self._tools_succeeded_this_turn()
         if succeeded & research_tools:
             return response_text
@@ -7461,7 +8370,8 @@ class EchoSpeakAgent:
             eid = str(getattr(self, "_current_execution_id", "") or "")
             if eid:
                 for run in self._state_store.list_tool_runs(eid) or []:
-                    if str(run.tool_name or "") not in research_tools:
+                    name = str(run.tool_name or "")
+                    if name not in research_tools:
                         continue
                     st = str(getattr(run, "status", "") or "").lower()
                     oc = run.outcome if isinstance(getattr(run, "outcome", None), dict) else {}
@@ -7473,9 +8383,28 @@ class EchoSpeakAgent:
         if isinstance(last, dict) and last.get("accepted"):
             # In-memory only is insufficient if no durable ToolRun — still require ToolRun
             pass
+        # One bounded structured retry when public research was requested but no ToolRun landed
+        # (includes wrong-tool selection such as youtube_transcript without a YouTube ask).
+        if not getattr(self, "_research_structured_retry_used", False):
+            try:
+                self._research_structured_retry_used = True
+                recovered = self._bounded_research_structured_retry(
+                    user_input, str(response_text or "")
+                )
+                if recovered is not None:
+                    if self._tools_succeeded_this_turn() & canonical_research_tools:
+                        return recovered
+                    if is_grounded_search_output(recovered) and "SEARCH_EVIDENCE_INSUFFICIENT" not in str(
+                        recovered or ""
+                    ):
+                        return recovered
+            except Exception:
+                pass
+        # Fluent unsupported summary is not allowed.
         return (
-            "I could not record usable search evidence for this Turn, so I cannot verify "
-            "the result yet. Please ask me to search again and I will retry with a live tool call."
+            "I could not complete verified public research this Turn: no successful web_search "
+            "(or equivalent research ToolRun) was recorded, so I will not present an unsupported summary. "
+            "Retry the research request, or switch to local-only sources explicitly."
         )
 
     def _clamp_discord_casual_reply(self, user_input: str, response_text: str) -> str:
@@ -7755,6 +8684,15 @@ class EchoSpeakAgent:
         }
         if name in project_tools:
             return True
+        # Video tools are only available when the current Turn bound a video package.
+        if str(name).startswith("video_"):
+            package = getattr(self, "_video_turn_package", None)
+            if package is None or not getattr(package, "active", False):
+                return False
+            allowed_video = set(getattr(package, "allowed_video_tools", None) or [])
+            if allowed_video and name not in allowed_video:
+                return False
+            return True
         allowlist = self._tool_allowlist_override
         if allowlist is None:
             return True
@@ -7960,13 +8898,26 @@ class EchoSpeakAgent:
 
         # Common weak-model prose wrappers: "Action: file_write(...)", "call_tool: web_search ..."
         for match in re.finditer(
-            r"(?:Action|call_tool|run_tool|invoke_tool)\s*:\s*((?:%s)\b.*)" % "|".join(sorted(map(re.escape, allowed))),
+            r"(?:Action|call_tool|run_tool|invoke_tool|invoke|call|run)\s*(?:tool)?\s*[:\s]\s*((?:%s)\b.*)"
+            % "|".join(sorted(map(re.escape, allowed))),
             text,
             flags=re.IGNORECASE | re.DOTALL,
         ):
             body = match.group(1).strip()
             candidates.extend(_extract_function_calls(body))
             candidates.append(body)
+        # OpenAI-style / Gemma-style name+arguments objects
+        for match in re.finditer(
+            r"\{\s*[\"']?(?:name|tool|action)[\"']?\s*:\s*[\"']((?:%s))[\"']\s*,\s*[\"']?(?:arguments|args|parameters|input)[\"']?\s*:\s*(\{[\s\S]*?\})\s*\}"
+            % "|".join(sorted(map(re.escape, allowed))),
+            text,
+            flags=re.IGNORECASE,
+        ):
+            candidates.append(
+                json.dumps({"action": match.group(1), "arguments": match.group(2)})
+                if False
+                else f'{{"action":"{match.group(1)}","arguments":{match.group(2)}}}'
+            )
 
         for match in re.finditer(r"<\|tool_call\|?>(.*?)(?:<\|/tool_call\|?>|$)", text, flags=re.IGNORECASE | re.DOTALL):
             body = match.group(1).strip()
@@ -8182,10 +9133,81 @@ class EchoSpeakAgent:
         except Exception:
             pass
 
+    def _user_wants_public_research(self, user_input: str) -> bool:
+        if re.search(
+            r"(?i)\b(local\s+(?:files?|project|sources?)|without\s+search(?:ing)?\s+the\s+web|"
+            r"do\s+not\s+search\s+the\s+web|use\s+local\s+(?:material|files?)\s+first)\b",
+            user_input or "",
+        ):
+            return False
+        return bool(
+            re.search(
+                r"(?i)\b(research|look\s+up|search\s+(the\s+)?(web|online|public)|"
+                r"latest\s+(info|information|news)|find\s+(sources?|citations?))\b",
+                user_input or "",
+            )
+        )
+
+    def _bounded_research_structured_retry(self, user_input: str, response_text: str) -> Optional[str]:
+        """One bounded research recovery when native/printed tool call is malformed.
+
+        Does not invent success: only runs web_search with a validated query derived
+        from the user request (or recovered tool payload), then returns grounded output.
+        """
+        if not self._user_wants_public_research(user_input):
+            return None
+        # Already have a successful canonical research ToolRun this Turn — do not double-fire.
+        if self._tools_succeeded_this_turn() & {"web_search", "sports_live"}:
+            return None
+        q = ""
+        # Prefer query recovered from tool-shaped text even if full parse failed.
+        m = re.search(
+            r"(?i)\b(?:query|q|search|keywords|topic|subject)\s*[=:]\s*[\"']?([^\"'\n]{3,200})",
+            response_text or "",
+        )
+        if m:
+            q = m.group(1).strip().rstrip(".,;")
+        if not q:
+            try:
+                q = str(self._extract_search_query(user_input) or "").strip()
+            except Exception:
+                q = ""
+        if not q:
+            q = re.sub(r"(?i)^\s*(research|look\s+up|search\s+for)\s+", "", str(user_input or "")).strip()
+        if len(q) < 3:
+            return None
+        try:
+            grounded = self._grounded_web_search(
+                q,
+                original_request=user_input or q,
+                emit_tool_events=True,
+            )
+        except Exception as exc:
+            logger.debug("bounded research retry failed: {}", exc)
+            return (
+                "I could not complete verified public research this Turn: the research tool call "
+                f"failed after a structured retry ({exc}). I will not invent sources."
+            )
+        if is_grounded_search_output(grounded) and "SEARCH_EVIDENCE_INSUFFICIENT" in str(grounded or ""):
+            return (
+                "I ran a structured web_search retry from the malformed tool-shaped output, "
+                "but the evidence was insufficient. I will not invent a sourced summary."
+            )
+        if grounded and str(grounded).strip():
+            return str(grounded)
+        return (
+            "I attempted a structured research retry after a malformed tool call, "
+            "but no usable search evidence was recorded."
+        )
+
     def _handle_printed_tool_directive(self, response_text: str, user_input: str) -> Optional[str]:
         data = self._parse_printed_tool_directive(response_text)
         toolish = self._looks_like_raw_tool_syntax(response_text)
         if data is None and toolish:
+            # One bounded structured research recovery before failing closed.
+            recovered = self._bounded_research_structured_retry(user_input, response_text)
+            if recovered is not None:
+                return recovered
             # parse already records unrecognized when it saw toolish markers;
             # also cover expanded patterns that only this detector knows about.
             self._record_tool_syntax_telemetry(
@@ -11356,23 +12378,26 @@ class EchoSpeakAgent:
 
         Priority:
           1. llm_trim_max_tokens (explicit runtime trim window)
-          2. config.local.context_length (configured model limit)
-          3. profile.context_limit when it came from explicit config/override
+          2. profile.context_limit when it came from explicit config/override
+          3. config.local.context_length for local providers only
           4. universal safe fallback (not a local-vs-hosted guess)
         """
-        local_cfg = getattr(config, "local", None)
         trim = int(getattr(config, "llm_trim_max_tokens", 0) or 0)
         if trim > 0:
             return max(2048, trim)
-        ctx_len = int(getattr(local_cfg, "context_length", 0) or 0)
-        if ctx_len > 0:
-            return max(2048, ctx_len)
         profile = getattr(self, "_active_model_profile", None)
         # Only trust profile.context_limit when metadata explicitly set it
         # (registry / preferred_model_profile / process_query injection).
         meta = getattr(profile, "metadata", None) or {}
         if isinstance(meta, dict) and meta.get("context_limit"):
             return max(2048, int(meta.get("context_limit") or 0))
+        # The local runtime's configured window is real only for local providers;
+        # it must never clamp an unrelated hosted model.
+        if str(getattr(self.llm_provider, "value", self.llm_provider) or "").lower() not in {"openai", "gemini"}:
+            local_cfg = getattr(config, "local", None)
+            ctx_len = int(getattr(local_cfg, "context_length", 0) or 0)
+            if ctx_len > 0:
+                return max(2048, ctx_len)
         profile_limit = int(getattr(profile, "context_limit", 0) or 0)
         # Profile defaults are universal now; use as last real-ish value before fallback.
         if profile_limit > 0:
@@ -12345,9 +13370,13 @@ class EchoSpeakAgent:
             max_tokens = 0
         if max_tokens > 0:
             return max_tokens
-        # Same rule for local and hosted: use configured context_length when set.
+        # A local provider may use its configured physical context length. Hosted
+        # providers need an explicit global trim or model-profile limit instead.
         try:
-            context_len = int(getattr(config.local, "context_length", 0) or 0)
+            is_local_provider = str(
+                getattr(self.llm_provider, "value", self.llm_provider) or ""
+            ).lower() not in {"openai", "gemini"}
+            context_len = int(getattr(config.local, "context_length", 0) or 0) if is_local_provider else 0
         except Exception:
             context_len = 0
         try:
@@ -12644,35 +13673,17 @@ class EchoSpeakAgent:
                 self.memory.add_conversation(
                     clean_user_input, response_text, mode=mode_val, thread_id=thread_val
                 )
-            # Deterministic regex-based profile extraction — captures facts like
-            # "im memo not max" → user_name="memo", friend="max" immediately,
-            # without needing an extra LLM call.
-            try:
-                self.memory.update_profile_from_text(clean_user_input)
-            except Exception:
-                pass
-            # Save durable facts (names, relations, explicit "remember" payloads) as
-            # searchable curated memory items so they surface in FAISS retrieval too.
-            try:
-                curated = self.memory.curated_lines_from_text(clean_user_input)
-                for line in curated:
-                    self.memory.add_memory_item(
-                        line,
-                        memory_type="note",
-                        pinned=False,
-                        mode=mode_val,
-                        thread_id=thread_val,
-                        source="curated",
-                        project_path=(
-                            str(self._execution_context.project_path or "")
-                            if getattr(getattr(self, "_current_mode_decision", None), "mode", None) == TurnMode.CODING
-                            else ""
-                        ),
-                    )
-            except Exception:
-                pass
+            # Durable memory only via MemoryCurator (LLM rewrite + runtime validate).
+            # Do not dual-write raw curated_lines_from_text into FAISS — that bypassed
+            # semantic rewriting, sensitivity gates, and confirmation policy.
             if not explicit_remember_payload:
                 self._maybe_extract_typed_memories(clean_user_input, response_text, mode=mode_val, thread_id=thread_val)
+                # Profile projection may still learn non-durable display facts after
+                # curator reflection; never treat profile alone as memory_write.
+                try:
+                    self.memory.update_profile_from_text(clean_user_input)
+                except Exception:
+                    pass
 
         # Ephemeral conversation context — saved only for user-facing chat turns
         if _record_visible_chat:
@@ -12743,6 +13754,7 @@ class EchoSpeakAgent:
             pass
 
     def _memory_write_policy_prompt(self, user_input: str, response_text: str) -> str:
+        # Kept for compatibility; MemoryCurator owns the primary reflection path.
         return (
             "You are a long-term memory curator for EchoSpeak. "
             "Given the latest user message and assistant reply, decide whether to save durable memory items. "
@@ -12769,66 +13781,58 @@ class EchoSpeakAgent:
         if not bool(getattr(config, "memory_importance_enabled", True)):
             return
         project_path = str(getattr(self._execution_context, "project_path", "") or "")
-
-        # Heuristic gate: don't spend an extra LLM call on every turn.
-        try:
-            if not bool(self.memory.importance_should_save(user_input)):
-                # Still allow explicit assistant phrasing like "I'll remember" to be captured.
-                low_resp = str(response_text or "").lower()
-                if "i'll remember" not in low_resp and "i will remember" not in low_resp:
-                    return
-        except Exception:
-            pass
+        origin_execution_id = str(self._current_execution_id or "")
 
         def _do_extract():
             try:
-                prompt = self._memory_write_policy_prompt(user_input, response_text)
-                raw = self.llm_wrapper.invoke(prompt)
-                text = str(raw or "").strip()
-                m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-                if not m:
-                    return
-                data = json.loads(m.group(0))
-                if not isinstance(data, dict):
-                    return
-                items = data.get("items")
-                if not isinstance(items, list) or not items:
-                    return
-                # Limit save burst per turn.
-                saved = 0
-                for it in items[:3]:
-                    if not isinstance(it, dict):
-                        continue
-                    t = str(it.get("text") or "").strip()
-                    if not t:
-                        continue
-                    mt = str(it.get("type") or "note").strip().lower() or "note"
-                    pinned = bool(it.get("pinned") is True)
+                from agent.memory_curator import MemoryCurator
+
+                user_name = ""
+                try:
+                    user_name = str((self.memory._profile or {}).get("user_name") or "")
+                except Exception:
+                    user_name = ""
+                llm_fn = None
+                try:
+                    # Only invoke LLM when heuristic says it may be worth it
+                    if bool(self.memory.importance_should_save(user_input)) or re.search(
+                        r"(?i)\b(prefer|always|never|from now on|usually|favorite|workflow|testing)\b",
+                        str(user_input or ""),
+                    ):
+                        llm_fn = lambda p: str(self.llm_wrapper.invoke(p) or "")
+                except Exception:
+                    llm_fn = None
+                curator = MemoryCurator(self.memory, llm_invoke=llm_fn)
+                result = curator.reflect_after_turn(
+                    user_text=user_input,
+                    response_text=response_text,
+                    session_id=str(thread_id or self._thread_key()),
+                    execution_id=origin_execution_id,
+                    project_path=project_path,
+                    user_name=user_name,
+                    mode=mode,
+                )
+                for mid, cand in zip(result.persisted_ids, result.accepted):
                     try:
-                        mid = self.memory.add_memory_item(
-                            t,
-                            memory_type=mt,
-                            pinned=pinned,
-                            mode=mode,
-                            thread_id=thread_id,
-                            source="policy",
-                            project_path=project_path,
+                        self._state_store.add_item(
+                            turn_id=origin_execution_id,
+                            item_type="memory_write",
+                            status="complete",
+                            payload={
+                                "memory_id": mid,
+                                "scope": cand.scope,
+                                "memory_type": cand.type,
+                                "text": cand.text,
+                                "explicit": False,
+                                "source": "curator_reflection",
+                            },
+                            session_id=str(thread_id or self._thread_key()),
+                            project_id=str(getattr(self._execution_context, "active_project_id", "") or ""),
                         )
-                        if mid:
-                            saved += 1
-                            # Update the profile store for profile/contacts items so
-                            # deterministic profile recall works immediately.
-                            if mt in {"profile", "contacts"}:
-                                try:
-                                    self.memory.update_profile_from_text(t)
-                                except Exception:
-                                    pass
                     except Exception:
-                        continue
-                if saved > 0:
-                    logger.info("Asynchronously extracted and saved {} typed memories", saved)
+                        pass
             except Exception as exc:
-                logger.warning(f"Async memory extraction background execution failed: {exc}")
+                logger.debug("Memory curator reflection failed: {}", exc)
 
         if getattr(config, "memory_extraction_async", True):
             import threading
@@ -13276,6 +14280,7 @@ class EchoSpeakAgent:
         # File system — can leak secrets (.env, credentials, code)
         "file_read", "file_list", "file_write", "file_move", "file_copy",
         "file_delete", "file_mkdir", "artifact_write",
+        "video_apply_transaction",
         # Terminal — arbitrary code execution
         "terminal_run",
         # System info — reveals host details
@@ -13302,6 +14307,7 @@ class EchoSpeakAgent:
         "terminal_run",
         # Self-modification — only owner should touch code
         "self_edit", "self_rollback",
+        "video_apply_transaction",
         # Desktop/screen — controls owner's machine
         "desktop_click", "desktop_type_text", "desktop_activate_window",
         "desktop_send_hotkey", "open_chrome", "open_application", "notepad_write",
@@ -13408,6 +14414,10 @@ class EchoSpeakAgent:
             )
         if tool_name == "terminal_run":
             return bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_terminal_commands", False))
+        if tool_name in {"email_send", "email_reply"}:
+            return bool(getattr(config, "allow_email", False))
+        if tool_name == "whatsapp_send":
+            return bool(getattr(config, "allow_whatsapp", False))
         if tool_name in {"self_edit", "self_rollback", "self_git_status", "self_read", "self_grep", "self_list"}:
             return bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_self_modification", False))
         entry = ToolRegistry.get(tool_name)
@@ -13417,7 +14427,32 @@ class EchoSpeakAgent:
             return True
         if tool_name == "project_status":
             return True  # Safe read-only tool, always allowed
+        # Registry policy flags are the configuration authority for extension
+        # actions. Flagless action plugins remain explicit system-action opt-in.
+        if entry is not None and entry.is_action:
+            return bool(
+                self._tool_policy_flags_satisfied(tool_name)
+                and (entry.policy_flags or getattr(config, "enable_system_actions", False))
+            )
         return False
+
+    def _current_action_authority_allows(self, tool_name: str) -> bool:
+        """Fresh non-identity authority check for approval consumption."""
+        name = str(tool_name or "").strip()
+        if not name or ToolRegistry.get(name) is None:
+            return False
+        if name not in self._registered_tool_names():
+            return False
+        if self._is_tool_role_blocked(name):
+            return False
+        allowed = set(getattr(self._execution_context, "allowed_tool_names", []) or [])
+        if name not in allowed:
+            return False
+        if not self._constraints_allow_tool(name, approved=True):
+            return False
+        if self._is_action_tool(name) and not self._action_configured(name):
+            return False
+        return True
 
     def _action_allowed(
         self,
@@ -13425,6 +14460,8 @@ class EchoSpeakAgent:
         kwargs: Optional[Dict[str, Any]] = None,
         approved_action: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        if tool_name not in self._registered_tool_names() or ToolRegistry.get(tool_name) is None:
+            return False
         approved = self._approved_action_matches(tool_name, kwargs, approved_action)
         # Planning and inspection are enforced read-only capabilities. An exact,
         # still-valid approval may resume the frozen action, but cannot broaden it.
@@ -13447,6 +14484,17 @@ class EchoSpeakAgent:
     def _thread_key(self, thread_id: Optional[str] = None) -> str:
         value = str(thread_id or getattr(self, "_current_thread_id", "default") or "default").strip()
         return value or "default"
+
+    def _owner_memory_access_allowed(self) -> bool:
+        """Whether the current request may read or mutate account memory."""
+        try:
+            from config import DiscordUserRole
+
+            role = getattr(self, "_current_user_role", None)
+            return role is None or role == DiscordUserRole.OWNER
+        except Exception:
+            # Ownership ambiguity must never expose account memory.
+            return False
 
     def select_thread_runtime(self, thread_id: Optional[str]) -> str:
         """Select only thread-keyed ephemeral buffers; durable scope comes from StateStore."""
@@ -13484,8 +14532,10 @@ class EchoSpeakAgent:
             "open_application": bool(getattr(config, "allow_open_application", False)),
             "open_chrome": bool(getattr(config, "allow_open_chrome", False)),
             "email": bool(getattr(config, "allow_email", False)),
+            "whatsapp": bool(getattr(config, "allow_whatsapp", False)),
             "discord_bot": bool(getattr(config, "allow_discord_bot", False)),
             "self_modification": bool(getattr(config, "allow_self_modification", False)),
+            "video_agent_edits": bool(getattr(config, "allow_video_agent_edits", False)),
         }
 
     def project_scope_report(self, thread_id: Optional[str] = None) -> dict[str, Any]:
@@ -13582,6 +14632,7 @@ class EchoSpeakAgent:
     def _set_pending_action(self, pending: Dict[str, Any], preview: str, user_input: str) -> Dict[str, Any]:
         pending_payload = dict(pending or {})
         tool_name = str(pending_payload.get("tool") or "").strip()
+        original_input = str(pending_payload.get("original_input") or user_input or "")
         # Rewrite bare coding paths (index.html → Desktop/<project>/index.html)
         try:
             kw = dict(pending_payload.get("kwargs") or {})
@@ -13593,11 +14644,20 @@ class EchoSpeakAgent:
                     kw["src"] = self._normalize_coding_file_path(str(kw.get("src")))
                 if kw.get("dst"):
                     kw["dst"] = self._normalize_coding_file_path(str(kw.get("dst")))
+            # Named-file pin: refuse write approvals that retarget off the user's file.
+            if tool_name == "file_write" and kw.get("path"):
+                if not self._file_write_path_allowed_by_request(original_input, str(kw.get("path"))):
+                    raise ValueError(
+                        f"approval_invalid: write path {Path(str(kw.get('path'))).name} "
+                        f"is not the file named in the user request"
+                    )
             pending_payload["kwargs"] = kw
             # Refresh preview if path was rewritten
-            if tool_name == "file_write" and kw.get("path"):
+            if tool_name == "file_write" and kw.get("path") and not pending_payload.get("diff_preview"):
                 content = kw.get("content") or ""
                 preview = f"Write {len(str(content))} chars to file: {kw.get('path')}"
+        except ValueError:
+            raise
         except Exception:
             pass
         canonical_kwargs = self._canonicalize_tool_arguments(
@@ -13609,6 +14669,15 @@ class EchoSpeakAgent:
         arguments_hash = hashlib.sha256(
             json.dumps(canonical_kwargs, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         ).hexdigest()
+        source_precondition = self._capture_source_precondition(tool_name, canonical_kwargs)
+        # Freeze identity fields used at consumption time
+        source_precondition = {
+            **dict(source_precondition or {}),
+            "version": int((source_precondition or {}).get("version") or 1),
+            "tool": tool_name,
+            "path_basename": Path(str(canonical_kwargs.get("path") or "")).name,
+            "original_input_sha256": hashlib.sha256(original_input.encode("utf-8")).hexdigest()[:32],
+        }
         pending_payload.update({"action_id": action_id, "plan_id": plan_id})
         risk_level, policy_flags = self._approval_risk_metadata(tool_name)
         approval = self._state_store.create_approval(
@@ -13633,6 +14702,7 @@ class EchoSpeakAgent:
                 "allowed_tool_names": list(self._execution_context.allowed_tool_names or []),
                 "required_flags": list(TOOL_METADATA.get(tool_name, {}).get("policy_flags", []) or []),
             },
+            source_precondition=source_precondition,
             dry_run_available=self._approval_dry_run_available(tool_name),
             source=str(getattr(self, "_current_source", None) or "web"),
             workspace_id=str(self._workspace_id or ""),
@@ -13650,6 +14720,7 @@ class EchoSpeakAgent:
                 "arguments_hash": arguments_hash,
                 "action_id": action_id,
                 "plan_id": plan_id,
+                "origin_execution_id": str(self._current_execution_id or ""),
                 "allowed_tool_names": list(self._execution_context.allowed_tool_names or []),
                 "permissions": dict(self._execution_context.permissions or {}),
             },
@@ -13682,11 +14753,86 @@ class EchoSpeakAgent:
             execution_status="needs_permission",
             pending_actions=[
                 *(self._execution_context.pending_actions or []),
-                {"tool": tool_name, "summary": self._format_pending_action(pending_payload), "status": "needs_permission"},
+                {"tool": tool_name, "summary": self._format_pending_action(pending_payload),
+                 "status": "needs_permission", "execution_id": str(self._current_execution_id or "")},
             ],
             safest_next_action=f"Wait for approval of {tool_name}",
         )
         return pending_payload
+
+    def _path_version(self, target: Path, *, argument: str) -> Dict[str, Any]:
+        """Content identity for an approval-bound filesystem path."""
+        from agent.tools import _mutation_path_version
+        return _mutation_path_version(target, argument)
+
+    def _capture_source_precondition(self, tool_name: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Snapshot every source/destination whose mutation semantics depend on current state."""
+        name = str(tool_name or "")
+        path_args = {
+            "file_write": ("path",),
+            "file_delete": ("path",),
+            "file_move": ("src", "dst"),
+            "file_copy": ("src", "dst"),
+            "file_mkdir": ("path",),
+        }.get(name, ())
+        entries: list[Dict[str, Any]] = []
+        if path_args:
+            from agent.tools import _safe_file_path
+            for argument in path_args:
+                raw_path = str((kwargs or {}).get(argument) or "").strip()
+                target = _safe_file_path(raw_path)
+                if target is None:
+                    raise ValueError(f"Cannot bind approval to out-of-scope {argument}: {raw_path}")
+                entries.append(self._path_version(target, argument=argument))
+        elif name in {"artifact_write", "notepad_write"}:
+            from agent.tools import _artifacts_root, _safe_artifact_filename
+            target = _artifacts_root() / _safe_artifact_filename((kwargs or {}).get("filename"))
+            entries.append(self._path_version(target, argument="filename"))
+        elif name == "checkpoint_undo":
+            from agent.checkpoints import get_last_checkpoint
+            context = self._execution_context
+            entry = get_last_checkpoint(self._thread_key(), str(context.project_path or context.workspace_root or ""))
+            if entry is None:
+                return {"version": 2, "checkpoint": None, "entries": []}
+            for argument in ("original_path", "backup_path"):
+                entries.append(self._path_version(Path(str(entry.get(argument) or "")), argument=argument))
+            return {
+                "version": 2,
+                "checkpoint": {key: entry.get(key) for key in ("timestamp", "original_path", "backup_path")},
+                "entries": entries,
+            }
+        if not entries:
+            return {}
+        return {"version": 2, "entries": entries}
+
+    def _source_precondition_matches(self, approval: Any) -> bool:
+        precondition = dict(getattr(approval, "source_precondition", None) or {})
+        if not precondition:
+            return True
+        try:
+            if int(precondition.get("version") or 1) >= 2:
+                current = self._capture_source_precondition(
+                    str(getattr(approval, "tool", "") or ""), dict(getattr(approval, "kwargs", None) or {})
+                )
+                # Compare content identity entries only. Approval freeze metadata
+                # (path_basename, original_input_sha256, tool) must not invalidate
+                # an unchanged file — those fields are identity aids, not source hashes.
+                return json.dumps(current.get("entries") or [], sort_keys=True, separators=(",", ":")) == json.dumps(
+                    precondition.get("entries") or [], sort_keys=True, separators=(",", ":")
+                )
+            # Backward-compatible validation for approvals created before v2.
+            target = Path(str(precondition.get("path") or "")).expanduser().resolve(strict=False)
+            expected_exists = bool(precondition.get("exists"))
+            if target.exists() != expected_exists:
+                return False
+            if not expected_exists:
+                return True
+            if not target.is_file():
+                return False
+            current_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+            return current_hash == str(precondition.get("sha256") or "")
+        except (OSError, ValueError):
+            return False
 
     def _canonicalize_tool_arguments(self, tool_name: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Return schema-validated arguments used for action identity and execution."""
@@ -13788,25 +14934,39 @@ class EchoSpeakAgent:
             return response, False
         if str(target.get("workspace_root") or "").strip() != str(context.workspace_root or "").strip():
             return "I did not retry because this thread's workspace scope changed.", False
-        if str(target.get("workspace_id") or "").strip() != str(context.workspace_id or "").strip():
-            return "I did not retry because the active workspace changed.", False
         if str(target.get("active_project_id") or "").strip() != str(context.active_project_id or "").strip():
             return "I did not retry because the active project identity changed.", False
-        if list(target.get("constraints") or []) != list(context.constraints or []):
-            return "I did not retry because the user constraints changed.", False
-        if dict(target.get("permissions") or {}) != self._session_permissions_snapshot():
-            return "I did not retry because action permissions changed.", False
-        if sorted(target.get("policy_flags") or []) != sorted(self._approval_risk_metadata(tool_name)[1]):
-            return "I did not retry because the tool policy changed.", False
-        current_hash = hashlib.sha256(
-            json.dumps(kwargs, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-        ).hexdigest()
+        try:
+            kwargs = self._canonicalize_tool_arguments(tool_name, kwargs)
+        except Exception:
+            return "I did not retry because the saved tool arguments are no longer valid.", False
+        current_hash = hashlib.sha256(json.dumps(
+            kwargs, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")).hexdigest()
         if str(target.get("arguments_hash") or "") != current_hash:
             return "I did not retry because the exact tool arguments changed.", False
+        if bool(target.get("requires_regeneration")) or str(target.get("error_code") or "") == "corrupted_write_content":
+            self._execution_context = self._state_store.update_thread_state(
+                self._thread_key(), execution_status="blocked",
+                safest_next_action="Regenerate the proposal without unresolved edit markers",
+            )
+            return (
+                f"I did not rerun the identical {tool_name} action because its content still contains "
+                "unresolved SEARCH/REPLACE or conflict markers. Regenerate a clean proposal first.",
+                False,
+            )
         tool = next((item for item in self.tools if str(getattr(item, "name", "")) == tool_name), None)
         if tool is None:
             response = f"I cannot retry {tool_name} because that tool is no longer available."
             return response, False
+        # Mutable permission, policy, inventory, mode, and user constraints are
+        # current authority, never retry identity.
+        if not self._tool_allowed(tool_name):
+            return f"The same {tool_name} action is not allowed in the current turn context. Nothing ran.", False
+        if not self._constraints_allow_tool(tool_name, approved=False):
+            return f"The same {tool_name} action is blocked by a current user constraint. Nothing ran.", False
+        if self._is_action_tool(tool_name) and not self._action_configured(tool_name):
+            return f"The same {tool_name} action is blocked by current configuration. Nothing ran.", False
 
         retry_count = int(target.get("retry_count") or 0) + 1
         target["retry_count"] = retry_count
@@ -13871,7 +15031,9 @@ class EchoSpeakAgent:
     def _pending_action_matches_execution_context(self, pending: Dict[str, Any]) -> bool:
         snapshot = dict(pending.get("execution_context") or {})
         if not snapshot:
-            return True
+            # ApprovalRecord is authoritative. Legacy/in-memory pending payloads
+            # without frozen identity must be re-prepared, never consumed.
+            return False
         current = self._execution_context
         approval_id = str(pending.get("approval_id") or "").strip()
         approval = self._state_store.get_approval(approval_id) if approval_id else None
@@ -13884,25 +15046,60 @@ class EchoSpeakAgent:
             return False
         if str(pending.get("plan_id") or "") != str(approval.plan_id or ""):
             return False
+        if str(approval.thread_id or "") != str(current.thread_id or ""):
+            return False
+        if str(approval.session_id or "") != str(current.session_id or current.thread_id or ""):
+            return False
+        if str(approval.project_id or "") != str(current.active_project_id or ""):
+            return False
+        if str(approval.active_project_id or "") != str(current.active_project_id or ""):
+            return False
+        # ProjectManager is the metadata/root authority. Re-read it at the
+        # consumption boundary rather than trusting ThreadSessionState's cache.
+        current_project_id = str(current.active_project_id or "").strip()
+        if current_project_id:
+            try:
+                from agent.projects import get_project_manager
+                project = get_project_manager().get_project(current_project_id)
+                metadata = dict(getattr(project, "metadata", None) or {}) if project is not None else {}
+                project_root = str(
+                    getattr(project, "workspace_root", "")
+                    or metadata.get("project_path")
+                    or metadata.get("workspace_root")
+                    or metadata.get("path")
+                    or ""
+                ).strip()
+                if project is None or not project_root or os.path.normcase(os.path.abspath(project_root)) != os.path.normcase(
+                    os.path.abspath(str(current.project_path or current.workspace_root or ""))
+                ):
+                    return False
+            except Exception:
+                return False
+        origin_execution_id = str(snapshot.get("origin_execution_id") or "").strip()
+        if origin_execution_id and origin_execution_id != str(approval.execution_id or ""):
+            return False
         if str(snapshot.get("thread_id") or "") != current.thread_id:
             return False
         snap_project = str(snapshot.get("project_path") or "").strip()
-        if snap_project and snap_project != str(current.project_path or "").strip():
-            return False
+        if snap_project:
+            try:
+                if os.path.normcase(os.path.abspath(snap_project)) != os.path.normcase(
+                    os.path.abspath(str(current.project_path or "").strip())
+                ):
+                    return False
+            except (OSError, ValueError):
+                return False
         snap_workspace = str(snapshot.get("workspace_root") or "").strip()
-        if snap_workspace and snap_workspace != str(current.workspace_root or "").strip():
-            return False
-        snap_workspace_id = str(snapshot.get("workspace_id") or "").strip()
-        if snap_workspace_id and snap_workspace_id != str(current.workspace_id or "").strip():
-            return False
+        if snap_workspace:
+            try:
+                if os.path.normcase(os.path.abspath(snap_workspace)) != os.path.normcase(
+                    os.path.abspath(str(current.workspace_root or "").strip())
+                ):
+                    return False
+            except (OSError, ValueError):
+                return False
         snap_project_id = str(snapshot.get("active_project_id") or "").strip()
         if snap_project_id and snap_project_id != str(current.active_project_id or "").strip():
-            return False
-        snap_objective = str(snapshot.get("objective") or "").strip()
-        if snap_objective and snap_objective != str(current.objective or "").strip():
-            return False
-        snap_constraints = list(snapshot.get("constraints") or [])
-        if snap_constraints and snap_constraints != list(current.constraints or []):
             return False
         snap_tool = str(snapshot.get("tool") or "").strip()
         if snap_tool and snap_tool != str(pending.get("tool") or "").strip():
@@ -13920,19 +15117,31 @@ class EchoSpeakAgent:
             ).hexdigest()
             if args_hash != current_hash:
                 return False
-        # Strict snapshot semantics: any permission or relevant policy change
-        # requires a new action identity and fresh user confirmation.
-        if dict(approval.session_permissions or {}) != self._session_permissions_snapshot():
+        if not self._current_action_authority_allows(str(pending.get("tool") or "")):
             return False
-        current_risk, current_flags = self._approval_risk_metadata(str(pending.get("tool") or ""))
-        if sorted(approval.policy_flags or []) != sorted(current_flags):
+        if not self._source_precondition_matches(approval):
             return False
-        if str(approval.risk_level or "") != str(current_risk or ""):
+        # Frozen path basename: reject if pending kwargs drifted to another file.
+        precondition = dict(getattr(approval, "source_precondition", None) or {})
+        frozen_base = str(precondition.get("path_basename") or "").casefold()
+        if frozen_base and str(pending.get("tool") or "") in {"file_write", "file_read", "file_delete"}:
+            current_base = Path(str((pending.get("kwargs") or {}).get("path") or "")).name.casefold()
+            if current_base and current_base != frozen_base:
+                return False
+        # Session / Project identity on the ApprovalRecord itself
+        if str(getattr(approval, "session_id", "") or "") and str(approval.session_id) != str(current.thread_id or ""):
             return False
-        if list(approval.constraints or []) != list(current.constraints or []):
+        if str(getattr(approval, "project_id", "") or "") and str(approval.project_id) != str(
+            current.active_project_id or ""
+        ):
             return False
-        if sorted(approval.required_capabilities or []) != sorted(current.required_capabilities or []):
+        if str(getattr(approval, "active_project_id", "") or "") and str(approval.active_project_id) != str(
+            current.active_project_id or ""
+        ):
             return False
+        # Mutable policy/permission snapshots are audit evidence, not action
+        # identity. Revalidate the current authority directly instead of
+        # canceling an unchanged action because metadata was refreshed.
         if not self._constraints_allow_tool(str(pending.get("tool") or ""), approved=True):
             return False
         return True
@@ -13943,7 +15152,9 @@ class EchoSpeakAgent:
         if target_workspace != (self._workspace_id or None):
             self.configure_workspace(target_workspace)
         target_project = str(state.active_project_id or "").strip() or None
-        if target_project and target_project != (getattr(self, "_active_project_id", None) or None):
+        if target_project:
+            # Re-read ProjectManager on every synchronization; ThreadSessionState
+            # is only the thread attachment/projection, never Project metadata.
             self.activate_project(target_project)
         elif not target_project:
             self._active_project_id = None
@@ -14051,8 +15262,9 @@ class EchoSpeakAgent:
                 respect_turn_mode=False,
             )
         )
-        if pending_tool and self._state_store.get_pending_approval(self._thread_key()) is not None:
-            allowed.add(pending_tool)
+        # Do not re-add a tool merely because an ApprovalRecord exists. The
+        # confirmation Turn must independently expose it through the freshly
+        # calculated executable inventory.
         project_path = str(decision.active_project_path or context.project_path or "").strip()
         workspace_root = str(project_path or context.workspace_root or "").strip()
         pending_actions = list(context.pending_actions or [])
@@ -14274,9 +15486,16 @@ class EchoSpeakAgent:
                 self._last_trace_id = trace_id
             except Exception:
                 trace_id = None
+        # Re-read after the pipeline: approval creation may have changed this
+        # execution since the entry snapshot was taken.
+        existing = self._state_store.get_execution(execution_id) or existing
         status = "completed" if success else "failed"
         success_value: Optional[bool] = bool(success)
-        if existing is not None and str(existing.status or "") == "pending_approval" and success:
+        pending_for_turn = next((
+            approval for approval in self._state_store.list_approvals(thread_id=self._thread_key(), limit=100)
+            if str(approval.execution_id or "") == execution_id and approval.status == "pending"
+        ), None)
+        if pending_for_turn is not None:
             status = "pending_approval"
             success_value = None
         try:
@@ -14316,6 +15535,11 @@ class EchoSpeakAgent:
             turn_runs = list(self._state_store.list_tool_runs(execution_id) or [])
         except Exception:
             turn_runs = []
+        tools_used = list(dict.fromkeys(
+            str(run.tool_name or "") for run in turn_runs
+            if str(run.tool_name or "").strip() not in {"", "unknown", "tool"}
+            and str(run.status or "").lower() not in {"cancelled", "canceled", "interrupted"}
+        ))
         # Only truly non-terminal statuses count as still running.
         _terminal = {
             "complete", "completed", "success", "failed", "error",
@@ -14568,7 +15792,29 @@ class EchoSpeakAgent:
             else:
                 execution_status = "complete"
                 next_action = "Await the next user request"
-        project_path = str(tool_context.get("project_root") or thread_context.project_path or "").strip()
+        # ProjectManager is the sole owner of an attached Project's root. A
+        # request-local tool context is only an execution projection and may be
+        # repinned by legacy coding callbacks; it must never rewrite durable
+        # Session scope at Turn finalization.
+        project_path = str(thread_context.project_path or "").strip()
+        active_project_id = str(thread_context.active_project_id or "").strip()
+        if active_project_id:
+            try:
+                from agent.projects import get_project_manager
+
+                attached_project = get_project_manager().get_project(active_project_id)
+                authoritative_root = str(
+                    getattr(attached_project, "workspace_root", "") or ""
+                ).strip()
+                if authoritative_root:
+                    project_path = authoritative_root
+            except Exception as exc:
+                logger.warning(
+                    "Could not refresh ProjectManager root for Turn finalization: {}",
+                    exc,
+                )
+        else:
+            project_path = str(tool_context.get("project_root") or project_path).strip()
         self._execution_context = self._state_store.update_thread_state(
             self._thread_key(),
             project_path=project_path,
@@ -14593,17 +15839,53 @@ class EchoSpeakAgent:
             )
         except Exception:
             pass
-        self._state_store.update_execution(
-            execution_id,
-            status=status,
-            success=success_value,
-            response_preview=(response_text or "")[:500],
-            error=error,
-            tools_used=tools_used,
-            tool_latencies_ms=tool_latencies,
-            trace_id=trace_id,
-            context_budget=dict(getattr(self, "_last_context_budget_report", {}) or getattr(existing, "context_budget", {}) or {}),
-            verification={
+        # Preserve durable pending approvals (coding/video). finalize used to always
+        # pass clear_pending_approval="" for non-pending_approval status, which wiped
+        # video_apply_transaction / file_write approvals created mid-Turn and made
+        # confirm return 409 "stale or is not the current pending action".
+        durable_pending_id = ""
+        try:
+            # Prefer in-memory pending, then thread pointer, then this-execution approvals.
+            pa = getattr(self, "_pending_action", None)
+            if isinstance(pa, dict) and str(pa.get("approval_id") or "").strip():
+                durable_pending_id = str(pa.get("approval_id") or "").strip()
+            if not durable_pending_id:
+                st_now = self._state_store.get_thread_state(self._thread_key())
+                cand = str(getattr(st_now, "pending_approval_id", "") or "").strip()
+                if cand:
+                    rec = self._state_store.get_approval(cand)
+                    if rec is not None and str(getattr(rec, "status", "") or "") == "pending":
+                        durable_pending_id = cand
+            if not durable_pending_id:
+                for item in self._state_store.list_approvals(thread_id=self._thread_key(), limit=50):
+                    if str(getattr(item, "status", "") or "") != "pending":
+                        continue
+                    if str(getattr(item, "execution_id", "") or "") == str(execution_id):
+                        durable_pending_id = str(item.id)
+                        break
+        except Exception:
+            durable_pending_id = ""
+        if durable_pending_id:
+            status = "pending_approval"
+            execution_status = "needs_permission"
+            next_action = next_action or "Wait for approval of the pending action"
+            # Do not force success=False — proposal creation is a successful governed step.
+            if success_value is False and not error:
+                success_value = None
+        exec_updates: Dict[str, Any] = {
+            "status": status,
+            "success": success_value,
+            "response_preview": (response_text or "")[:500],
+            "error": error,
+            "tools_used": tools_used,
+            "tool_latencies_ms": tool_latencies,
+            "trace_id": trace_id,
+            "context_budget": dict(
+                getattr(self, "_last_context_budget_report", {})
+                or getattr(existing, "context_budget", {})
+                or {}
+            ),
+            "verification": {
                 "status": execution_status,
                 "required": verification_required,
                 "passed": bool(verified_ok) if verification_required else None,
@@ -14613,10 +15895,27 @@ class EchoSpeakAgent:
                 "failed_actions": len(execution_failed),
                 "unfinished_workflow": bool(thread_context.unfinished_workflow),
                 "backend_authoritative": True,
+                "pending_approval_id": durable_pending_id or None,
             },
-            metadata=metadata,
-            clear_pending_approval="" if status != "pending_approval" else getattr(self._pending_action, "get", lambda *_: "")("approval_id") if isinstance(self._pending_action, dict) else "",
-        )
+            "metadata": metadata,
+        }
+        if durable_pending_id:
+            # Re-assert current pending id (parameter name is historical).
+            exec_updates["clear_pending_approval"] = durable_pending_id
+        # If no durable pending, do NOT pass clear_pending_approval at all —
+        # update_execution previously treated "" as "wipe pending_approval_id".
+        self._state_store.update_execution(execution_id, **exec_updates)
+        # Keep Session projection aligned with needs_permission when approval is open.
+        if durable_pending_id:
+            try:
+                self._execution_context = self._state_store.update_thread_state(
+                    self._thread_key(),
+                    pending_approval_id=durable_pending_id,
+                    execution_status="needs_permission",
+                    safest_next_action="Approve or cancel the pending action",
+                )
+            except Exception:
+                pass
         if existing is not None:
             self._state_store.add_item(
                 turn_id=execution_id,
@@ -16053,6 +17352,50 @@ class EchoSpeakAgent:
                 completed_at=now,
             )
 
+        # Raw legacy tools still return strings. Recognize their structured
+        # failure envelopes here so a blocked/no-op mutation can never become a
+        # successful ToolRun or changed-file projection.
+        if low.startswith("mutation blocked:"):
+            return ToolOutcome(
+                tool_name=name,
+                execution_id=str(getattr(self, "_current_execution_id", None) or ""),
+                success=False,
+                status="validation_failure",
+                error_code="mutation_precondition_failed",
+                error_message=raw,
+                retryable=True,
+                started_at=started_at or now,
+                completed_at=now,
+            )
+        if name == "terminal_run":
+            exit_match = re.search(r"(?i)\bexitcode\s*=\s*(-?\d+)", raw)
+            terminal_status = re.search(r"(?i)\bstatus\s*=\s*([a-z_]+)", raw)
+            status_value = str(terminal_status.group(1) if terminal_status else "").lower()
+            if (
+                (exit_match and int(exit_match.group(1)) != 0)
+                or status_value in {"fail", "failed", "timeout", "sandbox_unavailable", "blocked"}
+                or low.startswith("command blocked by terminal denylist")
+            ):
+                policy_block = "blocked" in status_value or "denylist" in low or "sandbox_unavailable" in low
+                return ToolOutcome(
+                    tool_name=name,
+                    execution_id=str(getattr(self, "_current_execution_id", None) or ""),
+                    success=False,
+                    status="policy_block" if policy_block else "tool_failure",
+                    error_code=(
+                        "terminal_sandbox_unavailable"
+                        if "sandbox_unavailable" in low
+                        else "terminal_timeout"
+                        if status_value == "timeout" or "timed out" in low
+                        else "terminal_command_failed"
+                    ),
+                    error_message=raw,
+                    retryable=not policy_block,
+                    policy_block=policy_block,
+                    started_at=started_at or now,
+                    completed_at=now,
+                )
+
         policy_patterns = (
             "system actions are disabled",
             "is disabled by system configuration",
@@ -16065,9 +17408,12 @@ class EchoSpeakAgent:
             "file operations are disabled",
             "terminal commands are disabled",
             "command rejected",
+            "command blocked by terminal denylist",
             "blocked by system action permissions",
             "is blocked by echospeak",
             "approval is required before",
+            "not allowlisted",
+            "no applications are allowlisted",
         )
         validation_patterns = (
             "calculation error:",
@@ -16075,6 +17421,7 @@ class EchoSpeakAgent:
             "invalid argument",
             "invalid syntax",
             "missing required",
+            "refusing to write content",
         )
         failure_prefixes = (
             "failed",
@@ -16085,6 +17432,11 @@ class EchoSpeakAgent:
             "file not found",
             "path is a directory",
             "binary file detected",
+            "unsupported text encoding",
+            "no content provided",
+            "source path not found",
+            "destination already exists",
+            "path not found",
             "rejected unresolved planner template",
             "rejected unresolved planner template path",
             "local_filesystem — web_search blocked",
@@ -16211,18 +17563,70 @@ class EchoSpeakAgent:
                     ),
                 )
             finished = self._state_store.finish_tool_run(rid, outcome)
-            # Always clear FIFO registration for this exact id after terminal attempt.
-            self._dequeue_tool_run(rid, outcome.tool_name)
-            if finished is not None and str(finished.status or "").lower() in {
-                "complete", "completed", "success"
-            } and not outcome.success:
-                # Durable already terminal-success; return stored success.
+        else:
+            finished = None
+        # Research artifact handoff: durable cited record for skills (not prose alone).
+        try:
+            if (
+                finished is not None
+                and str(getattr(finished, "tool_name", "") or "") == "web_search"
+                and str(getattr(finished, "status", "") or "").lower() in {"complete", "completed"}
+            ):
+                from agent.research_artifacts import (
+                    build_research_artifact_from_tool_output,
+                    save_research_artifact,
+                )
+
+                out_text = ""
                 try:
-                    return self._tool_outcomes_by_run_id.get(rid) or outcome
+                    out_text = str((finished.outcome or {}).get("output") or "")
                 except Exception:
-                    pass
+                    out_text = str(getattr(outcome, "output", "") or "")
+                query = ""
+                try:
+                    query = str((finished.canonical_arguments or {}).get("query") or (params or {}).get("q") or (params or {}).get("query") or "")
+                except Exception:
+                    query = ""
+                art = build_research_artifact_from_tool_output(
+                    output=out_text,
+                    query=query,
+                    project_id=str(getattr(finished, "project_id", "") or ""),
+                    session_id=str(getattr(finished, "session_id", "") or self._thread_key()),
+                    execution_id=str(getattr(finished, "turn_id", "") or ""),
+                    tool_run_id=str(getattr(finished, "id", "") or ""),
+                    objective=str(getattr(getattr(self, "_current_mode_decision", None), "objective", "") or query),
+                )
+                if art.status == "ready":
+                    save_research_artifact(art)
+                    try:
+                        self._state_store.add_item(
+                            turn_id=str(getattr(finished, "turn_id", "") or ""),
+                            item_type="research_artifact",
+                            status="complete",
+                            payload={"artifact_id": art.id, "query": query, "citations": len(art.citations)},
+                            session_id=str(getattr(finished, "session_id", "") or ""),
+                            project_id=str(getattr(finished, "project_id", "") or ""),
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Always clear FIFO registration for this exact id after terminal attempt.
+        if rid:
+            self._dequeue_tool_run(rid, outcome.tool_name)
+        if (
+            finished is not None
+            and str(finished.status or "").lower() in {"complete", "completed", "success"}
+            and not outcome.success
+        ):
+            # Durable already terminal-success; return stored success.
+            try:
+                return self._tool_outcomes_by_run_id.get(rid) or outcome
+            except Exception:
+                pass
         retry_target: Dict[str, Any] = {}
-        if outcome.retryable:
+
+        if outcome.retryable and ToolRegistry.get(outcome.tool_name) is not None:
             active_approved = getattr(self, "_active_approved_action", None)
             approval_id = (
                 str(active_approved.get("approval_id") or "")
@@ -16256,6 +17660,7 @@ class EchoSpeakAgent:
                 "permissions": self._session_permissions_snapshot(),
                 "policy_flags": list(self._approval_risk_metadata(outcome.tool_name)[1]),
                 "partial_side_effect_possible": bool(self._is_action_tool(outcome.tool_name)),
+                "requires_regeneration": bool(outcome.error_code == "corrupted_write_content"),
             }
         self._execution_context = self._state_store.update_thread_state(
             self._thread_key(),
@@ -16488,6 +17893,20 @@ class EchoSpeakAgent:
             )
             cached_read = dict(self._request_read_cache.get(cache_key) or {}) or None
 
+        mutation_precondition: Dict[str, Any] = {}
+        if name in {
+            "file_write", "file_delete", "file_move", "file_copy", "file_mkdir",
+            "artifact_write", "notepad_write", "checkpoint_undo",
+        }:
+            approval_id = str(active_action.get("approval_id") or "") if isinstance(active_action, dict) else ""
+            approval_record = self._state_store.get_approval(approval_id) if approval_id else None
+            mutation_precondition = dict(getattr(approval_record, "source_precondition", None) or {})
+            try:
+                from agent.tools import update_tool_execution_context
+                update_tool_execution_context(mutation_precondition=mutation_precondition)
+            except Exception:
+                mutation_precondition = {}
+
         try:
             if cached_read is not None:
                 result = cached_read.get("output", "")
@@ -16549,6 +17968,13 @@ class EchoSpeakAgent:
                 error=exc,
                 started_at=started_at,
             )
+        finally:
+            if mutation_precondition:
+                try:
+                    from agent.tools import update_tool_execution_context
+                    update_tool_execution_context(mutation_precondition={})
+                except Exception:
+                    pass
         outcome = self._persist_tool_outcome(
             outcome.model_copy(update={"run_id": run_id, "action_id": action_id}),
             arguments,
@@ -16685,7 +18111,7 @@ class EchoSpeakAgent:
         path_value = str(detail_args.get("path") or detail_args.get("src") or "").strip()
         if path_value and tool in {"file_read", "file_list"}:
             details["files_inspected"] = list(dict.fromkeys([*(details.get("files_inspected") or []), path_value]))[-64:]
-        if path_value and tool in {"file_write", "file_move", "file_copy", "file_delete", "file_mkdir", "artifact_write"}:
+        if success and path_value and tool in {"file_write", "file_move", "file_copy", "file_delete", "file_mkdir", "artifact_write"}:
             details["files_changed"] = list(dict.fromkeys([*(details.get("files_changed") or []), path_value]))[-64:]
         if tool == "terminal_run":
             command = re.sub(
@@ -18047,6 +19473,15 @@ class EchoSpeakAgent:
             self._record_turn(user_input, blocked_action_message)
             return blocked_action_message, True
 
+        # A durable exact approval decision outranks every planner/shortcut.
+        # The existing consumption block below remains the only executor; this
+        # guard merely prevents a literal confirm/cancel from being mistaken for
+        # a new coding objective before it reaches that block.
+        _pending_decision_turn = bool(
+            self._pending_action is not None
+            and (self._is_confirm_text(user_input) or self._is_cancel_text(user_input))
+        )
+
         # ── Search/Replace edit helpers ──────────────────────────────────
         def _parse_search_replace_blocks(llm_output: str) -> list:
             """Parse <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks from LLM output."""
@@ -18094,9 +19529,20 @@ class EchoSpeakAgent:
                 logger.warning(f"Search/replace block skipped (no match): {search_text[:80]}...")
             return content, applied, skipped
 
+        _bounded_named_edit_intent = bool(
+            re.search(
+                r"(?i)\b(?:fix|edit|update|change|modify|rewrite|add|insert|comment|patch|tweak)\b",
+                user_input or "",
+            )
+            and len(re.findall(
+                r"(?i)(?:[\w.-]+[\\/])*[\w.-]+\.(?:py|ts|tsx|js|jsx|json|md|css|html|yaml|yml|toml|cfg|ini|sh|bat|ps1|sql|go|rs|c|cpp|h|hpp|java|kt|swift|rb|php|lua|txt|env|conf|xml|svg)\b",
+                user_input or "",
+            )) == 1
+        )
+
         # Coding implement plan (plan-state driven): multi-file Desktop/project edits
         # MUST run before free ReAct so we don't only narrate steps. Emits task_plan.
-        if current_source not in _background_sources:
+        if current_source not in _background_sources and not _pending_decision_turn and not _bounded_named_edit_intent:
             try:
                 coding_plan = self._try_coding_implement_plan(user_input, callbacks)
                 if coding_plan is not None:
@@ -18114,6 +19560,7 @@ class EchoSpeakAgent:
             _fe_impl_ok = False
         if (
             current_source not in _background_sources
+            and not _pending_decision_turn
             and getattr(self, "_current_mode_decision", None) is not None
             and self._current_mode_decision.mode == TurnMode.CODING
             and (
@@ -18137,7 +19584,57 @@ class EchoSpeakAgent:
                 r"add|insert|comment|annotate|patch|tweak|make .+ more)\b",
                 _fe_low,
             )
-            if _fe_file_match and _fe_edit_match:
+            # True read-only inspect must NOT enter the write planner.
+            # "Do not edit game.js" is an *exclusion* of a sibling file, not full readonly —
+            # still allow "Change index.html. Do not edit game.js."
+            _inspect_only = bool(
+                re.search(
+                    r"(?i)("
+                    # Full-request non-mutation only (not sibling exclusions like "do not edit game.js")
+                    r"\bdo\s+not\s+(change|edit|touch|modify|write|save)\s+anything\b|"
+                    r"\bdon'?t\s+(change|edit|touch|modify|write|save)\s+anything\b|"
+                    r"\bwithout\s+(changing|editing|modifying|updating)\b|"
+                    r"\bno\s+changes?\b|"
+                    r"\bread[\s-]?only\b|"
+                    r"\bjust\s+(check|look|read|inspect|peek|include|show|explain)\b|"
+                    r"\binspect\s+only\b|"
+                    r"\bcheck\s+\S+\s+but\s+do\s+not\b|"
+                    r"\binclude\s+the\s+corrected\s+code\b|"
+                    r"\b(check|inspect|look\s+at|read|peek\s+at|explain)\b[\s\S]{0,80}"
+                    r"\b(do\s+not|don'?t)\s+(change|edit|touch|modify)\s+(it|anything)\b"
+                    r")",
+                    user_input,
+                )
+            )
+            # Positive edit toward a named file outweighs sibling exclusions
+            # (e.g. "Change index.html. Do not edit game.js.").
+            # Do NOT treat "…file.js … do not change" as positive edit.
+            _fe_positive_edit = bool(
+                re.search(
+                    r"(?i)("
+                    r"\b(?<!do not )(?<!don't )(?<!dont )(change|edit|fix|update|modify|rewrite|patch|tweak)\b[\s\S]{0,60}"
+                    r"\.(?:html?|js|tsx?|py|css|json|md)\b|"
+                    r"\b(change|edit|fix|update|modify|rewrite|patch|tweak)\s+"
+                    r"(?:the\s+)?(?:title|content|text|code|file)\s+"
+                    r"(?:in\s+)?[\w./\\-]*\.(?:html?|js|tsx?|py|css|json|md)\b"
+                    r")",
+                    user_input,
+                )
+            )
+            _fe_readonly = _inspect_only or (
+                bool(_fe_edit_match)
+                and not _fe_positive_edit
+                and bool(
+                    re.search(
+                        r"(?i)\b(check|inspect|look\s+at|read|peek|include)\b",
+                        user_input,
+                    )
+                )
+            )
+            # Sibling exclusion never blocks a positive edit of another named file.
+            if _fe_positive_edit and not _inspect_only:
+                _fe_readonly = False
+            if _fe_file_match and _fe_edit_match and not _fe_readonly:
                 logger.info("File-edit intent detected, routing through task planner pipeline")
                 # Resolve the file path — prefer active Desktop project, never EchoSpeak root by accident
                 _fe_filename = _fe_file_match.group(1)
@@ -18233,6 +19730,31 @@ class EchoSpeakAgent:
                     except Exception:
                         pass
 
+                # Final authority pin: the exact current-request path beneath the
+                # ProjectManager root always wins. Any legacy discovery above is
+                # advisory only and can never select the mutation target.
+                _fe_filename = str(_fe_file_match.group(1) or "").strip().replace("\\", "/")
+                try:
+                    from agent.projects import get_project_manager
+
+                    _state = self._state_store.get_thread_state(self._thread_key())
+                    _project_id = str(_state.active_project_id or "").strip()
+                    _project = get_project_manager().get_project(_project_id) if _project_id else None
+                    _root = Path(str(getattr(_project, "workspace_root", "") or "")).expanduser().resolve(strict=True)
+                    if not _root.is_dir():
+                        raise ValueError("The attached Project root is not a directory.")
+                    _requested = Path(_fe_filename)
+                    _candidate = _requested.expanduser().resolve() if _requested.is_absolute() else (_root / _requested).resolve()
+                    _candidate.relative_to(_root)
+                    _fe_path = str(_candidate)
+                except Exception as target_exc:
+                    response_text = (
+                        f"I could not resolve the exact target '{_fe_filename}' inside the attached Project: "
+                        f"{target_exc}. No file was changed."
+                    )
+                    self._record_turn(user_input, response_text)
+                    return response_text, False
+
                 # Build a deterministic 2-task plan: read → write (confirmation-gated)
                 tasks = [
                     {"index": 0, "description": f"Read current {_fe_filename}", "tool": "file_read", "params": {"path": _fe_path}, "depends_on": -1, "status": "pending", "result": None},
@@ -18271,8 +19793,28 @@ class EchoSpeakAgent:
                     _read_run_id = str(uuid.uuid4())
                     self._emit_tool_start(callbacks, "file_read", _fe_path, _read_run_id)
                     try:
-                        file_content = read_tool.invoke(path=_fe_path)
-                        self._emit_tool_end(callbacks, file_content, _read_run_id)
+                        read_outcome = (
+                            read_tool.invoke_outcome(path=_fe_path)
+                            if hasattr(read_tool, "invoke_outcome")
+                            else self._normalize_tool_outcome(
+                                tool_name="file_read", output=read_tool.invoke(path=_fe_path)
+                            )
+                        )
+                        if not read_outcome.success:
+                            raise RuntimeError(read_outcome.error_message or "file_read failed")
+                        from agent.tools import strip_echo_file_wrapper
+
+                        raw_read_output = str(read_outcome.output or "")
+                        if bool((read_outcome.verification or {}).get("truncated")) or "truncated=1" in raw_read_output or "…(truncated)" in raw_read_output:
+                            raise RuntimeError(
+                                "The source is larger than the safe complete-read limit; a whole-file replacement was not prepared."
+                            )
+                        file_content = strip_echo_file_wrapper(raw_read_output)
+                        if self._content_has_unresolved_edit_markers(file_content):
+                            raise RuntimeError(
+                                "The required source contains unresolved SEARCH/REPLACE or conflict markers. Restore or reconstruct it before ordinary feature work."
+                            )
+                        self._emit_tool_end(callbacks, raw_read_output, _read_run_id)
                         tasks[0]["status"] = "completed"
                         tasks[0]["result"] = file_content
                         self._task_planner.completed_tasks.append(tasks[0])
@@ -18288,7 +19830,7 @@ class EchoSpeakAgent:
                         self._task_planner.reset()
                         self._last_tts_text = self._clamp_tts_text(response_text)
                         self._record_turn(user_input, response_text)
-                        return response_text, True
+                        return response_text, False
 
                     # Step 2: LLM generates the edited content using SEARCH/REPLACE blocks
                     # This is much more efficient than asking for the complete file—
@@ -18354,17 +19896,51 @@ class EchoSpeakAgent:
                         self._task_planner.reset()
                         self._last_tts_text = self._clamp_tts_text(response_text)
                         self._record_turn(user_input, response_text)
-                        return response_text, True
+                        return response_text, False
 
                     # Do NOT emit a successful file_write ToolRun before approval.
                     # Code panel can preview via pending action / local state only.
                     # Step 3: file_write is an action tool → confirmation-gated
                     write_tool = next((t for t in self.tools if t.name == "file_write"), None)
                     if write_tool:
+                        if self._content_has_unresolved_edit_markers(str(new_content)):
+                            response_text = (
+                                "The proposed replacement still contains unresolved SEARCH/REPLACE markers. "
+                                "No approval was created and no file was changed."
+                            )
+                            self._record_turn(user_input, response_text)
+                            return response_text, False
+                        if self._is_suspicious_file_replacement(
+                            user_input, str(file_content), str(new_content), _fe_filename
+                        ):
+                            response_text = (
+                                f"The proposed whole-file replacement for {_fe_filename} is suspiciously destructive. "
+                                "No approval was created; prepare a smaller edit from the complete current file."
+                            )
+                            self._record_turn(user_input, response_text)
+                            return response_text, False
+                        diff_preview = "\n".join(
+                            difflib.unified_diff(
+                                str(file_content).splitlines(),
+                                str(new_content).splitlines(),
+                                fromfile=f"a/{_fe_filename}",
+                                tofile=f"b/{_fe_filename}",
+                                lineterm="",
+                                n=3,
+                            )
+                        )
+                        if not diff_preview.strip():
+                            response_text = f"The proposed edit does not change {_fe_filename}. No approval was created."
+                            self._record_turn(user_input, response_text)
+                            return response_text, False
+                        bounded_diff = diff_preview[:12000]
+                        if len(diff_preview) > len(bounded_diff):
+                            bounded_diff += "\n…(diff preview truncated)"
                         pending_action = {
                             "tool": "file_write",
                             "kwargs": {"path": _fe_path, "content": new_content},
                             "original_input": user_input,
+                            "diff_preview": bounded_diff,
                             "plan_state": {
                                 "tasks": tasks,
                                 "current_task_index": 1,
@@ -18378,7 +19954,7 @@ class EchoSpeakAgent:
                             return response_text, False
                         self._set_pending_action(
                             pending_action,
-                            f"Save edited {display_name} ({len(new_content)} chars)",
+                            bounded_diff,
                             user_input,
                         )
                         display = self._format_pending_action(self._pending_action)
@@ -18402,7 +19978,7 @@ class EchoSpeakAgent:
         unfinished = dict(getattr(self._execution_context, "unfinished_workflow", {}) or {})
         relation = str(getattr(getattr(self, "_current_mode_decision", None), "intent_relation", "") or "")
         # Accept either "tasks" or "remaining_tasks" payload shapes from TaskPlanner.
-        if current_source not in _background_sources and relation in {"continue", "confirm", "retry"} and (
+        if current_source not in _background_sources and not _pending_decision_turn and relation in {"continue", "confirm", "retry"} and (
             unfinished.get("tasks") or unfinished.get("remaining_tasks")
         ):
             raw_tasks = list(unfinished.get("tasks") or unfinished.get("remaining_tasks") or [])
@@ -18439,6 +20015,7 @@ class EchoSpeakAgent:
         # Multi-task planning
         if (
             current_source not in _background_sources
+            and not _pending_decision_turn
             and getattr(self, "_current_mode_decision", None) is not None
             and self._current_mode_decision.mode != TurnMode.CHAT
             and bool(getattr(config, "multi_task_planner_enabled", True))
@@ -18513,8 +20090,9 @@ class EchoSpeakAgent:
                             outcome_summary="Execution context changed before approval",
                         )
                     response_text = (
-                        "I did not run the pending action because this thread's project or workspace "
-                        "scope changed after it was proposed. Please request the action again in the current scope."
+                        "I did not run the pending action because its Session/Project scope, exact "
+                        "arguments, or source file changed after it was proposed. Please inspect "
+                        "the current file and request the action again."
                     )
                     self._state_store.update_thread_state(
                         self._thread_key(),
@@ -18555,7 +20133,42 @@ class EchoSpeakAgent:
                     run_id = str(uuid.uuid4())
                     tool_input = str(kwargs.get("path") or kwargs.get("src") or kwargs.get("command") or pending.get("original_input") or "")
                     self._emit_tool_start(callbacks, tool.name, tool_input, run_id)
+                    if tool_name == "file_write" and self._content_has_unresolved_edit_markers(str(kwargs.get("content") or "")):
+                        blocked_outcome = ToolOutcome(
+                            tool_name="file_write", run_id=run_id,
+                            action_id=str(decision_action.get("action_id") or ""),
+                            execution_id=str(self._current_execution_id or ""),
+                            success=False, status="validation_failure",
+                            error_code="corrupted_write_content",
+                            error_message=(
+                                "Refusing to write content that still contains unresolved "
+                                "SEARCH/REPLACE or conflict markers. Regenerate the proposal first."
+                            ),
+                            retryable=True, started_at=time.time(), completed_at=time.time(),
+                        )
+                        self._persist_tool_outcome(blocked_outcome, kwargs)
+                        self._emit_tool_end(callbacks, blocked_outcome.error_message, run_id)
+                        self._active_approved_action = None
+                        response_text = f"Action failed: {blocked_outcome.error_message}"
+                        if approval_id:
+                            self._state_store.update_approval(approval_id, status="failed", outcome_summary=response_text)
+                        if approved_execution_id and approved_execution_id != str(self._current_execution_id or ""):
+                            self._state_store.update_execution(
+                                approved_execution_id, status="failed", success=False, error=response_text[:500]
+                            )
+                        self._last_tts_text = self._clamp_tts_text(response_text)
+                        self._record_turn(user_input, response_text)
+                        return response_text, False
                     try:
+                        append_base = ""
+                        if tool_name == "file_write" and bool(kwargs.get("append", False)):
+                            from agent.tools import _safe_file_path
+
+                            append_target = _safe_file_path(str(kwargs.get("path") or ""))
+                            if append_target is None:
+                                raise RuntimeError("Append verification could not resolve the approved path.")
+                            if append_target.exists():
+                                append_base = append_target.read_text(encoding="utf-8", errors="strict")
                         tool_outcome = (
                             tool.invoke_outcome(**kwargs)
                             if hasattr(tool, "invoke_outcome")
@@ -18565,6 +20178,83 @@ class EchoSpeakAgent:
                         self._emit_tool_end(callbacks, tool_output, run_id)
                         if not tool_outcome.success:
                             raise RuntimeError(tool_outcome.error_message)
+
+                        if tool_name == "file_write":
+                            from agent.tools import strip_echo_file_wrapper
+
+                            verify_tool = next((t for t in self.tools if t.name == "file_read"), None)
+                            verification = {
+                                "verified": False,
+                                "verification_tool_run_id": "",
+                                "path": str(kwargs.get("path") or ""),
+                            }
+                            if verify_tool is not None:
+                                verify_run_id = str(uuid.uuid4())
+                                verification["verification_tool_run_id"] = verify_run_id
+                                self._emit_tool_start(callbacks, "file_read", str(kwargs.get("path") or ""), verify_run_id)
+                                verify_outcome = (
+                                    verify_tool.invoke_outcome(
+                                        path=str(kwargs.get("path") or ""),
+                                        max_chars=min(
+                                            200000,
+                                            max(
+                                                100000,
+                                                len(append_base) + len(str(kwargs.get("content") or "")) + 1024,
+                                            ),
+                                        ),
+                                    )
+                                    if hasattr(verify_tool, "invoke_outcome")
+                                    else self._normalize_tool_outcome(
+                                        tool_name="file_read",
+                                        output=verify_tool.invoke(path=str(kwargs.get("path") or "")),
+                                    )
+                                )
+                                verify_text = verify_outcome.output if verify_outcome.success else verify_outcome.error_message
+                                self._emit_tool_end(callbacks, verify_text, verify_run_id)
+                                approved_body = strip_echo_file_wrapper(str(kwargs.get("content") or ""))
+                                expected_text = append_base + approved_body if bool(kwargs.get("append", False)) else approved_body
+                                actual_text = strip_echo_file_wrapper(str(verify_outcome.output or ""))
+                                verification.update(
+                                    {
+                                        "verified": bool(
+                                            verify_outcome.success
+                                            and not bool((verify_outcome.verification or {}).get("truncated"))
+                                            and expected_text == actual_text
+                                        ),
+                                        "expected_sha256": hashlib.sha256(expected_text.encode("utf-8")).hexdigest(),
+                                        "actual_sha256": hashlib.sha256(actual_text.encode("utf-8")).hexdigest() if verify_outcome.success else "",
+                                        "error": "" if verify_outcome.success else str(verify_outcome.error_message or "Verification read failed"),
+                                    }
+                                )
+                            else:
+                                verification["error"] = "file_read is not present in the current executable inventory"
+                            self._state_store.attach_tool_verification(tool_outcome.run_id, verification)
+                            self._state_store.add_item(
+                                turn_id=str(self._current_execution_id or ""),
+                                item_type="verification",
+                                status="complete" if verification["verified"] else "failed",
+                                payload={"tool_run_id": tool_outcome.run_id, **verification},
+                                session_id=self._thread_key(),
+                                project_id=str(self._execution_context.active_project_id or ""),
+                                tool_run_id=tool_outcome.run_id,
+                            )
+                            tool_output = (
+                                f"{tool_output}\nVerified by a complete file_read."
+                                if verification["verified"]
+                                else f"{tool_output}\nThe file changed, but verification did not pass: {verification.get('error') or 'content mismatch'}."
+                            )
+                            if not verification["verified"]:
+                                failure_detail = str(verification.get("error") or "content mismatch")
+                                if approval_id:
+                                    self._state_store.update_approval(
+                                        approval_id,
+                                        status="failed",
+                                        outcome_summary=f"File changed, but post-write verification failed: {failure_detail}",
+                                    )
+                                raise RuntimeError(
+                                    f"The file changed, but post-write verification failed: {failure_detail}"
+                                )
+
                         action_success = True
 
                         if isinstance(plan_state, dict):
@@ -18652,7 +20342,6 @@ class EchoSpeakAgent:
                         approved_execution_id,
                         status="completed" if action_success else "failed",
                         success=bool(action_success),
-                        response_preview=str(response_text or "")[:500],
                         error="" if action_success else str(response_text or "Action failed")[:500],
                     )
                 self._record_turn(user_input, response_text)
@@ -18670,15 +20359,9 @@ class EchoSpeakAgent:
                 return response_text, True
 
             # Non-confirm input — auto-cancel pending action to avoid trapping
-            try:
-                display = self._format_pending_action(pending)
-            except Exception:
-                display = "(pending action)"
-            logger.info("Pending action canceled due to non-confirm input: {}", display)
-            approval_id = str(pending.get("approval_id") or "").strip()
-            self._pending_action = None
-            if approval_id:
-                self._state_store.update_approval(approval_id, status="canceled", outcome_summary="Canceled due to non-confirm input")
+            # Preserve the durable pending approval. Explicit new objectives are
+            # invalidated earlier by _supersede_stale_pending_action; ordinary
+            # chatter cannot silently cancel authority awaiting a real decision.
 
         # Pending detail
         if self._pending_detail is not None:
@@ -18706,18 +20389,21 @@ class EchoSpeakAgent:
         # user_name, relations (sister, friend, etc.) and returns instantly.
         # IMPORTANT: Profile data belongs to the OWNER only.  Non-owner
         # Discord users must NOT receive the owner's stored identity.
-        _is_owner_request = True
-        try:
-            from config import DiscordUserRole
-            _role = getattr(self, "_current_user_role", None)
-            if _role is not None and _role != DiscordUserRole.OWNER:
-                _is_owner_request = False
-        except Exception:
-            pass
+        is_owner_request = self._owner_memory_access_allowed()
 
-        if _is_owner_request:
+        if is_owner_request:
             try:
                 profile_query = self._extract_user_request_text(user_input)
+                if re.search(r"(?i)\bwhat do you know about me\b", profile_query):
+                    known = self.memory.personal_memory_summary()
+                    if known:
+                        lines = [f"- {item['text']} (saved memory {item['id']})" for item in known[:12]]
+                        response_text = "Here are the active account memories I can verify:\n" + "\n".join(lines)
+                    else:
+                        response_text = "I do not have any verified account memories saved for you yet."
+                    self._last_tts_text = self._clamp_tts_text(response_text)
+                    self._record_turn(user_input, response_text)
+                    return response_text, True
                 profile_answer = self.memory.answer_profile_question(profile_query)
                 if profile_answer:
                     response_text = profile_answer
@@ -18744,34 +20430,254 @@ class EchoSpeakAgent:
             self._record_turn(user_input, response_text)
             return response_text, True
 
+        # Deterministic video proposal (structured selection + exact op only).
+        # Runs before the model so prose-only local models still get a real
+        # ApprovalRecord when the action is fully governed.
+        try:
+            det = self._try_deterministic_video_proposal(user_input)
+            if det is not None:
+                return det
+        except Exception as det_exc:
+            logger.debug("Deterministic video proposal skipped: {}", det_exc)
+
+        # Memory confirmation / rejection for ask_confirmation candidates.
+        # Never intercept when a Session already has a pending tool ApprovalRecord
+        # (coding/video "confirm" must apply that mutation, not a stale memory prompt).
+        try:
+            from agent.memory_curator import MemoryCurator
+
+            _mem_session = self._last_memory_thread_id or self._thread_key()
+            _pending_tool_approval = None
+            try:
+                _pending_tool_approval = self._state_store.get_pending_approval(self._thread_key())
+            except Exception:
+                _pending_tool_approval = None
+            _curator_probe = MemoryCurator(self.memory)
+            if (
+                _pending_tool_approval is None
+                and _curator_probe.get_pending_confirmation(_mem_session)
+            ):
+                if MemoryCurator.is_memory_confirm(query_stripped) and is_owner_request:
+                    confirmed = _curator_probe.confirm_pending(
+                        _mem_session, mode=self._memory_mode_default()
+                    )
+                    if confirmed.persisted_ids:
+                        for mid, ack in zip(confirmed.persisted_ids, confirmed.acknowledgements):
+                            self._state_store.add_item(
+                                turn_id=str(self._current_execution_id or ""),
+                                item_type="memory_write",
+                                status="complete",
+                                payload={
+                                    "memory_id": mid,
+                                    "text": ack,
+                                    "confirmed": True,
+                                    "index_state": str(
+                                        (self.memory._records.get(mid) or {}).get("index_state") or "pending"
+                                    ),
+                                },
+                                session_id=self._thread_key(),
+                                project_id=str(
+                                    getattr(
+                                        self._state_store.get_execution(str(self._current_execution_id or "")),
+                                        "project_id",
+                                        "",
+                                    )
+                                    or ""
+                                ),
+                            )
+                        response_text = "Saved to durable memory after confirmation:\n" + "\n".join(
+                            f"- {a}" for a in confirmed.acknowledgements
+                        )
+                        ok = True
+                    elif confirmed.session_only_ids:
+                        response_text = (
+                            "Kept as Session-only context (not durable Studio memory):\n"
+                            + "\n".join(f"- {a}" for a in confirmed.acknowledgements)
+                        )
+                        ok = True
+                    else:
+                        response_text = (
+                            "I could not save that memory after confirmation. "
+                            "Nothing was stored as durable memory."
+                        )
+                        ok = False
+                    self._last_tts_text = self._clamp_tts_text(response_text)
+                    self._record_turn(user_input, response_text)
+                    return response_text, ok
+                if MemoryCurator.is_memory_reject(query_stripped):
+                    _curator_probe.reject_pending(_mem_session)
+                    response_text = "Okay — I discarded the proposed memory. Nothing was saved."
+                    self._last_tts_text = self._clamp_tts_text(response_text)
+                    self._record_turn(user_input, response_text)
+                    return response_text, True
+        except Exception as mem_conf_exc:
+            logger.debug("Memory confirmation gate failed: {}", mem_conf_exc)
+
         try:
             remember_payload = self.memory.extract_remember_payload(query_stripped)
         except Exception:
             remember_payload = ""
-        if remember_payload:
+        # Explicit memory delete only. Conversational topic-switches like
+        # "Forget coding for a moment — recommend a stretch" must reach the model.
+        forget_match = re.match(
+            r"(?i)^\s*(?:please\s+)?forget\s+(.+)$",
+            query_stripped,
+        )
+        if forget_match and is_owner_request:
+            forget_payload = str(forget_match.group(1) or "").strip()
+            # Reject topic-switch / non-memory idioms (not durable forget targets).
+            _forget_topic_switch = bool(
+                re.search(
+                    r"(?i)\bfor\s+(a\s+)?moment\b|\bfor\s+now\b|\babout\s+that\b|"
+                    r"\band\s+(recommend|tell|explain|help|show|give)\b|"
+                    r"\b—\b|\s+-\s+|\.\s+\S",
+                    forget_payload,
+                )
+            )
+            _forget_memory_like = bool(
+                re.search(
+                    r"(?i)\b(my|that|the|this)\b|"
+                    r"\b(preference|memory|memories|note|notes|fact)\b|"
+                    r"\b(i\s+(like|prefer|said|told)|that\s+i)\b",
+                    forget_payload,
+                )
+            )
+            if _forget_topic_switch or not _forget_memory_like:
+                forget_match = None
+        if forget_match and is_owner_request:
+            forget_payload = str(forget_match.group(1) or "").strip()
             try:
-                self.memory.update_profile_from_text(remember_payload)
-                curated = self.memory.curated_lines_from_text(remember_payload)
-                for line in curated:
-                    self.memory.add_memory_item(
-                        line,
-                        memory_type="note",
-                        pinned=True,
-                        mode=self._memory_mode_default(),
-                        thread_id=self._last_memory_thread_id,
-                        source="curated",
-                        project_path=(
-                            str(self._execution_context.project_path or "")
-                            if getattr(getattr(self, "_current_mode_decision", None), "mode", None) == TurnMode.CODING
-                            else ""
-                        ),
-                    )
-            except Exception:
-                pass
-            response_text = "Got it. I'll remember that."
+                forgotten = self.memory.forget_explicit_memory(forget_payload)
+                if forgotten:
+                    self._session_memory.forget_matching(forget_payload)
+                    response_text = f"Forgot {len(forgotten)} matching saved memory record(s)."
+                    ok = True
+                else:
+                    response_text = "I could not find an active saved memory matching that request. Nothing was deleted."
+                    ok = False
+            except Exception as exc:
+                response_text = f"I could not complete the memory deletion: {exc}"
+                ok = False
             self._last_tts_text = self._clamp_tts_text(response_text)
             self._record_turn(user_input, response_text)
-            return response_text, True
+            return response_text, ok
+        if remember_payload and not is_owner_request:
+            response_text = "I cannot save account memory from an unverified or non-owner surface."
+            self._last_tts_text = self._clamp_tts_text(response_text)
+            self._record_turn(user_input, response_text)
+            return response_text, False
+        if remember_payload:
+            memory_id = None
+            memory_error = ""
+            normalized = ""
+            memory_type = "note"
+            curated = None
+            try:
+                from agent.memory_curator import MemoryCurator
+
+                source_item_id = ""
+                for runtime_item in self._state_store.list_items(str(self._current_execution_id or "")):
+                    if runtime_item.item_type == "user_message":
+                        source_item_id = runtime_item.id
+                        break
+                user_name = ""
+                try:
+                    user_name = str((self.memory._profile or {}).get("user_name") or "")
+                except Exception:
+                    user_name = ""
+                llm_fn = None
+                try:
+                    llm_fn = (lambda p: str(self.llm_wrapper.invoke(p) or "")) if getattr(self, "llm_wrapper", None) else None
+                except Exception:
+                    llm_fn = None
+                curator = MemoryCurator(self.memory, llm_invoke=llm_fn)
+                curated = curator.curate_and_persist(
+                    user_text=query_stripped,
+                    response_text="",
+                    explicit=True,
+                    session_id=self._last_memory_thread_id or self._thread_key(),
+                    execution_id=str(self._current_execution_id or ""),
+                    item_id=source_item_id,
+                    project_path=str(getattr(self._execution_context, "project_path", "") or ""),
+                    user_name=user_name,
+                    mode=self._memory_mode_default(),
+                    allow_implicit_auto=True,
+                    max_candidates=3,
+                )
+                if curated.needs_confirmation and curated.confirmation_prompt:
+                    # Do not save; wait for explicit yes/confirm
+                    self._state_store.add_item(
+                        turn_id=str(self._current_execution_id or ""),
+                        item_type="memory_confirmation_pending",
+                        status="complete",
+                        payload={
+                            "pending_confirmation_id": curated.pending_confirmation_id,
+                            "candidates": [c.model_dump(mode="json") for c in curated.needs_confirmation],
+                            "llm_invoked": curated.llm_invoked,
+                        },
+                        session_id=self._thread_key(),
+                        project_id="",
+                    )
+                    response_text = curated.confirmation_prompt
+                    self._last_tts_text = self._clamp_tts_text(response_text)
+                    self._record_turn(user_input, response_text)
+                    return response_text, True
+                if curated.persisted_ids:
+                    memory_id = curated.persisted_ids[0]
+                    normalized = curated.acknowledgements[0] if curated.acknowledgements else remember_payload
+                    memory_type = (
+                        curated.accepted[0].type if curated.accepted else "preference"
+                    )
+                elif curated.session_only_ids:
+                    response_text = (
+                        "Kept as Session-only context (not durable memory):\n"
+                        + "\n".join(f"- {a}" for a in curated.acknowledgements)
+                    )
+                    self._last_tts_text = self._clamp_tts_text(response_text)
+                    self._record_turn(user_input, response_text)
+                    return response_text, True
+                else:
+                    # Fail honestly: do not bypass MemoryCurator with raw add_memory_item.
+                    # Deterministic rewrite already ran inside curator when LLM failed.
+                    errs = list(curated.errors or []) if curated is not None else []
+                    if curated is not None and curated.rejected:
+                        errs.append("curator_rejected_candidates")
+                    memory_error = (
+                        "; ".join(errs)
+                        if errs
+                        else "Could not create a durable memory from that request. "
+                        "Try a clearer preference or fact (not temporary task state)."
+                    )
+                if curated is not None and curated.errors and not memory_id:
+                    memory_error = memory_error or "; ".join(curated.errors)
+            except Exception as exc:
+                memory_error = str(exc)
+            execution = self._state_store.get_execution(str(self._current_execution_id or ""))
+            if memory_id:
+                self._state_store.add_item(
+                    turn_id=str(self._current_execution_id or ""), item_type="memory_write", status="complete",
+                    payload={
+                        "memory_id": memory_id,
+                        "scope": "account",
+                        "memory_type": memory_type,
+                        "text": normalized,
+                        "llm_invoked": bool(curated and curated.llm_invoked),
+                        "used_deterministic_fallback": bool(curated and curated.used_deterministic_fallback),
+                        "index_state": str((self.memory._records.get(memory_id) or {}).get("index_state") or "pending"),
+                    },
+                    session_id=self._thread_key(), project_id=str(getattr(execution, "project_id", "") or ""),
+                )
+                response_text = f"Saved to your account memory: {normalized}"
+            else:
+                self._state_store.add_item(
+                    turn_id=str(self._current_execution_id or ""), item_type="memory_write", status="failed",
+                    payload={"error": memory_error or "Memory persistence did not return a durable ID"},
+                    session_id=self._thread_key(), project_id=str(getattr(execution, "project_id", "") or ""),
+                )
+                response_text = "I could not save that to durable memory, so I will not claim it was saved."
+            self._last_tts_text = self._clamp_tts_text(response_text)
+            self._record_turn(user_input, response_text)
+            return response_text, bool(memory_id)
 
         # Delegate platform-specific routing to the adapter
         from agent.adapters import get_adapter
@@ -18942,17 +20848,21 @@ class EchoSpeakAgent:
                 self._active_user_query = resolved_input
             except Exception:
                 pass
+        # Durable account memory is owner-only. Public/community adapters may
+        # retain their own Session context, but never receive the owner's
+        # canonical or indexed personal records.
+        include_account_memory = bool(include_memory and self._owner_memory_access_allowed())
         memory_context = self.memory.get_conversation_context(
             memory_query or context_query,
             thread_id=thread_id,
             project_path=execution_context.project_path or None,
-        ) if include_memory else ""
+        ) if include_account_memory else ""
         memory_context = sanitize_untrusted_context(memory_context)
         # No small-model / local-profile compression gates. All models receive
         # the same retrieved context; real window pressure is handled by
         # ContextBudgetManager (configured + true context_limit only).
         pinned_context = ""
-        if include_memory:
+        if include_account_memory:
             try:
                 pinned_context = self.memory.pinned_context(
                     thread_id=thread_id,
@@ -18977,15 +20887,7 @@ class EchoSpeakAgent:
             # Profile data belongs to the OWNER — do not inject it for
             # non-owner Discord users so we never leak the owner's name,
             # relations, or preferences to other people.
-            _inject_profile = True
-            try:
-                from config import DiscordUserRole
-                _role = getattr(self, "_current_user_role", None)
-                if _role is not None and _role != DiscordUserRole.OWNER:
-                    _inject_profile = False
-            except Exception:
-                pass
-            if _inject_profile:
+            if self._owner_memory_access_allowed():
                 try:
                     profile_context = self._build_profile_context()
                 except Exception:
@@ -20682,7 +22584,8 @@ class EchoSpeakAgent:
         # Inject real configured window so profile never invents a local 32k clamp.
         try:
             trim = int(getattr(config, "llm_trim_max_tokens", 0) or 0)
-            ctx_len = int(getattr(getattr(config, "local", None), "context_length", 0) or 0)
+            is_local_provider = self.llm_provider.value not in {"openai", "gemini"}
+            ctx_len = int(getattr(getattr(config, "local", None), "context_length", 0) or 0) if is_local_provider else 0
             real_window = trim or ctx_len
             if real_window > 0 and "context_limit" not in profile_overrides:
                 profile_overrides["context_limit"] = real_window
@@ -21173,7 +23076,8 @@ class EchoSpeakAgent:
         )
         # Prefer real configured context length over guessed profile defaults.
         try:
-            ctx_len = int(getattr(getattr(config, "local", None), "context_length", 0) or 0)
+            is_local_provider = self.llm_provider.value not in {"openai", "gemini"}
+            ctx_len = int(getattr(getattr(config, "local", None), "context_length", 0) or 0) if is_local_provider else 0
             trim = int(getattr(config, "llm_trim_max_tokens", 0) or 0)
             real_window = trim or ctx_len
             if real_window > 0 and "context_limit" not in overrides:

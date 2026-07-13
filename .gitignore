@@ -68,3 +68,7 @@ out/
 
 # Local Project registry pins (machine paths)
 apps/backend/projects/
+
+# Disposable live acceptance roots (local only)
+.live-acceptance/
+

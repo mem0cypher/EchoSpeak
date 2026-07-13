@@ -521,38 +521,21 @@ def _route_telegram(text: str, label: str = "Notification") -> None:
 
 
 def _route_email(text: str, label: str = "Notification") -> None:
-    """Send a message via email."""
-    try:
-        from config import config
-        if not getattr(config, "allow_email", False):
-            return
-        from agent.skills_registry import get_skills_registry
-        registry = get_skills_registry()
-        email_tool = registry.get_tool_by_name("email_send")
-        if email_tool:
-            email_tool.invoke(
-                subject=f"🫀 EchoSpeak {label}",
-                body=text,
-            )
-    except Exception as exc:
-        logger.debug(f"route_message: email route error — {exc}")
+    """Fail closed: outbound email must be an approval-bound agent action."""
+    logger.warning(
+        "route_message: blocked background email delivery for {}; "
+        "prepare email_send through a Turn/Approval/ToolRun instead",
+        label,
+    )
 
 
 def _route_whatsapp(text: str, label: str = "Notification") -> None:
-    """Send a message via WhatsApp."""
-    try:
-        from config import config
-        if not getattr(config, "allow_whatsapp", False):
-            return
-        from agent.skills_registry import get_skills_registry
-        registry = get_skills_registry()
-        wa_tool = registry.get_tool_by_name("whatsapp_send")
-        if wa_tool:
-            wa_tool.invoke(
-                message=f"🫀 EchoSpeak {label}\n{text}",
-            )
-    except Exception as exc:
-        logger.debug(f"route_message: whatsapp route error — {exc}")
+    """Fail closed: outbound WhatsApp must be an approval-bound agent action."""
+    logger.warning(
+        "route_message: blocked background WhatsApp delivery for {}; "
+        "prepare whatsapp_send through a Turn/Approval/ToolRun instead",
+        label,
+    )
 
 
 # ---------------------------------------------------------------------------

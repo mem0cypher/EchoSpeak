@@ -5,6 +5,7 @@ This file is for developers extending EchoSpeak’s agent.
 ---
 
 ## Recent Updates
+- **Unified coordination (north-star)**: One request lifecycle, one owner per concept, capability inventory, no prose-as-truth — **`docs/UNIFIED_COORDINATION.md`**. Prefer foundation cleanup over demo-only features.
 - **Runtime contracts / lifecycle (v7.6.10)**: **Implemented (partial); pending live validation.**  
   - Full wave index: **`docs/RUNTIME_CONTRACTS.md`** (equal models, Project lifecycle, hydration, search/utility, coding targets, streaming, approval scope, Known limitations).  
   - Truthfulness contracts: **`docs/LIFECYCLE_TRUTHFULNESS.md`** (recovery I.1, confirm I.2, evidence I.3, ToolRuns, projection, corruption).  
@@ -176,16 +177,21 @@ Latest hardening changed the default tool policy for simple prompts:
 
 ---
 
-## Memory v2 (typed + pinned)
+## Memory v3 (authoritative records + retrieval index)
 
-EchoSpeak memory has two complementary layers:
+EchoSpeak memory has one durable owner and derived layers:
 
-- **Profile memory**: deterministic facts stored in `profile.json` (user name, relations, common structured preferences). Used to answer simple questions reliably.
-- **Vector memory**: FAISS semantic store for conversation chunks and durable memory items.
+- **Authoritative records**: `records.json` owns stable memory IDs, owner,
+  scope, provenance, active/deleted state, supersession, and index state.
+- **Profile projection**: `profile.json` is a backward-compatible legacy mirror;
+  deterministic recall resolves active authoritative records.
+- **Retrieval index**: FAISS is rebuildable and never proves persistence.
+- **Session memory**: per-Session summary/context cache; never account memory.
+- **Studio**: reads authoritative records through `GET /memory`.
 
 ### Typed memories
 
-Durable memory items use a `metadata.type` field (ex: `preference`, `project`, `contacts`).
+Durable memory records use `memory_type` plus explicit account/session/project scope.
 
 ### Pinned memories
 
@@ -195,13 +201,17 @@ If a memory has `metadata.pinned=true`, it is always injected into the agent con
 
 After each turn, the agent may run a memory curator pass which extracts 0-2 durable items as strict JSON and saves them via `AgentMemory.add_memory_item(...)`.
 
-Exception: explicit `remember ...` requests now bypass the extra typed-memory extraction pass so they complete quickly and deterministically.
+Exception: explicit `remember ...` requests synchronously write an authoritative
+record and acknowledge success only after a durable ID exists. Index failure is
+reported separately and does not hide the source record.
 
 Hard rules:
 
 - Save durable facts only.
 - Never store secrets (API keys, passwords, tokens).
 - Dedupe near-identical items.
+- Corrections supersede prior semantic preferences without erasing provenance.
+- Forget/delete tombstones the record and removes or invalidates derived retrieval/profile/Session projections.
 
 ### Memory API endpoints (thread-scoped)
 

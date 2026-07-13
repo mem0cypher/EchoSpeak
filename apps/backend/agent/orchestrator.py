@@ -1,9 +1,13 @@
 """
-Multi-Agent Orchestrator for EchoSpeak.
+Multi-Agent Orchestrator for EchoSpeak (OPTIONAL / NON-PRIMARY).
 
-Decomposes complex queries into sub-tasks, dispatches them in parallel
-across the agent pool, respects dependency ordering (DAG), and aggregates
-results via LLM.
+Production chat ownership is ``EchoSpeakAgent.process_query`` (core.py).
+This module is reachable only when ``config.orchestration_enabled`` is true
+via explicit ``/orchestrate`` API routes — not the normal Web UI chat path.
+
+When enabled, sub-tasks must still use the shared agent so Session/Project
+approvals and ToolRuns apply. This orchestrator must not invent a second
+mutation authority.
 """
 
 from __future__ import annotations

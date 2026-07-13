@@ -11,6 +11,10 @@ When the user asks you to:
 
 ## Tool reference
 
+### skill_create (governed)
+
+Creates an **experimental + DISABLED** package only. Never executes the skill in the same Turn. Registration approval and a separate `skill_enable` Turn are required. Does not install dependencies, download models, or grant permissions.
+
 ### skill_create
 Creates a new skill directory with SKILL.md and skill.json.
 Supply a clear `name`, `description`, and `prompt` that instructs the agent how to behave when the skill is active.

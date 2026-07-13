@@ -487,6 +487,7 @@ EchoSpeak remains local-first. Before exposing `API_HOST` beyond localhost, enab
 - `API_AUTH_ENABLED=true`
 - `API_AUTH_KEY=<long random key>`
 - `API_AUTH_LOCALHOST_BYPASS=true` keeps local desktop use smooth while requiring the key from non-local clients.
+- `API_TRUST_PROXY_HEADERS=false` is the safe default. Enable it only behind a trusted reverse proxy that overwrites `X-Forwarded-For`.
 - REST clients can send `X-EchoSpeak-Key`, `X-API-Key`, `X-Admin-Key`, or `Authorization: Bearer <key>`.
 - `/gateway/ws` uses the same header-based check and closes unauthorized network clients with policy violation code `1008`.
 

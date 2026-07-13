@@ -94,7 +94,11 @@ def test_state_store_keeps_execution_context_and_ledger_thread_isolated(tmp_path
 
 
 def test_memory_selection_allows_stable_facts_but_filters_other_projects(monkeypatch):
+    import threading
+
     memory = AgentMemory.__new__(AgentMemory)
+    memory._records_lock = threading.RLock()
+    memory._load_records = lambda: None
     memory.use_faiss = False
     memory.simple_memory = [
         {"text": "Stable preference", "mode": "general", "thread_id": "t1", "metadata": {"type": "preference", "project_path": ""}},

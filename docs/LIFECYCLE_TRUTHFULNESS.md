@@ -22,22 +22,28 @@ Future edits to these six topics land **here first**.
 
 ---
 
-## Status of this wave (v7.6.10)
+## Status of this wave (v7.6.10 + production-closure)
 
 | Layer | State |
 |-------|--------|
 | Design (this document + Runtime Contracts) | **Authoritative for contracts** |
-| Code paths in worktree | **Implemented (partial)** — honesty gates, offered actions, silent preflight, projection finalize, write-marker block, unit tests; **gaps** called out in Runtime Contracts §F–§H and Known limitations |
-| Live acceptance (§11 + Runtime Contracts §K) | **Pending live validation** |
+| Code paths in worktree | **Implemented for high-risk backend paths** — named-file pin, approval freeze metadata vs content-identity compare, video propose→apply ToolRuns, durable approval re-load, research artifacts, skill executable audit, orchestrator gated off by default |
+| Backend regression + disposable restart soak | **Exercised** (`test_production_closure*`, `test_coding_fixture_workflow`, `scripts/_restart_soak_once.py`) |
+| Live API + live model (LM Studio) | **Exercised** against disposable `ECHOSPEAK_DATA_DIR` (`scripts/live_api_acceptance.py`, `scripts/live_gap_closure.py`) — chat stream, coding, ToolRuns list, video selection fail-closed, video propose/apply, memory save/correct/forget, research artifact consume, skills truth |
+| Live Playwright browser | **Exercised** Chromium against `/app` and `/app/video` (`scripts/live_browser_acceptance.py`, `scripts/live_browser_concurrency.py`) — no phantom Session, dual tabs, simultaneous send, refresh |
+| Full process kill/restart | **Exercised** (`scripts/live_process_restart.py`) — taskkill backend PID, respawn, pending approval survives, confirm once, duplicate 409, no pre-confirm mutation |
+| Canonical ToolRuns API | **`GET /tool-runs`**, **`GET /executions/{id}/tool-runs`** — Session/Execution/Project hydration with parent/child (`retry_of`), approval_id, verification |
+| Deterministic video proposals | **`agent/video_editor/deterministic_ops.py`** — proposal-only for unambiguous split/delete/volume when selection+playhead present; never fakes model tool calls |
+| Stream reorder guards | Stream events carry monotonic **`seq`**; frontend ignores `seq <= maxSeen` for the active request |
+| FAISS forget/rebuild | **`POST /memory/rebuild-index`** rebuilds from **active** canonical records only; retrieval drops inactive vectors |
 
-**Release language rule:** Do **not** describe v7.6.10 as “done”, “shipped
-complete”, or “closed” in `ROADMAP.md` / `CHANGES.md` / `AUDIT.md` until live
-checks pass. Unit tests alone did not catch several manual failures. Prefer:
+**Release language rule:** Do **not** describe the product as fully “closed” until
+live browser multi-tab/refresh gates pass. Prefer:
 
-> **Implemented in code (partial); pending live validation**
+> **High-risk production paths hardened and regression-tested; browser UI acceptance still pending where not explicitly run.**
 
-Architecture text describes **intended + coded** behavior. It is not proof that
-a path was live-tested.
+Architecture text describes **intended + coded** behavior. Backend suite pass is
+not a substitute for browser multi-tab proof.
 
 ---
 
@@ -78,6 +84,13 @@ changing model capability product surface; editing the user’s
    ToolRuns + plan projection, not free-form “all done”.
 8. **Equal functional access across models.** Profiles are observability;
    authority is path, policy, and approval.
+9. **Memory acknowledgements require durable identity.** Recent conversation,
+   Session summaries, profile prompts, and vector hits cannot justify “saved.”
+   Durable writes go through **MemoryCurator** (LLM semantic rewrite + runtime
+   validate + confirm). Raw `curated_lines_from_text` / post-curator
+   `add_memory_item` bypasses are **forbidden**.
+10. **Failed mutations are attempts, not changes.** Only successful mutating
+    ToolRuns populate changed-file projections or saved-content UI.
 
 ---
 
@@ -170,6 +183,10 @@ These are **four different user intents**. Docs and code must not collapse them.
 - Accepting (A) may **start prepare/implement toward a proposal**. It still
   does **not** skip (B) for web/UI mutators: the eventual `file_write` must
   create or hit a pending approval unless auto-confirm policy explicitly allows.
+- A type-B filesystem approval captures every relevant source and destination
+  version (write/patch, delete, move, copy, mkdir, artifact replacement, and
+  checkpoint undo). If one changes before confirmation, the stale action is
+  blocked and must be prepared again from current state.
 
 ### 4.2 What each store does
 
@@ -215,8 +232,9 @@ that is only “proposed, not applied”), rewrite:
 ### 4.6 Implementation note
 
 **Implemented** paths: offered-action extract/resolve, pure-confirm refusal,
-mutation honesty, Stage 1 approval confirm. **Pending live validation** of the
-full A→prepare→B→write sequence on Web UI.
+mutation honesty, Stage 1 approval confirm, and filesystem version preconditions.
+**Pending live validation** of the full A→prepare→B→write sequence and stale-source
+blocking on Web UI.
 
 ---
 
