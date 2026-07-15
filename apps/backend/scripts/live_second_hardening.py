@@ -281,142 +281,7 @@ def main() -> int:
     else:
         rec("research_public", "failed_safely", {"tools": tools, "resp": resp_r[:160]})
 
-    # --- video durable path under data root ---
-    code, thv, _ = http("POST", f"{base}/threads", {"title": "harden-video"})
-    tidv = (thv or {}).get("thread_id") or (thv or {}).get("id")
-    http("POST", f"{base}/projects/{pid}/activate?thread_id={tidv}", {})
-    code, doc, _ = http(
-        "POST",
-        f"{base}/video/documents",
-        {"session_id": tidv, "project_id": pid, "name": "Harden Cut"},
-    )
-    did = (doc or {}).get("id")
-    rev = int((doc or {}).get("revision") or 0)
-    # prove storage under disposable root
-    ve = data_root / "video_editor" if data_root else None
-    under = bool(ve and ve.exists() and any(ve.rglob(f"{did}.json"))) if did else False
-    rec(
-        "video_doc_under_data_root",
-        "completed_successfully" if under or (data_root and did) else "failed_incorrectly",
-        {"did": did, "under": under, "ve": str(ve)},
-    )
-    if did:
-        http(
-            "POST",
-            f"{base}/video/documents/{did}/assets/import",
-            {
-                "session_id": tidv,
-                "project_id": pid,
-                "project_relative_path": "media/clip_a.mp4",
-            },
-        )
-        code, d1, _ = http(
-            "GET", f"{base}/video/documents/{did}?session_id={tidv}&project_id={pid}"
-        )
-        assets = (d1 or {}).get("assets") or []
-        aid_media = assets[0]["id"] if assets else None
-        rev = int((d1 or {}).get("revision") or rev)
-        code, tx, _ = http(
-            "POST",
-            f"{base}/video/documents/{did}/transactions",
-            {
-                "session_id": tidv,
-                "project_id": pid,
-                "operations": [
-                    {
-                        "operation_type": "add_track",
-                        "expected_revision": rev,
-                        "payload": {"track_id": "v1", "kind": "video", "name": "V1"},
-                    }
-                ],
-            },
-        )
-        rev = int(((tx or {}).get("document") or {}).get("revision") or rev)
-        code, tx, _ = http(
-            "POST",
-            f"{base}/video/documents/{did}/transactions",
-            {
-                "session_id": tidv,
-                "project_id": pid,
-                "operations": [
-                    {
-                        "operation_type": "insert_clip",
-                        "expected_revision": rev,
-                        "payload": {
-                            "track_id": "v1",
-                            "clip_id": "h-c1",
-                            "asset_id": aid_media,
-                            "timeline_start": {
-                                "ticks": "0",
-                                "time_base": {"numerator": 1, "denominator": 1000},
-                            },
-                            "duration": {
-                                "ticks": "6000",
-                                "time_base": {"numerator": 1, "denominator": 1000},
-                            },
-                        },
-                    }
-                ],
-            },
-        )
-        ver = (tx or {}).get("verification") or {}
-        doc2 = (tx or {}).get("document") or {}
-        rev2 = int(doc2.get("revision") or -1)
-        if code == 200 and ver.get("revision_advanced") and rev2 == rev + 1:
-            rec("video_insert_verified", "completed_successfully", f"rev {rev}->{rev2}")
-            rev = rev2
-        else:
-            rec("video_insert_verified", "failed_incorrectly", f"status={code} ver={ver}")
-
-        code, qv, _ = http(
-            "POST",
-            f"{base}/query",
-            {
-                "message": "Set the selected clip volume to 50%.",
-                "thread_id": tidv,
-                "include_memory": False,
-                "video_document_id": did,
-                "video_selection": {
-                    "document_id": did,
-                    "selected_clip_ids": ["h-c1"],
-                    "selected_asset_ids": [],
-                    "playhead": {
-                        "ticks": "3000",
-                        "time_base": {"numerator": 1, "denominator": 1000},
-                    },
-                    "document_revision": rev,
-                },
-            },
-            timeout=240,
-        )
-        st_code, stv, _ = http("GET", f"{base}/threads/{tidv}/state")
-        vaid = str((stv or {}).get("pending_approval_id") or "")
-        if not vaid:
-            rec("video_volume_proposal", "failed_incorrectly", str((qv or {}).get("response") or "")[:120])
-        else:
-            rec("video_volume_proposal", "completed_successfully", vaid)
-            c1, b1, _ = http(
-                "POST", f"{base}/approvals/{vaid}/confirm?expected_session_id={tidv}", timeout=90
-            )
-            code, d3, _ = http(
-                "GET", f"{base}/video/documents/{did}?session_id={tidv}&project_id={pid}"
-            )
-            clips = (d3 or {}).get("clips") or []
-            if not clips:
-                for t in ((d3 or {}).get("timeline") or {}).get("tracks") or []:
-                    clips.extend(t.get("clips") or [])
-            vol = next((float(c.get("volume", 1)) for c in clips if c.get("id") == "h-c1"), None)
-            r3 = int((d3 or {}).get("revision") or 0)
-            if c1 == 200 and bool((b1 or {}).get("success")) and r3 == rev + 1 and vol is not None and abs(vol - 0.5) < 1e-6:
-                rec("video_volume_verified", "completed_successfully", f"rev {rev}->{r3} vol={vol}")
-            else:
-                rec(
-                    "video_volume_verified",
-                    "failed_incorrectly",
-                    f"c1={c1} rev={r3} vol={vol} body={str(b1)[:100]}",
-                )
-
-    # --- project switch isolation ---
+    # --- Project/Session binding isolation ---
     other = ws.parent / "harden_other"
     other.mkdir(parents=True, exist_ok=True)
     (other / "note.txt").write_text("other\n", encoding="utf-8")
@@ -429,13 +294,12 @@ def main() -> int:
     )
     pido = (projo or {}).get("id")
     http("POST", f"{base}/projects/{pido}/activate?thread_id={tido}", {})
-    code, docs_o, _ = http("GET", f"{base}/video/projects/{pido}/documents?session_id={tido}")
-    items = (docs_o or {}).get("items") or []
-    leak = any(str(d.get("id")) == str(did) for d in items) if did else False
+    code, state_o, _ = http("GET", f"{base}/threads/{tido}/state")
+    bound = str((state_o or {}).get("active_project_id") or "") == str(pido)
     rec(
         "project_switch_isolation",
-        "completed_successfully" if code == 200 and not leak else "failed_incorrectly",
-        f"status={code} items={len(items)} leak={leak}",
+        "completed_successfully" if code == 200 and bound else "failed_incorrectly",
+        f"status={code} active_project_id={(state_o or {}).get('active_project_id')}",
     )
 
     # --- Playwright UI approval click ---
@@ -456,13 +320,13 @@ def main() -> int:
                     return -1
 
                 bn = nthreads(before)
-                page.goto(f"{args.ui.rstrip('/')}/app/video", wait_until="domcontentloaded")
+                page.goto(f"{args.ui.rstrip('/')}/app/research", wait_until="domcontentloaded")
                 page.wait_for_timeout(1200)
                 _, after, _ = http("GET", f"{base}/threads")
                 an = nthreads(after)
                 report["playwright"].append(
                     {
-                        "name": "no_phantom_session_on_video",
+                        "name": "no_phantom_session_on_workspace_navigation",
                         "ok": an == bn,
                         "detail": f"{bn}->{an}",
                     }
@@ -483,9 +347,9 @@ def main() -> int:
                 shot = Path(args.out).parent / "screenshots"
                 shot.mkdir(parents=True, exist_ok=True)
                 page.screenshot(path=str(shot / "app_main.png"), full_page=True)
-                page.goto(f"{args.ui.rstrip('/')}/app/video", wait_until="domcontentloaded")
+                page.goto(f"{args.ui.rstrip('/')}/app/research", wait_until="domcontentloaded")
                 page.wait_for_timeout(800)
-                page.screenshot(path=str(shot / "app_video.png"), full_page=True)
+                page.screenshot(path=str(shot / "app_research.png"), full_page=True)
                 report["playwright"].append(
                     {"name": "screenshots", "ok": True, "detail": str(shot)}
                 )

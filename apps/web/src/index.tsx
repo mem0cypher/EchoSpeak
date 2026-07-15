@@ -9,13 +9,13 @@ import { getToolCategory, getToolDisplayDetails } from "./components/echoAnimati
 import type { CodeDiffSession } from "./components/InlineCodeDiff";
 import { CodeWorkspace } from "./components/CodeWorkspace";
 import type { LiveFileChange, LiveTerminalEntry } from "./components/CodeWorkspace";
-import { TaskChecklist, createEmptyTaskPlan, taskPlanReducer } from "./components/TaskChecklist";
+import { createEmptyTaskPlan, taskPlanReducer } from "./components/TaskChecklist";
 import type { TaskPlanState } from "./components/TaskChecklist";
 import type { EchoReaction, ToolCategory } from "./components/echoAnimationUtils";
 import { TodoPanel } from "./components/TodoPanel";
 import { AvatarEditor } from "./components/AvatarEditor";
 import { ProjectSidebar } from "./components/ProjectSidebar";
-import { VideoEditorView } from "./features/video-editor/VideoEditorView.tsx";
+import { MediaLibraryView } from "./features/media/MediaLibraryView.tsx";
 import { loadRuntimeLayout, runtimeGridColumns, saveRuntimeLayout } from "./runtimeLayout";
 import { buildResearchRunFromToolEvent, normalizeResearchRun } from "./features/research/buildResearchRun";
 import { useResearchStore } from "./features/research/store";
@@ -29,9 +29,23 @@ import type { ChatEmbed } from "./features/embeds/types";
 import { CapabilityRegistryGroups, OperationalStateCard } from "./features/operations/OperationalStateCard";
 import type { OperationalApproval, OperationalThreadState } from "./features/operations/OperationalStateCard";
 import {
+  createEchoSpeakWebSocket,
+  getEchoSpeakApiBase,
+  isDesktopRuntime,
+  pickDesktopProjectFolder,
+} from "./desktop/bridge";
+import { canApplySessionHistory, ownsStreamCleanup } from "./desktop/sessionProjection";
+import {
+  desktopVisualizerMode,
+  desktopWorkspaceForView,
+  desktopWorkspaceLabel,
+  isDesktopContextualSurface,
+  type DesktopSidebarView,
+  type DesktopWorkspaceSurface,
+} from "./desktop/workspaceState";
+import {
   agentActivityReducer,
   initialAgentActivity,
-  isStreamEventCurrent,
   isStreamThreadCurrent,
   toolCategoryFromPhase,
   type AgentActivityState,
@@ -353,8 +367,7 @@ type TaskPlanEntry = {
 
 type TimelineItem =
   | { kind: "message"; id: string; at: number; msg: Message }
-  | { kind: "activity"; id: string; at: number; item: ActivityItem }
-  | { kind: "task_plan"; id: string; at: number; entry: TaskPlanEntry };
+  | { kind: "activity"; id: string; at: number; item: ActivityItem };
 
 type ProviderListItem = {
   id: string;
@@ -1228,12 +1241,26 @@ const globalCss = `
            justify-content: center;
            border-bottom: 1px solid rgba(255,255,255,0.06);
            background: rgba(255,255,255,0.015);
+           min-width: 0;
          }
+         .studio-nav-arrow {
+           width: 36px;
+           flex: 0 0 36px;
+           border: 0;
+           border-left: 1px solid rgba(255,255,255,0.06);
+           border-right: 1px solid rgba(255,255,255,0.06);
+           background: rgba(8,8,8,0.96);
+           color: rgba(255,255,255,0.72);
+           cursor: pointer;
+           font-size: 18px;
+         }
+         .studio-nav-arrow:hover { color: #fff; background: rgba(255,255,255,0.06); }
          .studio-nav-inner {
            display: flex;
            gap: 0;
            overflow-x: auto;
            max-width: 960px;
+           min-width: 0;
            width: 100%;
            padding: 0 8px;
            scrollbar-width: none;
@@ -2358,7 +2385,6 @@ const ChatBubble: React.FC<{
   const stillTyping = !isUser && typewriter && shown.length < (msg.text || "").length;
   return (
     <motion.div
-      layout
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: -4 }}
@@ -2468,15 +2494,6 @@ const ChatBubble: React.FC<{
             width: "100%",
           }}
         >
-          {!isUser && msg.operation ? (
-            <OperationalStateCard
-              state={msg.operation.state}
-              success={msg.operation.success}
-              executionId={msg.operation.executionId || msg.executionId}
-              compact
-            />
-          ) : null}
-
           {!isUser && msg.docSources?.length ? (
             <details style={{ color: colors.textDim, fontSize: 11, minWidth: 0, maxWidth: "100%", margin: 0 }}>
               <summary style={{ cursor: "pointer", color: colors.text }}>
@@ -2635,7 +2652,6 @@ const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; con
 
   return (
     <motion.div
-      layout
       initial={{ opacity: 0, y: 4 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0 }}
@@ -2757,7 +2773,6 @@ const ActivityCard: React.FC<{ item: ActivityItem }> = ({ item }) => {
 
   return (
     <motion.div
-      layout
       initial={{ opacity: 0, y: 4 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0 }}
@@ -3034,12 +3049,19 @@ const ConfirmationCard: React.FC<ConfirmationCardProps> = ({
   );
 };
 
-type DashboardTab = "chat" | "research" | "memory" | "docs" | "settings" | "capabilities" | "approvals" | "executions" | "projects" | "routines" | "soul" | "services" | "avatar_editor" | "video_editor";
+type DashboardTab = "chat" | "research" | "overview" | "skills" | "memory" | "docs" | "settings" | "capabilities" | "approvals" | "executions" | "projects" | "automations" | "connections" | "soul" | "services" | "avatar_editor";
 
 export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialView = "chat" }) => {
   const location = useLocation();
   const navigate = useNavigate();
-  const videoRouteActive = location.pathname.replace(/\/+$/, "") === "/app/video";
+  const desktopMode = useMemo(() => isDesktopRuntime(), []);
+  const apiBase = useMemo(() => getEchoSpeakApiBase(), []);
+  const workspaceRoute = location.pathname.replace(/\/+$/, "");
+  const mediaRouteActive = workspaceRoute === "/app/media";
+  const [desktopSurface, setDesktopSurface] = useState<DesktopWorkspaceSurface>(() =>
+    mediaRouteActive ? "media" : "chat"
+  );
+  const [desktopStudioHost, setDesktopStudioHost] = useState<HTMLDivElement | null>(null);
   const {
     messages,
     addMessage,
@@ -3153,20 +3175,21 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     userTypingTimerRef.current = window.setTimeout(() => setUserIsTyping(false), 1500);
   }, []);
   const research = useResearchStore((state) => state.runs);
+  const [researchArtifacts, setResearchArtifacts] = useState<any[]>([]);
+  const [researchArtifactsError, setResearchArtifactsError] = useState("");
   const prependResearchRun = useResearchStore((state) => state.prependRun);
   const replaceResearchRuns = useResearchStore((state) => state.replaceRuns);
   const clearResearchRuns = useResearchStore((state) => state.clearRuns);
-  const [leftTab, setLeftTab] = useState<DashboardTab>(() =>
-    videoRouteActive ? "video_editor" : initialView
-  );
+  const [leftTab, setLeftTab] = useState<DashboardTab>(initialView);
 
   useEffect(() => {
-    if (videoRouteActive) {
-      setLeftTab("video_editor");
+    if (mediaRouteActive) {
+      setLeftTab("chat");
+      if (desktopMode) setDesktopSurface("media");
       return;
     }
-    setLeftTab((current) => current === "video_editor" ? "chat" : current);
-  }, [videoRouteActive]);
+    if (desktopMode) setDesktopSurface((current) => current === "media" ? "chat" : current);
+  }, [desktopMode, mediaRouteActive]);
   const [activeGroup, setActiveGroup] = useState<string | null>(null);
   const activeGroupButtonRef = useRef<HTMLButtonElement | null>(null);
   const activeGroupMenuRef = useRef<HTMLDivElement | null>(null);
@@ -3192,12 +3215,17 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const [memoryError, setMemoryError] = useState<string | null>(null);
   const [memoryDoctor, setMemoryDoctor] = useState<MemoryDoctorReport | null>(null);
   const [memoryDoctorLoading, setMemoryDoctorLoading] = useState<boolean>(false);
+  const [obsidianPlan, setObsidianPlan] = useState<any>(null);
+  const [obsidianLoading, setObsidianLoading] = useState<boolean>(false);
+  const [obsidianStatus, setObsidianStatus] = useState<string>("");
   const [docItems, setDocItems] = useState<DocumentItem[]>([]);
   const [servicesHeartbeatStatus, setServicesHeartbeatStatus] = useState<any>(null);
   const [servicesHeartbeatHistory, setServicesHeartbeatHistory] = useState<any[]>([]);
   const [servicesTelegramStatus, setServicesTelegramStatus] = useState<any>(null);
   const [servicesDiscordStatus, setServicesDiscordStatus] = useState<any>(null);
   const [servicesLoading, setServicesLoading] = useState<boolean>(false);
+  const [studioOverview, setStudioOverview] = useState<any>(null);
+  const [studioOverviewLoading, setStudioOverviewLoading] = useState<boolean>(false);
   const [docCount, setDocCount] = useState<number>(0);
   const [docLoading, setDocLoading] = useState<boolean>(false);
   const [docEnabled, setDocEnabled] = useState<boolean>(false);
@@ -3212,6 +3240,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const toolInfoRef = useRef<Record<string, { name: string; input: string; requestId?: string }>>({});
   const latestCodeFilenameRef = useRef<string | null>(null);
   const [capabilitiesData, setCapabilitiesData] = useState<any>(null);
+  const [skillExecutions, setSkillExecutions] = useState<any[]>([]);
   const [codingReadiness, setCodingReadiness] = useState<CodingReadiness | null>(null);
   const [codingReadinessLoading, setCodingReadinessLoading] = useState<boolean>(false);
   const codingReadinessRequestRef = useRef(0);
@@ -3220,14 +3249,16 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const [selectedMemoryIds, setSelectedMemoryIds] = useState<string[]>([]);
   const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null);
   const [editingMemoryText, setEditingMemoryText] = useState<string>("");
+  const desktopBootstrap = typeof window !== "undefined" ? window.__ECHOSPEAK_DESKTOP_BOOTSTRAP__ : undefined;
   const [projects, setProjects] = useState<{
     id: string; name: string; description?: string; context_prompt?: string; tags?: string[];
     workspace_root?: string; archived?: boolean; git_metadata?: Record<string, any>;
-  }[]>([]);
-  const [activeProjectId, setActiveProjectId] = useState<string>("");
+  }[]>(() => (desktopBootstrap?.projects || []) as any[]);
+  const [activeProjectId, setActiveProjectId] = useState<string>(() => desktopBootstrap?.active_project_id || "");
   const [folderDropActive, setFolderDropActive] = useState(false);
   const [projectsLoading, setProjectsLoading] = useState<boolean>(false);
-  const [threadState, setThreadState] = useState<ThreadSessionState | null>(null);
+  const [initialHydrationComplete, setInitialHydrationComplete] = useState(Boolean(desktopBootstrap));
+  const [threadState, setThreadState] = useState<ThreadSessionState | null>(() => (desktopBootstrap?.thread_state || null) as ThreadSessionState | null);
   const [pendingApproval, setPendingApproval] = useState<PendingActionEnvelope | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRecord[]>([]);
   const [approvalsLoading, setApprovalsLoading] = useState<boolean>(false);
@@ -3242,16 +3273,70 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const [routines, setRoutines] = useState<{ id: string; name: string; description?: string; enabled: boolean; trigger_type: string; schedule?: string; webhook_path?: string; action_type: string; action_config: Record<string, any>; last_run?: string; next_run?: string; run_count: number }[]>([]);
   const [routinesLoading, setRoutinesLoading] = useState<boolean>(false);
 
-  const [threads, setThreads] = useState<{ id: string; name: string; at: number; projectId?: string; messageCount?: number }[]>([]);
-  const [activeThreadId, setActiveThreadId] = useState<string>("");
-  const activeThreadIdRef = useRef<string>("");
-  const activeStreamAbortRef = useRef<AbortController | null>(null);
+  const [threads, setThreads] = useState<{ id: string; name: string; at: number; projectId?: string; messageCount?: number }[]>(() =>
+    (desktopBootstrap?.threads || []).map((item: any) => ({
+      id: String(item.thread_id || item.id || ""),
+      name: String(item.title || item.name || "Session"),
+      at: normalizeTimestampMs(item.last_active_at || item.created_at || Date.now()),
+      projectId: String(item.project_id || ""),
+      messageCount: Number(item.message_count || 0),
+    })),
+  );
+  const [activeThreadId, setActiveThreadId] = useState<string>(() => desktopBootstrap?.active_session_id || "");
+  const activeThreadIdRef = useRef<string>(desktopBootstrap?.active_session_id || "");
+  const streamControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const historyRequestSeqRef = useRef<Map<string, number>>(new Map());
+  const projectionRevisionRef = useRef<Map<string, number>>(new Map());
+  const sessionProjectionRef = useRef<Map<string, { messages: Message[]; activities: ActivityItem[] }>>(new Map());
+  const [inFlightSessionIds, setInFlightSessionIds] = useState<Set<string>>(() => new Set());
+
+  const setSessionInFlight = useCallback((threadId: string, active: boolean) => {
+    setInFlightSessionIds((current) => {
+      const next = new Set(current);
+      if (active) next.add(threadId);
+      else next.delete(threadId);
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    const applyBootstrap = (event: Event) => {
+      const bootstrap = (event as CustomEvent).detail || window.__ECHOSPEAK_DESKTOP_BOOTSTRAP__;
+      if (!bootstrap) return;
+      const mapped = (Array.isArray(bootstrap.threads) ? bootstrap.threads : []).map((item: any) => ({
+        id: String(item.thread_id || item.id || ""),
+        name: String(item.title || item.name || "Session"),
+        at: normalizeTimestampMs(item.last_active_at || item.created_at || Date.now()),
+        projectId: String(item.project_id || ""),
+        messageCount: Number(item.message_count || 0),
+      }));
+      setProjects(Array.isArray(bootstrap.projects) ? bootstrap.projects : []);
+      setThreads(mapped);
+      setActiveProjectId(String(bootstrap.active_project_id || ""));
+      setThreadState((bootstrap.thread_state || null) as ThreadSessionState | null);
+      const sessionId = String(bootstrap.active_session_id || "");
+      const mustRebind = Boolean(sessionId && activeThreadIdRef.current === sessionId);
+      if (mustRebind) {
+        activeThreadIdRef.current = "";
+        setActiveThreadId("");
+        window.setTimeout(() => {
+          activeThreadIdRef.current = sessionId;
+          setActiveThreadId(sessionId);
+        }, 0);
+      } else {
+        activeThreadIdRef.current = sessionId;
+        setActiveThreadId(sessionId);
+      }
+      setInitialHydrationComplete(true);
+    };
+    window.addEventListener("echospeak-desktop-bootstrap", applyBootstrap);
+    return () => window.removeEventListener("echospeak-desktop-bootstrap", applyBootstrap);
+  }, []);
 
   useEffect(() => {
     activeThreadIdRef.current = activeThreadId;
-    activeStreamAbortRef.current?.abort();
-    activeStreamAbortRef.current = null;
-  }, [activeThreadId]);
+    setStreaming(Boolean(activeThreadId && streamControllersRef.current.has(activeThreadId)));
+  }, [activeThreadId, inFlightSessionIds, setStreaming]);
 
   useEffect(() => {
     if (activeThreadId) {
@@ -3271,6 +3356,9 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
    * Never parse assistant prose for tools/sources; never restart live stream chrome.
    */
   const loadHistory = async (threadId: string) => {
+    const requestSeq = (historyRequestSeqRef.current.get(threadId) || 0) + 1;
+    historyRequestSeqRef.current.set(threadId, requestSeq);
+    const startingRevision = projectionRevisionRef.current.get(threadId) || 0;
     try {
       const rawTid = String(threadId || "").trim();
       const tid = encodeURIComponent(rawTid);
@@ -3292,7 +3380,15 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       }
       if (!resp.ok) return;
       const data = await resp.json();
-      if (activeThreadIdRef.current !== threadId) return;
+      if (!canApplySessionHistory({
+        activeSessionId: activeThreadIdRef.current,
+        targetSessionId: threadId,
+        currentRequestSeq: historyRequestSeqRef.current.get(threadId) || 0,
+        requestSeq,
+        currentRevision: projectionRevisionRef.current.get(threadId) || 0,
+        startingRevision,
+        streamInFlight: streamControllersRef.current.has(threadId),
+      })) return;
 
       const turns: any[] = Array.isArray(data?.turns) ? data.turns : [];
       if (turns.length > 0) {
@@ -3555,6 +3651,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         // Replace — never append (idempotent refresh / session switch)
         useAppStore.setState({ messages: loadedMsgs });
         setActivities(loadedActs);
+        sessionProjectionRef.current.set(threadId, { messages: loadedMsgs, activities: loadedActs });
         // Historical research for Studio panel; chat embeds already on assistant messages.
         if (hydratedResearch.length) {
           replaceResearchRuns(hydratedResearch);
@@ -3585,6 +3682,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
           .filter((m: Message) => m.text);
         useAppStore.setState({ messages: loadedMsgs });
         setActivities([]);
+        sessionProjectionRef.current.set(threadId, { messages: loadedMsgs, activities: [] });
         clearResearchRuns();
         setAgentMode("idle");
       }
@@ -3599,13 +3697,12 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         .then(res => res.json())
         .then(data => setCapabilitiesData(data))
         .catch(e => console.error("Failed to fetch capabilities:", e));
+      fetch(`${apiBase}/skills/executions?session_id=${encodeURIComponent(activeThreadId)}&limit=20`)
+        .then(res => res.ok ? res.json() : { items: [] })
+        .then(data => setSkillExecutions(Array.isArray(data.items) ? data.items : []))
+        .catch(e => console.error("Failed to fetch skill executions:", e));
     }
-  }, [leftTab, activeThreadId]);
-
-  useEffect(() => {
-    refreshThreads();
-    refreshProjects();
-  }, []);
+  }, [leftTab, activeThreadId, activeProjectId]);
 
   const refreshThreads = async () => {
     try {
@@ -3613,7 +3710,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       if (!resp.ok) throw new Error(`Threads failed (${resp.status})`);
       const data = await resp.json();
       const items = Array.isArray(data) ? data : [];
-      const selectedId = activeThreadIdRef.current;
+      const selectedId = activeThreadIdRef.current || localStorage.getItem("echospeak.active_thread_id") || "";
       const mapped = items.map((item: any) => ({
         id: String(item.thread_id || item.id || ""),
         name: String(item.title || item.name || "Session"),
@@ -3644,8 +3741,10 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         useAppStore.setState({ messages: [] });
         setActivities([]);
       }
+      return true;
     } catch (e) {
       console.error("Failed to refresh threads:", e);
+      return false;
     }
   };
 
@@ -3841,28 +3940,51 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     setProjectsLoading(true);
     try {
       const res = await fetch(`${apiBase}/projects`);
+      if (!res.ok) throw new Error(`Projects failed (${res.status})`);
       const data = await res.json();
       setProjects(data.items || []);
+      return true;
     } catch (e) {
       console.error("Failed to load projects:", e);
+      return false;
     } finally {
       setProjectsLoading(false);
     }
   };
 
-  const createNewThread = async (projectId: string = "") => {
+  useEffect(() => {
+    let cancelled = false;
+    const hydrate = async () => {
+      // Dashboard mounts only after the desktop host reports ready, but a
+      // recovering sidecar can still race the first authenticated requests.
+      // Retry safe reads; never create a Session as part of hydration.
+      let hydrated = false;
+      for (let attempt = 0; attempt < 4 && !cancelled; attempt += 1) {
+        const [threadsReady, projectsReady] = await Promise.all([refreshThreads(), refreshProjects()]);
+        if (threadsReady && projectsReady) {
+          hydrated = true;
+          break;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 350 * (attempt + 1)));
+      }
+      if (!cancelled && hydrated) setInitialHydrationComplete(true);
+    };
+    void hydrate();
+    return () => { cancelled = true; };
+  }, [apiBase]);
+
+  const createNewThread = async (projectId: string = "", requestedTitle: string = "New Session"): Promise<string> => {
     try {
       const resp = await fetch(`${apiBase}/threads`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "New Session", source: "web", project_id: projectId }),
+        body: JSON.stringify({ title: requestedTitle, source: "web", project_id: projectId }),
       });
       if (!resp.ok) throw new Error(`Create thread failed (${resp.status})`);
       const data = await resp.json();
       const nextThread = { id: String(data.thread_id), name: String(data.title || "New Session"), at: normalizeTimestampMs(data.last_active_at || data.created_at || Date.now()), projectId: String(data.project_id || projectId || "") };
-      // Abort previous Session stream before swapping UI state.
-      activeStreamAbortRef.current?.abort();
-      activeStreamAbortRef.current = null;
+      projectionRevisionRef.current.set(nextThread.id, 0);
+      sessionProjectionRef.current.set(nextThread.id, { messages: [], activities: [] });
       activeThreadIdRef.current = nextThread.id;
       setThreads((prev) => [
         nextThread,
@@ -3889,29 +4011,38 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       setLiveReplyDraft("");
       setDocSources([]);
       toolInfoRef.current = {};
+      return nextThread.id;
     } catch (e) {
       console.error("Failed to create thread:", e);
+      return "";
     }
   };
 
   const switchThread = (id: string) => {
     if (id === activeThreadId) return;
-    // Abort synchronously BEFORE clearing UI so late NDJSON cannot repaint the new Session.
-    activeStreamAbortRef.current?.abort();
-    activeStreamAbortRef.current = null;
+    // A Session owns its request. Navigation changes only the projection;
+    // it must not cancel another Session's durable execution.
+    const previousId = String(activeThreadIdRef.current || activeThreadId || "");
+    if (previousId) {
+      sessionProjectionRef.current.set(previousId, {
+        messages: useAppStore.getState().messages,
+        activities,
+      });
+    }
     activeThreadIdRef.current = id;
     setThreads((prev) => prev.filter((item) => item.id === id || !isEmptySessionDraft(item)));
     setActiveThreadId(id);
     dispatchActivity({ type: "reset" });
-    setStreaming(false);
+    setStreaming(streamControllersRef.current.has(id));
     liveReplyDraftRef.current = "";
     setLiveReplyDraft("");
     setDocSources([]);
     toolInfoRef.current = {};
     // In a real app, we might fetch history from backend here.
     // For now, we'll clear local state to start fresh in the new context.
-    useAppStore.setState({ messages: [] });
-    setActivities([]);
+    const cachedProjection = sessionProjectionRef.current.get(id);
+    useAppStore.setState({ messages: cachedProjection?.messages || [] });
+    setActivities(cachedProjection?.activities || []);
     setTaskPlans([]);
     activeTaskPlanIdRef.current = null;
     clearResearchRuns();
@@ -3925,13 +4056,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     setExecutions([]);
     setSelectedTrace(null);
     setSelectedTraceId("");
-    // Re-onboard if switching to a fresh state or keep history if backend supports it
-    addMessage({
-      id: crypto.randomUUID(),
-      role: "assistant",
-      text: "Switched session. How can I assist you in this context?",
-      at: Date.now(),
-    });
   };
 
   const deleteThread = async (id: string) => {
@@ -3946,8 +4070,9 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     if (id === activeThreadId) {
       if (nextThreads[0]) switchThread(nextThreads[0].id);
       else {
-        activeStreamAbortRef.current?.abort();
-        activeStreamAbortRef.current = null;
+        streamControllersRef.current.get(id)?.abort();
+        streamControllersRef.current.delete(id);
+        setSessionInFlight(id, false);
         activeThreadIdRef.current = "";
         setActiveThreadId("");
         useAppStore.setState({ messages: [] });
@@ -3962,10 +4087,14 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const attachFolder = async (candidatePath: string = "") => {
     let path = candidatePath.trim();
     if (!path) {
-      try {
-        const picker = await fetch(`${apiBase}/projects/pick-folder`, { method: "POST" });
-        if (picker.ok) path = String((await picker.json()).path || "");
-      } catch { /* native picker may not be available outside the desktop host */ }
+      if (desktopMode) {
+        try { path = String(await pickDesktopProjectFolder() || ""); } catch { /* surfaced by the desktop host */ }
+      } else {
+        try {
+          const picker = await fetch(`${apiBase}/projects/pick-folder`, { method: "POST" });
+          if (picker.ok) path = String((await picker.json()).path || "");
+        } catch { /* native picker may not be available outside the desktop host */ }
+      }
     }
     if (!path) return;
     const response = await fetch(`${apiBase}/projects/attach-folder`, {
@@ -4000,7 +4129,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   };
 
   const docInputRef = useRef<HTMLInputElement | null>(null);
-  const apiBase = useMemo(() => (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(/\/$/, ""), []);
   const bootedRef = useRef(false);
   const backendRetryRef = useRef<{ attempt: number; timer: number | null }>({ attempt: 0, timer: null });
   const refreshAvatarConfig = useCallback(async () => {
@@ -4065,10 +4193,12 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
+  const sessionScrollRef = useRef<Map<string, { top: number; atBottom: boolean }>>(new Map());
   /** Ignore scroll events caused by our own pin-to-bottom so we never unstick mid-update. */
   const programmaticScrollRef = useRef(false);
   const pinBottomRafRef = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const sessionCreationForSendRef = useRef(false);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -4342,7 +4472,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     try {
       const tid = encodeURIComponent(String(activeThreadId || "").trim());
       const threadQs = tid ? `&thread_id=${tid}` : "";
-      const resp = await fetchWithTimeout(`${apiBase}/memory?offset=0&limit=200${threadQs}`);
+      const projectQs = `&project_id=${encodeURIComponent(activeProjectId)}`;
+      const resp = await fetchWithTimeout(`${apiBase}/memory?offset=0&limit=200${threadQs}${projectQs}`);
       if (!resp.ok) throw new Error(`Memory request failed (${resp.status})`);
       const data = (await resp.json()) as MemoryListResponse;
       setMemoryItems(Array.isArray(data.items) ? data.items : []);
@@ -4358,7 +4489,9 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     setMemoryDoctorLoading(true);
     try {
       const tid = encodeURIComponent(String(activeThreadId || "").trim());
-      const qs = tid ? `?thread_id=${tid}&max_scan=300` : "?max_scan=300";
+      const qs = tid
+        ? `?thread_id=${tid}&project_id=${encodeURIComponent(activeProjectId)}&max_scan=300`
+        : `?project_id=${encodeURIComponent(activeProjectId)}&max_scan=300`;
       const resp = await fetchWithTimeout(`${apiBase}/memory/doctor${qs}`, undefined, 7000);
       if (!resp.ok) throw new Error(`Memory doctor failed (${resp.status})`);
       const data = (await resp.json()) as MemoryDoctorReport;
@@ -4401,7 +4534,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       const resp = await fetchWithTimeout(`${apiBase}/memory/delete`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ids: [id], thread_id: activeThreadId }),
+        body: JSON.stringify({ ids: [id], thread_id: activeThreadId, project_id: activeProjectId }),
       });
       if (!resp.ok) throw new Error(`Delete failed (${resp.status})`);
       await refreshMemory();
@@ -4415,7 +4548,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       const resp = await fetchWithTimeout(`${apiBase}/memory/update`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: item.id, pinned: !Boolean(item.pinned), thread_id: activeThreadId }),
+        body: JSON.stringify({ id: item.id, pinned: !Boolean(item.pinned), thread_id: activeThreadId, project_id: activeProjectId }),
       });
       if (!resp.ok) throw new Error(`Update failed (${resp.status})`);
       setMemoryItems((prev: MemoryItem[]) =>
@@ -4430,7 +4563,9 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     if (!window.confirm("Clear all saved memory?")) return;
     try {
       const tid = encodeURIComponent(String(activeThreadId || "").trim());
-      const threadQs = tid ? `?thread_id=${tid}` : "";
+      const threadQs = tid
+        ? `?thread_id=${tid}&project_id=${encodeURIComponent(activeProjectId)}`
+        : `?project_id=${encodeURIComponent(activeProjectId)}`;
       const resp = await fetchWithTimeout(`${apiBase}/memory/clear${threadQs}`, { method: "POST" });
       if (!resp.ok) throw new Error(`Clear failed (${resp.status})`);
       await refreshMemory();
@@ -4443,7 +4578,9 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     setDocLoading(true);
     setDocError(null);
     try {
-      const resp = await fetchWithTimeout(`${apiBase}/documents`);
+      const docScope = new URLSearchParams({ session_id: activeThreadId });
+      if (activeProjectId) docScope.set("project_id", activeProjectId);
+      const resp = await fetchWithTimeout(`${apiBase}/documents?${docScope.toString()}`);
       if (!resp.ok) throw new Error(`Documents request failed (${resp.status})`);
       const data = (await resp.json()) as DocumentListResponse;
       setDocEnabled(Boolean(data.enabled));
@@ -4466,7 +4603,9 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     try {
       const form = new FormData();
       form.append("file", docFile);
-      const resp = await fetchWithTimeout(`${apiBase}/documents/upload`, { method: "POST", body: form }, 12000);
+      const docScope = new URLSearchParams({ session_id: activeThreadId });
+      if (activeProjectId) docScope.set("project_id", activeProjectId);
+      const resp = await fetchWithTimeout(`${apiBase}/documents/upload?${docScope.toString()}`, { method: "POST", body: form }, 12000);
       if (!resp.ok) throw new Error(await resp.text());
       setDocFile(null);
       if (docInputRef.current) docInputRef.current.value = "";
@@ -4483,7 +4622,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       const resp = await fetchWithTimeout(`${apiBase}/documents/delete`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ids: [id] }),
+        body: JSON.stringify({ ids: [id], session_id: activeThreadId, project_id: activeProjectId || "" }),
       });
       if (!resp.ok) throw new Error(`Delete failed (${resp.status})`);
       await refreshDocuments();
@@ -4495,7 +4634,9 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const clearAllDocuments = async () => {
     if (!window.confirm("Clear all uploaded documents?")) return;
     try {
-      const resp = await fetchWithTimeout(`${apiBase}/documents/clear`, { method: "POST" });
+      const scope = new URLSearchParams({ session_id: activeThreadId });
+      if (activeProjectId) scope.set("project_id", activeProjectId);
+      const resp = await fetchWithTimeout(`${apiBase}/documents/clear?${scope.toString()}`, { method: "POST" });
       if (!resp.ok) throw new Error(`Clear failed (${resp.status})`);
       await refreshDocuments();
     } catch (e) {
@@ -4551,21 +4692,9 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     }
   };
 
-  /**
-   * ONE plan for the current turn only — sticky under tools/thinking.
-   * Never inject historical task_plan rows into the timeline (that pinned
-   * checklists high above the current conversation).
-   */
-  const liveTaskPlan = useMemo(() => {
-    if (!taskPlans.length) return null;
-    // Always the latest plan only (one checklist, current turn).
-    const latest = taskPlans[taskPlans.length - 1];
-    if (!latest?.plan?.tasks?.length) return null;
-    return latest;
-  }, [taskPlans]);
-
   const timeline = useMemo<TimelineItem[]>(() => {
-    // Plans are NOT merged into history — only messages + activity cards.
+    // Chat is a conversation projection. Durable operational evidence stays in
+    // Studio/Viewer; only persistent errors remain alongside message bubbles.
     const merged: TimelineItem[] = [
       ...messages.map(
         (m): TimelineItem => ({
@@ -4575,7 +4704,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
           msg: m,
         })
       ),
-      ...activities.map(
+      ...activities.filter((item) => item.kind === "error").map(
         (a): TimelineItem => ({
           kind: "activity",
           id: a.id,
@@ -4584,36 +4713,12 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         })
       ),
     ];
-    // Chronological with multi-beat contract:
-    //   user → first spoken assistant beat (partial) → tool/search rows → final answer
-    // Plan checklist is rendered separately under the stream (liveTaskPlan).
+    // Chronological user/assistant history with persistent error rows.
     const kindRank = (k: TimelineItem["kind"]) =>
       k === "message" ? 0 : k === "activity" ? 1 : 2;
-    const isPartialBeat = (t: TimelineItem) => {
-      if (t.kind !== "message") return false;
-      const m = (t as Extract<TimelineItem, { kind: "message" }>).msg;
-      return m.role === "assistant" && m.streamBeat === "partial";
-    };
-    const isToolActivity = (t: TimelineItem) =>
-      t.kind === "activity" &&
-      ((t as Extract<TimelineItem, { kind: "activity" }>).item.kind === "thinking" ||
-        (t as Extract<TimelineItem, { kind: "activity" }>).item.kind === "tool");
-
     merged.sort((a, b) => {
       const dt = a.at - b.at;
-      // Close in time: partial spoken beat always above tool/search activity.
-      if (Math.abs(dt) < 180_000) {
-        if (isPartialBeat(a) && isToolActivity(b)) return -1;
-        if (isToolActivity(a) && isPartialBeat(b)) return 1;
-        if (a.kind !== "message" && b.kind !== "message") {
-          const ra = kindRank(a.kind);
-          const rb = kindRank(b.kind);
-          if (ra !== rb) return ra - rb;
-        }
-      }
       if (dt !== 0) return dt;
-      if (isPartialBeat(a) && isToolActivity(b)) return -1;
-      if (isToolActivity(a) && isPartialBeat(b)) return 1;
       return kindRank(a.kind) - kindRank(b.kind);
     });
     return merged;
@@ -4666,7 +4771,69 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     // User is still "at bottom" if within a small slack of the true end.
     const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     stickToBottomRef.current = distFromBottom <= 48;
+    const sessionId = String(activeThreadIdRef.current || "");
+    if (sessionId) sessionScrollRef.current.set(sessionId, { top: el.scrollTop, atBottom: stickToBottomRef.current });
   };
+
+  const refreshObsidianPlan = async () => {
+    setObsidianLoading(true);
+    setObsidianStatus("");
+    try {
+      const query = new URLSearchParams({ session_id: activeThreadId, project_id: activeProjectId });
+      const response = await fetchWithTimeout(`${apiBase}/memory/obsidian/plan?${query}`, undefined, 7000);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(String(payload?.detail || `Obsidian sync unavailable (${response.status})`));
+      setObsidianPlan(payload);
+      setObsidianStatus(`${(payload.actions || []).length} action(s) require review.`);
+    } catch (error) {
+      setObsidianPlan(null);
+      setObsidianStatus(String(error));
+    } finally {
+      setObsidianLoading(false);
+    }
+  };
+
+  const applyObsidianPlan = async (direction: "export" | "import") => {
+    const allowedKinds = direction === "export" ? ["export_new", "export_update"] : ["import_new", "import_update"];
+    const actionIds = (obsidianPlan?.actions || [])
+      .filter((action: any) => allowedKinds.includes(String(action.kind)))
+      .map((action: any) => String(action.id));
+    if (!actionIds.length) return;
+    setObsidianLoading(true);
+    try {
+      const response = await fetch(`${apiBase}/memory/obsidian/apply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: activeThreadId,
+          project_id: activeProjectId,
+          direction,
+          action_ids: actionIds,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(String(payload?.detail || `Obsidian ${direction} failed (${response.status})`));
+      setObsidianStatus(`${direction === "export" ? "Export" : "Import"} applied. Refreshing the governed plan…`);
+      await Promise.all([refreshMemory(), refreshObsidianPlan()]);
+    } catch (error) {
+      setObsidianStatus(String(error));
+    } finally {
+      setObsidianLoading(false);
+    }
+  };
+
+  useLayoutEffect(() => {
+    const el = chatScrollRef.current;
+    if (!el || !activeThreadId) return;
+    const saved = sessionScrollRef.current.get(activeThreadId);
+    programmaticScrollRef.current = true;
+    requestAnimationFrame(() => {
+      if (saved?.atBottom || !saved) el.scrollTop = el.scrollHeight;
+      else el.scrollTop = Math.min(saved.top, Math.max(0, el.scrollHeight - el.clientHeight));
+      stickToBottomRef.current = saved?.atBottom ?? true;
+      requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+    });
+  }, [activeThreadId]);
 
   useEffect(() => {
     // initial mount / tab switch — always jump to latest
@@ -4734,13 +4901,25 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const sendText = async (overrideText?: string) => {
     const raw = overrideText ?? input;
     if (!raw.trim()) return;
-    // Never let an empty UI scope fall through to the backend's legacy
-    // "default" thread. Only explicit New Session/+ controls create Sessions.
-    if (!activeThreadId) return;
-    const streamThreadId = activeThreadId;
-    activeStreamAbortRef.current?.abort();
+    // Sending is an explicit user action. If no Session exists yet, create one
+    // before the Turn and title it from the first message. Passive launch,
+    // navigation, view switching, and AI replies still never create Sessions.
+    let streamThreadId = String(activeThreadIdRef.current || activeThreadId || "").trim();
+    if (!streamThreadId) {
+      if (sessionCreationForSendRef.current) return;
+      sessionCreationForSendRef.current = true;
+      const title = raw.replace(/\s+/g, " ").trim().slice(0, 72) || "Quick Chat";
+      try {
+        streamThreadId = await createNewThread("", title);
+      } finally {
+        sessionCreationForSendRef.current = false;
+      }
+    }
+    if (!streamThreadId) return;
+    streamControllersRef.current.get(streamThreadId)?.abort();
     const streamController = new AbortController();
-    activeStreamAbortRef.current = streamController;
+    streamControllersRef.current.set(streamThreadId, streamController);
+    setSessionInFlight(streamThreadId, true);
 
     stickToBottomRef.current = true; // force sticky to bottom when sending a message
     if (!overrideText) setInput("");
@@ -4774,6 +4953,10 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         model: providerInfo?.model,
       }),
     };
+    projectionRevisionRef.current.set(
+      streamThreadId,
+      (projectionRevisionRef.current.get(streamThreadId) || 0) + 1,
+    );
     addMessage(userMsg);
     setInput("");
     setUserIsTyping(false);
@@ -4797,7 +4980,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     const bootstrapStepId = `${runRequestId}:working`;
     /** Backend Turn id once create_execution emits turn_bound / final. */
     let durableTurnId = "";
-    let finalHandled = false;
+      let finalHandled = false;
+      let streamWasHidden = false;
     /** Mid-turn spoken beats already committed (so final doesn't re-add them). */
     const partialReplies: string[] = [];
     /** True once the first spoken mid-turn beat is sealed — tools must sort after it. */
@@ -5398,7 +5582,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       };
 
       while (true) {
-        if (!isStreamEventCurrent(streamThreadId, activeThreadIdRef.current, streamController.signal.aborted)) break;
+        if (streamController.signal.aborted) break;
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
@@ -5415,7 +5599,12 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
           } catch (e) {
             continue;
           }
-          if (!isStreamEventCurrent(streamThreadId, activeThreadIdRef.current, streamController.signal.aborted)) continue;
+          if (streamController.signal.aborted) continue;
+          if (!isStreamThreadCurrent(streamThreadId, activeThreadIdRef.current)) {
+            streamWasHidden = true;
+            if (evt.type === "final") finalHandled = true;
+            continue;
+          }
           const evtSeq = Number((evt as { seq?: number }).seq || 0);
           if (evtSeq > 0) {
             if (evtSeq <= maxStreamSeq) {
@@ -5557,36 +5746,21 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
               setLiveReplyDraft(next);
             }
           } else if (evt.type === "partial_reply") {
-            // Multi-beat: seal the chatty preamble (e.g. "doing great") before tools run.
+            // Keep partial prose transient. The completed Turn is committed as
+            // one assistant message when the final event arrives.
             const text = String(evt.response || liveReplyDraftRef.current || "").trim();
             if (!text) continue;
             if (partialReplies.some((p) => p.trim() === text)) continue;
             partialReplies.push(text);
-            const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
             const beatAt = Date.now();
             sawPartialBeat = true;
-            // Tools must render strictly below this spoken beat (across all multi-beat turns).
             toolsAfterPartialAt = beatAt + 10;
-            addMessage({
-              id: crypto.randomUUID(),
-              role: "assistant",
-              text,
-              at: beatAt,
-              skipTypewriter: true,
-              streamBeat: "partial",
-              usage: buildMessageUsage(text, useAppStore.getState().messages, ctxWindow, {
-                provider: providerInfo?.provider,
-                model: providerInfo?.model,
-              }),
-            });
-            liveReplyDraftRef.current = "";
-            setLiveReplyDraft("");
+            liveReplyDraftRef.current = text;
+            setLiveReplyDraft(text);
             // Speak this beat now — tools may follow, then a second reply.
             if (evt.speak !== false) {
               void speakText(text);
             }
-            // Move the thinking/tool card under this beat. Keep any tool rows already
-            // recorded (they may have finished before this event was painted).
             const reqId = eventRequestId(evt);
             setActivities((prev) =>
               prev.map((p) => {
@@ -5672,26 +5846,12 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
 
             const liveDraft = liveReplyDraftRef.current.trim();
             let reply = String(evt.response || liveDraft || "").trim();
-            // Drop any mid-turn beats already committed as partial_reply.
-            for (const part of [...partialReplies, ...(Array.isArray(evt.partial_replies) ? evt.partial_replies : [])]) {
-              const p = String(part || "").trim();
-              if (!p) continue;
-              if (reply === p) {
-                reply = "";
-                break;
-              }
-              if (reply.startsWith(p)) {
-                reply = reply.slice(p.length).replace(/^[\s\n\-–—]+/, "").trim();
-              }
-            }
-            // Prefer remaining live draft (post-tool generation) when backend still echoes preamble.
-            if ((!reply || partialReplies.some((p) => reply === p.trim())) && liveDraft) {
-              let draft = liveDraft;
-              for (const part of partialReplies) {
-                const p = part.trim();
-                if (draft.startsWith(p)) draft = draft.slice(p.length).replace(/^[\s\n\-–—]+/, "").trim();
-              }
-              if (draft) reply = draft;
+            const partials = [...partialReplies, ...(Array.isArray(evt.partial_replies) ? evt.partial_replies : [])]
+              .map((part) => String(part || "").trim())
+              .filter(Boolean)
+              .filter((part, index, rows) => rows.indexOf(part) === index);
+            if (partials.length && !partials.some((part) => reply.includes(part))) {
+              reply = [...partials, reply].filter(Boolean).join("\n\n");
             }
 
             if (evt.execution_id) {
@@ -5737,14 +5897,14 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                 if (!turnResearchRuns.some((t) => t.id === r.id)) turnResearchRuns.push(r);
                 if (r.query) turnSearchQueries.push(r.query);
               }
+              void refreshResearchArtifacts();
             }
 
             liveReplyDraftRef.current = "";
             setLiveReplyDraft("");
             setStreaming(false);
 
-            // Second beat (tool result): only add/speak if there's new content after partials.
-            if (reply && !partialReplies.some((p) => p.trim() === reply)) {
+            if (reply) {
               const alreadyStreamed = liveDraft.length > 0;
               const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
               const renderPlan = buildResponseRenderPlan({
@@ -5849,9 +6009,10 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       }
     } catch (err) {
       if (streamController.signal.aborted) {
-        // Aborted (Session switch / cancel): never paint error into the next Session.
+        // Explicit same-Session supersession/delete: never paint a cancellation error.
         return;
       }
+      if (!isStreamThreadCurrent(streamThreadId, activeThreadIdRef.current)) return;
       const msg = String(err);
       const pretty = msg.includes("Failed to fetch") ? `Backend offline (${apiBase})` : msg;
       setBackendOnline(false);
@@ -5863,24 +6024,34 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       ]);
       setEchoReaction("error");
     } finally {
-      const owned = activeStreamAbortRef.current === streamController;
+      const owned = ownsStreamCleanup(streamControllersRef.current.get(streamThreadId), streamController);
       const sameThread = isStreamThreadCurrent(streamThreadId, activeThreadIdRef.current);
       const aborted = streamController.signal.aborted;
 
       if (owned) {
-        activeStreamAbortRef.current = null;
+        streamControllersRef.current.delete(streamThreadId);
+        setSessionInFlight(streamThreadId, false);
       }
 
-      // Always clear phase machine so tool/search never sticks after switch or cancel.
-      if (aborted || !sameThread) {
+      // A superseded controller owns no visible or durable projection cleanup.
+      if (!owned) return;
+
+      // Only the visible Session owns the current projection's phase machine.
+      if (sameThread && aborted) {
         dispatchActivity({ type: "reset" });
-      } else {
+      } else if (sameThread) {
         dispatchActivity({ type: "stream_end" });
       }
 
       // Do not mutate chat of a different Session (switch already cleared UI).
       if (!sameThread) {
         return;
+      }
+
+      if (streamWasHidden) {
+        // Frames skipped while this Session was hidden are reconstructed from
+        // canonical Turns/ToolRuns, preventing duplicate or partially measured rows.
+        await loadHistory(streamThreadId);
       }
 
       setStreaming(false);
@@ -5987,6 +6158,46 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     }
   };
 
+  const refreshStudioOverview = async () => {
+    setStudioOverviewLoading(true);
+    try {
+      const response = await fetchWithTimeout(
+        `${apiBase}/studio/overview?session_id=${encodeURIComponent(activeThreadId)}`,
+        undefined,
+        4000,
+      );
+      if (!response.ok) throw new Error(`Studio projection failed (${response.status})`);
+      const projection = await response.json();
+      setStudioOverview(projection);
+      setRoutines(projection.routines || []);
+    } catch (error) {
+      console.error("Failed to refresh Studio projection", error);
+    } finally {
+      setStudioOverviewLoading(false);
+    }
+  };
+
+  const refreshResearchArtifacts = async () => {
+    if (!activeThreadId || !activeProjectId) {
+      setResearchArtifacts([]);
+      return;
+    }
+    try {
+      const query = new URLSearchParams({ session_id: activeThreadId, project_id: activeProjectId, limit: "20" });
+      const response = await fetchWithTimeout(`${apiBase}/research/artifacts?${query}`, undefined, 5000);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(String(payload?.detail || `Research artifacts failed (${response.status})`));
+      setResearchArtifacts(Array.isArray(payload.items) ? payload.items : []);
+      setResearchArtifactsError("");
+    } catch (error) {
+      setResearchArtifactsError(String(error));
+    }
+  };
+
+  useEffect(() => {
+    if (leftTab === "research" || (desktopMode && desktopSurface === "research")) void refreshResearchArtifacts();
+  }, [activeProjectId, activeThreadId, desktopMode, desktopSurface, leftTab]);
+
   useEffect(() => {
     const gatewayUrl = `${apiBase.replace(/^http/i, "ws")}/gateway/ws`;
     let disposed = false;
@@ -6021,7 +6232,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
           gatewaySocketRef.current = null;
         }
 
-        const ws = new WebSocket(gatewayUrl);
+        const ws = createEchoSpeakWebSocket(gatewayUrl);
         gatewaySocketRef.current = ws;
 
         ws.onopen = () => {
@@ -6136,6 +6347,9 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   }, []);
 
   useEffect(() => {
+    if (["overview", "skills", "capabilities", "executions", "automations", "connections"].includes(leftTab)) {
+      refreshStudioOverview();
+    }
     if (leftTab === "memory") {
       refreshMemory();
       refreshMemoryDoctor();
@@ -6304,6 +6518,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     : [providerDraft.model || "Default model"];
   const modelPickerValue = showModelPicker ? providerDraft.model : modelPickerOptions[0];
   const studioTabs: { id: typeof leftTab; label: string; group: string }[] = [
+    { id: "overview", label: "Overview", group: "Control Center" },
+    { id: "skills", label: "Skills", group: "Capabilities" },
     { id: "memory", label: "Memory", group: "Knowledge" },
     { id: "docs", label: "Docs", group: "Knowledge" },
     { id: "settings", label: "Settings", group: "Config" },
@@ -6311,29 +6527,56 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     { id: "soul", label: "Soul", group: "Config" },
     { id: "avatar_editor", label: "Avatar", group: "Config" },
     { id: "approvals", label: "Approvals", group: "Automation" },
-    { id: "executions", label: "Executions", group: "Automation" },
+    { id: "executions", label: "Viewer", group: "Operations" },
     { id: "projects", label: "Projects", group: "Automation" },
-    { id: "routines", label: "Routines", group: "Automation" },
+    { id: "automations", label: "Automations", group: "Automation" },
+    { id: "connections", label: "Connections", group: "Automation" },
     { id: "services", label: "Services", group: "Automation" },
   ];
-  const studioOpen = leftTab !== "chat" && leftTab !== "research" && leftTab !== "video_editor";
-  /** Video occupies the shell as a first-class workspace: sidebar + editor only. */
-  const videoWorkspaceOpen = leftTab === "video_editor";
+  const studioOpen = desktopMode
+    ? desktopSurface === "studio"
+    : leftTab !== "chat" && leftTab !== "research";
+  /** Media occupies the shell as a first-class workspace. */
+  const mediaWorkspaceOpen = desktopMode ? desktopSurface === "media" : mediaRouteActive;
+  const desktopVisualizerOpen = desktopMode && ["visualizer", "research", "code", "tasks"].includes(desktopSurface);
+  const desktopContextualWorkspace = desktopMode && isDesktopContextualSurface(desktopSurface);
+  const activeWorkspaceLabel = desktopMode ? desktopWorkspaceLabel(desktopSurface) : "EchoSpeak";
   const studioActiveTab = studioTabs.find((t) => t.id === leftTab);
+  const studioNavRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    studioNavRef.current?.querySelector<HTMLElement>(`[data-studio-tab="${leftTab}"]`)?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+      inline: "center",
+    });
+  }, [leftTab]);
+  const moveStudioTabFocus = (currentIndex: number, key: string) => {
+    let nextIndex = currentIndex;
+    if (key === "ArrowRight") nextIndex = (currentIndex + 1) % studioTabs.length;
+    else if (key === "ArrowLeft") nextIndex = (currentIndex - 1 + studioTabs.length) % studioTabs.length;
+    else if (key === "Home") nextIndex = 0;
+    else if (key === "End") nextIndex = studioTabs.length - 1;
+    else return false;
+    const next = studioTabs[nextIndex];
+    setLeftTab(next.id);
+    window.requestAnimationFrame(() => studioNavRef.current?.querySelector<HTMLElement>(`[data-studio-tab="${next.id}"]`)?.focus());
+    return true;
+  };
   const closeStudio = () => {
     setLeftTab("chat");
-    if (videoRouteActive) navigate("/app");
+    if (desktopMode) setDesktopSurface("chat");
+    if (mediaRouteActive) navigate("/app");
     setShowVisualizer(true);
   };
 
-  // Video uses the same shell pattern as Code/Research visualizers:
-  // sidebar | workspace (video) | chat — agent chat stays on the right.
-  const shellColumns = runtimeGridColumns({
-    sidebarVisible: showSidebar,
-    sidebarCollapsed: sidebarCollapsed || narrowLayout,
-    visualizerVisible: videoWorkspaceOpen ? true : showVisualizer && !narrowLayout,
-    visualizerDensity,
-  });
+  const shellColumns = desktopMode
+    ? [showSidebar ? (sidebarCollapsed || narrowLayout ? "56px" : "252px") : null, "minmax(0, 1fr)"].filter(Boolean).join(" ")
+    : runtimeGridColumns({
+      sidebarVisible: showSidebar,
+      sidebarCollapsed: sidebarCollapsed || narrowLayout,
+      visualizerVisible: mediaWorkspaceOpen ? true : showVisualizer && !narrowLayout,
+      visualizerDensity,
+    });
 
   return (
     <div
@@ -6360,19 +6603,27 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         </button>
       ) : null}
       <div
-        className={"app-shell" + (studioOpen ? " is-studio-covered" : "")}
+        className={
+          "app-shell" +
+          (studioOpen && !desktopMode ? " is-studio-covered" : "") +
+          (desktopMode ? " desktop-single-workspace" : "")
+        }
         style={{
           gridTemplateColumns: shellColumns,
         }}
-        aria-hidden={studioOpen || undefined}
+        aria-hidden={!desktopMode && studioOpen || undefined}
       >
         {showSidebar ? <ProjectSidebar
+          desktop={desktopMode}
+          hydrating={!initialHydrationComplete}
           collapsed={sidebarCollapsed || narrowLayout}
           projects={projects}
           sessions={threads}
           activeProjectId={activeProjectId}
           activeSessionId={activeThreadId}
-          activeView={leftTab === "video_editor" ? "video" : leftTab === "research" ? "research" : leftTab !== "chat" ? "studio" : visualizerPin === "coding" ? "code" : visualizerPin === "tasks" ? "tasks" : "avatar"}
+          activeView={desktopMode
+            ? (desktopSurface === "visualizer" ? "avatar" : desktopSurface)
+            : mediaRouteActive ? "media" : leftTab === "research" ? "research" : leftTab !== "chat" ? "studio" : visualizerPin === "coding" ? "code" : visualizerPin === "tasks" ? "tasks" : "avatar"}
           onToggleCollapsed={() => setSidebarCollapsed(v => !v)}
           onNewSession={createNewThread}
           onAddFolder={() => void attachFolder()}
@@ -6387,42 +6638,48 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
             await refreshProjects();
           }}
           onView={(view) => {
-            if (view === "studio") {
-              if (videoRouteActive) navigate("/app");
-              setLeftTab("memory");
+            if (desktopMode) {
+              const surface = desktopWorkspaceForView(view as DesktopSidebarView);
+              setDesktopSurface(surface);
+              if (surface === "media") {
+                navigate("/app/media");
+                return;
+              }
+              if (mediaRouteActive) navigate("/app");
+              if (surface === "studio") {
+                setLeftTab("overview");
+                return;
+              }
+              setLeftTab(surface === "research" ? "research" : "chat");
+              const visualizerMode = desktopVisualizerMode(surface);
+              if (visualizerMode) setVisualizerPin(visualizerMode);
               return;
             }
-            if (view === "video") {
-              navigate("/app/video");
+            if (view === "studio") {
+              if (mediaRouteActive) navigate("/app");
+              setLeftTab("overview");
+              return;
+            }
+            if (view === "media") {
+              navigate("/app/media");
               return;
             }
             setLeftTab(view === "research" ? "research" : "chat");
-            if (videoRouteActive) navigate("/app");
+            if (mediaRouteActive) navigate("/app");
             setShowVisualizer(true);
             setVisualizerPin(view === "code" ? "coding" : view === "tasks" ? "tasks" : view === "research" ? "research" : "ring");
           }}
         /> : null}
-        {videoWorkspaceOpen ? (
-          <div className="visualizer-pane video-workspace-pane" data-testid="video-workspace-pane">
-            <VideoEditorView
+        {mediaWorkspaceOpen ? (
+          <div className="visualizer-pane media-workspace-pane" data-testid="media-workspace-pane">
+            <MediaLibraryView
               apiBase={apiBase}
               sessionId={activeThreadId}
               projectId={activeProjectId}
-              projectName={projects.find((project) => project.id === activeProjectId)?.name}
-              pendingApproval={pendingApproval}
-              onApprovalChanged={async () => {
-                const ownerSessionId = activeThreadIdRef.current;
-                await Promise.all([
-                  refreshPendingApproval(ownerSessionId),
-                  refreshThreadState(ownerSessionId),
-                  refreshApprovals(ownerSessionId),
-                  refreshExecutions(ownerSessionId),
-                ]);
-              }}
             />
           </div>
         ) : null}
-        {!videoWorkspaceOpen && showVisualizer && !narrowLayout ? (
+        {!mediaWorkspaceOpen && (desktopMode ? desktopVisualizerOpen : showVisualizer && !narrowLayout) ? (
           <div className="visualizer-pane">
             {/* Mode Indicator Tabs */}
             <div style={{
@@ -6526,13 +6783,35 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                       return (
                         <div style={{ width: "100%", height: "100%", minHeight: 0, minWidth: 0, padding: "12px 16px 16px", overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", gap: 12, boxSizing: "border-box" }}>
                           <div style={{ fontSize: 13, fontWeight: 700, color: "rgba(255,255,255,0.5)", textTransform: "uppercase", letterSpacing: 1.5, padding: "8px 0" }}>
-                            🔍 Research Feed
+                            Research Feed
                           </div>
-                          {research.length === 0 ? (
+                          {researchArtifactsError ? (
+                            <div style={{ border: "1px solid rgba(248,113,113,.35)", padding: 12, color: "#fca5a5", fontSize: 11 }}>{researchArtifactsError}</div>
+                          ) : null}
+                          {researchArtifacts.slice(0, 6).map((artifact) => (
+                            <details key={artifact.id} style={{ background: "rgba(255,255,255,.03)", border: "1px solid rgba(255,255,255,.09)", padding: 14 }}>
+                              <summary style={{ cursor: "pointer", fontSize: 12, fontWeight: 650 }}>
+                                {artifact.objective || artifact.query || "Research artifact"} · {artifact.status}
+                              </summary>
+                              {artifact.summary ? <div style={{ fontSize: 11, color: "rgba(255,255,255,.62)", lineHeight: 1.5, marginTop: 10 }}>{artifact.summary}</div> : null}
+                              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(110px,1fr))", gap: 6, marginTop: 10 }}>
+                                {[['Claims', artifact.claims?.length || 0], ['Sources', artifact.sources?.length || 0], ['Evidence', artifact.evidence?.length || 0], ['Gaps', artifact.coverage_gaps?.length || 0]].map(([label, value]) => (
+                                  <div key={String(label)} style={{ background: "rgba(255,255,255,.035)", padding: 7, fontSize: 10 }}>{label}: <strong>{value}</strong></div>
+                                ))}
+                              </div>
+                              {(artifact.claims || []).slice(0, 6).map((claim: any) => (
+                                <div key={claim.id} style={{ borderLeft: "2px solid rgba(255,255,255,.22)", paddingLeft: 9, marginTop: 9, fontSize: 11 }}>
+                                  {claim.text} <span style={{ color: "rgba(255,255,255,.4)" }}>· {claim.status} · {Math.round(Number(claim.confidence || 0) * 100)}%</span>
+                                </div>
+                              ))}
+                              {(artifact.contradictions || []).length ? <div style={{ color: "#fbbf24", fontSize: 10, marginTop: 9 }}>{artifact.contradictions.length} contradiction(s) retained for review.</div> : null}
+                            </details>
+                          ))}
+                          {researchArtifacts.length === 0 && research.length === 0 ? (
                             <div style={{ textAlign: "center", color: "rgba(255,255,255,0.25)", fontSize: 13, padding: 40, fontStyle: "italic" }}>
                               Research results will appear here when the agent searches the web...
                             </div>
-                          ) : (
+                          ) : research.length ? (
                             research.slice(0, 8).map((group, gi) => (
                               <motion.div
                                 key={group.id}
@@ -6585,7 +6864,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                 </div>
                               </motion.div>
                             ))
-                          )}
+                          ) : null}
                         </div>
                       );
                     }
@@ -6619,7 +6898,13 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                     if (effectiveMode === "tasks") {
                       return (
                         <div style={{ flex: 1, width: "100%", height: "100%", minHeight: 0, minWidth: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-                          <TodoPanel apiBase={apiBase} colors={colors} variant="visualizer" />
+                          <TodoPanel
+                            apiBase={apiBase}
+                            projectId={activeProjectId}
+                            sessionId={activeThreadId}
+                            colors={colors}
+                            variant="visualizer"
+                          />
                         </div>
                       );
                     }
@@ -6677,16 +6962,14 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
             })()}
           </div>
         ) : null}
-        <div className="glow-panel">
+        {desktopMode && studioOpen ? (
+          <div className="desktop-studio-host" ref={setDesktopStudioHost} data-testid="desktop-studio-host" />
+        ) : null}
+        <div className={`glow-panel${desktopContextualWorkspace ? " desktop-contextual-workspace" : desktopMode ? " desktop-chat-workspace" : ""}`}>
           <div className="panel-header">
             <div className="title">
               <img src="/logo.png" alt="Logo" style={{ width: 14, height: 14, borderRadius: 2 }} />
-              <span>EchoSpeak</span>
-              {videoWorkspaceOpen && (
-                <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)", color: "rgba(255,255,255,0.75)", fontWeight: 600, marginLeft: 8 }}>
-                  Video · agent chat
-                </span>
-              )}
+              <span>{activeWorkspaceLabel}</span>
               {activeProjectId && leftTab === "chat" && threadState?.mode === "coding" && (
                 <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6, background: "linear-gradient(135deg, rgba(34,197,94,0.15), rgba(34,197,94,0.05))", border: "1px solid rgba(34,197,94,0.25)", color: "#22c55e", fontWeight: 600, marginLeft: 8 }}>
                   📁 {projects.find(p => p.id === activeProjectId)?.name || "Project Active"}
@@ -6703,7 +6986,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                     return;
                   }
                   setShowVisualizer(true);
-                  setLeftTab("memory");
+                  setLeftTab("overview");
                 }}
                 title={studioOpen ? "Close Studio" : "Open Studio"}
                 style={{
@@ -6793,7 +7076,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                     { id: 'core', label: 'Core', icon: '⚡', tabs: [{ id: 'chat', label: 'Chat' }, { id: 'research', label: 'Research' }] },
                     { id: 'knowledge', label: 'Knowledge', icon: '📚', tabs: [{ id: 'memory', label: 'Memory' }, { id: 'docs', label: 'Docs' }] },
                     { id: 'config', label: 'Config', icon: '⚙️', tabs: [{ id: 'settings', label: 'Settings' }, { id: 'capabilities', label: 'Tools' }, { id: 'soul', label: 'Soul' }, { id: 'avatar_editor', label: 'Avatar' }] },
-                    { id: 'automation', label: 'Automation', icon: '🤖', tabs: [{ id: 'approvals', label: 'Approvals' }, { id: 'executions', label: 'Executions' }, { id: 'projects', label: 'Projects' }, { id: 'routines', label: 'Routines' }, { id: 'services', label: 'Services' }] },
+                    { id: 'operations', label: 'Operations', icon: '🤖', tabs: [{ id: 'overview', label: 'Overview' }, { id: 'skills', label: 'Skills' }, { id: 'executions', label: 'Viewer' }, { id: 'approvals', label: 'Approvals' }, { id: 'projects', label: 'Projects' }, { id: 'automations', label: 'Automations' }, { id: 'connections', label: 'Connections' }, { id: 'services', label: 'Services' }] },
                   ].map((group) => {
                     const isGroupActive = group.tabs.some(t => t.id === leftTab);
                     return (
@@ -6877,7 +7160,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           { id: 'core', label: 'Core', icon: '⚡', tabs: [{ id: 'chat', label: 'Chat' }, { id: 'research', label: 'Research' }] },
                           { id: 'knowledge', label: 'Knowledge', icon: '📚', tabs: [{ id: 'memory', label: 'Memory' }, { id: 'docs', label: 'Docs' }] },
                           { id: 'config', label: 'Config', icon: '⚙️', tabs: [{ id: 'settings', label: 'Settings' }, { id: 'capabilities', label: 'Tools' }, { id: 'soul', label: 'Soul' }, { id: 'avatar_editor', label: 'Avatar' }] },
-                          { id: 'automation', label: 'Automation', icon: '🤖', tabs: [{ id: 'approvals', label: 'Approvals' }, { id: 'executions', label: 'Executions' }, { id: 'projects', label: 'Projects' }, { id: 'routines', label: 'Routines' }, { id: 'services', label: 'Services' }] },
+                          { id: 'operations', label: 'Operations', icon: '🤖', tabs: [{ id: 'overview', label: 'Overview' }, { id: 'skills', label: 'Skills' }, { id: 'executions', label: 'Viewer' }, { id: 'approvals', label: 'Approvals' }, { id: 'projects', label: 'Projects' }, { id: 'automations', label: 'Automations' }, { id: 'connections', label: 'Connections' }, { id: 'services', label: 'Services' }] },
                         ].find((g) => g.id === activeGroup)?.tabs || []
                       ).map((tab) => (
                         <button
@@ -6916,7 +7199,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
               {/* Chat Tab */}
               {true && (
                 <>
-                  <div className="chat-scroll" style={{ flex: 1 }} ref={chatScrollRef} onScroll={onChatScroll}>
+                  <div key={activeThreadId || "quick-chat"} className="chat-scroll" style={{ flex: 1 }} ref={chatScrollRef} onScroll={onChatScroll}>
                     <AnimatePresence initial={false}>
                       {timeline.map((t) =>
                         t.kind === "message" ? (
@@ -6937,22 +7220,11 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                               sendText(text);
                             }}
                           />
-                        ) : t.kind === "task_plan" ? (
-                          <TaskChecklist key={`plan-${t.id}`} plan={t.entry.plan} />
                         ) : (
                           <ActivityCard key={`act-${t.id}`} item={t.item} />
                         )
                       )}
                     </AnimatePresence>
-                    {/* Current-turn plan only — always under latest tools, never mid-history */}
-                    {liveTaskPlan && liveTaskPlan.plan.tasks.length > 0 ? (
-                      <div
-                        key={`live-plan-${liveTaskPlan.id}`}
-                        style={{ width: "100%", padding: "4px 4px 6px" }}
-                      >
-                        <TaskChecklist plan={liveTaskPlan.plan} />
-                      </div>
-                    ) : null}
                     {pendingApproval?.has_pending && pendingApproval.action ? (
                       <div
                         style={{ width: "100%", padding: "2px 4px 4px", position: "relative", zIndex: 20 }}
@@ -6972,12 +7244,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           onDecision={decideApproval}
                           compact
                         />
-                      </div>
-                    ) : null}
-                    {!pendingApproval?.has_pending && threadState && threadState.mode !== "chat" &&
-                    messages[messages.length - 1]?.operation?.executionId !== threadState.last_execution_id ? (
-                      <div style={{ width: "100%", padding: "2px 4px 4px" }}>
-                        <OperationalStateCard state={threadState} compact />
                       </div>
                     ) : null}
                     {streaming && liveReplyDraft ? (
@@ -7114,13 +7380,12 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                             updateComposerInput(e.target.value);
                           }}
                           onKeyDown={(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-                            if (e.key === "Enter" && !e.shiftKey) {
+                            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                               e.preventDefault();
-                              sendText();
+                              void sendText();
                             }
                           }}
-                          disabled={!activeThreadId}
-                          placeholder={activeThreadId ? "Ask Echo anything..." : "Create a Session with + to start"}
+                          placeholder="Ask Echo anything..."
                           aria-label="Ask Echo anything"
                         />
                       </div>
@@ -7128,9 +7393,9 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                         <ContextMeter messages={messages} contextWindow={providerInfo?.context_window || 0} />
                         <button
                           className="send-button"
-                          onClick={() => sendText()}
+                          onClick={() => void sendText()}
                           type="button"
-                          disabled={!activeThreadId}
+                          disabled={!input.trim()}
                           title="Send"
                           aria-label="Send message"
                         >
@@ -7178,11 +7443,19 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           </svg>
                         </button>
                         <button
-                          className={`composer-square ${showVisualizer && !narrowLayout ? "active" : ""}`}
+                          className={`composer-square ${(desktopMode ? desktopSurface === "visualizer" : showVisualizer && !narrowLayout) ? "active" : ""}`}
                           type="button"
-                          title={showVisualizer && !narrowLayout ? "Hide visualizer" : "Show visualizer"}
-                          aria-label={showVisualizer && !narrowLayout ? "Hide visualizer" : "Show visualizer"}
-                          onClick={() => setShowVisualizer((v) => !v)}
+                          title={(desktopMode ? desktopSurface === "visualizer" : showVisualizer && !narrowLayout) ? "Return to Chat" : "Show visualizer"}
+                          aria-label={(desktopMode ? desktopSurface === "visualizer" : showVisualizer && !narrowLayout) ? "Return to Chat" : "Show visualizer"}
+                          onClick={() => {
+                            if (!desktopMode) {
+                              setShowVisualizer((v) => !v);
+                              return;
+                            }
+                            if (mediaRouteActive) navigate("/app");
+                            setLeftTab("chat");
+                            setDesktopSurface((surface) => surface === "visualizer" ? "chat" : "visualizer");
+                          }}
                         >
                           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
                             <rect x="3.5" y="5" width="17" height="14" rx="2" />
@@ -7267,7 +7540,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                 </>
               )}
 
-              {studioOpen && createPortal(
+              {studioOpen && (!desktopMode || desktopStudioHost) && createPortal(
                 <motion.div
                   className="studio-shell"
                   initial={{ opacity: 0 }}
@@ -7302,13 +7575,21 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                   </div>
 
                   <div className="studio-nav">
-                    <div className="studio-nav-inner">
-                      {studioTabs.map((tab) => (
+                    <button type="button" className="studio-nav-arrow" aria-label="Scroll Studio tabs left" onClick={() => studioNavRef.current?.scrollBy({ left: -280, behavior: "smooth" })}>‹</button>
+                    <div className="studio-nav-inner" ref={studioNavRef} role="tablist" aria-label="Studio sections">
+                      {studioTabs.map((tab, tabIndex) => (
                         <button
                           key={tab.id}
                           type="button"
                           className={"studio-tab" + (leftTab === tab.id ? " active" : "")}
                           onClick={() => setLeftTab(tab.id)}
+                          onKeyDown={(event) => {
+                            if (moveStudioTabFocus(tabIndex, event.key)) event.preventDefault();
+                          }}
+                          role="tab"
+                          aria-selected={leftTab === tab.id}
+                          tabIndex={leftTab === tab.id ? 0 : -1}
+                          data-studio-tab={tab.id}
                           title={tab.group}
                         >
                           {tab.label}
@@ -7326,6 +7607,96 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                         <span>{studioActiveTab?.group || "workspace"}</span>
                       </div>
                       <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column", width: "100%" }}>
+
+              {/* Studio Overview */}
+              {leftTab === "overview" && (
+                <div className="research-scroll">
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 12 }}>
+                    <div style={{ color: colors.textDim, fontSize: 12 }}>
+                      Canonical operational state for this Session and its attached Project.
+                    </div>
+                    <button className="icon-button" type="button" onClick={refreshStudioOverview} disabled={studioOverviewLoading}>
+                      {studioOverviewLoading ? "Refreshing…" : "Refresh"}
+                    </button>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 14 }}>
+                    {[
+                      ["Active tasks", (studioOverview?.tasks || []).filter((item: any) => !["complete", "done", "cancelled"].includes(item.status)).length],
+                      ["Enabled routines", (studioOverview?.routines || []).filter((item: any) => item.enabled).length],
+                      ["Tools available", (studioOverview?.tools || []).filter((item: any) => item.available).length],
+                      ["Skills executable", (studioOverview?.skills || []).filter((item: any) => item.executable).length],
+                      ["Heartbeat", studioOverview?.heartbeat?.running ? "Running" : studioOverview?.heartbeat?.enabled ? "Stopped" : "Disabled"],
+                    ].map(([label, value]) => (
+                      <div key={String(label)} className="research-card" style={{ margin: 0, minHeight: 86 }}>
+                        <div style={{ fontSize: 10, color: colors.textDim, letterSpacing: "0.08em", textTransform: "uppercase" }}>{label}</div>
+                        <div style={{ fontSize: 22, fontWeight: 720, marginTop: 10 }}>{String(value)}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="research-card">
+                    <div className="research-title">Current scope</div>
+                    <div className="research-snippet" style={{ marginTop: 8 }}>
+                      Session <code>{activeThreadId || "none"}</code> · Project <code>{studioOverview?.active_project_id || "detached"}</code>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 8, marginTop: 12 }}>
+                      {Object.entries(studioOverview?.owners || {}).map(([domain, owner]) => (
+                        <div key={domain} style={{ borderTop: `1px solid ${colors.line}`, paddingTop: 8 }}>
+                          <div style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase" }}>{domain}</div>
+                          <div style={{ fontSize: 12, marginTop: 3 }}>{String(owner)}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <button type="button" className="studio-nav-arrow" aria-label="Scroll Studio tabs right" onClick={() => studioNavRef.current?.scrollBy({ left: 280, behavior: "smooth" })}>›</button>
+                  </div>
+                  <div className="research-card">
+                    <div className="research-title">Recent Tasks</div>
+                    {(studioOverview?.tasks || []).slice(0, 8).map((task: any) => (
+                      <div key={task.id} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 12, borderTop: `1px solid ${colors.line}`, padding: "10px 0" }}>
+                        <div>
+                          <div style={{ fontSize: 12, fontWeight: 650 }}>{task.title}</div>
+                          <div style={{ fontSize: 10, color: colors.textDim, marginTop: 3 }}>{task.source} · {task.project_id || "no Project"} · {task.session_id || "no Session"}</div>
+                        </div>
+                        <span style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase" }}>{task.status}</span>
+                      </div>
+                    ))}
+                    {!(studioOverview?.tasks || []).length ? <div className="research-snippet" style={{ marginTop: 8 }}>No durable Product Tasks yet.</div> : null}
+                  </div>
+                </div>
+              )}
+
+              {/* Skills */}
+              {leftTab === "skills" && (
+                <div className="research-scroll">
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 12 }}>
+                    <div style={{ color: colors.textDim, fontSize: 12 }}>Visibility is descriptive; only reviewed, enabled registry entries can execute.</div>
+                    <button className="icon-button" type="button" onClick={refreshStudioOverview} disabled={studioOverviewLoading}>Refresh</button>
+                  </div>
+                  {(studioOverview?.skills || []).map((skill: any) => (
+                    <div key={skill.id} className="research-card">
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
+                        <div>
+                          <div className="research-title">{skill.name}</div>
+                          <div className="research-snippet">{skill.origin} · v{skill.version} · {skill.manifest_status}</div>
+                        </div>
+                        <span style={{ fontSize: 10, border: `1px solid ${colors.line}`, borderRadius: 999, padding: "3px 8px", textTransform: "uppercase" }}>{skill.status}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: colors.textDim, marginTop: 10 }}>Required tools: {skill.required_tools?.length ? skill.required_tools.join(", ") : "none"}</div>
+                      <div style={{ fontSize: 11, color: colors.textDim, marginTop: 4 }}>Models: {skill.required_models?.length ? skill.required_models.join(", ") : "none"}</div>
+                      {skill.reasons?.length ? <div style={{ fontSize: 11, marginTop: 8 }}>Blocked reason: {skill.reasons.join(", ")}</div> : null}
+                    </div>
+                  ))}
+                  <div className="research-card">
+                    <div className="research-title">Skill proposals</div>
+                    {(studioOverview?.skill_proposals || []).map((proposal: any) => (
+                      <div key={proposal.id} style={{ borderTop: `1px solid ${colors.line}`, padding: "10px 0" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}><span>{proposal.name}</span><span style={{ color: colors.textDim, fontSize: 10 }}>{proposal.status}</span></div>
+                        <div style={{ color: colors.textDim, fontSize: 10, marginTop: 4 }}>{proposal.registration_approval_id ? `Approval ${proposal.registration_approval_id}` : "Awaiting registration approval"}</div>
+                      </div>
+                    ))}
+                    {!(studioOverview?.skill_proposals || []).length ? <div className="research-snippet" style={{ marginTop: 8 }}>No proposed skills.</div> : null}
+                  </div>
+                </div>
+              )}
 
               {/* Memory Tab */}
               {leftTab === "memory" && (
@@ -7347,7 +7718,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                       style={{ height: 32, padding: "0 12px", fontSize: 14, flex: 1 }}
                       onClick={async () => {
                         try {
-                          const res = await fetch(`${apiBase}/memory/compact?thread_id=${encodeURIComponent(activeThreadId)}`, { method: "POST" });
+                          const res = await fetch(`${apiBase}/memory/compact?thread_id=${encodeURIComponent(activeThreadId)}&project_id=${encodeURIComponent(activeProjectId)}`, { method: "POST" });
                           if (res.ok) {
                             await refreshMemory();
                             await refreshMemoryDoctor();
@@ -7432,6 +7803,36 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                       <div className="research-snippet">Run the doctor to see memory health for this session.</div>
                     )}
                   </div>
+                  <div className="research-card" style={{ marginBottom: 12 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                      <div>
+                        <div className="research-title">Obsidian projection</div>
+                        <div className="research-snippet">Optional, explicit sync. EchoSpeak memory remains authoritative.</div>
+                      </div>
+                      <button className="icon-button" type="button" onClick={refreshObsidianPlan} disabled={obsidianLoading || !activeProjectId || !activeThreadId}>
+                        {obsidianLoading ? "Checking…" : "Check sync"}
+                      </button>
+                    </div>
+                    {obsidianStatus ? <div className="research-snippet" style={{ marginTop: 8 }}>{obsidianStatus}</div> : null}
+                    {obsidianPlan ? (
+                      <>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
+                          {(obsidianPlan.actions || []).map((action: any) => (
+                            <span key={action.id} title={action.reason} style={{ fontSize: 10, padding: "4px 7px", borderRadius: 4, background: action.kind === "conflict" ? "rgba(245,158,11,.12)" : "rgba(255,255,255,.05)" }}>
+                              {action.kind} · {action.note_path}
+                            </span>
+                          ))}
+                        </div>
+                        <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                          <button className="icon-button" type="button" disabled={obsidianLoading || !(obsidianPlan.actions || []).some((action: any) => ["export_new", "export_update"].includes(action.kind))} onClick={() => void applyObsidianPlan("export")}>Apply exports</button>
+                          <button className="icon-button" type="button" disabled={obsidianLoading || !(obsidianPlan.actions || []).some((action: any) => ["import_new", "import_update"].includes(action.kind))} onClick={() => void applyObsidianPlan("import")}>Apply imports</button>
+                        </div>
+                        {(obsidianPlan.actions || []).some((action: any) => ["conflict", "note_deleted", "memory_deleted"].includes(action.kind)) ? (
+                          <div className="research-snippet" style={{ color: "#f59e0b", marginTop: 8 }}>Conflicts and deletions require manual review and are never auto-applied.</div>
+                        ) : null}
+                      </>
+                    ) : null}
+                  </div>
                   {selectedMemoryIds.length > 0 && (
                     <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8, padding: "8px 12px", background: colors.panel2, borderRadius: 8 }}>
                       <span style={{ fontSize: 12, color: colors.textDim }}>{selectedMemoryIds.length} selected</span>
@@ -7443,7 +7844,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           await fetch(`${apiBase}/memory/delete`, {
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ ids: selectedMemoryIds, thread_id: activeThreadId }),
+                            body: JSON.stringify({ ids: selectedMemoryIds, thread_id: activeThreadId, project_id: activeProjectId }),
                           });
                           setSelectedMemoryIds([]);
                           refreshMemory();
@@ -7462,7 +7863,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                               await fetch(`${apiBase}/memory/update`, {
                                 method: "POST",
                                 headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ id, thread_id: activeThreadId, memory_type: newType }),
+                                body: JSON.stringify({ id, thread_id: activeThreadId, project_id: activeProjectId, memory_type: newType }),
                               });
                             }
                             setSelectedMemoryIds([]);
@@ -7543,7 +7944,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                       await fetch(`${apiBase}/memory/update`, {
                                         method: "POST",
                                         headers: { "Content-Type": "application/json" },
-                                        body: JSON.stringify({ id: m.id, thread_id: activeThreadId, memory_type: newType }),
+                                        body: JSON.stringify({ id: m.id, thread_id: activeThreadId, project_id: activeProjectId, memory_type: newType }),
                                       });
                                       refreshMemory();
                                     }}
@@ -7601,7 +8002,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                       await fetch(`${apiBase}/memory/update`, {
                                         method: "POST",
                                         headers: { "Content-Type": "application/json" },
-                                        body: JSON.stringify({ id: m.id, thread_id: activeThreadId, text: editingMemoryText }),
+                                        body: JSON.stringify({ id: m.id, thread_id: activeThreadId, project_id: activeProjectId, text: editingMemoryText }),
                                       });
                                       setEditingMemoryId(null);
                                       refreshMemory();
@@ -7956,11 +8357,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                 label="Allow File Write"
                                 checked={Boolean(settingsDraft.allow_file_write)}
                                 onChange={(v) => updateDraft("allow_file_write", v)}
-                              />
-                              <Toggle
-                                label="Allow Video Agent Edits"
-                                checked={Boolean(settingsDraft.allow_video_agent_edits)}
-                                onChange={(v) => updateDraft("allow_video_agent_edits", v)}
                               />
                               <Toggle
                                 label="Allow Desktop Automation"
@@ -9333,9 +9729,14 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                         type="button"
                         onClick={async () => {
                           try {
-                            const res = await fetch(`${apiBase}/capabilities?thread_id=${encodeURIComponent(activeThreadId)}`);
+                            const [res, skillRes] = await Promise.all([
+                              fetch(`${apiBase}/capabilities?thread_id=${encodeURIComponent(activeThreadId)}`),
+                              fetch(`${apiBase}/skills/executions?session_id=${encodeURIComponent(activeThreadId)}&limit=20`),
+                            ]);
                             const data = await res.json();
                             setCapabilitiesData(data);
+                            const skillData = skillRes.ok ? await skillRes.json() : { items: [] };
+                            setSkillExecutions(Array.isArray(skillData.items) ? skillData.items : []);
                             await refreshCodingReadiness();
                           } catch (e) {
                             console.error("Failed to fetch capabilities:", e);
@@ -9452,6 +9853,32 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                               ) : (
                                 <div style={{ fontSize: 11, color: colors.textDim }}>No external skills or plugins are currently loaded.</div>
                               )}
+                            </div>
+                            <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${colors.line}` }}>
+                              <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 7 }}>Recent governed executions</div>
+                              {skillExecutions.length ? skillExecutions.slice(0, 8).map((execution: any) => (
+                                <div key={execution.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 0", fontSize: 10, color: colors.textDim }}>
+                                  <span style={{ color: colors.text, minWidth: 120 }}>{execution.skill_id}</span>
+                                  <span>{execution.status}</span>
+                                  <span>{(execution.tool_run_ids || []).length} ToolRuns</span>
+                                  <div style={{ flex: 1 }} />
+                                  {["selected", "planned", "running", "pending_approval", "partial", "blocked", "failed"].includes(execution.status) ? (
+                                    <button
+                                      type="button"
+                                      className="icon-button"
+                                      style={{ padding: "3px 7px", fontSize: 9 }}
+                                      onClick={async () => {
+                                        await fetch(`${apiBase}/skills/executions/${encodeURIComponent(execution.id)}/cancel?session_id=${encodeURIComponent(activeThreadId)}`, { method: "POST" });
+                                        const response = await fetch(`${apiBase}/skills/executions?session_id=${encodeURIComponent(activeThreadId)}&limit=20`);
+                                        const payload = response.ok ? await response.json() : { items: [] };
+                                        setSkillExecutions(Array.isArray(payload.items) ? payload.items : []);
+                                      }}
+                                    >
+                                      Cancel
+                                    </button>
+                                  ) : null}
+                                </div>
+                              )) : <div style={{ fontSize: 10, color: colors.textDim }}>No governed Skill executions for this Session.</div>}
                             </div>
                           </div>
 
@@ -9647,6 +10074,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                       onClick={async () => {
                         await refreshThreadState();
                         await refreshExecutions();
+                        await refreshStudioOverview();
                         if (latestTraceId) await loadTrace(latestTraceId);
                       }}
                       type="button"
@@ -9664,8 +10092,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                     </button>
                   </div>
 
-                  <div style={{ padding: "12px 14px", marginBottom: 12, borderRadius: 12, background: "linear-gradient(135deg, rgba(168,85,247,0.08), rgba(168,85,247,0.02))", border: "1px solid rgba(168,85,247,0.2)" }}>
-                    <div style={{ fontSize: 11, color: "#c084fc", fontWeight: 600, letterSpacing: "0.04em", marginBottom: 6 }}>EXECUTION STATE</div>
+                  <div style={{ padding: "12px 14px", marginBottom: 12, borderRadius: 12, background: "rgba(255,255,255,0.025)", border: `1px solid ${colors.line}` }}>
+                    <div style={{ fontSize: 11, color: colors.textDim, fontWeight: 600, letterSpacing: "0.08em", marginBottom: 6 }}>VIEWER · EXECUTION STATE</div>
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 10 }}>
                       <div><div style={{ fontSize: 10, color: colors.textDim }}>Latest execution</div><div style={{ fontSize: 13, fontWeight: 600 }}>{latestExecutionId || threadState?.last_execution_id || "—"}</div></div>
                       <div><div style={{ fontSize: 10, color: colors.textDim }}>Latest trace</div><div style={{ fontSize: 13, fontWeight: 600 }}>{latestTraceId || threadState?.last_trace_id || "—"}</div></div>
@@ -9674,6 +10102,34 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                   </div>
 
                   <div className="research-scroll">
+                    <div className="research-card">
+                      <div className="research-title">Echo Resolution</div>
+                      <div className="research-snippet" style={{ marginTop: 6 }}>
+                        {studioOverview?.resolution?.ran
+                          ? `Ran once · ${studioOverview.resolution.advice?.recommendation || "advisory"}`
+                          : "Not needed for the latest Turn"}
+                      </div>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 10 }}>
+                      <div className="research-card" style={{ margin: 0 }}>
+                        <div className="research-title">Tools</div>
+                        {(studioOverview?.tools || []).filter((tool: any) => tool.selected || !tool.available).slice(0, 12).map((tool: any) => (
+                          <div key={tool.name} style={{ display: "flex", justifyContent: "space-between", gap: 10, borderTop: `1px solid ${colors.line}`, padding: "8px 0", fontSize: 11 }}>
+                            <span>{tool.name}</span>
+                            <span style={{ color: colors.textDim }}>{tool.selected ? "selected" : tool.available ? "available" : "blocked"}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="research-card" style={{ margin: 0 }}>
+                        <div className="research-title">Skills</div>
+                        {(studioOverview?.skills || []).slice(0, 12).map((skill: any) => (
+                          <div key={skill.id} style={{ display: "flex", justifyContent: "space-between", gap: 10, borderTop: `1px solid ${colors.line}`, padding: "8px 0", fontSize: 11 }}>
+                            <span>{skill.name}</span>
+                            <span style={{ color: colors.textDim }}>{skill.status}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                     {executionsLoading ? (
                       <div className="research-card"><div className="research-snippet">Loading executions…</div></div>
                     ) : executions.length ? (
@@ -9870,16 +10326,29 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                 </>
               )}
 
-              {/* Routines Tab */}
-              {leftTab === "routines" && (
+              {/* Unified Automations Tab */}
+              {leftTab === "automations" && (
                 <>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8, marginBottom: 10 }}>
+                    {[
+                      ["Tasks", (studioOverview?.tasks || []).length],
+                      ["Runs", (studioOverview?.automation_runs || []).length],
+                      ["Routines", routines.length],
+                      ["Connections", (studioOverview?.connections || []).length],
+                    ].map(([label, value]) => (
+                      <div key={String(label)} className="research-card" style={{ padding: 12 }}>
+                        <div style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase", letterSpacing: ".08em" }}>{label}</div>
+                        <div style={{ fontSize: 22, fontWeight: 700, marginTop: 4 }}>{value}</div>
+                      </div>
+                    ))}
+                  </div>
                   {/* Pipeline Status */}
                   <div style={{ padding: "10px 14px", marginBottom: 4, borderRadius: 10, background: "linear-gradient(135deg, rgba(34,197,94,0.08), rgba(34,197,94,0.02))", border: "1px solid rgba(34,197,94,0.2)" }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#22c55e", boxShadow: "0 0 6px rgba(34,197,94,0.5)", animation: "pulse 2s infinite" }} />
                       <span style={{ fontSize: 11, color: "#22c55e", fontWeight: 600, letterSpacing: "0.03em" }}>SCHEDULER ACTIVE · CONNECTED TO PIPELINE</span>
                     </div>
-                    <div style={{ fontSize: 10, color: colors.textDim, marginTop: 4 }}>Routines fire through process_query() — full tool access, safety gating, and memory recording.</div>
+                    <div style={{ fontSize: 10, color: colors.textDim, marginTop: 4 }}>Each trigger creates one durable Task and one governed Turn. External delivery remains approval-bound.</div>
                   </div>
                   <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
                     <button
@@ -9888,7 +10357,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                       onClick={async () => {
                         setRoutinesLoading(true);
                         try {
-                          const res = await fetch(`${apiBase}/routines`);
+                          const res = await fetch(`${apiBase}/routines?session_id=${encodeURIComponent(activeThreadId)}&project_id=${encodeURIComponent(activeProjectId)}`);
                           const data = await res.json();
                           setRoutines(data.items || []);
                         } catch (e) {
@@ -9926,6 +10395,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                               webhook_path: webhookPath ? `/${webhookPath}` : null,
                               action_type: "query",
                               action_config: { query: queryText || "" },
+                              project_id: activeProjectId,
+                              session_id: activeThreadId,
                             }),
                           });
                           const data = await res.json();
@@ -10006,9 +10477,9 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                               style={{ height: 28, padding: "0 10px", fontSize: 12 }}
                               type="button"
                               onClick={async () => {
-                                await fetch(`${apiBase}/routines/${routine.id}/run`, { method: "POST" });
+                                await fetch(`${apiBase}/routines/${routine.id}/run?session_id=${encodeURIComponent(activeThreadId)}&project_id=${encodeURIComponent(activeProjectId)}`, { method: "POST" });
                                 // Refresh to update run count
-                                const res = await fetch(`${apiBase}/routines`);
+                                const res = await fetch(`${apiBase}/routines?session_id=${encodeURIComponent(activeThreadId)}&project_id=${encodeURIComponent(activeProjectId)}`);
                                 const data = await res.json();
                                 setRoutines(data.items || []);
                               }}
@@ -10020,7 +10491,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                               style={{ height: 28, padding: "0 10px", fontSize: 12 }}
                               type="button"
                               onClick={async () => {
-                                await fetch(`${apiBase}/routines/${routine.id}`, {
+                                await fetch(`${apiBase}/routines/${routine.id}?session_id=${encodeURIComponent(activeThreadId)}&project_id=${encodeURIComponent(activeProjectId)}`, {
                                   method: "PUT",
                                   headers: { "Content-Type": "application/json" },
                                   body: JSON.stringify({ enabled: !routine.enabled }),
@@ -10036,7 +10507,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                               type="button"
                               onClick={async () => {
                                 if (!confirm("Delete this routine?")) return;
-                                await fetch(`${apiBase}/routines/${routine.id}`, { method: "DELETE" });
+                                await fetch(`${apiBase}/routines/${routine.id}?session_id=${encodeURIComponent(activeThreadId)}&project_id=${encodeURIComponent(activeProjectId)}`, { method: "DELETE" });
                                 setRoutines(routines.filter(r => r.id !== routine.id));
                               }}
                             >
@@ -10052,6 +10523,51 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                     )}
                   </div>
                 </>
+              )}
+
+              {/* Connections Tab */}
+              {leftTab === "connections" && (
+                <div className="research-scroll">
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 12 }}>
+                    <div style={{ color: colors.textDim, fontSize: 12 }}>
+                      Secret-free capabilities available to this exact Project and Session.
+                    </div>
+                    <button className="icon-button" type="button" onClick={refreshStudioOverview} disabled={studioOverviewLoading}>
+                      {studioOverviewLoading ? "Refreshing…" : "Refresh"}
+                    </button>
+                  </div>
+                  {(studioOverview?.connections || []).map((connection: any) => (
+                    <div key={connection.id} className="research-card" style={{ marginBottom: 10 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                        <div>
+                          <div style={{ fontSize: 15, fontWeight: 650 }}>{connection.display_name}</div>
+                          <div style={{ fontSize: 11, color: colors.textDim, marginTop: 3 }}>
+                            {connection.kind}{connection.provider ? ` · ${connection.provider}` : ""}
+                          </div>
+                        </div>
+                        <span style={{ fontSize: 10, padding: "3px 7px", border: "1px solid rgba(255,255,255,.12)", borderRadius: 999 }}>
+                          {connection.health}
+                        </span>
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
+                        {(connection.capabilities || []).map((capability: any) => (
+                          <span key={capability.id} style={{ fontSize: 10, padding: "4px 7px", background: "rgba(255,255,255,.05)", borderRadius: 4 }}>
+                            {capability.name}{capability.requires_approval ? " · approval" : ""}
+                          </span>
+                        ))}
+                      </div>
+                      {connection.authentication !== "none" ? (
+                        <div style={{ fontSize: 11, color: colors.textDim, marginTop: 10 }}>Authentication: {connection.authentication}</div>
+                      ) : null}
+                      {(connection.errors || []).length ? (
+                        <div style={{ fontSize: 11, color: "#fca5a5", marginTop: 8 }}>{connection.errors[0]}</div>
+                      ) : null}
+                    </div>
+                  ))}
+                  {!(studioOverview?.connections || []).length ? (
+                    <div className="research-card"><div className="research-snippet">No Connections are registered for this scope.</div></div>
+                  ) : null}
+                </div>
               )}
 
               {/* Soul Tab */}
@@ -10357,7 +10873,7 @@ I am EchoSpeak, a personal AI assistant...
                     </div>
                   </div>
                 </motion.div>
-              , document.body)}
+              , desktopMode ? desktopStudioHost! : document.body)}
             </div>
           </div>
         </div>

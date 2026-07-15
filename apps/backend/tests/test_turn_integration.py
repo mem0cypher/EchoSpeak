@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from agent.core import EchoSpeakAgent
 from agent.mode_controller import ModeDecision, TurnMode
+from agent.state import ThreadSessionState
 
 
 def _agent_with_tools(*names: str) -> EchoSpeakAgent:
@@ -65,13 +66,15 @@ def test_durable_session_subject_restores_research_followup_after_agent_restart(
     agent._current_thread_id = "thread-weather"
     agent._current_subject_text = ""
     agent._load_active_work = lambda: None
-    agent._session_memory = SimpleNamespace(
-        load=lambda _thread: SimpleNamespace(current_subject="Edmonton weather")
+    agent._execution_context = ThreadSessionState(
+        thread_id="thread-weather",
+        current_subject="Edmonton weather",
     )
 
     decision = agent._bind_turn_mode("what about Calgary?", source="web")
 
     assert decision.mode == TurnMode.TASK_RESEARCH
-    assert decision.current_subject == "Edmonton weather"
-    assert decision.continuation_context == "Follow-up to: Edmonton weather"
+    assert decision.current_subject == "weather in Calgary"
+    assert decision.continuation_context == "Follow-up to: weather in Calgary"
+    assert decision.required_capabilities == frozenset({"research"})
     assert "web_search" in decision.allowed_tool_names

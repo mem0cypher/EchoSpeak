@@ -74,6 +74,33 @@ def _bare_agent(tmp_path=None):
     return agent
 
 
+def _disposable_file_agent(tmp_path, monkeypatch):
+    """Build a full agent with Project/Session authority entirely under tmp_path."""
+    import agent.projects as projects_module
+    import agent.state as state_module
+    from agent.active_work import ActiveWorkStore
+    from agent.projects import ProjectManager
+    from agent.state import StateStore
+
+    project_root = tmp_path / "project"
+    project_root.mkdir(parents=True, exist_ok=True)
+    manager = ProjectManager(tmp_path / "projects")
+    runtime = StateStore(tmp_path / "runtime")
+    monkeypatch.setattr(projects_module, "_project_manager", manager)
+    monkeypatch.setattr(state_module, "_state_store", runtime)
+    project = manager.attach_folder(str(project_root), name="Eval Project", trust_state="trusted")
+
+    agent = EchoSpeakAgent(
+        memory_path=str(tmp_path / "memory"),
+        manage_background_services=False,
+    )
+    agent._current_thread_id = f"eval-{tmp_path.name}"
+    agent._state_store = runtime
+    agent._active_work_store = ActiveWorkStore(tmp_path / "active-work")
+    assert agent.activate_project(project.id) is True
+    return agent
+
+
 # E1 — Printed file_write becomes pending confirm, not chat text
 def test_e1_printed_file_write_becomes_pending(tmp_path, monkeypatch):
     from config import config
@@ -82,7 +109,7 @@ def test_e1_printed_file_write_becomes_pending(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "enable_system_actions", True, raising=False)
     monkeypatch.setattr(config, "allow_file_write", True, raising=False)
 
-    agent = EchoSpeakAgent(memory_path=str(tmp_path))
+    agent = _disposable_file_agent(tmp_path, monkeypatch)
     agent._allow_llm_tool_calling = lambda: False
     agent.graph_agent = None
     agent.agent_executor = None
@@ -214,7 +241,7 @@ def test_e8_coding_file_write_pending(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "allow_file_write", True, raising=False)
     monkeypatch.setattr(config, "action_parser_enabled", True, raising=False)
 
-    agent = EchoSpeakAgent(memory_path=str(tmp_path))
+    agent = _disposable_file_agent(tmp_path, monkeypatch)
     agent._allow_llm_tool_calling = lambda: False
     agent.graph_agent = None
     agent.agent_executor = None
@@ -371,6 +398,22 @@ def test_e11_long_conversation_memory_and_subject(tmp_path, monkeypatch):
     for user, reply, _bucket in turns:
         before = int(getattr(agent.memory, "memory_count", 0) or 0)
         conv_before = _conversation_item_count()
+        if user.lower().startswith("remember that"):
+            # Explicit persistence belongs to MemoryCurator/process_query, not
+            # the passive Turn recorder exercised by this scripted harness.
+            from agent.memory_curator import MemoryCurator
+
+            curated = MemoryCurator(agent.memory).curate_and_persist(
+                user_text=user,
+                response_text="",
+                explicit=True,
+                session_id="e11-long",
+                execution_id="e11-scripted",
+                item_id="e11-remember",
+                mode="web",
+                allow_implicit_auto=True,
+            )
+            assert curated.persisted_ids
         agent._record_turn(user, reply)
         after = int(getattr(agent.memory, "memory_count", 0) or 0)
         conv_after = _conversation_item_count()
@@ -454,7 +497,7 @@ def test_e11_long_conversation_memory_and_subject(tmp_path, monkeypatch):
     assert "gta" in sess_ctx.lower() or "trailer" in sess_ctx.lower() or session.current_subject
 
     # --- 5) Memory Doctor: raw conversation dominance stays healthy for this session ---
-    report = server_mod._build_memory_doctor_report(agent, thread_id="e11-long", max_scan=300)
+    report = server_mod._build_memory_doctor_report(agent, thread_id="e11-long", project_id="", max_scan=300)
     assert report.auto_store_conversations is False
     # One manually injected conversation exists for the drift probe; should not dominate
     # a long real session of durable-only writes.
@@ -897,19 +940,40 @@ def test_e18_gta_trailer_and_characters_split_not_release_only():
     assert "lucia" in out.lower() or "accepted=true" in out.lower() or "Jason" in out or "jason" in out.lower()
 
 
-def test_e17_coding_loop_multi_file_tool_sequence():
+def test_e17_coding_loop_multi_file_tool_sequence(tmp_path, monkeypatch):
     """
     v7.5.2: multi-file coding path advances the enforced loop
     inspect → plan → implement (2 files) → verify (terminal status) → confirm path.
     """
     from agent.coding_loop import CodingLoop, CodingPhase, CodingExit, parse_terminal_status_block
+    from agent.coding_ledger import CodingLedgerStore
     from agent.core import EchoSpeakAgent
+    from agent.projects import ProjectManager
+    from agent.state import StateStore
+    import agent.coding_ledger as coding_ledger_module
+    import agent.projects as projects_module
     from unittest.mock import MagicMock
 
     agent = EchoSpeakAgent.__new__(EchoSpeakAgent)
     agent._workspace_id = "coding"
+    agent._current_thread_id = "coding-session"
     agent._coding_loop = None
     agent._is_coding_project_intent = lambda u: True  # type: ignore
+    root = tmp_path / "project"
+    root.mkdir()
+    manager = ProjectManager(tmp_path / "projects")
+    project = manager.attach_folder(str(root), trust_state="trusted")
+    monkeypatch.setattr(projects_module, "get_project_manager", lambda: manager)
+    monkeypatch.setattr(coding_ledger_module, "_STORE", CodingLedgerStore(tmp_path / "ledgers"))
+    agent._state_store = StateStore(tmp_path / "state")
+    agent._state_store.update_thread_state(
+        "coding-session",
+        session_id="coding-session",
+        active_project_id=project.id,
+        project_path=str(root),
+        workspace_root=str(root),
+        objective="create a small website with index.html and style.css",
+    )
 
     agent._ensure_coding_loop("create a small website with index.html and style.css")
     assert agent._coding_loop is not None
@@ -1300,30 +1364,8 @@ def test_e20c_search_cache_dedupes_identical_queries():
         tools_mod.web_search = orig
 
 
-def test_e20d_routine_does_not_clobber_subject():
-    agent = _bare_agent()
-    agent._current_subject_text = "Edmonton Oilers odds"
-    agent._last_web_query_context = "Oilers moneyline"
-    agent._partial_tool_results = [{"tool": "web_search", "output": "oilers odds"}]
-    agent.process_query = MagicMock(return_value=("Daily briefing done.", True))
-    routine = SimpleNamespace(
-        id="daily_news",
-        name="daily news briefing",
-        action_type="query",
-        action_config={"message": "daily news briefing"},
-        delivery_channels=["web"],
-    )
-    agent._execute_routine = EchoSpeakAgent._execute_routine.__get__(agent, EchoSpeakAgent)
-    try:
-        agent._execute_routine(routine)
-    except Exception:
-        pass
-    assert agent._current_subject_text == "Edmonton Oilers odds"
-    assert agent._last_web_query_context == "Oilers moneyline"
-    assert agent.process_query.called
-    kwargs = agent.process_query.call_args.kwargs
-    assert kwargs.get("source") == "routine"
-    assert str(kwargs.get("thread_id") or "").startswith("routine_")
+def test_e20d_routine_execution_is_not_agent_owned():
+    assert not hasattr(EchoSpeakAgent, "_execute_routine")
 
 
 def test_eval_board_counts_at_least_eight_passing():

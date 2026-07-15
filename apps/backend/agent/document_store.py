@@ -6,9 +6,12 @@ Handles document ingestion, chunking, FAISS indexing, and retrieval.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import shutil
 import sys
+import time
 import uuid
 from collections import defaultdict
 from datetime import datetime
@@ -372,17 +375,39 @@ class DocumentStore:
             if isinstance(data, dict):
                 self._docs = data
             else:
-                self._docs = {}
+                raise ValueError("Document metadata root must be an object")
         except Exception as exc:
-            logger.warning(f"Failed to load doc metadata: {exc}")
-            self._docs = {}
+            quarantine = self.meta_path.parent / "corrupt-state" / f"documents-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+            note = "quarantine unavailable"
+            try:
+                quarantine.mkdir(parents=True, exist_ok=False)
+                copy = quarantine / self.meta_path.name
+                shutil.copy2(self.meta_path, copy)
+                guide = quarantine / "RECOVERY.txt"
+                guide.write_text(
+                    "EchoSpeak document metadata recovery\n\n"
+                    f"Authoritative file: {self.meta_path}\nQuarantine copy: {copy}\nError: {exc}\n\n"
+                    "Keep EchoSpeak stopped, repair or restore the authoritative JSON, then restart. "
+                    "The original file was not overwritten.\n",
+                    encoding="utf-8",
+                )
+                note = f"quarantine copy: {copy}; recovery guide: {guide}"
+            except Exception as quarantine_exc:
+                note = f"quarantine failed: {quarantine_exc}"
+            raise RuntimeError(f"Document metadata is unreadable; {note}. ({exc})") from exc
 
     def _save_meta(self) -> None:
+        self.meta_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.meta_path.with_suffix(f".tmp.{os.getpid()}.{time.time_ns()}")
         try:
-            self.meta_path.parent.mkdir(parents=True, exist_ok=True)
-            self.meta_path.write_text(json.dumps(self._docs, indent=2), encoding="utf-8")
+            with temp.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(self._docs, indent=2, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, self.meta_path)
         except Exception as exc:
-            logger.warning(f"Failed to save doc metadata: {exc}")
+            temp.unlink(missing_ok=True)
+            raise RuntimeError(f"Failed to atomically persist document metadata: {exc}") from exc
 
     def _load_or_create_vectorstore(self) -> FAISS:
         if self.index_dir.exists() and any(self.index_dir.iterdir()):
@@ -417,7 +442,21 @@ class DocumentStore:
             i += max(1, size - overlap)
         return chunks
 
-    def add_document(self, filename: str, text: str, source: str = "", mime: str = "") -> Dict[str, Any]:
+    def add_document(
+        self,
+        filename: str,
+        text: str,
+        source: str = "",
+        mime: str = "",
+        *,
+        project_id: str = "",
+        session_id: str = "",
+        domain: str = "general",
+        authority: str = "user_provided",
+        sensitivity: str = "private",
+        language: str = "unknown",
+        freshness: str = "unknown",
+    ) -> Dict[str, Any]:
         if not self.enabled or self.vector_store is None:
             raise RuntimeError("Document store is disabled (no embeddings available)")
 
@@ -427,6 +466,24 @@ class DocumentStore:
 
         doc_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
+        content_checksum = hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+        embedding_model = str(
+            getattr(self.embeddings, "model", "")
+            or getattr(self.embeddings, "model_name", "")
+            or self.embeddings.__class__.__name__
+        )
+        shared_metadata = {
+            "content_revision": 1,
+            "content_checksum": content_checksum,
+            "embedding_model": embedding_model,
+            "embedding_schema_version": 1,
+            "chunker_schema_version": 1,
+            "domain": str(domain or "general"),
+            "authority": str(authority or "unknown"),
+            "sensitivity": str(sensitivity or "private"),
+            "language": str(language or "unknown"),
+            "freshness": str(freshness or "unknown"),
+        }
 
         documents = [
             Document(
@@ -438,6 +495,9 @@ class DocumentStore:
                     "source": source,
                     "mime": mime,
                     "timestamp": now,
+                    "project_id": str(project_id or ""),
+                    "session_id": str(session_id or ""),
+                    **shared_metadata,
                 },
             )
             for idx, chunk in enumerate(chunks)
@@ -453,23 +513,51 @@ class DocumentStore:
             "source": source,
             "mime": mime,
             "timestamp": now,
+            "project_id": str(project_id or ""),
+            "session_id": str(session_id or ""),
+            **shared_metadata,
         }
         self._docs[doc_id] = meta
         self._save_meta()
         self._refresh_indices()
         return meta
 
-    def list_documents(self) -> List[Dict[str, Any]]:
+    def list_documents(self, *, project_id: str = "", session_id: str = "") -> List[Dict[str, Any]]:
         items = list(self._docs.values())
+        if project_id:
+            items = [item for item in items if str(item.get("project_id") or "") == project_id]
+        elif session_id:
+            items = [
+                item for item in items
+                if not str(item.get("project_id") or "")
+                and str(item.get("session_id") or "") in {"", session_id}
+            ]
         items.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
         return items
 
-    def delete_documents(self, ids: List[str]) -> int:
+    def delete_documents(
+        self,
+        ids: List[str],
+        *,
+        project_id: str = "",
+        session_id: str = "",
+    ) -> int:
         if not self.enabled or self.vector_store is None:
             return 0
         id_set = {str(i) for i in ids if i}
         if not id_set:
             return 0
+        if not project_id and not session_id:
+            raise ValueError("Document mutation requires an explicit Project or Session scope")
+        for doc_id in id_set:
+            meta = self._docs.get(doc_id)
+            if meta is None:
+                raise ValueError(f"Document is not present in the authoritative registry: {doc_id}")
+            if project_id:
+                if str(meta.get("project_id") or "") != str(project_id):
+                    raise ValueError("Document belongs to a different Project")
+            elif str(meta.get("project_id") or "") or str(meta.get("session_id") or "") not in {"", str(session_id)}:
+                raise ValueError("Document belongs to a different Session or Project")
 
         store = getattr(self.vector_store, "docstore", None)
         d = getattr(store, "_dict", None) if store is not None else None
@@ -529,7 +617,32 @@ class DocumentStore:
         self._save_meta()
         self._refresh_indices()
 
-    def query(self, query: str, k: int = 4) -> Tuple[str, List[Dict[str, Any]]]:
+    def clear_scope(self, *, project_id: str = "", session_id: str = "") -> int:
+        """Delete only documents in one currently authorized scope."""
+        if not project_id and not session_id:
+            raise ValueError("Document clear requires an explicit Project or Session scope")
+        ids = [
+            str(doc_id)
+            for doc_id, meta in self._docs.items()
+            if (
+                str(meta.get("project_id") or "") == str(project_id)
+                if project_id
+                else not str(meta.get("project_id") or "")
+                and str(meta.get("session_id") or "") in {"", str(session_id)}
+            )
+        ]
+        if not ids:
+            return 0
+        return self.delete_documents(ids, project_id=project_id, session_id=session_id)
+
+    def query(
+        self,
+        query: str,
+        k: int = 4,
+        *,
+        project_id: str = "",
+        session_id: str = "",
+    ) -> Tuple[str, List[Dict[str, Any]]]:
         if not self.enabled or self.vector_store is None:
             return "", []
         q = (query or "").strip()
@@ -538,6 +651,8 @@ class DocumentStore:
 
         final_k = max(int(k or 0), 1)
         candidate_k = self._resolve_candidate_k(final_k)
+        if project_id or session_id:
+            candidate_k = max(candidate_k, final_k * 8)
 
         if self.hybrid_enabled:
             vector_docs = self._vector_search(q, k=max(self.vector_k, candidate_k))
@@ -547,8 +662,31 @@ class DocumentStore:
             candidates = self._vector_search(q, k=max(candidate_k, 8))
 
         candidates = self._dedupe_docs(candidates)
+        if project_id:
+            candidates = [
+                doc for doc in candidates
+                if str((getattr(doc, "metadata", {}) or {}).get("project_id") or "") == project_id
+            ]
+        elif session_id:
+            candidates = [
+                doc for doc in candidates
+                if not str((getattr(doc, "metadata", {}) or {}).get("project_id") or "")
+                and str((getattr(doc, "metadata", {}) or {}).get("session_id") or "") in {"", session_id}
+            ]
         if self.graph_enabled:
             candidates = self._expand_with_graph(candidates, q)
+            # Graph expansion is a projection and cannot expand authority.
+            if project_id:
+                candidates = [
+                    doc for doc in candidates
+                    if str((getattr(doc, "metadata", {}) or {}).get("project_id") or "") == project_id
+                ]
+            elif session_id:
+                candidates = [
+                    doc for doc in candidates
+                    if not str((getattr(doc, "metadata", {}) or {}).get("project_id") or "")
+                    and str((getattr(doc, "metadata", {}) or {}).get("session_id") or "") in {"", session_id}
+                ]
         if candidate_k > 0 and len(candidates) > candidate_k:
             candidates = candidates[:candidate_k]
 
@@ -583,6 +721,8 @@ class DocumentStore:
                 "filename": meta.get("filename"),
                 "source": meta.get("source"),
                 "timestamp": meta.get("timestamp"),
+                "project_id": meta.get("project_id"),
+                "session_id": meta.get("session_id"),
                 "preview": preview,
             })
 

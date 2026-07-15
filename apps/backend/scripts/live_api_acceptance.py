@@ -270,110 +270,7 @@ def main() -> int:
     )
     report.ok("memory_request", f"{code} {str((mem or {}).get('response') or '')[:100]}")
 
-    # 4) Video document + propose via API (domain path; chat tool may or may not fire depending on model)
-    code, docs = http_json(
-        "POST",
-        f"{base}/video/documents",
-        {"session_id": thread_id, "project_id": project_id, "name": "Live Cut"},
-        timeout=30,
-    )
-    if code >= 400 or not (docs or {}).get("id"):
-        report.fail("video_create_doc", f"{code} {docs}")
-        doc_id = None
-    else:
-        doc_id = docs["id"]
-        report.ok("video_create_doc", doc_id)
-        # Import media path if supported
-        code, imp = http_json(
-            "POST",
-            f"{base}/video/documents/{doc_id}/import",
-            {
-                "session_id": thread_id,
-                "project_id": project_id,
-                "project_relative_path": "media/clip_a.mp4",
-            },
-            timeout=30,
-        )
-        report.ok("video_import_attempt", f"{code}")
-        # Manual seed track+clip then propose split via proposals API
-        rev = int(docs.get("revision") or 0)
-        # Use store-level operations through transaction endpoint if available
-        ops_seed = [
-            {
-                "operation_type": "add_track",
-                "expected_revision": rev,
-                "payload": {"track_id": "v1", "kind": "video", "name": "V1"},
-            }
-        ]
-        code, tx = http_json(
-            "POST",
-            f"{base}/video/documents/{doc_id}/transactions",
-            {"session_id": thread_id, "project_id": project_id, "operations": ops_seed},
-            timeout=30,
-        )
-        report.ok("video_seed_track", f"{code}")
-        # reload doc
-        code, doc2 = http_json(
-            "GET",
-            f"{base}/video/documents/{doc_id}?session_id={thread_id}&project_id={project_id}",
-            timeout=20,
-        )
-        rev2 = int((doc2 or {}).get("revision") or rev + 1)
-        # propose volume/trim-like simple op: add second track as mutation with approval
-        code, proposal = http_json(
-            "POST",
-            f"{base}/video/documents/{doc_id}/proposals",
-            {
-                "session_id": thread_id,
-                "project_id": project_id,
-                "objective": "Add a B-roll track for the selected cut",
-                "operations": [
-                    {
-                        "operation_type": "add_track",
-                        "expected_revision": rev2 if code < 400 else rev,
-                        "payload": {"track_id": "v2", "kind": "video", "name": "Broll"},
-                    }
-                ],
-            },
-            timeout=40,
-        )
-        if code >= 400:
-            # retry with revision 0/1 common cases
-            for rtry in range(0, 5):
-                code, proposal = http_json(
-                    "POST",
-                    f"{base}/video/documents/{doc_id}/proposals",
-                    {
-                        "session_id": thread_id,
-                        "project_id": project_id,
-                        "objective": "Add track v2",
-                        "operations": [
-                            {
-                                "operation_type": "add_track",
-                                "expected_revision": rtry,
-                                "payload": {"track_id": f"v2r{rtry}", "kind": "video", "name": "Broll"},
-                            }
-                        ],
-                    },
-                    timeout=40,
-                )
-                if code < 400:
-                    break
-        if code >= 400:
-            report.fail("video_propose", f"{code} {proposal}")
-        else:
-            report.ok("video_propose", str((proposal or {}).get("tool_run_id") or "")[:80])
-            appr = (proposal or {}).get("approval") or {}
-            aid = appr.get("id")
-            # duplicate approve
-            c1, b1 = http_json("POST", f"{base}/approvals/{aid}/confirm?expected_session_id={thread_id}", timeout=60)
-            c2, b2 = http_json("POST", f"{base}/approvals/{aid}/confirm?expected_session_id={thread_id}", timeout=60)
-            if c1 == 200 and (b1 or {}).get("success") and (c2 >= 400 or not (b2 or {}).get("success")):
-                report.ok("video_double_approve", f"c1={c1} c2={c2}")
-            else:
-                report.fail("video_double_approve", f"c1={c1} c2={c2} b1={b1} b2={b2}")
-
-    # 5) Research request
+    # 4) Research request
     code, research = http_json(
         "POST",
         f"{base}/query",
@@ -386,13 +283,13 @@ def main() -> int:
     )
     report.ok("research_query", f"{code} len={len(str((research or {}).get('response') or ''))}")
 
-    # 6) Skills audit endpoint if any
+    # 5) Skills audit endpoint if any
     code, skills = http_json("GET", f"{base}/skills", timeout=20)
     if code >= 400:
         code, skills = http_json("GET", f"{base}/capabilities?thread_id={thread_id}", timeout=20)
     report.ok("skills_or_capabilities", f"{code}")
 
-    # 7) Self-edit fail closed (policy disabled in live settings)
+    # 6) Self-edit fail closed (policy disabled in live settings)
     code, se = http_json(
         "POST",
         f"{base}/query",
@@ -405,7 +302,7 @@ def main() -> int:
     )
     report.ok("self_git_query", f"{code}")
 
-    # 8) Concurrent messages
+    # 7) Concurrent messages
     def _msg(i: int):
         return http_json(
             "POST",

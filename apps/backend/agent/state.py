@@ -637,6 +637,12 @@ class StateStore:
             self._persist_runtime_activity()
             return ToolRunRecord(**record.model_dump())
 
+    def get_tool_run(self, run_id: str) -> Optional[ToolRunRecord]:
+        """Return one durable ToolRun by stable id, regardless of owning Turn."""
+        with self._lock:
+            record = self._tool_runs.get(str(run_id or "").strip())
+            return ToolRunRecord(**record.model_dump()) if record is not None else None
+
     def attach_tool_verification(self, run_id: str, verification: dict[str, Any]) -> Optional[ToolRunRecord]:
         """Attach post-action verification without changing terminal outcome truth."""
         with self._lock:

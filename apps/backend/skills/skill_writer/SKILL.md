@@ -13,20 +13,23 @@ When the user asks you to:
 
 ### skill_create (governed)
 
-Creates an **experimental + DISABLED** package only. Never executes the skill in the same Turn. Registration approval and a separate `skill_enable` Turn are required. Does not install dependencies, download models, or grant permissions.
+Creates an **experimental + DISABLED** package only. Never executes the skill in the same Turn. Approved review and a separate `skill_enable` Turn are required. Does not install dependencies, download models, or grant permissions.
 
 ### skill_create
 Creates a new skill directory with SKILL.md and skill.json.
 Supply a clear `name`, `description`, and `prompt` that instructs the agent how to behave when the skill is active.
 Optionally provide `tool_names` (list of existing tool names) the skill needs access to.
-The skill is immediately available — hot-reload picks it up on the next query.
+The candidate stays unavailable until approved review and explicit enablement.
 
 ### skill_list
 Returns a table of all installed skills with their ID, name, description, and what files they include (tools.py, plugin.py).
 Use this to understand what skills already exist before creating duplicates.
 
+### skill_review
+After isolated tests, records concise validation evidence and the active registration approval. It promotes the candidate to installed-but-disabled; it does not load or enable the skill.
+
 ### skill_enable
-Enable or disable a skill by ID. Disabling creates a `.disabled` marker; enabling removes it.
+Enable or disable a reviewed skill by ID. Draft or experimental candidates fail closed. Disabling creates a `.disabled` marker; enabling removes it and refreshes the canonical registry.
 Use this when the user wants to turn off a skill without deleting it.
 
 ## Best practices

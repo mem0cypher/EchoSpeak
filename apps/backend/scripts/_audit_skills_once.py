@@ -6,12 +6,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import agent.video_editor.tools  # noqa: F401
 from agent.skill_status_audit import audit_all_skills
 from collections import Counter
 
 rows = audit_all_skills(
-    available_capabilities={"deterministic_editing", "approvals", "research"},
+    available_capabilities={"approvals", "research"},
     available_artifacts=set(),
 )
 print("STATUS_COUNTS", dict(Counter(r["status"] for r in rows)))

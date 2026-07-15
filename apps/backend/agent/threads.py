@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -76,11 +77,36 @@ class ThreadManager:
                     for tid, data in raw.items():
                         try:
                             self._threads[tid] = ThreadInfo.from_dict(data)
-                        except Exception:
-                            continue
+                        except Exception as exc:
+                            self._fail_corrupt_threads(exc)
                 logger.debug(f"Loaded {len(self._threads)} threads from {self._path}")
         except Exception as exc:
-            logger.warning(f"Failed to load threads: {exc}")
+            if isinstance(exc, RuntimeError):
+                raise
+            self._fail_corrupt_threads(exc)
+
+    def _fail_corrupt_threads(self, error: Exception) -> None:
+        quarantine = self._path.parent / "corrupt-state" / f"threads-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        note = "quarantine copy could not be created"
+        try:
+            quarantine.mkdir(parents=True, exist_ok=False)
+            copy = quarantine / self._path.name
+            if self._path.exists():
+                shutil.copy2(self._path, copy)
+            recovery = quarantine / "RECOVERY.txt"
+            recovery.write_text(
+                "EchoSpeak Session recovery\n\n"
+                f"Authoritative file: {self._path}\nQuarantine copy: {copy}\nError: {error}\n\n"
+                "Keep EchoSpeak stopped, repair or restore the authoritative JSON, then restart. "
+                "The original file was not changed.\n",
+                encoding="utf-8",
+            )
+            note = f"quarantine copy: {copy}; recovery guide: {recovery}"
+        except Exception as quarantine_error:
+            note = f"quarantine failed: {quarantine_error}"
+        raise RuntimeError(
+            f"Session registry is unreadable at {self._path}; the authoritative file was not overwritten; {note}. ({error})"
+        ) from error
 
     def _save(self) -> None:
         """Persist threads to disk."""

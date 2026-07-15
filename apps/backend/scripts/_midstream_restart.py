@@ -81,7 +81,6 @@ def main() -> int:
             "ECHOSPEAK_DATA_DIR": str(DATA),
             "ENABLE_SYSTEM_ACTIONS": "true",
             "ALLOW_FILE_WRITE": "true",
-            "ALLOW_VIDEO_AGENT_EDITS": "true",
             "USE_LOCAL_MODELS": "true",
             "LOCAL_MODEL_PROVIDER": "lmstudio",
             "LOCAL_MODEL_URL": "http://localhost:1234",

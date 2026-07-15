@@ -467,6 +467,71 @@ class MemoryCurator:
                 )
             )
 
+        # Explicit identity correction: "I'm Memo, not Max".
+        corrected_name = re.search(
+            r"(?i)\b(?:i\s+am|i'm|im)\s+([A-Za-z][A-Za-z0-9_\-]{1,32})"
+            r"\s*,?\s+not\s+[A-Za-z][A-Za-z0-9_\-]{1,32}\b",
+            clean,
+        )
+        if corrected_name and not any(c.semantic_key == "profile:user_name" for c in candidates):
+            name = corrected_name.group(1)
+            candidates.append(
+                MemoryCandidate(
+                    owner_id=owner_id,
+                    type="identity",
+                    scope="account",
+                    subject="name",
+                    text=f"User name: {name}",
+                    structured_attributes={"user_name": name},
+                    source_session_id=session_id,
+                    source_execution_id=execution_id,
+                    source_item_id=item_id,
+                    source_text=source_text[:500],
+                    explicit=explicit,
+                    confidence=1.0,
+                    importance=1.0,
+                    action="create",
+                    semantic_key="profile:user_name",
+                    reason="User corrected their identity",
+                )
+            )
+
+        # Stable relationship fact: "my sister's name is Emily".
+        relation = re.search(
+            r"(?i)\bmy\s+([a-z][a-z']{1,32})\s*(?:'s)?\s+name\s+is\s+"
+            r"([A-Za-z][A-Za-z\-']{1,64})\b",
+            clean,
+        )
+        if not relation:
+            relation = re.search(
+                r"(?i)\bmy\s+([a-z][a-z']{1,32})\s+(?:is\s+named|named)\s+"
+                r"([A-Za-z][A-Za-z\-']{1,64})\b",
+                clean,
+            )
+        if relation:
+            relation_name = relation.group(1).lower().rstrip("s").rstrip("'")
+            value = relation.group(2)
+            candidates.append(
+                MemoryCandidate(
+                    owner_id=owner_id,
+                    type="relationship",
+                    scope="account",
+                    subject=relation_name,
+                    text=f"Relation: {relation_name} name is {value}",
+                    structured_attributes={f"relation_{relation_name}": value},
+                    source_session_id=session_id,
+                    source_execution_id=execution_id,
+                    source_item_id=item_id,
+                    source_text=source_text[:500],
+                    explicit=explicit,
+                    confidence=1.0 if explicit else 0.9,
+                    importance=0.9,
+                    action="create",
+                    semantic_key=f"profile:relations:{relation_name}",
+                    reason="Stable relationship fact stated by the user",
+                )
+            )
+
         # Prefer / dislike patterns → semantic preference
         if re.search(r"(?i)\b(prefer|dislike|don't like|do not like|hate huge|concise|short prompts|manual testing)\b", clean):
             # Rewrite to third-person durable form
@@ -548,6 +613,8 @@ class MemoryCurator:
         if not re.search(
             r"\b(always|never|prefer|from now on|usually|whenever|"
             r"i like|i don't like|i dislike|my favorite|"
+            r"my\s+[a-z][a-z']{1,32}\s+(?:name\s+is|is\s+named|named)|"
+            r"(?:i\s+am|i'm|im)\s+[a-z][a-z0-9_-]{1,32}\s+not\s+[a-z][a-z0-9_-]{1,32}|"
             r"for this project|convention)\b",
             low,
         ):
@@ -794,7 +861,12 @@ class MemoryCurator:
         existing = list(existing or [])
         if not existing:
             try:
-                existing = self.memory.list_items(offset=0, limit=200)
+                existing = self.memory.list_items(
+                    offset=0,
+                    limit=200,
+                    thread_id=c.source_session_id or None,
+                    project_path=project_path or None,
+                )
             except Exception:
                 existing = []
 
@@ -1047,6 +1119,7 @@ class MemoryCurator:
         session_id: str,
         *,
         mode: Optional[str] = None,
+        current_project_path: str = "",
     ) -> CuratorResult:
         pending = self.get_pending_confirmation(session_id)
         result = CuratorResult()
@@ -1054,6 +1127,10 @@ class MemoryCurator:
             result.errors.append("no_pending_memory_confirmation")
             return result
         project_path = str(pending.get("project_path") or "")
+        current = str(current_project_path or "")
+        if project_path and current != project_path:
+            result.errors.append("stale_project_scope")
+            return result
         for raw in pending.get("candidates") or []:
             if not isinstance(raw, dict):
                 continue
@@ -1179,6 +1256,10 @@ class MemoryCurator:
                         pref_key = k.replace("favorite_", "").replace("_", " ").strip()
                         if pref_key:
                             self.memory.update_preference(pref_key, str(v))
+                    elif k.startswith("relation_"):
+                        relation_name = k.removeprefix("relation_").replace("_", " ").strip()
+                        if relation_name:
+                            self.memory.update_relation(relation_name, str(v))
             except Exception:
                 pass
         return mid
@@ -1340,7 +1421,13 @@ def build_memory_context_for_turn(
 ) -> str:
     """Selective retrieval of durable memories + optional Session-only context."""
     try:
-        items = memory.list_items(offset=0, limit=80, owner_id=owner_id)
+        items = memory.list_items(
+            offset=0,
+            limit=80,
+            owner_id=owner_id,
+            thread_id=session_id or None,
+            project_path=project_path or None,
+        )
     except Exception:
         return ""
     query = " ".join(
@@ -1427,7 +1514,11 @@ def skill_memory_context(
 ) -> List[Dict[str, Any]]:
     """Governed read interface for skills — never writes."""
     try:
-        items = memory.list_items(offset=0, limit=100)
+        items = memory.list_items(
+            offset=0,
+            limit=100,
+            project_path=project_path or None,
+        )
     except Exception:
         return []
     subjects_l = [s.casefold() for s in (subjects or []) if s]
@@ -1435,8 +1526,8 @@ def skill_memory_context(
     for it in items:
         meta = it.get("metadata") or {}
         scope = str(meta.get("scope") or "account")
-        if scope == "project" and project_path:
-            if str(meta.get("project_path") or "") not in {"", project_path}:
+        if scope == "project":
+            if not project_path or str(meta.get("project_path") or "") != project_path:
                 continue
         text = str(it.get("text") or "")
         if subjects_l:

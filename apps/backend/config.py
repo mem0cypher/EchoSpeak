@@ -29,8 +29,9 @@ DATA_DIR.mkdir(exist_ok=True)
 MEMORY_DIR = DATA_DIR / "memory"
 MEMORY_DIR.mkdir(exist_ok=True)
 
-LOGS_DIR = BASE_DIR / "logs"
-LOGS_DIR.mkdir(exist_ok=True)
+_configured_logs_dir = str(os.getenv("ECHOSPEAK_LOGS_DIR", "") or "").strip()
+LOGS_DIR = Path(_configured_logs_dir).expanduser().resolve() if _configured_logs_dir else BASE_DIR / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 DOCS_DIR = DATA_DIR / "documents"
 DOCS_DIR.mkdir(exist_ok=True)
@@ -71,6 +72,7 @@ SECRET_TOP_LEVEL_SETTINGS = {
     "twitter_access_token",
     "twitter_access_token_secret",
     "twitter_bearer_token",
+    "runway_api_key",
 }
 
 SECRET_NESTED_SETTINGS = {
@@ -500,7 +502,6 @@ class Config:
             os.getenv("WEB_SEARCH_PROVIDER", "auto").strip().lower() or "auto"
         )  # auto | duckduckgo | brave | searxng
         self.searxng_base_url = os.getenv("SEARXNG_BASE_URL", "").strip()
-        self.echo_search_max_rounds = int(os.getenv("ECHO_SEARCH_MAX_ROUNDS", "2") or 2)
         # Live sports structured data (The Odds API) - preferred over crawl for scores/odds
         self.odds_api_key = (
             os.getenv("ODDS_API_KEY", "").strip()
@@ -527,6 +528,7 @@ class Config:
         self.llm_trim_max_tokens = int(os.getenv("LLM_TRIM_MAX_TOKENS", "0") or 0)
         self.llm_trim_reserve_tokens = int(os.getenv("LLM_TRIM_RESERVE_TOKENS", "512") or 512)
         self.context_budget_enabled = os.getenv("CONTEXT_BUDGET_ENABLED", "true").lower() == "true"
+        self.echo_resolution_enabled = os.getenv("ECHO_RESOLUTION_ENABLED", "true").lower() == "true"
 
         self.document_rag_enabled = os.getenv("DOCUMENT_RAG_ENABLED", "true").lower() == "true"
         self.doc_upload_max_mb = int(os.getenv("DOC_UPLOAD_MAX_MB", "25"))
@@ -534,7 +536,7 @@ class Config:
         self.doc_context_max_chars = int(os.getenv("DOC_CONTEXT_MAX_CHARS", "2800") or 2800)
         self.doc_context_show_labels = os.getenv("DOC_CONTEXT_SHOW_LABELS", "true").lower() == "true"
         self.doc_source_preview_chars = int(os.getenv("DOC_SOURCE_PREVIEW_CHARS", "160") or 160)
-        self.doc_hybrid_enabled = os.getenv("DOC_HYBRID_ENABLED", "false").lower() == "true"
+        self.doc_hybrid_enabled = os.getenv("DOC_HYBRID_ENABLED", "true").lower() == "true"
         self.doc_vector_k = int(os.getenv("DOC_VECTOR_K", "30") or 30)
         self.doc_bm25_k = int(os.getenv("DOC_BM25_K", "30") or 30)
         self.doc_final_k = int(os.getenv("DOC_FINAL_K", "5") or 5)
@@ -685,8 +687,21 @@ class Config:
         self.terminal_docker_cpus = os.getenv("TERMINAL_DOCKER_CPUS", "1.0").strip() or "1.0"
         self.terminal_docker_user = os.getenv("TERMINAL_DOCKER_USER", "65534:65534").strip() or "65534:65534"
         self.ffprobe_path = os.getenv("VIDEO_FFPROBE_PATH", "ffprobe").strip() or "ffprobe"
+        self.ffmpeg_path = os.getenv("VIDEO_FFMPEG_PATH", "ffmpeg").strip() or "ffmpeg"
         self.video_ffprobe_timeout_seconds = int(os.getenv("VIDEO_FFPROBE_TIMEOUT_SECONDS", "15") or 15)
-        self.allow_video_agent_edits = os.getenv("ALLOW_VIDEO_AGENT_EDITS", "false").lower() == "true"
+        # Voice and generated-media work is opt-in even when the host action
+        # gate is enabled. Provider credentials never imply permission.
+        self.allow_voice_actions = os.getenv("ALLOW_VOICE_ACTIONS", "false").lower() == "true"
+        self.allow_generation_actions = os.getenv("ALLOW_GENERATION_ACTIONS", "false").lower() == "true"
+        self.voice_local_provider = os.getenv("VOICE_LOCAL_PROVIDER", "windows-sapi").strip() or "windows-sapi"
+        self.voice_cloud_provider = os.getenv("VOICE_CLOUD_PROVIDER", "").strip()
+        self.generation_local_provider = os.getenv("GENERATION_LOCAL_PROVIDER", "comfyui-local").strip() or "comfyui-local"
+        self.generation_cloud_provider = os.getenv("GENERATION_CLOUD_PROVIDER", "").strip()
+        self.comfyui_base_url = os.getenv("COMFYUI_BASE_URL", "http://127.0.0.1:8188").strip().rstrip("/")
+        self.comfyui_workflow_path = os.getenv("COMFYUI_WORKFLOW_PATH", "").strip()
+        self.runway_api_key = os.getenv("RUNWAY_API_KEY", "").strip()
+        self.vertex_project_id = os.getenv("VERTEX_PROJECT_ID", "").strip()
+        self.vertex_location = os.getenv("VERTEX_LOCATION", "us-central1").strip() or "us-central1"
         self.skill_curator_interval_minutes = int(os.getenv("SKILL_CURATOR_INTERVAL_MINUTES", "120") or 120)
         raw_notification_channels = os.getenv("NOTIFICATION_CHANNELS", "web")
         self.notification_channels = [
@@ -709,6 +724,8 @@ class Config:
         # --- Heartbeat (v5.4.0 - Proactive Mode) ---
         self.heartbeat_enabled = os.getenv("HEARTBEAT_ENABLED", "false").lower() == "true"
         self.heartbeat_interval = int(os.getenv("HEARTBEAT_INTERVAL", "30") or 30)
+        self.heartbeat_project_id = os.getenv("HEARTBEAT_PROJECT_ID", "").strip()
+        self.heartbeat_session_id = os.getenv("HEARTBEAT_SESSION_ID", "").strip()
         self.heartbeat_prompt = os.getenv(
             "HEARTBEAT_PROMPT",
             "You are Echo, running a system pulse check. Review the SYSTEM PULSE data above and decide if anything is worth reporting. "
@@ -725,6 +742,10 @@ class Config:
         self.heartbeat_channels = [
             c.strip().lower() for c in raw_heartbeat_channels.replace("\n", ",").split(",") if c.strip()
         ]
+
+        # Optional human-editable projection. Canonical memory remains records.json.
+        self.obsidian_sync_enabled = os.getenv("OBSIDIAN_SYNC_ENABLED", "false").lower() == "true"
+        self.obsidian_vault_path = os.getenv("OBSIDIAN_VAULT_PATH", "").strip()
 
         # --- Email / IMAP+SMTP (v5.4.0) ---
         self.allow_email = os.getenv("ALLOW_EMAIL", "false").lower() == "true"
@@ -998,6 +1019,7 @@ class Config:
             "llm_trim_max_tokens",
             "llm_trim_reserve_tokens",
             "context_budget_enabled",
+            "echo_resolution_enabled",
             "document_rag_enabled",
             "doc_upload_max_mb",
             "doc_context_max_chars",
@@ -1035,7 +1057,6 @@ class Config:
             "brave_search_api_key",
             "web_search_provider",
             "searxng_base_url",
-            "echo_search_max_rounds",
             "odds_api_key",
             "sports_live_enabled",
             "tesseract_path",
@@ -1176,8 +1197,19 @@ class Config:
             "terminal_docker_cpus",
             "terminal_docker_user",
             "ffprobe_path",
+            "ffmpeg_path",
             "video_ffprobe_timeout_seconds",
-            "allow_video_agent_edits",
+            "allow_voice_actions",
+            "allow_generation_actions",
+            "voice_local_provider",
+            "voice_cloud_provider",
+            "generation_local_provider",
+            "generation_cloud_provider",
+            "comfyui_base_url",
+            "comfyui_workflow_path",
+            "runway_api_key",
+            "vertex_project_id",
+            "vertex_location",
             "skill_curator_interval_minutes",
         }
 

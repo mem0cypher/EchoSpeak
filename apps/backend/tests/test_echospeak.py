@@ -7,10 +7,25 @@ import asyncio
 import os
 import sys
 import pytest
+from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _bind_disposable_file_scope(agent, root) -> None:
+    """Give parser tests an explicit disposable filesystem authority root."""
+    from agent.tools import set_active_project_root
+
+    set_active_project_root(str(root))
+    agent._execution_context.project_path = str(root)
+    agent._execution_context.workspace_root = str(root)
+    agent._state_store.update_thread_state(
+        agent._thread_key(),
+        project_path=str(root),
+        workspace_root=str(root),
+    )
 
 
 class TestConfig:
@@ -253,7 +268,7 @@ class TestTools:
         assert "timed out after 7s" in str(out).lower()
 
 class TestActionParser:
-    def test_action_parser_file_write_python_script(self, monkeypatch):
+    def test_action_parser_file_write_python_script(self, monkeypatch, tmp_path):
         """Ensure the action parser can propose a file_write for python script phrasing."""
         from agent.core import EchoSpeakAgent
         from config import config
@@ -263,6 +278,7 @@ class TestActionParser:
         monkeypatch.setattr(config, "allow_file_write", True, raising=False)
 
         agent = EchoSpeakAgent(memory_path=str(config.memory_path))
+        _bind_disposable_file_scope(agent, tmp_path)
         agent._tool_allowlist_override = {"file_write"}
         agent._allow_llm_tool_calling = lambda: False
 
@@ -698,6 +714,7 @@ class TestDiscordHardening:
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        _bind_disposable_file_scope(agent, tmp_path)
         monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
@@ -716,6 +733,7 @@ class TestDiscordHardening:
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        _bind_disposable_file_scope(agent, tmp_path)
         monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
@@ -727,12 +745,13 @@ class TestDiscordHardening:
         assert "<execute_tool>" not in response
         assert "Reply 'confirm'" in response
         assert agent._pending_action["tool"] == "file_write"
-        assert agent._pending_action["kwargs"]["path"] == "index.html"
+        assert Path(agent._pending_action["kwargs"]["path"]).name == "index.html"
 
     def test_malformed_execute_tool_file_path_alias_becomes_pending_file_action(self, tmp_path, monkeypatch):
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        _bind_disposable_file_scope(agent, tmp_path)
         monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
@@ -745,13 +764,14 @@ class TestDiscordHardening:
         assert "<execute_tool>" not in response
         assert "Reply 'confirm'" in response
         assert agent._pending_action["tool"] == "file_write"
-        assert agent._pending_action["kwargs"]["path"] == "index.html"
+        assert Path(agent._pending_action["kwargs"]["path"]).name == "index.html"
         assert "<!DOCTYPE html>" in agent._pending_action["kwargs"]["content"]
 
     def test_tool_call_json_tag_becomes_pending_terminal_action(self, tmp_path, monkeypatch):
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        _bind_disposable_file_scope(agent, tmp_path)
         monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
@@ -768,6 +788,7 @@ class TestDiscordHardening:
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        _bind_disposable_file_scope(agent, tmp_path)
         monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
@@ -780,13 +801,14 @@ class TestDiscordHardening:
         assert "<|tool_call>" not in response
         assert "Reply 'confirm'" in response
         assert agent._pending_action["tool"] == "file_write"
-        assert agent._pending_action["kwargs"]["path"] == "index.html"
+        assert Path(agent._pending_action["kwargs"]["path"]).name == "index.html"
         assert "<!DOCTYPE html>" in agent._pending_action["kwargs"]["content"]
 
     def test_pipe_token_file_write_infers_missing_path_from_prompt(self, tmp_path, monkeypatch):
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        _bind_disposable_file_scope(agent, tmp_path)
         monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
@@ -797,12 +819,13 @@ class TestDiscordHardening:
         assert response is not None
         assert "<|tool_call>" not in response
         assert agent._pending_action["tool"] == "file_write"
-        assert agent._pending_action["kwargs"]["path"] == "index.html"
+        assert Path(agent._pending_action["kwargs"]["path"]).name == "index.html"
 
     def test_tool_code_block_extracts_first_function_call_as_pending_action(self, tmp_path, monkeypatch):
         from agent.core import EchoSpeakAgent
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
+        _bind_disposable_file_scope(agent, tmp_path)
         monkeypatch.setattr(agent, "_action_allowed", lambda _name, *_args: True)
 
         response = agent._handle_printed_tool_directive(
@@ -814,7 +837,8 @@ class TestDiscordHardening:
         assert response is not None
         assert "<tool_code>" not in response
         assert agent._pending_action["tool"] == "file_write"
-        assert agent._pending_action["kwargs"]["path"] == "movement_demo/index.html"
+        assert Path(agent._pending_action["kwargs"]["path"]).name == "index.html"
+        assert Path(agent._pending_action["kwargs"]["path"]).parent.name == "movement_demo"
         assert "<html></html>" in agent._pending_action["kwargs"]["content"]
 
     def test_unrecognized_tool_call_shape_is_blocked_not_displayed(self, tmp_path):
@@ -1292,10 +1316,12 @@ class TestConversationAndResearchRouting:
         agent._fetch_search_result_page_text = lambda url, **kw: (
             "The Oilers play the Stars on March 6, 2026 at 7:00 PM MT versus Dallas."
         )
+        agent._silent_time_context = fake_time
         agent.tools = [
             Tool("web_search", lambda q: agent._grounded_web_search(q), "Search the web"),
             Tool("get_system_time", fake_time, "Get current time"),
         ]
+        agent.lc_tools = list(agent.tools)
         agent.graph_agent = None
         agent.agent_executor = None
         agent.fallback_executor = None
@@ -1346,10 +1372,12 @@ class TestConversationAndResearchRouting:
         agent._fetch_search_result_page_text = lambda url, **kw: (
             "The Oilers play the Stars on March 6, 2026 at 7:00 PM MT versus Dallas."
         )
+        agent._silent_time_context = fake_time
         agent.tools = [
             Tool("web_search", lambda q: agent._grounded_web_search(q), "Search the web"),
             Tool("get_system_time", fake_time, "Get current time"),
         ]
+        agent.lc_tools = list(agent.tools)
         agent.graph_agent = None
         agent.agent_executor = None
         agent.fallback_executor = None
@@ -1385,6 +1413,7 @@ class TestConversationAndResearchRouting:
         agent._raw_web_search_execute = fake_raw_web_search
         agent._fetch_search_result_page_text = lambda url, **kw: ""
         agent.tools = [Tool("web_search", lambda q: agent._grounded_web_search(q), "Search the web")]
+        agent.lc_tools = list(agent.tools)
         agent.graph_agent = None
         agent.agent_executor = None
         agent.fallback_executor = None

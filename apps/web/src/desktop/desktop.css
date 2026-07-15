@@ -1,0 +1,361 @@
+html.echospeak-desktop-root {
+  color-scheme: dark;
+  background: #070707;
+}
+
+html.echospeak-desktop-root,
+html.echospeak-desktop-root body,
+html.echospeak-desktop-root #root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #070707;
+}
+
+.desktop-window {
+  --desktop-bg: #070707;
+  --desktop-surface-1: #0b0b0c;
+  --desktop-surface-2: #111113;
+  --desktop-line: rgba(255, 255, 255, 0.095);
+  --desktop-line-strong: rgba(255, 255, 255, 0.16);
+  --desktop-text: #f4f4f5;
+  --desktop-muted: rgba(244, 244, 245, 0.52);
+  --desktop-red: #e5484d;
+  display: grid;
+  grid-template-rows: 42px minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  background: var(--desktop-bg);
+  color: var(--desktop-text);
+  font-family: Inter, "Segoe UI Variable", "Segoe UI", sans-serif;
+  user-select: none;
+}
+
+.desktop-window input,
+.desktop-window textarea,
+.desktop-window [contenteditable="true"] {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.desktop-titlebar {
+  display: grid;
+  grid-template-columns: minmax(210px, 1fr) auto minmax(210px, 1fr);
+  align-items: center;
+  height: 42px;
+  background: #09090a;
+  border-bottom: 1px solid var(--desktop-line);
+  position: relative;
+  z-index: 10000;
+}
+
+.desktop-titlebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding-left: 13px;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.desktop-titlebar-brand img {
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  object-fit: cover;
+  pointer-events: none;
+}
+
+.desktop-titlebar-brand small {
+  border-left: 1px solid var(--desktop-line-strong);
+  padding-left: 8px;
+  color: var(--desktop-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.desktop-titlebar-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  max-width: 420px;
+  color: var(--desktop-muted);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
+.desktop-titlebar-status i {
+  width: 5px;
+  height: 5px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #71717a;
+}
+
+.desktop-titlebar-status.is-ready i { background: #41c77a; box-shadow: 0 0 9px rgba(65, 199, 122, 0.55); }
+.desktop-titlebar-status.is-recovering i,
+.desktop-titlebar-status.is-connecting i { background: #d6a955; animation: desktop-status-pulse 1.2s ease-in-out infinite; }
+.desktop-titlebar-status.is-failed i { background: var(--desktop-red); box-shadow: 0 0 9px rgba(229, 72, 77, 0.55); }
+
+.desktop-titlebar-status span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.desktop-window-controls {
+  justify-self: end;
+  display: flex;
+  height: 100%;
+}
+
+.desktop-window-controls button {
+  width: 46px;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  color: rgba(255, 255, 255, 0.68);
+  background: transparent;
+  border: 0;
+  border-left: 1px solid transparent;
+  cursor: default;
+}
+
+.desktop-window-controls button:hover { background: rgba(255, 255, 255, 0.075); color: #fff; }
+.desktop-window-controls button:active { background: rgba(255, 255, 255, 0.12); }
+.desktop-window-controls button.is-close:hover { background: #c42b1c; }
+.desktop-window-controls button:focus-visible { outline: 1px solid #fff; outline-offset: -2px; }
+.desktop-window-controls svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1; }
+
+.desktop-content {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--desktop-bg);
+}
+
+.desktop-content > .echo-root {
+  height: 100% !important;
+  max-height: 100% !important;
+  animation: desktop-workspace-enter 280ms ease-out both;
+}
+
+.desktop-boot-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px;
+  text-align: center;
+  background: #050505;
+  animation: desktop-boot-enter 220ms ease-out both;
+}
+
+.desktop-boot-echo {
+  width: 52px;
+  height: 52px;
+  display: grid;
+  place-items: center;
+}
+
+.desktop-boot-echo img {
+  width: 46px;
+  height: 46px;
+  border-radius: 8px;
+  object-fit: cover;
+  filter: grayscale(1) contrast(1.08);
+  animation: desktop-echo-rotate 1.8s cubic-bezier(.55,.08,.45,.92) infinite;
+}
+.desktop-boot-progress { width: min(240px, 56vw); height: 2px; margin-top: 25px; overflow: hidden; background: rgba(255,255,255,.09); }
+.desktop-boot-progress span { display: block; width: 34%; height: 100%; background: rgba(255,255,255,.92); animation: desktop-progress 1.35s ease-in-out infinite; }
+.desktop-boot-detail { max-width: 560px; margin: 13px 0 0; color: rgba(255,255,255,.48); font-size: 11px; line-height: 1.5; letter-spacing: .015em; }
+.desktop-boot-step { margin: 5px 0 0; color: rgba(255,255,255,.25); font: 9px/1.4 "Cascadia Mono", monospace; letter-spacing: .08em; }
+
+.desktop-recovery-actions { display: flex; gap: 8px; margin-top: 24px; }
+.desktop-recovery-actions button,
+.desktop-service-banner button {
+  min-height: 32px;
+  padding: 0 13px;
+  color: var(--desktop-text);
+  background: #151517;
+  border: 1px solid var(--desktop-line-strong);
+  font: 600 11px/1 "Segoe UI", sans-serif;
+}
+.desktop-recovery-actions button:hover,
+.desktop-service-banner button:hover { background: #1d1d20; border-color: rgba(255,255,255,.25); }
+.desktop-recovery-actions button.is-primary { color: #050505; background: #f2f2f2; border-color: #fff; }
+
+.desktop-service-banner {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  z-index: 9000;
+  transform: translateX(-50%);
+  min-width: 340px;
+  max-width: min(680px, calc(100% - 48px));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 9px 10px 9px 13px;
+  color: rgba(255,255,255,.76);
+  background: rgba(20, 20, 22, 0.96);
+  border: 1px solid var(--desktop-line-strong);
+  box-shadow: 0 14px 42px rgba(0,0,0,.5);
+  font-size: 11px;
+}
+.desktop-service-banner.is-failed { border-color: rgba(229, 72, 77, 0.52); }
+.desktop-service-banner div { display: flex; gap: 6px; }
+
+@keyframes desktop-status-pulse { 50% { opacity: .35; } }
+@keyframes desktop-echo-rotate { to { transform: rotate(360deg); } }
+@keyframes desktop-progress { from { transform: translateX(-120%); } to { transform: translateX(350%); } }
+@keyframes desktop-boot-enter { from { opacity: 0; transform: scale(.992); } to { opacity: 1; transform: scale(1); } }
+@keyframes desktop-workspace-enter { from { opacity: 0; } to { opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .desktop-titlebar-status i,
+  .desktop-boot-echo img,
+  .desktop-boot-progress span,
+  .desktop-content > .echo-root { animation: none; }
+}
+
+/* Desktop-only adaptive shell: Sidebar | one ActiveSurface, then contextual composer. */
+.desktop-window .app-shell.desktop-single-workspace {
+  display: grid !important;
+  grid-template-rows: minmax(0, 1fr) minmax(142px, auto) !important;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  background: #070707;
+}
+
+.desktop-window .desktop-single-workspace > .echo-sidebar {
+  grid-row: 1 / 3;
+  min-height: 0;
+  border-right-color: var(--desktop-line) !important;
+}
+
+.desktop-window .desktop-single-workspace > .visualizer-pane,
+.desktop-window .desktop-single-workspace > .video-workspace-pane,
+.desktop-window .desktop-single-workspace > .media-workspace-pane,
+.desktop-window .desktop-single-workspace > .desktop-studio-host {
+  grid-column: 2;
+  grid-row: 1;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 0 !important;
+  border-top: 1px solid var(--desktop-line) !important;
+  border-bottom: 1px solid var(--desktop-line) !important;
+  background: #080809 !important;
+}
+
+.desktop-window .desktop-single-workspace > .glow-panel.desktop-chat-workspace {
+  grid-column: 2;
+  grid-row: 1 / 4;
+  min-width: 0;
+  min-height: 0;
+  border: 0 !important;
+  background: #080809 !important;
+}
+
+.desktop-window .desktop-single-workspace > .glow-panel.desktop-contextual-workspace,
+.desktop-window .desktop-contextual-workspace > .panel-body,
+.desktop-window .desktop-contextual-workspace .research-panel {
+  display: contents !important;
+}
+
+.desktop-window .desktop-contextual-workspace > .panel-header {
+  display: none !important;
+}
+
+.desktop-window .desktop-contextual-workspace .chat-scroll {
+  display: none !important;
+}
+
+.desktop-window .desktop-contextual-workspace .input-bar {
+  grid-column: 2;
+  grid-row: 2;
+  align-self: end;
+  width: 100%;
+  max-height: 238px;
+  min-width: 0;
+  overflow: auto;
+  box-sizing: border-box;
+  background: #0a0a0b !important;
+  border-top: 0 !important;
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
+}
+
+.desktop-window .desktop-single-workspace .input-field {
+  position: relative;
+  z-index: 1;
+  pointer-events: auto;
+}
+
+.desktop-window .desktop-studio-host .studio-shell {
+  position: relative !important;
+  inset: auto !important;
+  width: 100% !important;
+  height: 100% !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  z-index: 1 !important;
+}
+
+.desktop-window .desktop-studio-host .studio-top {
+  display: none !important;
+}
+
+.desktop-window .desktop-single-workspace .panel-header .title {
+  font-family: "Segoe UI Variable", "Segoe UI", sans-serif !important;
+  font-size: 12px !important;
+  letter-spacing: -0.01em !important;
+}
+
+.desktop-window .desktop-single-workspace .input-bar {
+  padding: 12px 16px 14px !important;
+}
+
+.desktop-window .desktop-single-workspace .echo-sidebar-scroll {
+  gap: 8px !important;
+}
+
+.desktop-window .desktop-single-workspace .visualizer-pane-body.is-avatar,
+.desktop-window .desktop-single-workspace .visualizer-pane-body.is-avatar > div {
+  width: 100% !important;
+  height: 100% !important;
+  min-width: 0;
+  min-height: 0;
+  align-items: center !important;
+  justify-content: center !important;
+}
+
+.desktop-window .desktop-single-workspace button:focus-visible,
+.desktop-window .desktop-single-workspace select:focus-visible,
+.desktop-window .desktop-single-workspace textarea:focus-visible {
+  outline: 1px solid rgba(255, 255, 255, 0.82) !important;
+  outline-offset: 2px;
+}
+
+@media (max-width: 1100px) {
+  .desktop-window .desktop-single-workspace {
+    grid-template-rows: minmax(0, 1fr) minmax(174px, auto) !important;
+  }
+  .desktop-window .desktop-contextual-workspace .input-bar { max-height: 270px; }
+}

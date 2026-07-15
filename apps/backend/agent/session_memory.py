@@ -96,6 +96,10 @@ class SessionMemoryDistiller:
         parts: List[str] = []
         if state.current_subject:
             parts.append(f"Current subject: {state.current_subject}")
+        if state.current_objective:
+            # Projection only: ThreadSessionState remains the active objective
+            # authority and supplies this value during turn distillation.
+            parts.append(f"Current objective: {state.current_objective}")
         if state.summary:
             parts.append(f"Session summary: {state.summary}")
         for label, values in (

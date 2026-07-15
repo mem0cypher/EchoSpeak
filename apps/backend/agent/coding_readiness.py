@@ -98,10 +98,7 @@ def _tool_status(agent: Any, name: str, *, project_attached: bool) -> tuple[str,
     try:
         loaded_names = set(agent._registered_tool_names())  # type: ignore[attr-defined]
     except Exception:
-        loaded_names = {
-            str(getattr(tool, "name", "") or "")
-            for tool in [*(getattr(agent, "tools", []) or []), *(getattr(agent, "lc_tools", []) or [])]
-        }
+        loaded_names = set(ToolRegistry.get_names())
     if name not in loaded_names:
         return "filtered", f"{name} is registered but not present in this Session's executable inventory."
 

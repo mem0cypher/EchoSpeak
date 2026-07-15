@@ -9,6 +9,53 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _make_disposable_coding_agent(
+    tmp_path,
+    monkeypatch,
+    thread_id: str,
+    project_name: str = "synthetic-shooter",
+):
+    """Create a Project/Session/ActiveWork authority chain under tmp_path only."""
+    from agent import projects as projects_module
+    from agent import state as state_module
+    from agent.active_work import ActiveWorkStore
+    from agent.core import EchoSpeakAgent
+    from agent.projects import ProjectManager
+    from agent.state import StateStore
+
+    root = tmp_path / project_name
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "game.js").write_text(
+        "const player={hp:100}; const enemies=[]; function update() {}\n",
+        encoding="utf-8",
+    )
+    (root / "index.html").write_text("<canvas id='game'></canvas>\n", encoding="utf-8")
+    (root / "style.css").write_text("canvas { display: block; }\n", encoding="utf-8")
+
+    project_manager = ProjectManager(tmp_path / "projects")
+    state_store = StateStore(tmp_path / "phase3")
+    monkeypatch.setattr(projects_module, "_project_manager", project_manager)
+    monkeypatch.setattr(state_module, "_state_store", state_store)
+
+    project = project_manager.attach_folder(str(root), name=project_name, trust_state="trusted")
+    state = state_store.update_thread_state(
+        thread_id,
+        active_project_id=project.id,
+        project_path=str(root.resolve()),
+        workspace_root=str(root.resolve()),
+    )
+    agent = EchoSpeakAgent(
+        memory_path=str(tmp_path / "memory"),
+        manage_background_services=False,
+    )
+    agent._current_thread_id = thread_id
+    agent._state_store = state_store
+    agent._execution_context = state
+    agent._active_project_id = project.id
+    agent._active_work_store = ActiveWorkStore(tmp_path / "active-work")
+    return agent, root
+
+
 def test_coding_intent_novel_genres_never_discussed():
     """Rhythm / tower defense / mystery adventure must match same as any create+artifact ask."""
     from agent.core import EchoSpeakAgent
@@ -179,44 +226,50 @@ def test_weather_place_structural_not_city_list():
     assert "weather" in bare.lower()
 
 
-def test_active_work_persists_across_agent_reinit():
+def test_active_work_persists_across_agent_reinit(tmp_path, monkeypatch):
     """Desktop project open must leave durable fingerprint; new agent restores it."""
-    import tempfile
-    from agent.core import EchoSpeakAgent
-    from agent.active_work import ActiveWorkStore, looks_like_desktop_relist, goal_looks_incomplete
-    from pathlib import Path
+    from agent.active_work import ActiveWorkState, looks_like_desktop_relist
 
     tid = "test-aw-persist-" + tempfile.mkdtemp()[-8:]
-    a = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
-    a._current_thread_id = tid
-    q = "start 2d-shooter-game on my desktop"
+    a, project_root = _make_disposable_coding_agent(tmp_path, monkeypatch, tid)
+    q = "start on the project folder"
     assert a._is_local_filesystem_intent(q) is True
-    scan = a._run_local_project_deep_scan(q)
-    if not (Path.home() / "Desktop" / "2d-shooter-game").is_dir():
-        return
-    assert "2d-shooter" in str(scan.get("path") or "").lower()
+    a._active_work_store.save(
+        ActiveWorkState(
+            thread_id=tid,
+            kind="coding_project",
+            phase="ready",
+            project_path=str(project_root),
+            project_name=project_root.name,
+            goal="inspect and continue the synthetic game",
+            next_step="Edit game.js for score",
+            files_known=["game.js", "index.html", "style.css"],
+            listing="game.js\nindex.html\nstyle.css\n",
+            code_digest="### game.js\n// player enemies score collision\n" + ("x" * 100),
+        )
+    )
     aw = a._load_active_work()
     assert aw is not None and aw.is_active()
-    assert "2d-shooter" in aw.project_path.lower().replace("_", "-")
+    assert project_root.name in aw.project_path.lower().replace("_", "-")
     assert aw.files_known
     stall = "Looks like you got a folder. What kind of game is it? I gotta see what's in there."
     assert a._local_scan_answer_is_hollow(q, stall) is True
     assert looks_like_desktop_relist(stall) is True
     # Fresh agent instance (simulates process/pool re-init)
-    b = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
-    b._current_thread_id = tid
+    b, _ = _make_disposable_coding_agent(tmp_path, monkeypatch, tid)
+    b._active_work_store = a._active_work_store
     aw2 = b._load_active_work()
     assert aw2.project_path == aw.project_path
     ctx = b._active_work_context_block()
     assert "Do NOT re-list" in ctx
-    assert aw.project_name in ctx or "2d-shooter" in ctx.lower()
+    assert aw.project_name in ctx or project_root.name in ctx.lower()
     # Continuity recovery must replace hollow stall without re-asking (no live LLM)
     b._invoke_visible_llm = lambda prompt: (
-        "Project at Desktop/2d-shooter-game with game.js, index.html, style.css. "
+        f"Project at {project_root} with game.js, index.html, style.css. "
         "Canvas shooter already has player/enemies. Next: edit game.js for score."
     )
     b._synthesize_local_project_brief = lambda ui: (
-        "Scanned 2d-shooter-game: game.js, index.html, style.css. Ready to edit."
+        f"Scanned {project_root.name}: game.js, index.html, style.css. Ready to edit."
     )
     fixed = b._ensure_active_work_continuity(q, stall)
     assert fixed
@@ -226,27 +279,23 @@ def test_active_work_persists_across_agent_reinit():
     assert len(fixed) > 60
     # Hydrate seeds pin + samples
     assert b._hydrate_from_active_work() is True
-    assert "2d-shooter" in str(getattr(b, "_last_local_project_path", "")).lower()
+    assert project_root.name in str(getattr(b, "_last_local_project_path", "")).lower()
 
 
-def test_active_work_replan_on_incomplete_implement_goal():
+def test_active_work_replan_on_incomplete_implement_goal(tmp_path, monkeypatch):
     """Mid-task implement goals must replan from fingerprint, not re-list Desktop."""
     import tempfile
-    from agent.core import EchoSpeakAgent
-    from agent.active_work import ActiveWorkState, ActiveWorkStore, goal_looks_incomplete
-    from pathlib import Path
+    from agent.active_work import ActiveWorkState, goal_looks_incomplete
 
-    desk = Path.home() / "Desktop" / "2d-shooter-game"
-    if not desk.is_dir():
-        return
     tid = "test-aw-replan-" + tempfile.mkdtemp()[-8:]
-    store = ActiveWorkStore()
+    agent, desk = _make_disposable_coding_agent(tmp_path, monkeypatch, tid)
+    store = agent._active_work_store
     state = ActiveWorkState(
         thread_id=tid,
         kind="coding_project",
         phase="implement",
         project_path=str(desk),
-        project_name="2d-shooter-game",
+        project_name=desk.name,
         goal="add score when enemies die and despawn on player hit",
         next_step="Implement in project files: add score when enemies die",
         files_known=["game.js", "index.html", "style.css"],
@@ -254,17 +303,15 @@ def test_active_work_replan_on_incomplete_implement_goal():
         code_digest="### game.js\n// player enemies score collision\nfunction update() {}\n",
     )
     store.save(state)
-    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
-    agent._current_thread_id = tid
     agent._hydrate_from_active_work()
     stall = (
-        "File list done — content='2d-shooter-game/ EchoSpeak/ Win11Debloat... "
+        "File list done — content='synthetic-shooter/ unrelated-folder... "
         "What kind of game is it? I gotta see what's in there before I can try."
     )
     aw = agent._load_active_work()
     assert goal_looks_incomplete(aw, stall, tools_ran=["file_list"]) is True
     agent._invoke_visible_llm = lambda prompt: (
-        "Resuming 2d-shooter-game. Goal: add score on enemy kill and despawn on player hit. "
+        "Resuming synthetic-shooter. Goal: add score on enemy kill and despawn on player hit. "
         "Next edit: game.js collision + score counter. Not re-listing Desktop."
     )
     out = agent._ensure_active_work_continuity(
@@ -273,7 +320,7 @@ def test_active_work_replan_on_incomplete_implement_goal():
     )
     low = out.lower()
     assert "what kind of game" not in low
-    assert "win11debloat" not in low
+    assert "unrelated-folder" not in low
     assert "game.js" in low or "score" in low or "resuming" in low or "continuing" in low
     assert len(out) > 40
     # Partial tool restore must include active_work_restore
@@ -281,30 +328,25 @@ def test_active_work_replan_on_incomplete_implement_goal():
     assert "active_work_restore" in tools
 
 
-def test_new_app_request_never_resumes_unrelated_shooter_project():
+def test_new_app_request_never_resumes_unrelated_shooter_project(tmp_path, monkeypatch):
     """CRITICAL: to-do list must not reuse 2d-shooter-game pin/path."""
     import tempfile
-    from pathlib import Path
-    from agent.core import EchoSpeakAgent
     from agent.active_work import (
         ActiveWorkState,
-        ActiveWorkStore,
         request_continues_project,
         infer_new_project_slug,
     )
 
-    desk = Path.home() / "Desktop" / "2d-shooter-game"
-    if not desk.is_dir():
-        return
     tid = "test-aw-newproj-" + tempfile.mkdtemp()[-8:]
-    store = ActiveWorkStore()
+    agent, desk = _make_disposable_coding_agent(tmp_path, monkeypatch, tid)
+    store = agent._active_work_store
     store.save(
         ActiveWorkState(
             thread_id=tid,
             kind="coding_project",
             phase="implement",
             project_path=str(desk),
-            project_name="2d-shooter-game",
+            project_name=desk.name,
             goal="health and scoreboard for shooter",
             next_step="Continue shooter",
             files_known=["game.js", "index.html", "style.css"],
@@ -314,15 +356,13 @@ def test_new_app_request_never_resumes_unrelated_shooter_project():
             file_mtimes={"game.js": 1.0},
         )
     )
-    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
-    agent._current_thread_id = tid
     aw = agent._load_active_work()
     q_new = "build me a brand new to-do list app on my desktop"
     assert request_continues_project(q_new, aw) is False
     assert agent._active_work_is_relevant(q_new, aw) is False
     path = agent._resolve_coding_project_path(q_new)
     assert path
-    assert "2d-shooter" not in path.lower().replace("_", "-")
+    assert desk.name not in path.lower().replace("_", "-")
     assert "todo" in path.lower().replace("_", "-") or "to-do" in path.lower() or "list" in path.lower()
     # slug helper sanity
     slug = infer_new_project_slug(q_new)
@@ -332,15 +372,17 @@ def test_new_app_request_never_resumes_unrelated_shooter_project():
     # Continuity gate on the *shooter* fingerprint (in-memory), independent of overwrite
     q_cont = "also add a pause button to the shooter game"
     assert request_continues_project(q_cont, aw) is True
-    # Restore shooter state on a fresh thread and confirm path resolves to shooter
+    # Restore the prior synthetic project on a fresh Session and confirm continuity.
     tid2 = "test-aw-cont-" + tempfile.mkdtemp()[-8:]
-    store.save(
+    agent2, _ = _make_disposable_coding_agent(tmp_path, monkeypatch, tid2)
+    store2 = agent2._active_work_store
+    store2.save(
         ActiveWorkState(
             thread_id=tid2,
             kind="coding_project",
             phase="implement",
             project_path=str(desk),
-            project_name="2d-shooter-game",
+            project_name=desk.name,
             goal="health and scoreboard for shooter",
             next_step="Continue shooter",
             files_known=["game.js", "index.html", "style.css"],
@@ -350,24 +392,19 @@ def test_new_app_request_never_resumes_unrelated_shooter_project():
             file_mtimes={"game.js": 1.0},
         )
     )
-    agent2 = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
-    agent2._current_thread_id = tid2
     path2 = agent2._resolve_coding_project_path(q_cont)
-    assert "2d-shooter" in path2.lower().replace("_", "-")
+    assert desk.name in path2.lower().replace("_", "-")
 
 
-def test_coding_followup_reuses_active_work_skips_full_rescan():
+def test_coding_followup_reuses_active_work_skips_full_rescan(tmp_path, monkeypatch):
     """Case 2: state stored but was ignored — follow-up must resume, not cold-scan all files."""
     import tempfile
     from pathlib import Path
-    from agent.core import EchoSpeakAgent
-    from agent.active_work import ActiveWorkState, ActiveWorkStore
+    from agent.active_work import ActiveWorkState
 
-    desk = Path.home() / "Desktop" / "2d-shooter-game"
-    if not desk.is_dir():
-        return
     tid = "test-aw-followup-" + tempfile.mkdtemp()[-8:]
-    store = ActiveWorkStore()
+    agent, desk = _make_disposable_coding_agent(tmp_path, monkeypatch, tid)
+    store = agent._active_work_store
     # Simulate prior turn wrote usable project fingerprint
     digest = (
         "### game.js\nconst player={hp:100}; function damagePlayer(){}\n"
@@ -385,7 +422,7 @@ def test_coding_followup_reuses_active_work_skips_full_rescan():
             kind="coding_project",
             phase="implement",
             project_path=str(desk),
-            project_name="2d-shooter-game",
+            project_name=desk.name,
             goal="health and scoreboard",
             next_step="Continue implementation",
             files_known=["game.js", "index.html", "style.css"],
@@ -395,8 +432,6 @@ def test_coding_followup_reuses_active_work_skips_full_rescan():
             file_mtimes=mtimes,
         )
     )
-    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
-    agent._current_thread_id = tid
     aw = agent._load_active_work()
     assert aw is not None and aw.has_usable_scan()
     assert aw.same_project(str(desk))
@@ -416,29 +451,25 @@ def test_coding_followup_reuses_active_work_skips_full_rescan():
     assert any("game.js" in k.replace("\\", "/") for k in parsed)
 
 
-def test_coding_implement_intent_uses_plan_state_hooks():
+def test_coding_implement_intent_uses_plan_state_hooks(tmp_path, monkeypatch):
     """Feature edits on Desktop game must be recognized as implement + plan-worthy."""
-    import tempfile
     from pathlib import Path
-    from agent.core import EchoSpeakAgent
 
-    agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
+    tid = "test-aw-hooks-" + tempfile.mkdtemp()[-8:]
+    agent, desk = _make_disposable_coding_agent(tmp_path, monkeypatch, tid)
     q = (
-        "lets work on 2d-shooter-game on my desktop and add a health bar "
+        f"lets work on {desk.name} and add a health bar "
         "and scoreboard and a you died screen with restart"
     )
     assert agent._is_coding_implement_intent(q) is True
     assert agent._task_planner.needs_planning(q) is True
-    desk = Path.home() / "Desktop" / "2d-shooter-game"
-    if not desk.is_dir():
-        return
     path = agent._resolve_coding_project_path(q)
-    assert path and "2d-shooter" in path.lower().replace("_", "-")
+    assert path and desk.name in path.lower().replace("_", "-")
     files = agent._coding_project_source_files(path)
     names = {Path(f).name for f in files}
     assert "game.js" in names
     # Scan/open-only should NOT be implement (brief path stays)
-    assert agent._is_coding_implement_intent("start 2d-shooter-game on my desktop") is False
+    assert agent._is_coding_implement_intent(f"start {desk.name}") is False
 
 
 def test_active_work_store_disk_roundtrip():

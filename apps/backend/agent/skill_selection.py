@@ -123,8 +123,7 @@ def _validate_executable(
     for cap in [*manifest.required_capabilities, *manifest.required_models]:
         # Capability tokens; if inventory is empty, do not block on unknown map.
         if available_capabilities and cap not in available_capabilities:
-            # Deterministic editing always present for video domain tools.
-            if cap in {"deterministic_editing", "timeline_mutation", "agent_proposals", "approvals", "research"}:
+            if cap in {"approvals", "research"}:
                 continue
             missing.append(f"capability:{cap}")
     if any(m.startswith("capability:") for m in missing):
@@ -142,10 +141,7 @@ def _validate_executable(
     for perm in manifest.permissions:
         if perm and permissions and perm not in permissions:
             # Common aliases
-            aliases = {
-                "video_agent_edits": {"video_agent_edits", "ALLOW_VIDEO_AGENT_EDITS"},
-                "system_actions": {"system_actions", "ENABLE_SYSTEM_ACTIONS"},
-            }
+            aliases = {"system_actions": {"system_actions", "ENABLE_SYSTEM_ACTIONS"}}
             ok = perm in permissions or any(a in permissions for a in aliases.get(perm, ()))
             if not ok:
                 missing.append(f"permission:{perm}")

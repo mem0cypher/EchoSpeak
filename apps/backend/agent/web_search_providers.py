@@ -366,20 +366,37 @@ class SearXNGProvider:
         if not q:
             return SearchProviderResult(provider=self.name, errors=["empty query"])
         try:
-            from agent.search_provider import SearXNGSearchProvider
+            import httpx
 
-            rows = SearXNGSearchProvider(self.base_url, timeout_s=self.timeout_s).search(q, limit=self.max_results)
-            hits = [
-                SearchHit(
-                    title=row.title,
-                    url=row.url,
-                    snippet=row.snippet,
-                    provider=self.name,
-                    query=q,
-                    score_hint=0.1,
+            params = {"q": q, "format": "json"}
+            endpoint = f"{self.base_url}/search"
+            with httpx.Client(timeout=self.timeout_s, follow_redirects=True) as client:
+                response = client.get(endpoint, params=params)
+                if response.status_code in {400, 415}:
+                    response = client.post(endpoint, json=params)
+                response.raise_for_status()
+                payload = response.json()
+            rows = payload.get("results") if isinstance(payload, dict) else []
+            hits: List[SearchHit] = []
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                title = str(row.get("title") or row.get("content") or "").strip()
+                url = str(row.get("url") or "").strip()
+                if not title and not url:
+                    continue
+                hits.append(
+                    SearchHit(
+                        title=title or url,
+                        url=url,
+                        snippet=str(row.get("content") or row.get("snippet") or "").strip(),
+                        provider=self.name,
+                        query=q,
+                        score_hint=0.1,
+                    )
                 )
-                for row in rows
-            ]
+                if len(hits) >= self.max_results:
+                    break
             return SearchProviderResult(hits=_dedupe_hits(hits), provider=self.name, queries_used=[q])
         except Exception as exc:
             return SearchProviderResult(

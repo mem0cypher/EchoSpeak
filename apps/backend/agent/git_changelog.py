@@ -20,9 +20,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
+from config import DATA_DIR
 
 # State persistence
-_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_DATA_DIR = Path(DATA_DIR)
 _DATA_DIR.mkdir(exist_ok=True)
 _CHANGELOG_STATE_PATH = _DATA_DIR / "git_changelog_state.json"
 

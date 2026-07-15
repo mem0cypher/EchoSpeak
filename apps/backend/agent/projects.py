@@ -7,6 +7,7 @@ import json
 import os
 import uuid
 import subprocess
+import shutil
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from pathlib import Path
@@ -15,6 +16,15 @@ from loguru import logger
 
 
 PROJECTS_DIR = Path(__file__).parent.parent / "projects"
+
+
+def _default_projects_dir() -> Path:
+    """Keep browser storage compatible while desktop follows its owned data root."""
+    if os.getenv("ECHOSPEAK_RUNTIME_KIND", "").strip().lower() == "desktop":
+        from config import DATA_DIR
+
+        return Path(DATA_DIR) / "projects"
+    return PROJECTS_DIR
 
 
 class Project(BaseModel):
@@ -42,7 +52,7 @@ class ProjectManager:
     """Manages project storage and retrieval."""
     
     def __init__(self, projects_dir: Optional[Path] = None):
-        self.projects_dir = projects_dir or PROJECTS_DIR
+        self.projects_dir = projects_dir or _default_projects_dir()
         self.projects_dir.mkdir(parents=True, exist_ok=True)
         self._cache: Dict[str, Project] = {}
         self._load_all()
@@ -59,9 +69,33 @@ class ProjectManager:
                     project = Project(**data)
                     self._cache[project.id] = project
                 except Exception as e:
-                    logger.warning(f"Failed to load project {file}: {e}")
+                    self._fail_corrupt_project(file, e)
         except Exception as e:
-            logger.error(f"Failed to load projects: {e}")
+            if isinstance(e, RuntimeError):
+                raise
+            raise RuntimeError(f"Failed to load Projects from {self.projects_dir}: {e}") from e
+
+    def _fail_corrupt_project(self, path: Path, error: Exception) -> None:
+        quarantine = self.projects_dir / "corrupt-state" / f"{int(datetime.now(timezone.utc).timestamp())}-{uuid.uuid4().hex[:8]}"
+        note = "quarantine copy could not be created"
+        try:
+            quarantine.mkdir(parents=True, exist_ok=False)
+            copy = quarantine / path.name
+            shutil.copy2(path, copy)
+            recovery = quarantine / "RECOVERY.txt"
+            recovery.write_text(
+                "EchoSpeak Project recovery\n\n"
+                f"Authoritative file: {path}\nQuarantine copy: {copy}\nError: {error}\n\n"
+                "Keep EchoSpeak stopped, repair or restore the authoritative JSON, then restart. "
+                "The original file was not changed.\n",
+                encoding="utf-8",
+            )
+            note = f"quarantine copy: {copy}; recovery guide: {recovery}"
+        except Exception as quarantine_error:
+            note = f"quarantine failed: {quarantine_error}"
+        raise RuntimeError(
+            f"Project registry is unreadable at {path}; the authoritative file was not overwritten; {note}. ({error})"
+        ) from error
     
     def list_projects(self) -> List[Project]:
         """List all projects."""

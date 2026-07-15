@@ -47,15 +47,9 @@ class ModeExecutionProfile:
 CHAT_PROFILE = ModeExecutionProfile(
     mode=TurnMode.CHAT,
     executor_name="chat_executor",
-    behavior=(
-        "Prefer a direct conversational answer. Tools remain available from the "
-        "authorized inventory when the user request needs them; Project scope and "
-        "permissions still gate filesystem and terminal use."
-    ),
+    behavior="Prefer a direct conversational answer without operational tools.",
     failure_policy="Return a concise conversational fallback when no tool is needed.",
     log_scope="mode.chat",
-    may_read_files=True,
-    may_search=True,
 )
 
 RESEARCH_PROFILE = ModeExecutionProfile(

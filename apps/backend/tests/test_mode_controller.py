@@ -73,6 +73,16 @@ def test_new_project_enters_implement_phase_with_confirmation_gated_tools():
     assert profile.may_write_files
 
 
+def test_named_file_change_enters_implement_not_inspect():
+    decision = classify_turn_mode("Change the title in index.html.")
+    tools = allowed_tools_for_mode(decision, ALL_TOOLS)
+
+    assert decision.mode == TurnMode.CODING
+    assert decision.coding_phase == CodingPhaseName.IMPLEMENT
+    assert "file_read" in tools
+    assert "file_write" in tools
+
+
 def test_active_project_approval_enters_implement_phase():
     active = ActiveWorkState(
         thread_id="t1",
@@ -194,12 +204,12 @@ def test_turn_constraints_are_structured_and_reduce_authority():
     assert "file_write" not in tools
 
 
-def test_deep_research_routes_to_research_model():
+def test_deep_research_uses_active_session_model():
     decision = classify_turn_mode(
         "deep research the evidence, compare sources, and trace the timeline for the recall"
     )
     assert decision.mode == TurnMode.TASK_RESEARCH
-    assert decision.model_name == "mradermacher/Marco-DeepResearch-8B-i1-GGUF"
+    assert decision.model_name == ""
     assert decision.evidence_required is True
 
 

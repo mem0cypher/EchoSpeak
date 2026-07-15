@@ -8,5 +8,4 @@ system_monitor
 daily_briefing
 email_comms
 telegram
-video_editor
 skill_writer

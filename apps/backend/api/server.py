@@ -54,6 +54,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import (
     config,
+    DATA_DIR,
     ModelProvider,
     SECRET_NESTED_SETTINGS,
     SECRET_TOP_LEVEL_SETTINGS,
@@ -439,7 +440,6 @@ def _validate_settings_effective(effective: dict) -> list[dict]:
         "allow_terminal_commands",
         "allow_open_application",
         "allow_self_modification",
-        "allow_video_agent_edits",
         "allow_discord_webhook",
     ]
     if not enable_system_actions:
@@ -791,6 +791,11 @@ async def _reconcile_heartbeat_runtime() -> None:
     from agent.heartbeat import HeartbeatManager, get_heartbeat_manager, set_heartbeat_manager
 
     desired_enabled = bool(getattr(config, "heartbeat_enabled", False))
+    heartbeat_project_id = str(getattr(config, "heartbeat_project_id", "") or "").strip()
+    heartbeat_session_id = str(getattr(config, "heartbeat_session_id", "") or "").strip()
+    if desired_enabled and (not heartbeat_project_id or not heartbeat_session_id):
+        logger.error("Heartbeat requires HEARTBEAT_PROJECT_ID and HEARTBEAT_SESSION_ID")
+        desired_enabled = False
 
     with _heartbeat_runtime_lock:
         hb = get_heartbeat_manager()
@@ -802,7 +807,11 @@ async def _reconcile_heartbeat_runtime() -> None:
         agent = get_agent()
         hb = get_heartbeat_manager()
         if hb is None:
-            hb = HeartbeatManager(agent=agent)
+            hb = HeartbeatManager(
+                agent=agent,
+                project_id=heartbeat_project_id,
+                session_id=heartbeat_session_id,
+            )
             set_heartbeat_manager(hb)
         else:
             hb.set_agent(agent)
@@ -810,6 +819,8 @@ async def _reconcile_heartbeat_runtime() -> None:
                 interval_minutes=getattr(config, "heartbeat_interval", 30),
                 prompt=getattr(config, "heartbeat_prompt", ""),
                 channels=list(getattr(config, "heartbeat_channels", ["web"])),
+                project_id=heartbeat_project_id,
+                session_id=heartbeat_session_id,
             )
 
         if not hb.is_running:
@@ -1616,6 +1627,9 @@ def _extract_text_from_upload(filename: str, content_type: Optional[str], data: 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan."""
+    # The API lifespan is the sole scheduler/coordinator owner in server and
+    # desktop processes. Agent instances must not start competing daemons.
+    os.environ["ECHOSPEAK_API_RUNTIME"] = "1"
     logger.info("Starting Echo Speak API server...")
     global _gateway_loop
     _gateway_loop = asyncio.get_running_loop()
@@ -1661,28 +1675,197 @@ async def lifespan(app: FastAPI):
         from agent.routines import get_routine_manager
 
         def _routine_callback(routine):
-            """Execute a scheduled routine through the agent pipeline."""
-            try:
-                r_agent = get_agent("routine_" + routine.id)
-                query = routine.action_config.get("query", routine.name)
-                response, success = r_agent.process_query(
-                    query, source="routine", thread_id="routine_" + routine.id,
-                )
-                if response and success:
-                    _deliver_routine_result(routine, response)
-            except Exception as exc:
-                logger.warning(f"Routine callback error ({routine.name}): {exc}")
+            """Claim one durable Run, then execute one governed Turn."""
+            from agent.automation_runtime import (
+                AutomationModelBinding,
+                AutomationRunStatus,
+                ModelBindingPolicy,
+                get_automation_run_store,
+            )
+            from agent.projects import get_project_manager
+            from agent.task_store import get_task_store
 
-        def _deliver_routine_result(routine, response):
-            """Push routine output to configured delivery channels."""
-            channels = getattr(routine, "delivery_channels", None) or ["web"]
+            scheduled_for = str(getattr(routine, "next_run", "") or f"run:{int(getattr(routine, 'run_count', 0)) + 1}")
+            session_id = str(getattr(routine, "session_id", "") or "").strip()
+            project_id = str(getattr(routine, "project_id", "") or "").strip()
+            query = str(routine.action_config.get("query") or routine.action_config.get("message") or routine.name).strip()
+            if not project_id or not session_id:
+                return {
+                    "success": False,
+                    "error": "Routine requires an explicit Project and Session",
+                }
+            project = get_project_manager().get_project(project_id)
+            session = get_state_store().get_thread_state(session_id)
+            if project is None or str(session.active_project_id or "") != project_id:
+                return {
+                    "success": False,
+                    "error": "Routine Project/Session binding is missing or stale",
+                }
+            task = get_task_store().create(
+                title=f"Routine: {routine.name}",
+                description=query,
+                objective=query,
+                project_id=project_id,
+                session_id=session_id,
+                source="routine",
+                source_id=routine.id,
+                scheduled_for=scheduled_for,
+                idempotency_key=f"routine:{routine.id}:{scheduled_for}",
+            )
+            if task.status in {"complete", "done"}:
+                return {"success": True, "task_id": task.id}
+            run_store = get_automation_run_store()
+            run = run_store.create_run(
+                idempotency_key=f"routine:{routine.id}:{scheduled_for}",
+                project_id=project_id,
+                session_id=session_id,
+                task_id=task.id,
+                routine_id=str(routine.id),
+                trigger_id=scheduled_for,
+                source="routine",
+                source_id=str(routine.id),
+                objective=query,
+                model_binding=AutomationModelBinding(
+                    policy=ModelBindingPolicy.SESSION_DEFAULT,
+                    source_session_id=session_id,
+                ),
+            )
+            if run.status == AutomationRunStatus.COMPLETED:
+                return {"success": True, "task_id": task.id, "run_id": run.id}
+            claimed = run_store.claim(
+                run.id,
+                project_id=project_id,
+                session_id=session_id,
+                claimant_id="api-routine-coordinator",
+                expected_revision=run.revision,
+                lease_seconds=300,
+            )
+            if claimed is None or claimed.lease is None:
+                return {
+                    "success": False,
+                    "task_id": task.id,
+                    "run_id": run.id,
+                    "error": "Routine occurrence is already claimed or no longer queued",
+                }
+            lease_token = claimed.lease.token
+            get_task_store().update(
+                task.id,
+                status="in_progress",
+                automation_run_ids=list(dict.fromkeys([*task.automation_run_ids, run.id])),
+            )
             try:
-                from agent.heartbeat import route_message
-                route_message(str(response), list(channels), label=f"Routine: {getattr(routine, 'name', 'Routine')}")
+                r_agent = get_agent(session_id)
+                provider = str(r_agent.llm_provider.value)
+                model_id = str(r_agent.provider_info.get("model") or "default")
+                claimed = run_store.bind_model(
+                    run.id,
+                    AutomationModelBinding(
+                        policy=ModelBindingPolicy.SESSION_DEFAULT,
+                        source_session_id=session_id,
+                        resolved_provider=provider,
+                        resolved_model_id=model_id,
+                    ),
+                    project_id=project_id,
+                    session_id=session_id,
+                    claimant_id="api-routine-coordinator",
+                    lease_token=lease_token,
+                )
+                claimed = run_store.transition(
+                    run.id,
+                    AutomationRunStatus.RUNNING,
+                    project_id=project_id,
+                    session_id=session_id,
+                    claimant_id="api-routine-coordinator",
+                    lease_token=lease_token,
+                )
+                response, success = r_agent.process_query(
+                    query, source="routine", thread_id=session_id, callbacks=[],
+                )
+                state = get_state_store().get_thread_state(session_id)
+                channels = list(getattr(routine, "delivery_channels", None) or ["web"])
+                blocked_channels = [channel for channel in channels if str(channel).lower() != "web"]
+                verified = bool(success and response and not blocked_channels)
+                status = "complete" if verified else "needs_permission" if blocked_channels else "failed"
+                execution_id = str(state.last_execution_id or state.current_execution_id or "")
+                tool_run_ids = [
+                    item.id for item in get_state_store().list_tool_runs(execution_id)
+                ] if execution_id else []
+                approval_ids = [str(state.pending_approval_id)] if state.pending_approval_id else []
+                if verified:
+                    run_status = AutomationRunStatus.COMPLETED
+                elif state.pending_approval_id:
+                    run_status = AutomationRunStatus.WAITING_FOR_APPROVAL
+                elif blocked_channels:
+                    run_status = AutomationRunStatus.BLOCKED
+                else:
+                    run_status = AutomationRunStatus.FAILED
+                run_store.transition(
+                    run.id,
+                    run_status,
+                    project_id=project_id,
+                    session_id=session_id,
+                    claimant_id="api-routine-coordinator",
+                    lease_token=lease_token,
+                    execution_id=execution_id,
+                    tool_run_ids=tool_run_ids,
+                    approval_ids=approval_ids,
+                    outcome={
+                        "verified": verified,
+                        "response_present": bool(response),
+                        "blocked_delivery_channels": blocked_channels,
+                    },
+                    error="" if verified else "Governed Turn did not reach a verified terminal outcome",
+                )
+                get_task_store().update(
+                    task.id,
+                    status=status,
+                    execution_ids=[execution_id] if execution_id else [],
+                    tool_run_ids=tool_run_ids,
+                    approval_ids=approval_ids,
+                    verification={
+                        "verified": verified,
+                        "response_present": bool(response),
+                        "blocked_delivery_channels": blocked_channels,
+                        "reason": (
+                            "External routine delivery requires a governed communication ToolRun"
+                            if blocked_channels else "Turn completed" if verified else "Turn failed"
+                        ),
+                    },
+                )
+                return {
+                    "success": verified,
+                    "task_id": task.id,
+                    "run_id": run.id,
+                    "error": "External delivery awaits governed approval" if blocked_channels else "" if verified else str(response or "Routine failed"),
+                }
             except Exception as exc:
-                logger.debug(f"Routine delivery failed: {exc}")
+                try:
+                    current_run = run_store.get_run(run.id, project_id=project_id, session_id=session_id)
+                    if current_run and current_run.status in {
+                        AutomationRunStatus.PREPARING,
+                        AutomationRunStatus.RUNNING,
+                    }:
+                        run_store.transition(
+                            run.id,
+                            AutomationRunStatus.FAILED,
+                            project_id=project_id,
+                            session_id=session_id,
+                            claimant_id="api-routine-coordinator",
+                            lease_token=lease_token,
+                            error=str(exc),
+                        )
+                except Exception as transition_exc:
+                    logger.error(f"Routine Run failure transition failed: {transition_exc}")
+                get_task_store().update(task.id, status="failed", verification={"verified": False, "error": str(exc)})
+                logger.warning(f"Routine callback error ({routine.name}): {exc}")
+                return {"success": False, "task_id": task.id, "run_id": run.id, "error": str(exc)}
 
         rm = get_routine_manager()
+        from agent.automation_runtime import get_automation_run_store
+
+        recovered_runs = get_automation_run_store().recover_expired()
+        if recovered_runs:
+            logger.info("Recovered {} expired Automation Runs", len(recovered_runs))
         rm.set_run_callback(_routine_callback)
         rm.start_scheduler()
         logger.info("Routine scheduler started")
@@ -1775,14 +1958,17 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-from api.video_editor import router as video_editor_router
+from api.media import router as media_router
+from api.media_runtime import router as media_runtime_router
 
-app.include_router(video_editor_router)
-# Ensure video ToolRegistry entries are loaded even if agent import order varies.
-try:
-    import agent.video_editor.tools  # noqa: F401
-except Exception:
-    pass
+app.include_router(media_router)
+app.include_router(media_runtime_router)
+# Ensure domain ToolRegistry entries load independently of agent import order.
+for _domain_module in ("agent.voice_runtime", "agent.generation_runtime"):
+    try:
+        __import__(_domain_module)
+    except Exception:
+        pass
 
 app.add_middleware(
     CORSMiddleware,
@@ -1795,6 +1981,9 @@ app.add_middleware(
         "http://127.0.0.1:5174",
         "http://127.0.0.1:5175",
         "http://127.0.0.1:5176",
+        "tauri://localhost",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -1827,6 +2016,13 @@ def _extract_api_auth_key_from_headers(headers: Any) -> str:
     auth = str(headers.get("authorization") or "").strip()
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
+    # Browsers cannot add arbitrary headers to WebSocket handshakes. The
+    # desktop bridge therefore supplies the per-launch key as a constrained
+    # subprotocol token; it is not placed in a URL or persisted to storage.
+    for protocol in str(headers.get("sec-websocket-protocol") or "").split(","):
+        value = protocol.strip()
+        if value.startswith("echospeak-auth-"):
+            return value[len("echospeak-auth-"):].strip()
     return ""
 
 
@@ -1971,7 +2167,6 @@ _RATE_LIMIT_SAFE_GET_PREFIXES = (
     "/settings",
     "/memory",
     "/projects",
-    "/video/",
     "/history",
     "/soul",
 )
@@ -2159,12 +2354,6 @@ class QueryRequest(BaseModel):
     include_memory: bool = Field(default=True, description="Include conversation memory")
     thread_id: Optional[str] = Field(default=None, description="Conversation thread id for LangGraph persistence")
     workspace: Optional[str] = Field(default=None, description="Optional workspace/mode override (ex: auto|chat|coding|research)")
-    # Optional Video Editor binding for chat Turns (selection + revision).
-    video_document_id: str = Field(default="", description="Active video document for this Turn")
-    video_selection: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Structured editor selection (clip ids, playhead, revision)",
-    )
 
 
 class QueryResponse(BaseModel):
@@ -2534,7 +2723,8 @@ async def get_soul():
     # Resolve path
     soul_path = Path(soul_path_str).expanduser()
     if not soul_path.is_absolute():
-        soul_path = BASE_DIR / soul_path
+        soul_root = DATA_DIR if os.getenv("ECHOSPEAK_RUNTIME_KIND", "").strip().lower() == "desktop" else BASE_DIR
+        soul_path = soul_root / soul_path
     
     content = ""
     exists = soul_path.exists()
@@ -2567,7 +2757,8 @@ async def update_soul(request: SoulUpdateRequest):
     # Resolve path
     soul_path = Path(soul_path_str).expanduser()
     if not soul_path.is_absolute():
-        soul_path = BASE_DIR / soul_path
+        soul_root = DATA_DIR if os.getenv("ECHOSPEAK_RUNTIME_KIND", "").strip().lower() == "desktop" else BASE_DIR
+        soul_path = soul_root / soul_path
     
     # Validate content length
     content = request.content.strip()
@@ -2656,12 +2847,17 @@ class MemoryItem(BaseModel):
     pinned: Optional[bool] = None
     owner_id: str = ""
     scope: str = "account"
+    project_id: str = ""
     source_session_id: str = ""
     source_execution_id: str = ""
     source_item_id: str = ""
     updated_at: Optional[str] = None
     index_state: str = "pending"
     supersedes: str = ""
+    superseded_by: str = ""
+    status: str = "active"
+    checksum: str = ""
+    version: int = 1
     # Curated Studio projection fields (same canonical records.json source)
     subject: Optional[str] = None
     confidence: Optional[float] = None
@@ -2677,10 +2873,12 @@ class MemoryUpdateRequest(BaseModel):
     memory_type: Optional[str] = None
     pinned: Optional[bool] = None
     thread_id: Optional[str] = None
+    project_id: str = ""
 
 
 class MemoryCompactRequest(BaseModel):
     thread_id: Optional[str] = None
+    project_id: str = ""
     similarity: float = Field(default=0.94, ge=0.5, le=1.0)
     max_scan: int = Field(default=250, ge=10, le=1000)
 
@@ -2715,6 +2913,7 @@ class MemoryDoctorResponse(BaseModel):
 class MemoryDeleteRequest(BaseModel):
     ids: List[str]
     thread_id: Optional[str] = None
+    project_id: str = ""
 
 
 class DocumentItem(BaseModel):
@@ -2724,6 +2923,8 @@ class DocumentItem(BaseModel):
     source: Optional[str] = None
     mime: Optional[str] = None
     timestamp: Optional[str] = None
+    project_id: str = ""
+    session_id: str = ""
 
 
 class DocumentListResponse(BaseModel):
@@ -2734,6 +2935,8 @@ class DocumentListResponse(BaseModel):
 
 class DocumentDeleteRequest(BaseModel):
     ids: List[str]
+    session_id: str
+    project_id: str = ""
 
 
 class ProviderInfoResponse(BaseModel):
@@ -2844,6 +3047,10 @@ async def query(request: QueryRequest):
             bool(request.include_memory),
             len((request.message or "")),
         )
+        # The explicit Session exists independently of optional model readiness.
+        # Record its real user activity before provider/coding preflight so a
+        # blocked first Turn never leaves a misleading zero-message placeholder.
+        _record_session_message(request.thread_id, request.message)
         if _should_preflight_provider(request.message):
             readiness = _check_provider_readiness()
             if not bool(readiness.get("ok")):
@@ -2879,17 +3086,8 @@ async def query(request: QueryRequest):
                 trace_id=None,
                 thread_state=get_state_store().get_thread_state(request.thread_id).model_dump(),
             )
-        _record_session_message(request.thread_id, request.message)
         # process_query restores Session scope under its request lock. Query
         # payloads do not override backend-selected workspace/mode.
-        # Optional video editor binding for this Turn (selection + revision).
-        try:
-            agent._video_turn_binding = {
-                "document_id": str(getattr(request, "video_document_id", "") or ""),
-                "selection": dict(getattr(request, "video_selection", None) or {}) or None,
-            }
-        except Exception:
-            pass
         thread_state = get_state_store().get_thread_state(request.thread_id).model_dump()
         q: queue.Queue = queue.Queue()
         handler = _StreamingHandler(q, request_id)
@@ -2925,6 +3123,7 @@ async def query(request: QueryRequest):
 async def compact_memory(
     request: Optional[MemoryCompactRequest] = Body(default=None),
     thread_id: Optional[str] = Query(default=None),
+    project_id: str = Query(default=""),
     similarity: float = Query(default=0.94, ge=0.5, le=1.0),
     max_scan: int = Query(default=250, ge=10, le=1000),
 ):
@@ -2935,15 +3134,27 @@ async def compact_memory(
     try:
         import difflib
 
+        direct_project_id = project_id if isinstance(project_id, str) else ""
         req = request or MemoryCompactRequest(
             thread_id=thread_id,
+            project_id=direct_project_id,
             similarity=similarity,
             max_scan=max_scan,
         )
+        session_id = str(req.thread_id or "").strip()
+        scoped_project_id = _require_automation_project_scope(session_id, req.project_id)
+        state = get_state_store().get_thread_state(session_id)
         agent = get_agent(req.thread_id)
-        items = agent.memory.list_items(offset=0, limit=int(req.max_scan or 250))
+        items = agent.memory.list_items(
+            offset=0,
+            limit=int(req.max_scan or 250),
+            thread_id=session_id,
+            project_id=scoped_project_id,
+            project_path=str(state.project_path or ""),
+            include_global=False,
+        )
         if not items:
-            return {"success": True, "deleted": 0, "kept": 0, "memory_count": agent.memory.memory_count}
+            return {"success": True, "deleted": 0, "kept": 0, "memory_count": 0}
 
         # Group by type.
         groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -2983,7 +3194,13 @@ async def compact_memory(
                         kept_ids.add(cid)
                         if is_pinned:
                             try:
-                                agent.memory.update_item(cid, pinned=True)
+                                agent.memory.update_item(
+                                    cid,
+                                    pinned=True,
+                                    thread_id=session_id,
+                                    project_id=scoped_project_id,
+                                    include_global=False,
+                                )
                             except Exception:
                                 pass
                         merged = True
@@ -2992,12 +3209,21 @@ async def compact_memory(
                     canon.append(it)
                     kept_ids.add(iid)
 
-        deleted = agent.memory.delete_items(deleted_ids)
+        deleted = agent.memory.delete_items(
+            deleted_ids,
+            thread_id=session_id,
+            project_id=scoped_project_id,
+            include_global=False,
+        )
         return {
             "success": True,
             "deleted": int(deleted),
             "kept": int(len(kept_ids)),
-            "memory_count": agent.memory.memory_count,
+            "memory_count": agent.memory.count_items(
+                thread_id=session_id,
+                project_id=scoped_project_id,
+                include_global=False,
+            ),
         }
     except Exception as e:
         logger.error(f"Compact memory error: {e}")
@@ -3047,12 +3273,6 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
             tool_names = sorted(ToolRegistry.get_names())
         except Exception:
             tool_names = []
-        if not tool_names:
-            # Fallback only if registry empty (tests)
-            for t in list(getattr(agent, "tools", []) or []):
-                n = str(getattr(t, "name", "") or "").strip()
-                if n:
-                    tool_names.append(n)
         for name in tool_names:
             if not name or name in seen_tool_names:
                 continue
@@ -3419,24 +3639,6 @@ async def confirm_approval(
     state = store.get_thread_state(approval.thread_id)
     if approval.status != "pending" or state.pending_approval_id != approval_id:
         raise HTTPException(status_code=409, detail="Approval is stale or is not the current pending action")
-    if approval.tool == "video_apply_transaction":
-        try:
-            from api.video_editor import consume_video_approval
-
-            result = consume_video_approval(approval)
-        except Exception as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        updated = store.get_approval(approval_id)
-        if updated is None:
-            raise HTTPException(status_code=500, detail="Approval missing after video transaction")
-        thread_state = store.get_thread_state(approval.thread_id)
-        return ApprovalDecisionResponse(
-            approval=ApprovalResponse(**updated.model_dump()),
-            success=bool(result.get("success")),
-            response=str(result.get("response") or "Video transaction applied."),
-            execution_id=str(result.get("execution_id") or "") or None,
-            thread_state=thread_state.model_dump(),
-        )
     agent = get_agent(approval.thread_id)
     agent._requested_approval_id = approval_id
     response, success = agent.process_query("confirm", include_memory=False, thread_id=approval.thread_id)
@@ -3444,6 +3646,31 @@ async def confirm_approval(
     if updated is None:
         raise HTTPException(status_code=500, detail="Approval missing after confirm")
     thread_state = store.get_thread_state(approval.thread_id)
+    try:
+        from agent.skill_execution import (
+            finalize_skill_executions_for_turn,
+            record_skill_tool_outcome,
+            resume_skill_executions_for_approval,
+        )
+
+        original_execution_id = str(approval.execution_id or approval.original_turn_id or "")
+        continuation_id = str(thread_state.last_execution_id or "")
+        if original_execution_id and continuation_id:
+            resume_skill_executions_for_approval(
+                original_execution_id,
+                continuation_execution_id=continuation_id,
+                approval_id=approval.id,
+                state_store=store,
+            )
+            for run in store.list_tool_runs(continuation_id):
+                record_skill_tool_outcome(store, run, owner_execution_id=original_execution_id)
+            finalize_skill_executions_for_turn(
+                original_execution_id,
+                state_store=store,
+                turn_success=bool(success),
+            )
+    except Exception as exc:
+        logger.warning(f"Skill approval reconciliation failed: {exc}")
     return ApprovalDecisionResponse(
         approval=ApprovalResponse(**updated.model_dump()),
         success=bool(success),
@@ -3467,13 +3694,15 @@ async def cancel_approval(
     state = store.get_thread_state(approval.thread_id)
     if approval.status != "pending" or state.pending_approval_id != approval_id:
         raise HTTPException(status_code=409, detail="Approval is stale or is not the current pending action")
-    if approval.tool == "video_apply_transaction":
-        try:
-            from api.video_editor import cancel_video_approval
+    try:
+        from agent.skill_execution import cancel_skill_execution, list_skill_executions_for_turn
 
-            cancel_video_approval(approval)
-        except Exception as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        original_execution_id = str(approval.execution_id or approval.original_turn_id or "")
+        for record in list_skill_executions_for_turn(original_execution_id):
+            if record.status.value == "pending_approval":
+                cancel_skill_execution(record.id, state_store=store)
+    except Exception as exc:
+        logger.warning(f"Skill cancellation projection failed: {exc}")
     updated = store.update_approval(approval_id, status="canceled", outcome_summary="Canceled by user")
     if updated is None:
         raise HTTPException(status_code=500, detail="Approval missing after cancel")
@@ -4152,6 +4381,13 @@ class RoutineResponse(BaseModel):
     created_at: str
     updated_at: str
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    delivery_channels: List[str] = Field(default_factory=lambda: ["web"])
+    project_id: str = ""
+    session_id: str = ""
+    missed_run_policy: str = "run_next"
+    last_task_id: str = ""
+    last_result_status: str = ""
+    last_error: str = ""
 
 
 class RoutineListResponse(BaseModel):
@@ -4169,6 +4405,10 @@ class RoutineCreateRequest(BaseModel):
     action_type: Optional[str] = "query"
     action_config: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
+    delivery_channels: Optional[List[str]] = None
+    project_id: str = ""
+    session_id: str = ""
+    missed_run_policy: str = "run_next"
 
 
 class RoutineUpdateRequest(BaseModel):
@@ -4181,14 +4421,42 @@ class RoutineUpdateRequest(BaseModel):
     action_type: Optional[str] = None
     action_config: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
+    delivery_channels: Optional[List[str]] = None
+    project_id: Optional[str] = None
+    session_id: Optional[str] = None
+    missed_run_policy: Optional[str] = None
+
+
+def _require_automation_project_scope(session_id: str, project_id: str = "") -> str:
+    key = str(session_id or "").strip()
+    if not key:
+        raise HTTPException(status_code=422, detail="Session scope is required")
+    state = get_state_store().get_thread_state(key)
+    active_project_id = str(state.active_project_id or "").strip()
+    requested_project_id = str(project_id or active_project_id).strip()
+    if not requested_project_id or active_project_id != requested_project_id:
+        raise HTTPException(status_code=409, detail="Session is not bound to the requested Project")
+    from agent.projects import get_project_manager
+
+    if get_project_manager().get_project(requested_project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return requested_project_id
 
 
 @app.get("/routines", response_model=RoutineListResponse)
-async def list_routines(enabled_only: bool = False):
-    """List all routines."""
+async def list_routines(
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+    enabled_only: bool = False,
+):
+    """List Routines in the exact active Project/Session scope."""
     from agent.routines import get_routine_manager
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
     manager = get_routine_manager()
-    routines = manager.list_routines(enabled_only=enabled_only)
+    routines = [
+        routine for routine in manager.list_routines(enabled_only=enabled_only)
+        if routine.project_id == scoped_project_id and routine.session_id == session_id
+    ]
     return RoutineListResponse(
         items=[RoutineResponse(**r.model_dump()) for r in routines],
         count=len(routines),
@@ -4196,12 +4464,17 @@ async def list_routines(enabled_only: bool = False):
 
 
 @app.get("/routines/{routine_id}", response_model=RoutineResponse)
-async def get_routine(routine_id: str):
+async def get_routine(
+    routine_id: str,
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
     """Get a routine by ID."""
     from agent.routines import get_routine_manager
     manager = get_routine_manager()
     routine = manager.get_routine(routine_id)
-    if not routine:
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    if not routine or routine.project_id != scoped_project_id or routine.session_id != session_id:
         raise HTTPException(status_code=404, detail="Routine not found")
     return RoutineResponse(**routine.model_dump())
 
@@ -4210,6 +4483,7 @@ async def get_routine(routine_id: str):
 async def create_routine(request: RoutineCreateRequest):
     """Create a new routine."""
     from agent.routines import get_routine_manager
+    scoped_project_id = _require_automation_project_scope(request.session_id, request.project_id)
     manager = get_routine_manager()
     routine = manager.create_routine(
         name=request.name,
@@ -4221,15 +4495,32 @@ async def create_routine(request: RoutineCreateRequest):
         action_type=request.action_type,
         action_config=request.action_config,
         metadata=request.metadata,
+        delivery_channels=request.delivery_channels,
+        project_id=scoped_project_id,
+        session_id=request.session_id,
+        missed_run_policy=request.missed_run_policy,
     )
     return RoutineResponse(**routine.model_dump())
 
 
 @app.put("/routines/{routine_id}", response_model=RoutineResponse)
-async def update_routine(routine_id: str, request: RoutineUpdateRequest):
+async def update_routine(
+    routine_id: str,
+    request: RoutineUpdateRequest,
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
     """Update an existing routine."""
     from agent.routines import get_routine_manager
     manager = get_routine_manager()
+    existing = manager.get_routine(routine_id)
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    if not existing or existing.project_id != scoped_project_id or existing.session_id != session_id:
+        raise HTTPException(status_code=404, detail="Routine not found")
+    if request.project_id is not None and str(request.project_id) != scoped_project_id:
+        raise HTTPException(status_code=409, detail="Routine Project cannot change outside its scope")
+    if request.session_id is not None and str(request.session_id) != session_id:
+        raise HTTPException(status_code=409, detail="Routine Session cannot change outside its scope")
     routine = manager.update_routine(
         routine_id=routine_id,
         name=request.name,
@@ -4241,6 +4532,10 @@ async def update_routine(routine_id: str, request: RoutineUpdateRequest):
         action_type=request.action_type,
         action_config=request.action_config,
         metadata=request.metadata,
+        delivery_channels=request.delivery_channels,
+        project_id=request.project_id,
+        session_id=request.session_id,
+        missed_run_policy=request.missed_run_policy,
     )
     if not routine:
         raise HTTPException(status_code=404, detail="Routine not found")
@@ -4248,10 +4543,18 @@ async def update_routine(routine_id: str, request: RoutineUpdateRequest):
 
 
 @app.delete("/routines/{routine_id}")
-async def delete_routine(routine_id: str):
+async def delete_routine(
+    routine_id: str,
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
     """Delete a routine."""
     from agent.routines import get_routine_manager
     manager = get_routine_manager()
+    routine = manager.get_routine(routine_id)
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    if not routine or routine.project_id != scoped_project_id or routine.session_id != session_id:
+        raise HTTPException(status_code=404, detail="Routine not found")
     success = manager.delete_routine(routine_id)
     if not success:
         raise HTTPException(status_code=404, detail="Routine not found")
@@ -4259,10 +4562,18 @@ async def delete_routine(routine_id: str):
 
 
 @app.post("/routines/{routine_id}/run")
-async def run_routine(routine_id: str):
+async def run_routine(
+    routine_id: str,
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
     """Manually run a routine."""
     from agent.routines import get_routine_manager
     manager = get_routine_manager()
+    routine = manager.get_routine(routine_id)
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    if not routine or routine.project_id != scoped_project_id or routine.session_id != session_id:
+        raise HTTPException(status_code=404, detail="Routine not found")
     success = manager.run_routine(routine_id)
     if not success:
         raise HTTPException(status_code=404, detail="Routine not found or run failed")
@@ -4801,11 +5112,18 @@ async def delete_thread(thread_id: str):
     return {"deleted": True, "thread_id": thread_id}
 
 @app.get("/documents", response_model=DocumentListResponse)
-async def list_documents():
+async def list_documents(
+    session_id: Optional[str] = Query(default=None),
+    project_id: Optional[str] = Query(default=None),
+):
     store = get_document_store()
     if store is None:
         return DocumentListResponse(items=[], count=0, enabled=False)
-    items = store.list_documents()
+    if session_id and project_id:
+        state = get_state_store().get_thread_state(session_id)
+        if str(state.active_project_id or "") != str(project_id or ""):
+            raise HTTPException(status_code=409, detail="Document Project does not match the active Session Project")
+    items = store.list_documents(project_id=str(project_id or ""), session_id=str(session_id or ""))
     return DocumentListResponse(items=[DocumentItem(**i) for i in items], count=len(items), enabled=True)
 
 
@@ -4980,7 +5298,12 @@ async def get_orchestration_plan(plan_id: str):
 
 
 @app.post("/documents/upload", response_model=DocumentItem)
-async def upload_document(file: UploadFile = File(...), source: Optional[str] = None):
+async def upload_document(
+    file: UploadFile = File(...),
+    source: Optional[str] = None,
+    session_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+):
     store = get_document_store()
     if store is None:
         raise HTTPException(status_code=503, detail="Document RAG is disabled")
@@ -4990,7 +5313,18 @@ async def upload_document(file: UploadFile = File(...), source: Optional[str] = 
         if len(data) > max_bytes:
             raise HTTPException(status_code=413, detail="Upload too large")
         text = _extract_text_from_upload(file.filename or "document", file.content_type, data)
-        meta = store.add_document(file.filename or "document", text, source=source or "", mime=file.content_type or "")
+        if session_id and project_id:
+            state = get_state_store().get_thread_state(session_id)
+            if str(state.active_project_id or "") != str(project_id or ""):
+                raise HTTPException(status_code=409, detail="Document Project does not match the active Session Project")
+        meta = store.add_document(
+            file.filename or "document",
+            text,
+            source=source or "",
+            mime=file.content_type or "",
+            project_id=str(project_id or ""),
+            session_id=str(session_id or ""),
+        )
         return DocumentItem(**meta)
     except HTTPException:
         raise
@@ -5004,17 +5338,37 @@ async def delete_documents(request: DocumentDeleteRequest):
     store = get_document_store()
     if store is None:
         raise HTTPException(status_code=503, detail="Document RAG is disabled")
-    deleted = store.delete_documents(request.ids)
+    state = get_state_store().get_thread_state(request.session_id)
+    if request.project_id and str(state.active_project_id or "") != request.project_id:
+        raise HTTPException(status_code=409, detail="Document Project does not match the active Session Project")
+    if not request.project_id and state.active_project_id:
+        raise HTTPException(status_code=409, detail="Project-bound Session requires a Project-scoped document mutation")
+    try:
+        deleted = store.delete_documents(
+            request.ids,
+            project_id=request.project_id,
+            session_id=request.session_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"success": True, "deleted": deleted}
 
 
 @app.post("/documents/clear")
-async def clear_documents():
+async def clear_documents(session_id: str = Query(...), project_id: str = Query(default="")):
     store = get_document_store()
     if store is None:
         raise HTTPException(status_code=503, detail="Document RAG is disabled")
-    store.clear()
-    return {"success": True}
+    state = get_state_store().get_thread_state(session_id)
+    if project_id and str(state.active_project_id or "") != project_id:
+        raise HTTPException(status_code=409, detail="Document Project does not match the active Session Project")
+    if not project_id and state.active_project_id:
+        raise HTTPException(status_code=409, detail="Project-bound Session requires a Project-scoped document clear")
+    try:
+        deleted = store.clear_scope(project_id=project_id, session_id=session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"success": True, "deleted": deleted}
 
 
 @app.post("/query/stream")
@@ -5030,6 +5384,9 @@ async def query_stream(request: QueryRequest):
         bool(request.include_memory),
         len((request.message or "")),
     )
+    # Session metadata is authoritative even when an optional provider cannot
+    # run the Turn. Unknown ids still fail closed in _record_session_message.
+    _record_session_message(request.thread_id, request.message)
 
     if _should_preflight_provider(request.message):
         readiness = _check_provider_readiness()
@@ -5073,15 +5430,6 @@ async def query_stream(request: QueryRequest):
             ) + "\n").encode("utf-8")
 
         return StreamingResponse(coding_unavailable_gen(), media_type="application/x-ndjson")
-    _record_session_message(request.thread_id, request.message)
-    try:
-        agent._video_turn_binding = {
-            "document_id": str(getattr(request, "video_document_id", "") or ""),
-            "selection": dict(getattr(request, "video_selection", None) or {}) or None,
-        }
-    except Exception:
-        pass
-
     _start_agent_thread(
         agent=agent,
         message=request.message,
@@ -5256,7 +5604,12 @@ async def gateway_ws(websocket: WebSocket):
     if not _api_auth_ok(websocket.headers, client_host):
         await websocket.close(code=1008, reason="EchoSpeak API auth required")
         return
-    await websocket.accept()
+    offered_protocols = {
+        value.strip()
+        for value in str(websocket.headers.get("sec-websocket-protocol") or "").split(",")
+        if value.strip()
+    }
+    await websocket.accept(subprotocol="echospeak" if "echospeak" in offered_protocols else None)
     _gateway_connections.add(websocket)
     session_id = str(uuid.uuid4())
     await websocket.send_json({"type": "gateway_ready", "session_id": session_id, "at": time.time()})
@@ -5544,114 +5897,19 @@ async def browse_workspace(path: str = Query(default="", description="Relative p
 
 
 @app.post("/trigger/cron")
-async def trigger_cron(request: CronTickRequest):
-    if not bool(getattr(config, "cron_enabled", False)):
-        raise HTTPException(status_code=403, detail="Cron triggers disabled (CRON_ENABLED=false)")
-    if croniter is None:
-        raise HTTPException(status_code=503, detail="croniter is not available")
-
-    job_id = (request.job_id or "").strip() or "default"
-    cron_expr = (request.cron or "").strip()
-    if not cron_expr:
-        raise HTTPException(status_code=422, detail="Missing cron expression")
-
-    now = datetime.utcnow()
-    now_ts = now.timestamp()
-    with _cron_state_lock:
-        state = _load_cron_state()
-        jobs = state.get("jobs")
-        if not isinstance(jobs, dict):
-            jobs = {}
-        last_run = jobs.get(job_id)
-
-        due = False
-        next_run = None
-        if last_run is None:
-            due = True
-            try:
-                next_run = croniter(cron_expr, now).get_next(datetime)
-            except Exception:
-                next_run = None
-        else:
-            try:
-                base = datetime.utcfromtimestamp(float(last_run))
-                next_run = croniter(cron_expr, base).get_next(datetime)
-                due = now >= next_run
-            except Exception as exc:
-                raise HTTPException(status_code=400, detail=f"Invalid cron expression: {exc}")
-
-        if not due:
-            return {
-                "ran": False,
-                "job_id": job_id,
-                "next_run_at": next_run.isoformat() if next_run else None,
-                "last_run_at": datetime.utcfromtimestamp(float(last_run)).isoformat() if last_run is not None else None,
-            }
-
-        agent = get_agent(request.thread_id)
-        response, success = agent.process_query(
-            request.message,
-            include_memory=request.include_memory,
-            thread_id=request.thread_id,
-        )
-        jobs[job_id] = now_ts
-        state["jobs"] = jobs
-        _save_cron_state(state)
-
-    return {
-        "ran": True,
-        "job_id": job_id,
-        "ran_at": now.isoformat(),
-        "success": bool(success),
-        "response": response,
-    }
+async def trigger_cron(_request: CronTickRequest):
+    raise HTTPException(
+        status_code=410,
+        detail="Legacy cron trigger retired; create a Project/Session-scoped Routine",
+    )
 
 
 @app.post("/trigger/webhook")
-async def trigger_webhook(req: Request):
-    if not bool(getattr(config, "webhook_enabled", False)):
-        raise HTTPException(status_code=403, detail="Webhook triggers disabled (WEBHOOK_ENABLED=false)")
-
-    body = await req.body()
-    secret = _load_webhook_secret()
-    if not secret:
-        raise HTTPException(status_code=500, detail="Webhook secret not configured")
-
-    sig = req.headers.get("x-echospeak-signature") or req.headers.get("x-signature") or ""
-    if not _verify_webhook_signature(secret, body, sig):
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
-    try:
-        payload = json.loads(body.decode("utf-8")) if body else {}
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON body: {exc}")
-
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Body must be a JSON object")
-
-    message = (str(payload.get("message") or "").strip())
-    if not message:
-        raise HTTPException(status_code=422, detail="Missing 'message'")
-    thread_id_val = payload.get("thread_id")
-    thread_id = str(thread_id_val).strip() if thread_id_val is not None else None
-    if thread_id == "":
-        thread_id = None
-    include_memory = payload.get("include_memory", True)
-    if isinstance(include_memory, str):
-        include_memory = include_memory.strip().lower() not in {"false", "0", "no", "off"}
-    else:
-        include_memory = bool(include_memory)
-
-    agent = get_agent(thread_id)
-    response, success = agent.process_query(
-        message,
-        include_memory=include_memory,
-        thread_id=thread_id,
+async def trigger_webhook(_request: Request):
+    raise HTTPException(
+        status_code=410,
+        detail="Legacy generic webhook retired; use a signed Project/Session-scoped Routine webhook",
     )
-
-    return {"success": bool(success), "response": response}
-
-
 @app.get("/history", response_model=HistoryResponse)
 def get_history(thread_id: Optional[str] = Query(default=None)):
     """
@@ -5771,20 +6029,34 @@ def clear_history(thread_id: Optional[str] = Query(default=None)):
 @app.get("/research/artifacts")
 async def list_research_artifacts_api(
     project_id: str = Query(default=""),
-    session_id: str = Query(default=""),
+    session_id: str = Query(...),
     limit: int = Query(default=50, ge=1, le=200),
 ):
-    from agent.research_artifacts import list_research_artifacts
+    from agent.research_artifacts import list_research_artifacts_for_scope
 
-    rows = list_research_artifacts(project_id=project_id, session_id=session_id, limit=limit)
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    rows = list_research_artifacts_for_scope(
+        project_id=scoped_project_id,
+        session_id=session_id,
+        limit=limit,
+    )
     return {"items": [r.model_dump(mode="json") for r in rows], "count": len(rows)}
 
 
 @app.get("/research/artifacts/{artifact_id}")
-async def get_research_artifact_api(artifact_id: str):
-    from agent.research_artifacts import get_research_artifact
+async def get_research_artifact_api(
+    artifact_id: str,
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
+    from agent.research_artifacts import get_research_artifact_for_scope
 
-    art = get_research_artifact(artifact_id)
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    art = get_research_artifact_for_scope(
+        artifact_id,
+        project_id=scoped_project_id,
+        session_id=session_id,
+    )
     if art is None:
         raise HTTPException(status_code=404, detail="Research artifact not found")
     return art.model_dump(mode="json")
@@ -5794,9 +6066,11 @@ async def get_research_artifact_api(artifact_id: str):
 async def lookup_research_artifact_api(payload: Dict[str, Any] = Body(default_factory=dict)):
     from agent.research_artifacts import find_compatible_research_artifact
 
+    session_id = str(payload.get("session_id") or "")
+    project_id = _require_automation_project_scope(session_id, str(payload.get("project_id") or ""))
     art = find_compatible_research_artifact(
-        project_id=str(payload.get("project_id") or ""),
-        session_id=str(payload.get("session_id") or ""),
+        project_id=project_id,
+        session_id=session_id,
         objective=str(payload.get("objective") or ""),
         require_project=bool(payload.get("require_project", True)),
     )
@@ -5810,10 +6084,12 @@ async def consume_research_artifact_api(artifact_id: str, payload: Dict[str, Any
     """Skill handoff: structured artifact only (never invent citations from prose)."""
     from agent.research_artifacts import consume_research_artifact_for_skill
 
+    session_id = str(payload.get("session_id") or "")
+    project_id = _require_automation_project_scope(session_id, str(payload.get("project_id") or ""))
     result = consume_research_artifact_for_skill(
         artifact_id,
-        project_id=str(payload.get("project_id") or ""),
-        session_id=str(payload.get("session_id") or ""),
+        project_id=project_id,
+        session_id=session_id,
         skill_id=str(payload.get("skill_id") or ""),
         objective=str(payload.get("objective") or ""),
     )
@@ -5828,7 +6104,7 @@ async def skills_status_api():
     from agent.skill_status_audit import audit_all_skills
 
     rows = audit_all_skills(
-        available_capabilities={"deterministic_editing", "approvals", "research"},
+        available_capabilities={"approvals", "research"},
         available_artifacts=set(),
     )
     return {
@@ -5844,21 +6120,203 @@ async def skills_status_api():
     }
 
 
+@app.get("/studio/overview")
+async def studio_overview_api(session_id: Optional[str] = Query(default=None)):
+    """Read-only Studio/Viewer projection over canonical backend owners."""
+    from agent.heartbeat import get_heartbeat_manager
+    from agent.automation_runtime import get_automation_run_store
+    from agent.connections import get_connection_registry
+    from agent.projects import get_project_manager
+    from agent.routines import get_routine_manager
+    from agent.skill_execution import list_skill_executions_for_session, list_skill_proposals
+    from agent.skill_status_audit import audit_all_skills
+    from agent.task_store import get_task_store
+    from agent.tool_registry import ToolRegistry
+
+    key = _normalize_thread_id(session_id)
+    state_store = get_state_store()
+    state = state_store.get_thread_state(key)
+    enabled_funcs = {
+        str(getattr(func, "name", None) or getattr(func, "__name__", ""))
+        for func in ToolRegistry.get_config_filtered_funcs(config)
+    }
+    selected = set(state.allowed_tool_names or [])
+    tools = []
+    for name, entry in sorted(ToolRegistry.get_all().items()):
+        missing_flags = [
+            flag for flag in entry.policy_flags
+            if not bool(getattr(config, str(flag).lower(), False))
+        ]
+        tools.append(
+            {
+                "name": name,
+                "description": entry.description,
+                "owner": entry.owner,
+                "category": entry.category,
+                "registered": True,
+                "available": name in enabled_funcs,
+                "executable": name in enabled_funcs,
+                "selected": name in selected,
+                "running": False,
+                "risk_level": entry.risk_level,
+                "is_action": entry.is_action,
+                "policy_flags": list(entry.policy_flags),
+                "blocked_reason": f"Missing configuration: {', '.join(missing_flags)}" if missing_flags else "",
+            }
+        )
+
+    skills = audit_all_skills(
+        available_capabilities={"approvals", "research"},
+        available_artifacts=set(),
+    )
+    active_project_id = str(state.active_project_id or "")
+    tasks = (
+        get_task_store().list(project_id=active_project_id, session_id=key)
+        if active_project_id else []
+    )
+    routines = [
+        routine for routine in get_routine_manager().list_routines()
+        if routine.project_id == active_project_id and routine.session_id == key
+    ] if active_project_id else []
+    automation_runs = (
+        get_automation_run_store().list_runs(project_id=active_project_id, session_id=key)
+        if active_project_id else []
+    )
+    connections = (
+        get_connection_registry().list(project_id=active_project_id, session_id=key)
+        if active_project_id else []
+    )
+    projects = get_project_manager().list_projects()
+    executions = state_store.list_executions(thread_id=key, limit=30)
+    heartbeat = get_heartbeat_manager()
+    resolution = {}
+    if executions:
+        resolution = dict((executions[0].metadata or {}).get("echo_resolution") or {})
+
+    return {
+        "schema_version": 1,
+        "session": state.model_dump(mode="json"),
+        "active_project_id": active_project_id,
+        "projects": [item.model_dump(mode="json") for item in projects],
+        "tasks": [item.model_dump(mode="json") for item in tasks],
+        "routines": [item.model_dump(mode="json") for item in routines],
+        "automation_runs": [item.model_dump(mode="json") for item in automation_runs],
+        "connections": [item.model_dump(mode="json") for item in connections],
+        "heartbeat": {
+            "enabled": bool(getattr(config, "heartbeat_enabled", False)),
+            "running": bool(heartbeat and heartbeat.is_running),
+            "last_tick": heartbeat.last_tick if heartbeat else None,
+            "next_tick": heartbeat.next_tick if heartbeat else None,
+            "history": heartbeat.get_history(limit=10) if heartbeat else [],
+        },
+        "tools": tools,
+        "skills": skills,
+        "skill_proposals": [item.model_dump(mode="json") for item in list_skill_proposals()],
+        "skill_executions": [
+            item.model_dump(mode="json")
+            for item in list_skill_executions_for_session(key, limit=30)
+        ],
+        "executions": [item.model_dump(mode="json") for item in executions],
+        "resolution": resolution,
+        "owners": {
+            "projects": "ProjectManager",
+            "sessions": "ThreadSessionState",
+            "tasks": "TaskStore",
+            "routines": "RoutineManager",
+            "automation_runs": "AutomationRunStore",
+            "connections": "ConnectionRegistry",
+            "heartbeat": "HeartbeatManager",
+            "tools": "ToolRegistry",
+            "skills": "SkillsRegistry",
+            "executions": "StateStore",
+        },
+    }
+
+
+@app.get("/automations/runs")
+async def list_automation_runs_api(
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
+    """Exact-scope read model for durable Task/Routine occurrences."""
+    from agent.automation_runtime import get_automation_run_store
+
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    rows = get_automation_run_store().list_runs(
+        project_id=scoped_project_id,
+        session_id=session_id,
+    )
+    return {"items": [row.model_dump(mode="json") for row in rows], "count": len(rows)}
+
+
+@app.get("/connections")
+async def list_connections_api(
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
+    """Secret-free Connection capabilities in the active exact scope."""
+    from agent.connections import get_connection_registry
+
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    rows = get_connection_registry().list(
+        project_id=scoped_project_id,
+        session_id=session_id,
+    )
+    return {"items": [row.model_dump(mode="json") for row in rows], "count": len(rows)}
+
+
+@app.get("/skills/executions")
+async def skill_executions_api(session_id: str = Query(...), limit: int = Query(default=40, ge=1, le=200)):
+    """Session-scoped projection of durable governed SkillExecution records."""
+    from agent.skill_execution import list_skill_executions_for_session
+    from agent.threads import get_thread_manager
+
+    key = str(session_id or "").strip()
+    if not key or get_thread_manager().get_thread(key) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    rows = list_skill_executions_for_session(key, limit=limit)
+    return {"items": [row.model_dump(mode="json") for row in rows], "count": len(rows)}
+
+
+@app.post("/skills/executions/{skill_execution_id}/cancel")
+async def cancel_skill_execution_api(skill_execution_id: str, session_id: str = Query(...)):
+    from agent.skill_execution import SkillExecutionError, cancel_skill_execution, get_skill_execution
+
+    record = get_skill_execution(skill_execution_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="SkillExecutionRecord not found")
+    if record.session_id != str(session_id or "").strip():
+        raise HTTPException(status_code=403, detail="SkillExecution belongs to another Session")
+    try:
+        updated = cancel_skill_execution(record.id, state_store=get_state_store())
+    except SkillExecutionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return updated.model_dump(mode="json")
+
+
 @app.get("/diagnostics/tool-calling")
 async def tool_calling_diagnostics_api(thread_id: Optional[str] = Query(default=None)):
     """Honest provider tool-calling capability matrix for operators."""
-    from agent.video_editor.deterministic_ops import provider_tool_capability_matrix
-
     agent = get_existing_agent(thread_id) or get_agent(thread_id)
     diag = agent._tool_calling_diagnostics() if hasattr(agent, "_tool_calling_diagnostics") else {}
-    matrix = provider_tool_capability_matrix(
-        provider=str(diag.get("provider") or getattr(agent, "llm_provider", "")),
-        native_tool_calling_enabled=bool(diag.get("native_tool_calling_enabled")),
-        langgraph_available=bool(diag.get("langgraph_available")),
-        agent_executor_available=bool(diag.get("agent_executor_available")),
-        lmstudio_tool_calling=bool(diag.get("lmstudio_tool_calling")),
-        disable_native_tool_calling=bool(diag.get("disable_native_tool_calling")),
-    )
+    provider = str(diag.get("provider") or getattr(agent, "llm_provider", ""))
+    langgraph_available = bool(diag.get("langgraph_available"))
+    agent_executor_available = bool(diag.get("agent_executor_available"))
+    disabled = bool(diag.get("disable_native_tool_calling"))
+    native_attempted = bool(diag.get("native_tool_calling_enabled")) and not disabled
+    matrix = {
+        "provider": provider,
+        "native_tool_calls": bool(native_attempted and (langgraph_available or agent_executor_available)),
+        "native_tool_calls_attempted": native_attempted,
+        "langgraph_available": langgraph_available,
+        "agent_executor_available": agent_executor_available,
+        "validated_json_plan_output": True,
+        "deterministic_direct_tool_fallback": False,
+        "prose_only_risk": not bool(langgraph_available or agent_executor_available),
+        "lmstudio_tool_calling_flag": bool(diag.get("lmstudio_tool_calling")),
+        "disable_native_tool_calling": disabled,
+        "notes": "Mutating tools remain governed by current ToolRun and approval authority.",
+    }
     return {"diagnostics": diag, "capability_matrix": matrix, "mode_label": agent._tool_calling_mode_label()}
 
 
@@ -5872,15 +6330,88 @@ async def memory_rebuild_index():
     return result
 
 
+def _build_obsidian_sync_plan(session_id: str, project_id: str):
+    if not bool(getattr(config, "obsidian_sync_enabled", False)):
+        raise HTTPException(status_code=409, detail="Obsidian sync is disabled")
+    vault = str(getattr(config, "obsidian_vault_path", "") or "").strip()
+    if not vault:
+        raise HTTPException(status_code=409, detail="Obsidian vault path is not configured")
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    state = get_state_store().get_thread_state(session_id)
+    agent = get_agent(session_id)
+    records = agent.memory.list_items(
+        offset=0,
+        limit=1000,
+        thread_id=session_id,
+        project_id=scoped_project_id,
+        project_path=str(state.project_path or ""),
+        include_global=False,
+    )
+    from agent.obsidian_sync import ObsidianMemorySync
+
+    adapter = ObsidianMemorySync(Path(vault))
+    plan = adapter.plan(records, project_id=scoped_project_id, session_id=session_id)
+    return adapter, agent, state, plan
+
+
+@app.get("/memory/obsidian/plan")
+async def obsidian_sync_plan_api(
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
+    """Return explicit imports, exports, deletions, and conflicts; make no changes."""
+    _adapter, _agent, _state, plan = _build_obsidian_sync_plan(session_id, project_id)
+    return plan.model_dump(mode="json")
+
+
+@app.post("/memory/obsidian/apply")
+async def obsidian_sync_apply_api(payload: Dict[str, Any] = Body(default_factory=dict)):
+    """Apply only selected deterministic actions after fresh scope revalidation."""
+    session_id = str(payload.get("session_id") or "").strip()
+    project_id = str(payload.get("project_id") or "").strip()
+    direction = str(payload.get("direction") or "").strip().lower()
+    action_ids = [str(item) for item in (payload.get("action_ids") or []) if str(item)]
+    if direction not in {"export", "import"} or not action_ids:
+        raise HTTPException(status_code=422, detail="direction and action_ids are required")
+    adapter, agent, state, plan = _build_obsidian_sync_plan(session_id, project_id)
+    current_ids = {action.id for action in plan.actions}
+    if any(action_id not in current_ids for action_id in action_ids):
+        raise HTTPException(status_code=409, detail="Obsidian sync plan changed; review it again")
+    try:
+        if direction == "export":
+            manifest = adapter.apply_exports(plan, action_ids)
+        else:
+            manifest = adapter.apply_imports(
+                plan,
+                action_ids,
+                memory=agent.memory,
+                project_path=str(state.project_path or ""),
+            )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "manifest": manifest.model_dump(mode="json")}
+
+
 @app.get("/memory", response_model=MemoryListResponse)
 async def list_memory(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=200, ge=1, le=500),
     thread_id: Optional[str] = Query(default=None),
+    project_id: str = Query(default=""),
 ):
     try:
+        session_id = _normalize_thread_id(thread_id)
+        scoped_project_id = _require_automation_project_scope(session_id, project_id)
+        session_state = get_state_store().get_thread_state(session_id)
         agent = get_agent(thread_id)
-        items = agent.memory.list_items(offset=offset, limit=limit, thread_id=thread_id)
+        items = agent.memory.list_items(
+            offset=offset,
+            limit=limit,
+            thread_id=session_id,
+            project_id=scoped_project_id,
+            project_path=str(session_state.project_path or ""),
+            include_global=False,
+        )
         out_items: List[MemoryItem] = []
         for i in items:
             payload = (i or {}) if isinstance(i, dict) else {}
@@ -5892,11 +6423,16 @@ async def list_memory(
             mi.pinned = bool(pinned) if pinned is not None else None
             mi.owner_id = str(meta.get("owner_id") or "")
             mi.scope = str(meta.get("scope") or "account")
+            mi.project_id = str(meta.get("project_id") or "")
             mi.source_session_id = str(meta.get("source_session_id") or "")
             mi.source_execution_id = str(meta.get("source_execution_id") or "")
             mi.source_item_id = str(meta.get("source_item_id") or "")
             mi.index_state = str(meta.get("index_state") or "pending")
             mi.supersedes = str(meta.get("supersedes") or "")
+            mi.superseded_by = str(meta.get("superseded_by") or "")
+            mi.status = str(meta.get("status") or "active")
+            mi.checksum = str(meta.get("checksum") or "")
+            mi.version = int(meta.get("version") or 1)
             mi.subject = str(meta.get("subject") or "") or None
             conf = meta.get("confidence")
             mi.confidence = float(conf) if conf is not None else None
@@ -5912,7 +6448,11 @@ async def list_memory(
             out_items.append(mi)
         return MemoryListResponse(
             items=out_items,
-            count=agent.memory.count_items(thread_id=thread_id),
+            count=agent.memory.count_items(
+                thread_id=session_id,
+                project_id=scoped_project_id,
+                include_global=False,
+            ),
             use_faiss=bool(getattr(agent.memory, "use_faiss", False)),
         )
     except Exception as e:
@@ -5925,7 +6465,12 @@ def _normalize_memory_audit_text(text: str) -> str:
     return cleaned[:500]
 
 
-def _build_memory_doctor_report(agent, thread_id: Optional[str], max_scan: int = 300) -> MemoryDoctorResponse:
+def _build_memory_doctor_report(
+    agent,
+    thread_id: Optional[str],
+    project_id: str = "",
+    max_scan: int = 300,
+) -> MemoryDoctorResponse:
     max_scan = max(10, min(int(max_scan or 300), 1000))
     memory = getattr(agent, "memory", None)
     if memory is None:
@@ -5945,7 +6490,13 @@ def _build_memory_doctor_report(agent, thread_id: Optional[str], max_scan: int =
             recommendations=["Restart the backend or check memory initialization logs."],
         )
 
-    items = memory.list_items(offset=0, limit=max_scan, thread_id=thread_id)
+    items = memory.list_items(
+        offset=0,
+        limit=max_scan,
+        thread_id=thread_id,
+        project_id=project_id,
+        include_global=False,
+    )
     type_counts: Dict[str, int] = {}
     pinned_count = 0
     missing_type_count = 0
@@ -5991,6 +6542,13 @@ def _build_memory_doctor_report(agent, thread_id: Optional[str], max_scan: int =
     superseded_count = 0
     try:
         for rec in (getattr(memory, "_records", None) or {}).values():
+            if not memory._record_matches_scope(
+                rec,
+                project_id=project_id,
+                thread_id=str(thread_id or ""),
+                include_global=False,
+            ):
+                continue
             if not bool(rec.get("active", True)) and str(rec.get("supersedes") or rec.get("deleted_at") or ""):
                 superseded_count += 1
             elif not bool(rec.get("active", True)):
@@ -6029,18 +6587,13 @@ def _build_memory_doctor_report(agent, thread_id: Optional[str], max_scan: int =
     duplicate_groups.sort(key=lambda g: int(g.get("count") or 0), reverse=True)
     duplicate_groups = duplicate_groups[:12]
 
-    profile = getattr(memory, "_profile", None)
-    profile_fact_count = 0
-    if isinstance(profile, dict):
-        for val in profile.values():
-            if isinstance(val, dict):
-                profile_fact_count += len([v for v in val.values() if str(v or "").strip()])
-            elif isinstance(val, list):
-                profile_fact_count += len([v for v in val if str(v or "").strip()])
-            elif str(val or "").strip():
-                profile_fact_count += 1
+    profile_fact_count = int(type_counts.get("profile", 0))
 
-    memory_count = int(getattr(memory, "memory_count", 0) or 0)
+    memory_count = memory.count_items(
+        thread_id=thread_id,
+        project_id=project_id,
+        include_global=False,
+    )
     auto_store = bool(getattr(config, "memory_auto_store_conversations", False))
     conversation_count = int(type_counts.get("conversation", 0))
     warnings: list[str] = []
@@ -6102,12 +6655,20 @@ def _build_memory_doctor_report(agent, thread_id: Optional[str], max_scan: int =
 @app.get("/memory/doctor", response_model=MemoryDoctorResponse)
 async def memory_doctor(
     thread_id: Optional[str] = Query(default=None),
+    project_id: str = Query(default=""),
     max_scan: int = Query(default=300, ge=10, le=1000),
 ):
     """Read-only memory health report for duplicate/stale/untyped memory diagnosis."""
     try:
-        agent = get_agent(thread_id)
-        return _build_memory_doctor_report(agent, thread_id, max_scan=max_scan)
+        session_id = _normalize_thread_id(thread_id)
+        scoped_project_id = _require_automation_project_scope(session_id, project_id)
+        agent = get_agent(session_id)
+        return _build_memory_doctor_report(
+            agent,
+            session_id,
+            scoped_project_id,
+            max_scan=max_scan,
+        )
     except Exception as e:
         logger.error(f"Memory doctor error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -6116,9 +6677,28 @@ async def memory_doctor(
 @app.post("/memory/delete")
 async def delete_memory(request: MemoryDeleteRequest):
     try:
-        agent = get_agent(request.thread_id)
-        deleted = agent.memory.delete_items(request.ids)
-        return {"success": True, "deleted": deleted, "memory_count": agent.memory.memory_count}
+        session_id = _normalize_thread_id(request.thread_id)
+        scoped_project_id = _require_automation_project_scope(session_id, request.project_id)
+        agent = get_agent(session_id)
+        deleted = agent.memory.delete_items(
+            request.ids,
+            project_id=scoped_project_id,
+            thread_id=session_id,
+        )
+        if deleted != len(set(request.ids)):
+            raise HTTPException(status_code=409, detail="One or more memories are outside the active scope")
+        return {
+            "success": True,
+            "deleted": deleted,
+            "memory_count": agent.memory.count_items(
+                thread_id=session_id,
+                project_id=scoped_project_id,
+            ),
+        }
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Delete memory error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -6127,25 +6707,57 @@ async def delete_memory(request: MemoryDeleteRequest):
 @app.post("/memory/update")
 async def update_memory(request: MemoryUpdateRequest):
     try:
-        agent = get_agent(request.thread_id)
+        session_id = _normalize_thread_id(request.thread_id)
+        scoped_project_id = _require_automation_project_scope(session_id, request.project_id)
+        agent = get_agent(session_id)
         ok = agent.memory.update_item(
             request.id,
             text=request.text,
             memory_type=request.memory_type,
             pinned=request.pinned,
+            project_id=scoped_project_id,
+            thread_id=session_id,
         )
-        return {"success": bool(ok), "memory_count": agent.memory.memory_count}
+        if not ok:
+            raise HTTPException(status_code=404, detail="Memory not found in active scope")
+        return {
+            "success": True,
+            "memory_count": agent.memory.count_items(
+                thread_id=session_id,
+                project_id=scoped_project_id,
+            ),
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Update memory error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/memory/clear")
-async def clear_memory(thread_id: Optional[str] = Query(default=None)):
+async def clear_memory(
+    thread_id: Optional[str] = Query(default=None),
+    project_id: str = Query(default=""),
+):
     try:
-        agent = get_agent(thread_id)
-        agent.memory.clear_memory()
-        return {"success": True, "memory_count": agent.memory.memory_count}
+        session_id = _normalize_thread_id(thread_id)
+        scoped_project_id = _require_automation_project_scope(session_id, project_id)
+        agent = get_agent(session_id)
+        deleted = agent.memory.clear_scope(
+            project_id=scoped_project_id,
+            thread_id=session_id,
+            include_global=False,
+        )
+        return {
+            "success": True,
+            "deleted": deleted,
+            "memory_count": agent.memory.count_items(
+                thread_id=session_id,
+                project_id=scoped_project_id,
+            ),
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Clear memory error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -6470,6 +7082,14 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.get("/startup/readiness")
+async def startup_readiness():
+    """Authoritative durable-owner readiness; optional providers never block it."""
+    from agent.startup_readiness import build_startup_readiness
+
+    return build_startup_readiness()
+
+
 @app.get("/metrics")
 async def metrics():
     with _metrics_lock:
@@ -6498,7 +7118,7 @@ async def metrics():
 
 # ── Todo List Endpoints ──────────────────────────────────────────────────────
 
-_TODO_FILE = BASE_DIR / "data" / "todos.json"
+_TODO_FILE = DATA_DIR / "todos.json"
 _todo_lock = threading.Lock()
 
 
@@ -6524,6 +7144,8 @@ class TodoItem(BaseModel):
     description: str = ""
     status: str = "pending"  # pending | in_progress | done
     priority: str = "medium"  # low | medium | high
+    project_id: str = ""
+    session_id: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -6536,9 +7158,23 @@ class TodoUpdateRequest(BaseModel):
 
 
 @app.get("/todos")
-async def list_todos():
-    """List all todo items."""
-    return {"todos": _load_todos()}
+async def list_todos(
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
+    """List Product Tasks in the exact active Project/Session scope."""
+    from agent.task_store import get_task_store
+
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    return {
+        "todos": [
+            task.model_dump(mode="json")
+            for task in get_task_store().list(
+                project_id=scoped_project_id,
+                session_id=session_id,
+            )
+        ]
+    }
 
 
 @app.post("/todos")
@@ -6546,73 +7182,92 @@ async def create_todo(item: TodoItem):
     """Create a new todo item."""
     if not (item.title or "").strip():
         raise HTTPException(status_code=400, detail="Todo title is required")
-    todos = _load_todos()
-    now = datetime.utcnow().isoformat()
-    entry = {
-        "id": item.id or str(uuid.uuid4())[:8],
-        "title": item.title,
-        "description": item.description,
-        "status": item.status,
-        "priority": item.priority,
-        "created_at": now,
-        "updated_at": now,
-    }
-    todos.append(entry)
-    _save_todos(todos)
-    return {"todo": entry}
+    from agent.task_store import get_task_store
+    scoped_project_id = _require_automation_project_scope(item.session_id, item.project_id)
+
+    entry = get_task_store().create(
+        id=item.id or str(uuid.uuid4()),
+        title=item.title,
+        description=item.description,
+        status=item.status,
+        priority=item.priority,
+        project_id=scoped_project_id,
+        session_id=item.session_id,
+        source="user",
+    )
+    return {"todo": entry.model_dump(mode="json")}
 
 
 @app.put("/todos/{todo_id}")
-async def update_todo(todo_id: str, item: TodoUpdateRequest):
+async def update_todo(
+    todo_id: str,
+    item: TodoUpdateRequest,
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
     """Update a todo item by ID."""
-    todos = _load_todos()
-    for t in todos:
-        if t.get("id") == todo_id:
-            if item.title is not None:
-                t["title"] = item.title
-            if item.description is not None:
-                t["description"] = item.description
-            if item.status is not None:
-                t["status"] = item.status
-            if item.priority is not None:
-                t["priority"] = item.priority
-            t["updated_at"] = datetime.utcnow().isoformat()
-            _save_todos(todos)
-            return {"todo": t}
-    raise HTTPException(status_code=404, detail="Todo not found")
+    from agent.task_store import get_task_store
+
+    store = get_task_store()
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    current = store.get(todo_id)
+    if current is None or current.project_id != scoped_project_id or current.session_id != session_id:
+        raise HTTPException(status_code=404, detail="Todo not found")
+    task = store.update(todo_id, **item.model_dump())
+    if task is None:
+        raise HTTPException(status_code=404, detail="Todo not found")
+    return {"todo": task.model_dump(mode="json")}
 
 
 @app.delete("/todos/{todo_id}")
-async def delete_todo(todo_id: str):
+async def delete_todo(
+    todo_id: str,
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
     """Delete a todo item by ID."""
-    todos = _load_todos()
-    filtered = [t for t in todos if t.get("id") != todo_id]
-    if len(filtered) == len(todos):
+    from agent.task_store import get_task_store
+
+    store = get_task_store()
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    current = store.get(todo_id)
+    if current is None or current.project_id != scoped_project_id or current.session_id != session_id:
         raise HTTPException(status_code=404, detail="Todo not found")
-    _save_todos(filtered)
+    if not store.delete(todo_id):
+        raise HTTPException(status_code=404, detail="Todo not found")
     return {"deleted": todo_id}
 
 
 @app.post("/todos/reorder")
-async def reorder_todos(request: Request):
+async def reorder_todos(
+    request: Request,
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
     """Reorder todos by providing a list of IDs in order."""
     data = await request.json()
     order = data.get("order", [])
-    todos = _load_todos()
-    by_id = {t["id"]: t for t in todos}
-    reordered = [by_id[tid] for tid in order if tid in by_id]
-    # append any that weren't in the order list
-    seen = set(order)
-    for t in todos:
-        if t["id"] not in seen:
-            reordered.append(t)
-    _save_todos(reordered)
-    return {"todos": reordered}
+    from agent.task_store import get_task_store
+
+    store = get_task_store()
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    scoped = store.list(project_id=scoped_project_id, session_id=session_id)
+    scoped_ids = {task.id for task in scoped}
+    requested = [str(item) for item in order]
+    if any(item not in scoped_ids for item in requested):
+        raise HTTPException(status_code=409, detail="Task reorder crosses Project/Session scope")
+    store.reorder(requested)
+    return {
+        "todos": [
+            task.model_dump(mode="json")
+            for task in store.list(project_id=scoped_project_id, session_id=session_id)
+        ]
+    }
 
 
 # ── Avatar Config Endpoints ─────────────────────────────────────────────────
 
-_AVATAR_CONFIG_FILE = BASE_DIR / "data" / "avatar_config.json"
+_AVATAR_CONFIG_FILE = DATA_DIR / "avatar_config.json"
 
 _DEFAULT_AVATAR_CONFIG = {
     "body_color": "#ffffff",

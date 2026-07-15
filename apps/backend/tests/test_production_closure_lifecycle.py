@@ -1,4 +1,4 @@
-"""Production-closure: approval identity, video propose→apply ToolRuns, concurrency, research handoff."""
+"""Production closure: approval identity, concurrency, research, and verified writes."""
 
 from __future__ import annotations
 
@@ -134,203 +134,44 @@ def test_mutation_precondition_ignores_freeze_metadata(tmp_path, monkeypatch):
     assert "changed after approval" in denial
 
 
-def test_video_propose_approve_toolrun_and_double_claim(tmp_path, monkeypatch):
-    from agent.projects import ProjectManager
-    from agent.state import StateStore
-    from agent.video_editor.models import EditOperation, MediaAsset, MediaKind, RationalTime
-    from agent.video_editor.store import VideoEditorStore
-    from api.video_editor import ProposalRequest, consume_video_approval, propose_video_transaction_sync
-    from config import config
-    import agent.projects as projects_mod
-    import agent.state as state_mod
-    import agent.video_editor.store as store_mod
-
-    root = tmp_path / "vproj"
-    root.mkdir()
-    manager = ProjectManager(tmp_path / "prec")
-    project = manager.attach_folder(str(root), name="Vid", trust_state="trusted")
-    store = VideoEditorStore(tmp_path / "vstore", project_manager=manager)
-    runtime = StateStore(tmp_path / "vrt")
-    monkeypatch.setattr(projects_mod, "_project_manager", manager)
-    monkeypatch.setattr(state_mod, "_state_store", runtime)
-    monkeypatch.setattr(store_mod, "_STORE", store)
-    monkeypatch.setattr(store_mod, "_STORE_ROOT", Path(store.root).resolve())
-    monkeypatch.setattr(store_mod, "resolve_video_data_dir", lambda data_dir=None: Path(store.root).resolve())
-    monkeypatch.setattr(config, "enable_system_actions", True)
-    monkeypatch.setattr(config, "allow_video_agent_edits", True)
-
-    runtime.update_thread_state(
-        "vsess",
-        active_project_id=project.id,
-        project_path=str(root),
-        workspace_root=str(root),
-        permissions={"system_actions": True, "video_agent_edits": True},
-        allowed_tool_names=["video_propose_operations", "video_apply_transaction"],
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("file_delete", ("path",)),
+        ("file_move", ("src", "dst")),
+        ("file_copy", ("src", "dst")),
+        ("file_mkdir", ("path",)),
+    ],
+)
+def test_all_filesystem_mutation_arguments_are_versioned_at_tool_boundary(
+    tmp_path, tool_name, arguments
+):
+    from agent.tools import (
+        bind_tool_execution_context,
+        _mutation_path_version,
+        _mutation_precondition_denial,
+        reset_tool_execution_context,
     )
-    doc = store.create_document(project.id, "Cut")
-    asset = MediaAsset(
-        project_id=project.id,
-        document_id=doc.id,
-        name="cam.mp4",
-        kind=MediaKind.VIDEO,
-        project_relative_path="cam.mp4",
-        sha256="b" * 64,
-        size_bytes=10,
-        mtime_ns=1,
-        duration=RationalTime(ticks="10000"),
+
+    paths = {}
+    entries = []
+    for argument in arguments:
+        path = tmp_path / f"{argument}.txt"
+        if argument != "dst":
+            path.write_text(f"approved-{argument}", encoding="utf-8")
+        paths[argument] = path
+        entries.append(_mutation_path_version(path, argument))
+    token = bind_tool_execution_context(
+        {"mutation_precondition": {"version": 2, "entries": entries}}
     )
-    doc = store.add_asset(project.id, doc.id, asset)
-    # Seed timeline with track + clip via manual apply
-    tx0, _ = store.prepare_transaction(
-        project.id,
-        doc.id,
-        "vsess",
-        [
-            EditOperation(
-                operation_type="add_track",
-                expected_revision=0,
-                payload={"track_id": "v1", "kind": "video", "name": "V1"},
-            ),
-            EditOperation(
-                operation_type="insert_clip",
-                expected_revision=0,
-                payload={
-                    "track_id": "v1",
-                    "clip_id": "c1",
-                    "asset_id": asset.id,
-                    "timeline_start": {"ticks": "0", "time_base": {"numerator": 1, "denominator": 1000}},
-                    "duration": {"ticks": "6000", "time_base": {"numerator": 1, "denominator": 1000}},
-                },
-            ),
-        ],
-        source="manual",
-    )
-    doc = store.apply_transaction(tx0)
-    rev = doc.revision
+    try:
+        assert _mutation_precondition_denial(tool_name) == ""
 
-    proposal = propose_video_transaction_sync(
-        doc.id,
-        ProposalRequest(
-            session_id="vsess",
-            project_id=project.id,
-            objective="Split selected clip at mid",
-            operations=[
-                EditOperation(
-                    operation_type="split_clip",
-                    expected_revision=rev,
-                    payload={
-                        "clip_id": "c1",
-                        "right_clip_id": "c2",
-                        "at": {"ticks": "3000", "time_base": {"numerator": 1, "denominator": 1000}},
-                    },
-                )
-            ],
-        ),
-    )
-    assert proposal["execution_id"]
-    assert proposal["tool_run_id"]
-    assert proposal["approval"]["id"]
-    approval_id = proposal["approval"]["id"]
-    runs = runtime.list_tool_runs(proposal["execution_id"])
-    assert any(r.tool_name == "video_propose_operations" for r in runs)
-    assert runtime.get_pending_approval("vsess") is not None
-
-    # Project switch during pending approval must fail authority
-    (tmp_path / "other").mkdir(exist_ok=True)
-    other = manager.create_project(name="Other", workspace_root=str(tmp_path / "other"))
-    runtime.update_thread_state("vsess", active_project_id=other.id)
-    approval = runtime.get_approval(approval_id)
-    from agent.video_editor.store import VideoStoreError
-    from fastapi import HTTPException
-
-    # Fail closed: switched Project is not attached (HTTPException or VideoStoreError)
-    with pytest.raises((VideoStoreError, HTTPException)):
-        consume_video_approval(approval)
-
-    # Restore project and apply once
-    runtime.update_thread_state("vsess", active_project_id=project.id, pending_approval_id=approval_id)
-    # Re-fetch pending approval after project restore
-    approval = runtime.get_approval(approval_id)
-    # After failed consume attempt, approval remains pending (validate fails before claim)
-    assert approval.status == "pending"
-    result = consume_video_approval(approval)
-    assert result.get("success") is True
-    applied = store.get_document(project.id, doc.id)
-    assert applied.revision == rev + 1
-    clips = applied.timeline.tracks[0].clips
-    assert {c.id for c in clips} == {"c1", "c2"}
-
-    # Duplicate approve fails closed
-    with pytest.raises(VideoStoreError):
-        consume_video_approval(approval)
-
-
-def test_video_stale_revision_rejected(tmp_path, monkeypatch):
-    from agent.projects import ProjectManager
-    from agent.state import StateStore
-    from agent.video_editor.models import EditOperation
-    from agent.video_editor.store import VideoEditorStore, VideoStoreError
-    from api.video_editor import ProposalRequest, consume_video_approval, propose_video_transaction_sync
-    from config import config
-    import agent.projects as projects_mod
-    import agent.state as state_mod
-    import agent.video_editor.store as store_mod
-
-    root = tmp_path / "vproj2"
-    root.mkdir()
-    manager = ProjectManager(tmp_path / "prec2")
-    project = manager.attach_folder(str(root), name="Vid2", trust_state="trusted")
-    store = VideoEditorStore(tmp_path / "vstore2", project_manager=manager)
-    runtime = StateStore(tmp_path / "vrt2")
-    monkeypatch.setattr(projects_mod, "_project_manager", manager)
-    monkeypatch.setattr(state_mod, "_state_store", runtime)
-    monkeypatch.setattr(store_mod, "_STORE", store)
-    monkeypatch.setattr(store_mod, "_STORE_ROOT", Path(store.root).resolve())
-    monkeypatch.setattr(store_mod, "resolve_video_data_dir", lambda data_dir=None: Path(store.root).resolve())
-    monkeypatch.setattr(config, "enable_system_actions", True)
-    monkeypatch.setattr(config, "allow_video_agent_edits", True)
-    runtime.update_thread_state(
-        "s2",
-        active_project_id=project.id,
-        project_path=str(root),
-        workspace_root=str(root),
-        permissions={"system_actions": True, "video_agent_edits": True},
-        allowed_tool_names=["video_apply_transaction"],
-    )
-    doc = store.create_document(project.id, "D")
-    proposal = propose_video_transaction_sync(
-        doc.id,
-        ProposalRequest(
-            session_id="s2",
-            project_id=project.id,
-            objective="add track",
-            operations=[
-                EditOperation(
-                    operation_type="add_track",
-                    expected_revision=0,
-                    payload={"track_id": "v1", "kind": "video", "name": "V"},
-                )
-            ],
-        ),
-    )
-    # Advance revision externally
-    other_tx, _ = store.prepare_transaction(
-        project.id,
-        doc.id,
-        "s2",
-        [
-            EditOperation(
-                operation_type="add_track",
-                expected_revision=0,
-                payload={"track_id": "v9", "kind": "video", "name": "ext"},
-            )
-        ],
-        source="manual",
-    )
-    store.apply_transaction(other_tx)
-    approval = runtime.get_approval(proposal["approval"]["id"])
-    with pytest.raises(VideoStoreError, match="changed|revision|precondition"):
-        consume_video_approval(approval)
+        changed_argument = arguments[-1]
+        paths[changed_argument].write_text("changed-after-approval", encoding="utf-8")
+        assert "changed after approval" in _mutation_precondition_denial(tool_name)
+    finally:
+        reset_tool_execution_context(token)
 
 
 def test_research_artifact_from_web_search_toolrun(tmp_path, monkeypatch):
@@ -349,6 +190,9 @@ def test_research_artifact_from_web_search_toolrun(tmp_path, monkeypatch):
     agent._state_store = runtime
     agent._thread_key = lambda: "rs1"
     agent._current_execution_id = "ex1"
+    agent._active_project_id = "project-r"
+    agent.llm_provider = ModelProvider.OPENAI
+    agent.memory = type("MemoryStub", (), {"memory_count": 0})()
     agent._tool_outcomes_by_run_id = {}
     agent._current_mode_decision = type("D", (), {"objective": "research oilers highlights"})()
     agent._promote_materialized_project = lambda *a, **k: None
@@ -358,7 +202,16 @@ def test_research_artifact_from_web_search_toolrun(tmp_path, monkeypatch):
     from agent.tool_registry import ToolRegistry
 
     # Ensure web_search path persists
-    runtime.create_execution(kind="turn", thread_id="rs1", source="test", status="running", query="q")
+    runtime.create_execution(
+        kind="turn",
+        thread_id="rs1",
+        session_id="rs1",
+        project_id="project-r",
+        source="test",
+        status="running",
+        query="q",
+    )
+    runtime.update_thread_state("rs1", active_project_id="project-r")
     # Force turn id
     agent._current_execution_id = list(runtime._executions.keys())[0]
     outcome = ToolOutcome(
@@ -378,21 +231,18 @@ def test_research_artifact_from_web_search_toolrun(tmp_path, monkeypatch):
     assert data["status"] == "ready"
     assert data["citations"] or data["source_urls"]
     assert data["session_id"] == "rs1"
-    # Session-only lookup allowed when require_project=False; Project pin is preferred
     found = find_compatible_research_artifact(
-        project_id="",
+        project_id="project-r",
         session_id="rs1",
         objective="research oilers highlights",
-        require_project=False,
     )
     assert found is not None
 
 def test_skill_audit_no_disabled_executable(tmp_path, monkeypatch):
-    import agent.video_editor.tools  # noqa: F401
     from agent.skill_status_audit import audit_all_skills
 
     rows = audit_all_skills(
-        available_capabilities={"deterministic_editing", "approvals"},
+        available_capabilities={"research", "approvals"},
         available_artifacts=set(),
     )
     for r in rows:

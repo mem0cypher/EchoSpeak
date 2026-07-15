@@ -109,6 +109,7 @@ class SkillSelectionResult(BaseModel):
 
 
 class SkillExecutionStatus(str, Enum):
+    SELECTED = "selected"
     PLANNED = "planned"
     BLOCKED = "blocked"
     PENDING_APPROVAL = "pending_approval"
@@ -131,7 +132,9 @@ class SkillExecutionRecord(BaseModel):
     session_id: str = ""
     turn_id: str = ""
     parent_execution_id: str = ""  # composition parent
+    parent_skill_execution_id: str = ""
     child_skill_ids: list[str] = Field(default_factory=list)
+    child_execution_ids: list[str] = Field(default_factory=list)
     input_context_identity: dict[str, Any] = Field(default_factory=dict)
     selected_tool_ids: list[str] = Field(default_factory=list)
     operation_ids: list[str] = Field(default_factory=list)
@@ -139,6 +142,9 @@ class SkillExecutionRecord(BaseModel):
     approval_ids: list[str] = Field(default_factory=list)
     artifact_ids: list[str] = Field(default_factory=list)
     tool_run_ids: list[str] = Field(default_factory=list)
+    parent_tool_run_id: str = ""
+    prompt_only: bool = False
+    cancellation_requested: bool = False
     status: SkillExecutionStatus = SkillExecutionStatus.PLANNED
     verification: dict[str, Any] = Field(default_factory=dict)
     failure_reason: str = ""
