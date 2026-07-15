@@ -27,6 +27,8 @@ Usage in core.py:
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -44,6 +46,13 @@ class ToolEntry:
     risk_level: str = "safe"  # "safe" | "moderate" | "destructive"
     policy_flags: tuple = ()  # env flags required to enable
     keyword_hints: tuple = ()  # keywords for heuristic routing
+    owner: str = "builtin"
+
+
+_registration_context: ContextVar[tuple[str, bool]] = ContextVar(
+    "echospeak_tool_registration_context",
+    default=("builtin", False),
+)
 
 
 class ToolRegistry:
@@ -55,6 +64,16 @@ class ToolRegistry:
     """
 
     _entries: Dict[str, ToolEntry] = {}
+
+    @classmethod
+    @contextmanager
+    def registration_scope(cls, owner: str, *, reject_conflicts: bool = True):
+        """Bind provenance for one reviewed dynamic registration transaction."""
+        token = _registration_context.set((str(owner or "unknown"), bool(reject_conflicts)))
+        try:
+            yield
+        finally:
+            _registration_context.reset(token)
 
     # ── Registration ────────────────────────────────────────────────
 
@@ -83,6 +102,13 @@ class ToolRegistry:
         _hints = tuple(keyword_hints or [])
 
         def decorator(func: Callable) -> Callable:
+            owner, reject_conflicts = _registration_context.get()
+            existing = cls._entries.get(name)
+            if existing is not None and reject_conflicts:
+                raise ValueError(
+                    f"Tool registration collision for '{name}': "
+                    f"owner '{owner}' cannot replace '{existing.owner}'"
+                )
             cls._entries[name] = ToolEntry(
                 name=name,
                 func=func,
@@ -92,6 +118,7 @@ class ToolRegistry:
                 risk_level=risk_level,
                 policy_flags=_flags,
                 keyword_hints=_hints,
+                owner=owner,
             )
             return func
 
@@ -134,6 +161,7 @@ class ToolRegistry:
                 is_action=requires_confirm,
                 risk_level=risk,
                 policy_flags=flags,
+                owner="legacy_metadata",
             )
 
     # ── Queries ─────────────────────────────────────────────────────

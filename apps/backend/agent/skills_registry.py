@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional, Dict, List
 
@@ -113,9 +113,7 @@ def package_to_manifest(entry: Path, meta: Dict[str, object], prompt: str) -> Sk
     modes = [str(x).strip() for x in (meta.get("supported_modes") or meta.get("modes") or []) if str(x).strip()]
     if not modes:
         # Infer domain from id / tools
-        if skill_id.startswith("video") or any(t.startswith("video_") for t in tool_allowlist):
-            modes = ["video", "chat"]
-        elif skill_id in {"web_search"} or "web_search" in tool_allowlist:
+        if skill_id in {"web_search"} or "web_search" in tool_allowlist:
             modes = ["chat", "research"]
         else:
             modes = ["chat"]
@@ -127,9 +125,12 @@ def package_to_manifest(entry: Path, meta: Dict[str, object], prompt: str) -> Sk
     errors: list[str] = []
     if not prompt and not (entry / "tools.py").exists():
         errors.append("missing_prompt_and_tools_module")
-    if tool_allowlist and not reachable and not skill_id.startswith("video"):
-        # Video tools may load after import of video_editor package.
+    if tool_allowlist and not reachable:
         errors.append("no_required_tools_registered")
+    if (entry / "tools.py").exists() and errors == ["no_required_tools_registered"]:
+        # Reviewed package code is the bootstrap source for its declared tools.
+        # The bridge revalidates the complete declaration after import.
+        errors = []
 
     if disabled:
         status = SkillStatus.DISABLED
@@ -137,14 +138,14 @@ def package_to_manifest(entry: Path, meta: Dict[str, object], prompt: str) -> Sk
         status = SkillStatus.DRAFT
     elif experimental:
         status = SkillStatus.EXPERIMENTAL
+    elif meta.get("origin") == "built_in" or skill_id in {
+        "web_search", "soul", "skill_writer",
+    }:
+        status = SkillStatus.BUILT_IN
     elif errors and "no_required_tools_registered" in errors:
         status = SkillStatus.NEEDS_DEPENDENCY
     elif errors:
         status = SkillStatus.INVALID
-    elif meta.get("origin") == "built_in" or skill_id in {
-        "web_search", "soul", "video_editor", "skill_writer",
-    }:
-        status = SkillStatus.BUILT_IN
     else:
         status = SkillStatus.INSTALLED
 
@@ -206,6 +207,34 @@ def package_to_manifest(entry: Path, meta: Dict[str, object], prompt: str) -> Sk
     )
 
 
+def executable_package_manifest(skill_dir: Path) -> Optional[SkillManifest]:
+    """Return the import-authorizing manifest, or fail closed before code import."""
+    meta = _load_json(skill_dir / "skill.json")
+    prompt_file = str(meta.get("prompt_file") or "SKILL.md")
+    prompt = _read_text(skill_dir / prompt_file)
+    if not prompt:
+        logger.warning("Skill '{}' cannot load code: missing prompt/manifest content", skill_dir.name)
+        return None
+    manifest = package_to_manifest(skill_dir, meta, prompt)
+    if (
+        (skill_dir / ".disabled").exists()
+        or (skill_dir / ".draft").exists()
+        or (skill_dir / ".experimental").exists()
+        or manifest.status not in {SkillStatus.BUILT_IN, SkillStatus.INSTALLED}
+        or not manifest.executable
+        or bool(manifest.validation_errors)
+    ):
+        logger.warning(
+            "Skill '{}' code import blocked by lifecycle status={} executable={} errors={}",
+            skill_dir.name,
+            manifest.status.value,
+            manifest.executable,
+            manifest.validation_errors,
+        )
+        return None
+    return manifest
+
+
 def load_skills(skills_dir: Path, *, include_disabled: bool = False) -> Dict[str, SkillDefinition]:
     """Load package skills as SkillDefinition (prompt projection).
 
@@ -229,6 +258,12 @@ def load_skills(skills_dir: Path, *, include_disabled: bool = False) -> Dict[str
         if not prompt:
             continue
         manifest = package_to_manifest(entry, meta, prompt)
+        if not include_disabled and (
+            manifest.status not in {SkillStatus.BUILT_IN, SkillStatus.INSTALLED}
+            or not manifest.executable
+            or bool(manifest.validation_errors)
+        ):
+            continue
         skills[manifest.id] = SkillDefinition(
             id=manifest.id,
             name=manifest.name,
@@ -333,6 +368,9 @@ def load_skill_tools(skill_dir: Path) -> List[str]:
     tools_file = skill_dir / "tools.py"
     if not tools_file.exists():
         return []
+    manifest = executable_package_manifest(skill_dir)
+    if manifest is None:
+        return []
 
     module_key = str(tools_file.resolve())
     if module_key in _loaded_skill_tool_modules:
@@ -343,7 +381,8 @@ def load_skill_tools(skill_dir: Path) -> List[str]:
     # Capture registry state before import to detect new registrations
     try:
         from agent.tool_registry import ToolRegistry
-        before_names = set(ToolRegistry.get_names())
+        before_entries = ToolRegistry.get_all()
+        before_names = set(before_entries)
     except ImportError:
         logger.warning("ToolRegistry not available — skipping skill tool loading")
         return []
@@ -351,20 +390,44 @@ def load_skill_tools(skill_dir: Path) -> List[str]:
     # Dynamically import the skill's tools module
     import importlib.util
     try:
-        spec = importlib.util.spec_from_file_location(
-            f"skill_tools_{skill_dir.name}",
-            str(tools_file),
-        )
+        spec = importlib.util.spec_from_file_location(f"skill_tools_{skill_dir.name}", str(tools_file))
         if spec is None or spec.loader is None:
             logger.warning(f"Could not load spec for {tools_file}")
             return []
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        with ToolRegistry.registration_scope(f"skill:{manifest.id}", reject_conflicts=True):
+            spec.loader.exec_module(module)
         _loaded_skill_tool_modules.add(module_key)
 
         # Detect newly registered tools
         after_names = set(ToolRegistry.get_names())
         new_tools = sorted(after_names - before_names)
+
+        declared = set(manifest.required_tools) | set(manifest.optional_tools)
+        undeclared = sorted(set(new_tools) - declared)
+        missing = sorted(set(manifest.required_tools) - after_names)
+        if undeclared or missing:
+            ToolRegistry._entries.clear()
+            ToolRegistry._entries.update(before_entries)
+            logger.warning(
+                "Skill '{}' registration rejected: undeclared={} missing={}",
+                skill_dir.name,
+                undeclared,
+                missing,
+            )
+            return []
+
+        # Package code is always treated as an action-capable authority surface.
+        # Runtime policy and approval gates may narrow it further, never widen it.
+        for tool_name in new_tools:
+            entry = ToolRegistry.get(tool_name)
+            if entry is not None:
+                ToolRegistry._entries[tool_name] = replace(
+                    entry,
+                    is_action=True,
+                    risk_level="destructive" if entry.risk_level == "destructive" else "moderate",
+                    owner=f"skill:{manifest.id}",
+                )
 
         # Enforce policy_flags — remove tools whose config flags aren't enabled
         if new_tools:
@@ -391,6 +454,11 @@ def load_skill_tools(skill_dir: Path) -> List[str]:
         return new_tools  # empty list — no new tools registered
 
     except Exception as exc:
+        try:
+            ToolRegistry._entries.clear()
+            ToolRegistry._entries.update(before_entries)
+        except Exception:
+            pass
         logger.warning(f"Failed to load skill tools from {tools_file}: {exc}")
         return []
 
@@ -451,65 +519,6 @@ class SkillsRegistry:
                         continue
                     manifests[entry.name] = package_to_manifest(entry, meta, prompt)
 
-            # Bridge video domain skills into the same registry (not a second owner).
-            try:
-                from agent.video_editor.skills import ensure_builtin_video_skills, VideoSkillRegistry
-
-                ensure_builtin_video_skills()
-                for vs in VideoSkillRegistry.list():
-                    if vs.id in manifests:
-                        # Enrich package skill with video domain metadata
-                        base = manifests[vs.id]
-                        manifests[vs.id] = base.model_copy(
-                            update={
-                                "accepted_intents": list(dict.fromkeys([*base.accepted_intents, *vs.accepted_intentions])),
-                                "required_tools": list(dict.fromkeys([*base.required_tools, *vs.required_tools])),
-                                "required_models": list(dict.fromkeys([*base.required_models, *vs.required_models])),
-                                "required_artifacts": list(dict.fromkeys([*base.required_artifacts, *vs.required_analysis])),
-                                "job_types": list(dict.fromkeys([*base.job_types, *vs.job_requirements])),
-                                "operation_templates": base.operation_templates or list(vs.operation_templates),
-                                "permissions": list(dict.fromkeys([*base.permissions, *vs.permissions])),
-                                "approval_policy": base.approval_policy or dict(vs.approval_rules),
-                                "verification_rules": list(dict.fromkeys([*base.verification_rules, *vs.verification_rules])),
-                                "resource_limits": base.resource_limits or dict(vs.resource_limits),
-                                "supported_modes": list(dict.fromkeys([*(base.supported_modes or []), "video", "chat"])),
-                            }
-                        )
-                        continue
-                    registered = _registered_tool_names()
-                    missing = [t for t in vs.required_tools if t not in registered]
-                    reachable = [t for t in vs.required_tools if t in registered]
-                    status = SkillStatus.BUILT_IN
-                    # Skills that require analysis/generation models stay built_in but
-                    # may be blocked at selection time when capabilities missing.
-                    manifests[vs.id] = SkillManifest(
-                        id=vs.id,
-                        version="1.0.0",
-                        status=status,
-                        owner="echospeak",
-                        origin=SkillOrigin.VIDEO_DOMAIN,
-                        name=vs.name,
-                        description=vs.description,
-                        accepted_intents=list(vs.accepted_intentions),
-                        supported_modes=["video", "chat"],
-                        required_tools=list(vs.required_tools),
-                        required_models=list(vs.required_models),
-                        required_capabilities=list(vs.required_models) + list(vs.required_analysis),
-                        required_artifacts=list(vs.required_analysis),
-                        produced_artifacts=[],
-                        job_types=list(vs.job_requirements),
-                        operation_templates=list(vs.operation_templates),
-                        permissions=list(vs.permissions),
-                        approval_policy=dict(vs.approval_rules),
-                        verification_rules=list(vs.verification_rules),
-                        resource_limits=dict(vs.resource_limits),
-                        implementation_entry=f"video_domain:{vs.id}",
-                        tools_reachable=reachable,
-                        tools_missing=missing,
-                        executable=True,
-                    )
-            except Exception as exc:
-                logger.debug(f"Video skill bridge skipped: {exc}")
 
             cls._manifests = manifests
             cls._loaded_root = root
@@ -574,6 +583,9 @@ def load_skill_plugin(skill_dir: Path) -> bool:
     """
     plugin_file = skill_dir / "plugin.py"
     if not plugin_file.exists():
+        return False
+    manifest = executable_package_manifest(skill_dir)
+    if manifest is None:
         return False
 
     module_key = str(plugin_file.resolve())

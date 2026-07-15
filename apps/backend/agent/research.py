@@ -703,7 +703,7 @@ def is_deep_research_intent(text: str) -> bool:
         return False
     explicit = bool(
         re.search(
-            r"\b(deep research|deep[- ]dive|research report|literature review|"
+            r"\b(deep (?:research|search)|deep[- ]dive|research report|literature review|"
             r"multi[- ]hop|investigate|trace (?:the )?(?:root cause|timeline|evidence)|"
             r"synthesize (?:sources|evidence)|compare (?:sources|evidence|claims)|"
             r"primary sources|source audit|technical report)\b",

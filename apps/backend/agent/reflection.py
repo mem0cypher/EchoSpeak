@@ -10,8 +10,8 @@ The engine is tool-agnostic — it evaluates ANY tool result against the
 user's original goal and the current task description. It does not
 hardcode specific tool names or sequences.
 
-Absorbs the existing WebTaskReflector as a specialized fast-path for
-web_search result quality checks (date staleness, market queries, etc.).
+Web search is excluded because SearchGrounder owns its complete bounded
+quality/retry loop and ToolRun identity.
 """
 
 from __future__ import annotations
@@ -111,6 +111,12 @@ class ReflectionEngine:
         """
         tool_name = str(task.get("tool", "")).strip()
         task_index = int(task.get("index", 0))
+
+        # SearchGrounder is the single production search orchestrator. A
+        # generic retry here would invoke the raw registry tool and fork its
+        # evidence budget and ToolRun identity.
+        if tool_name == "web_search":
+            return False
 
         # Small plans don't need per-step reflection
         if plan_size < MIN_PLAN_SIZE_FOR_REFLECTION:
@@ -499,11 +505,11 @@ class ReflectionEngine:
 
         tool_name = str(task.get("tool", "")).strip()
 
-        # For search tools, the suggestion is typically a refined query
-        if tool_name in {"web_search"}:
-            new_params = dict(original_params)
-            new_params["q"] = suggestion
-            return new_params
+        # SearchGrounder owns query refinement, evidence budgets, and retry
+        # ToolRun identity. Generic reflection must never manufacture a second
+        # web-search orchestration, even if called outside TaskPlanner.
+        if tool_name == "web_search":
+            return None
 
         # For browse tools, the suggestion might be a different URL
         if tool_name in {"browse_task"}:

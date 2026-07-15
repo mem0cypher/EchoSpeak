@@ -55,13 +55,18 @@ class TestReflectionEngineHeuristics:
 
     def test_reflect_on_empty_result(self):
         engine = self._make_engine()
-        task = {"tool": "web_search", "index": 0}
+        task = {"tool": "browse_task", "index": 0}
         assert engine.should_reflect(task, "", plan_size=3) is True
 
     def test_reflect_on_short_result(self):
         engine = self._make_engine()
-        task = {"tool": "web_search", "index": 0}
+        task = {"tool": "browse_task", "index": 0}
         assert engine.should_reflect(task, "No results found", plan_size=2) is True
+
+    def test_web_search_is_owned_by_search_grounder(self):
+        engine = self._make_engine()
+        task = {"tool": "web_search", "index": 0}
+        assert engine.should_reflect(task, "", plan_size=3) is False
 
     def test_reflect_on_failure_signals(self):
         engine = self._make_engine()
@@ -255,7 +260,7 @@ class TestReflectionEngineRetryParams:
         agent = Mock()
         return ReflectionEngine(agent)
 
-    def test_web_search_retry_uses_suggestion_as_query(self):
+    def test_web_search_retry_stays_with_search_grounder(self):
         from agent.reflection import ReflectionResult
         engine = self._make_engine()
         task = {"tool": "web_search", "index": 0}
@@ -263,8 +268,7 @@ class TestReflectionEngineRetryParams:
         params = {"q": "cat meme"}
 
         new_params = engine.get_retry_params(task, reflection, params)
-        assert new_params is not None
-        assert new_params["q"] == "funny cat meme imgur"
+        assert new_params is None
 
     def test_accepted_result_returns_none(self):
         from agent.reflection import ReflectionResult

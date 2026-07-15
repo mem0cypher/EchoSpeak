@@ -1,9 +1,19 @@
 # EchoSpeak Architecture
 
-The first-class hybrid video-editor domain, its authority owners, rational-time
-schemas, operation/revision engine, media ingest, approval path, adapters, and
-deferred render/generation phases are canonical in
-[`docs/VIDEO_EDITOR_ARCHITECTURE.md`](docs/VIDEO_EDITOR_ARCHITECTURE.md).
+The canonical domain ownership and lifecycle invariants are maintained in [docs/ECHO_CORE_CONTRACT_MATRIX.md](docs/ECHO_CORE_CONTRACT_MATRIX.md).
+
+The additive Windows desktop host, its native/sidecar ownership boundary,
+authenticated loopback transport, startup/recovery state machine, adaptive
+workspace contract, and environment-gated release procedure are canonical in
+[`docs/DESKTOP_ARCHITECTURE.md`](docs/DESKTOP_ARCHITECTURE.md). The desktop host
+reuses the existing web and backend owners; it does not create parallel Project,
+Session, Turn, ToolRun, approval, job, or memory stores.
+
+The coordinated Research, Memory, Coding, Studio/Chat, retrieval, and
+Automations redesign is tracked in
+[`docs/SIX_SYSTEM_IMPLEMENTATION_LEDGER.md`](docs/SIX_SYSTEM_IMPLEMENTATION_LEDGER.md).
+The built-in image/video Editor has been retired; Media Library and governed
+generation remain independent runtime capabilities.
 
 This document explains how EchoSpeak works internally.
 

@@ -305,6 +305,7 @@ from agent.context_budget import (
     estimate_tokens,
     sanitize_untrusted_context,
 )
+from agent.context_chain import ContextAssembler, ContextItem
 from agent.memory import AgentMemory, get_agent_memory
 from agent.research import (
     SearchGrounder,
@@ -316,7 +317,6 @@ from agent.intent_guard import is_explicit_new_project_request, is_information_r
 from agent.mode_controller import (
     CodingPhaseName,
     ModeDecision,
-    RESEARCH_MODEL,
     TurnMode,
     allowed_tools_for_mode,
     classify_turn_mode,
@@ -324,7 +324,6 @@ from agent.mode_controller import (
 )
 from agent.mode_executor import execution_profile_for
 
-from agent.research_context import ResearchWorkspace
 from agent.skills_registry import (
     build_skills_prompt,
     list_skills,
@@ -339,6 +338,7 @@ from agent.skills_registry import (
 from agent.tools import get_available_tools, TOOL_METADATA
 from agent.tool_registry import ToolRegistry, PluginRegistry
 from agent.router import IntentRouter, RoutingDecision
+from agent.resolution import EchoResolutionEngine, ResolutionRecommendation
 from agent.state import ProjectLedgerEntry, ThreadSessionState, ToolOutcome, get_state_store
 from agent.update_context import ensure_update_context_plugin_registered, get_update_context_service
 from agent.verification import VerificationTelemetry
@@ -398,8 +398,12 @@ class ConversationMemory(BaseModel):
 
 class WebTaskReflector:
     """
-    Per-task reflection and retry system for web search tasks.
-    Validates results, detects stale/insufficient answers, and refines queries.
+    Compatibility quality gate for web-search results.
+
+    SearchGrounder, reached through ``EchoSpeakAgent._grounded_web_search``, is
+    the only production search orchestrator. This class retains the legacy
+    quality helpers used by routing and tests, but it never invokes a provider
+    or starts a retry loop of its own.
     """
     
     MAX_RETRIES = 2  # default; overridden by config when present
@@ -745,12 +749,11 @@ class WebTaskReflector:
     def reflect_and_retry(self, task: Dict, tool_name: str, original_result: str, 
                           tools: List, callbacks: Optional[List] = None) -> str:
         """
-        Main entry point: evaluate result and retry if needed.
-        Returns the final result (either original or from retry).
-        """
-        task_id = str(task.get("index", id(task)))
+        Return grounded output unchanged or enter the canonical owner once.
 
-        # Only handle web search tools
+        ``tools`` is intentionally ignored. Invoking a registry tool here
+        would create a second search orchestration and ToolRun identity.
+        """
         if tool_name != "web_search":
             return original_result
 
@@ -780,108 +783,16 @@ class WebTaskReflector:
             )
             return raw
 
-        silent = bool(task.get("params", {}).get("silent"))
-        emit_events = False if silent else True
-
-        if bool(getattr(config, "search_grounding_enabled", True)) and hasattr(self.agent, "_grounded_web_search"):
-            if q:
-                return self.agent._grounded_web_search(
-                    q,
-                    original_request=str(
-                        task.get("params", {}).get("original_request") or q
-                    ),
-                    callbacks=callbacks,
-                    emit_tool_events=emit_events,
-                )
+        if not q or not hasattr(self.agent, "_grounded_web_search"):
             return raw
 
-        # If result is already good, return it
-        if self._is_result_acceptable(q, original_result):
-            logger.info(f"WebTaskReflector: original result accepted for query: {q[:80]}")
-            return original_result
-        
-        # Track attempts (non-grounded legacy path only)
-        self._attempt_count[task_id] = self._attempt_count.get(task_id, 0) + 1
-        attempt = self._attempt_count[task_id]
-        
-        if attempt > self.MAX_RETRIES:
-            logger.info(f"WebTaskReflector: max retries ({self.MAX_RETRIES}) reached for task {task_id}")
-            return original_result
-        
-        logger.info(f"WebTaskReflector: attempt {attempt} for task {task_id}, refining query...")
-        
-        # Generate refined query
-        refined_q = self._refine_query(q, attempt, original_result, task)
-        if refined_q == q:
-            refined_q = q
-        try:
-            if hasattr(self.agent, "_emit_thinking_step"):
-                reason = "Search result did not satisfy the request; retrying with a sharper query."
-                if self._is_live_score_query(q):
-                    reason = "Search result did not look like a live score/result; retrying."
-                self.agent._emit_thinking_step("thought", reason, "done")
-        except Exception:
-            pass
-
-        # Prefer grounded re-search when available (Stage 3 / tool wrappers)
-        if hasattr(self.agent, "_grounded_web_search"):
-            try:
-                result = self.agent._grounded_web_search(
-                    refined_q,
-                    original_request=str(
-                        task.get("params", {}).get("original_request") or q or refined_q
-                    ),
-                    callbacks=callbacks,
-                    emit_tool_events=False,  # silent retry — anti-loop
-                )
-                result = str(result or "")
-                logger.info(
-                    f"WebTaskReflector: grounded retry attempt {attempt} returned {len(result)} chars"
-                )
-                if is_grounded_search_output(result):
-                    return result  # never cascade reflect_and_retry on grounded
-                if self._is_result_acceptable(q, result):
-                    return result
-                if attempt < self.MAX_RETRIES:
-                    return self.reflect_and_retry(task, tool_name, result, tools, callbacks)
-                return result
-            except Exception as e:
-                logger.warning(f"WebTaskReflector: grounded retry failed: {e}")
-        
-        # Find the tool
-        target_tool = next((t for t in tools if t.name == tool_name), None)
-        if not target_tool:
-            return original_result
-        
-        # Execute retry
-        run_id = str(uuid.uuid4())
-        params = {"q": refined_q}
-        
-        try:
-            if callbacks and hasattr(self.agent, "_emit_tool_start"):
-                self.agent._emit_tool_start(callbacks, tool_name, str(params), run_id)
-            
-            result = target_tool.invoke(**params)
-            
-            if callbacks and hasattr(self.agent, "_emit_tool_end"):
-                self.agent._emit_tool_end(callbacks, result, run_id)
-            
-            logger.info(f"WebTaskReflector: retry attempt {attempt} returned {len(str(result))} chars")
-            
-            # Recursively check if this result is acceptable
-            if self._is_result_acceptable(q, result):
-                return result
-            elif attempt < self.MAX_RETRIES:
-                # Try again
-                return self.reflect_and_retry(task, tool_name, result, tools, callbacks)
-            else:
-                return result
-        
-        except Exception as e:
-            logger.warning(f"WebTaskReflector: retry failed: {e}")
-            if callbacks and hasattr(self.agent, "_emit_tool_error"):
-                self.agent._emit_tool_error(callbacks, e, run_id)
-            return original_result
+        silent = bool(task.get("params", {}).get("silent"))
+        return self.agent._grounded_web_search(
+            q,
+            original_request=str(task.get("params", {}).get("original_request") or q),
+            callbacks=callbacks,
+            emit_tool_events=not silent,
+        )
     
     def reset(self):
         """Reset attempt counters."""
@@ -2134,15 +2045,16 @@ Return ONLY the JSON array, no explanation:
                 except Exception:
                     pass
             
-            # Apply reflection and retry for web search tasks (legacy fast-path)
-            if tool_name == "web_search":
-                result = self.web_reflector.reflect_and_retry(
-                    task, tool_name, result, tools, callbacks
-                )
+            # web_search already entered the canonical grounded-search owner
+            # above. Do not run the legacy reflector as a second orchestrator.
 
             # General reflection (v7.0.0): evaluate result quality
             engine = self.reflection_engine
-            if engine and engine.should_reflect(task, str(result), len(self.pending_tasks)):
+            if (
+                tool_name != "web_search"
+                and engine
+                and engine.should_reflect(task, str(result), len(self.pending_tasks))
+            ):
                 reflection = engine.reflect_on_step(
                     task, str(result), self._user_goal,
                     len(self.pending_tasks), self.pending_tasks,
@@ -2173,9 +2085,6 @@ Return ONLY the JSON array, no explanation:
                                 self.agent._emit_tool_error(callbacks, retry_exc, retry_run_id)
 
             outcome = retry_outcome if "retry_outcome" in locals() else initial_outcome
-            if tool_name == "web_search" and str(result or "") != str(outcome.output or ""):
-                # Deliberate legacy adapter for the read-only grounded-search reflector.
-                outcome = self.agent._normalize_tool_outcome(tool_name=tool_name, output=result)
             task["outcome"] = outcome.model_dump()
             task["status"] = "completed" if outcome.success else "failed"
             task["result"] = outcome.output if outcome.success else outcome.error_message
@@ -2862,56 +2771,6 @@ class LLMWrapper:
             return self.invoke(text)
 
 
-class ResearchLLMWrapper(LLMWrapper):
-    """Wrapper class for local research LLM provider (v8.0 dual-model feature)."""
-
-    def _create_llm(self) -> Any:
-        llm_config = config.research_model
-        model_name = llm_config.model_name
-        base_url = llm_config.base_url
-        temperature = llm_config.temperature
-        max_tokens = llm_config.max_tokens
-
-        if self.llm_type == ModelProvider.OLLAMA:
-            if ChatOllama is None:
-                raise ImportError("langchain-ollama is required for provider=ollama")
-            return ChatOllama(
-                model=model_name,
-                base_url=base_url,
-                temperature=temperature,
-                num_predict=max_tokens,
-                num_ctx=llm_config.context_length
-            )
-        elif self.llm_type in (ModelProvider.LM_STUDIO, ModelProvider.LOCALAI):
-            if ChatOpenAI is None:
-                raise ImportError("langchain-openai is required for provider=lmstudio/localai")
-            openai_compat_base = base_url or ""
-            if openai_compat_base.endswith("/v1"):
-                base = openai_compat_base
-            else:
-                base = f"{openai_compat_base}/v1" if openai_compat_base else ""
-            return ReasoningChatOpenAI(
-                model=model_name,
-                temperature=temperature,
-                base_url=base,
-                api_key="not-needed",
-                max_tokens=max_tokens,
-                streaming=True,
-            )
-        elif self.llm_type == ModelProvider.LLAMA_CPP:
-            if LlamaCpp is None:
-                raise ImportError("langchain-community + llama-cpp-python are required for provider=llama_cpp")
-            return LlamaCpp(
-                model_path=model_name,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                n_ctx=llm_config.context_length,
-                verbose=True
-            )
-        else:
-            raise ValueError(f"Unsupported LLM provider: {self.llm_type}")
-
-
 class Tool:
     """Simple tool wrapper."""
 
@@ -2992,14 +2851,9 @@ class EchoSpeakAgent:
         self.llm_wrapper = LLMWrapper(self.llm_provider)
         self._mode_llm_cache: Dict[str, Any] = {}
 
-        # Initialize local research model if enabled (v8.0 dual-model feature)
+        # A Session has one selected model. Research, coding, and chat change
+        # tools/evidence policy, not providers or model identity.
         self.research_llm_wrapper = None
-        if getattr(config.research_model, "enabled", False):
-            try:
-                self.research_llm_wrapper = ResearchLLMWrapper(config.research_model.provider)
-                logger.info("[Dual-Model] Initialized local research model: {}", config.research_model.model_name)
-            except Exception as exc:
-                logger.warning("[Dual-Model] Failed to initialize local research model: {}", exc)
         # Thread-pooled agents share the one canonical in-process memory owner;
         # per-agent vector-store snapshots could otherwise overwrite each other.
         self.memory = get_agent_memory(memory_path)
@@ -3085,6 +2939,7 @@ class EchoSpeakAgent:
         self._action_parser_enabled = bool(getattr(config, "action_parser_enabled", True))
         # v7.5.2: code-enforced coding lifecycle (inspect→…→summarize)
         self._coding_loop = None  # Optional[CodingLoop]
+        self._coding_ledger_id: Optional[str] = None
         # Track tool outputs so LangGraph fallback can preserve partial results
         self._partial_tool_results: List[Dict[str, Any]] = []
         self._partial_tool_names: Dict[str, str] = {}  # run_id → tool_name
@@ -3100,11 +2955,16 @@ class EchoSpeakAgent:
         self._router: Optional[IntentRouter] = None  # Set after tools are built
         # Populate the global tool registry from the legacy lists (migration bridge)
         ToolRegistry.register_from_metadata(get_available_tools(), TOOL_METADATA)
-        # Video domain tools (ToolRegistry self-register on import)
-        try:
-            import agent.video_editor.tools  # noqa: F401
-        except Exception as video_tools_exc:
-            logger.debug("Video tool registration skipped: {}", video_tools_exc)
+        # Domain tools self-register independently. One optional dependency must
+        # never prevent an unrelated domain from joining the canonical inventory.
+        for domain_module in (
+            "agent.voice_runtime",
+            "agent.generation_runtime",
+        ):
+            try:
+                __import__(domain_module)
+            except Exception as domain_tools_exc:
+                logger.debug("Domain tool registration skipped for {}: {}", domain_module, domain_tools_exc)
 
         # Load MCP dynamic tools via process-wide singleton (Trust Center + agent share state)
         self._mcp_manager = None
@@ -3180,63 +3040,15 @@ class EchoSpeakAgent:
         default_ws = getattr(config, "default_workspace", "").strip() or None
         self.configure_workspace(default_ws)
 
-        if not manage_background_services:
-            self._routine_manager = None
-            self._heartbeat_manager = None
-            self._proactive_engine = None
-            return
-
-        # Connect routine scheduler to the agent pipeline
-        try:
-            from agent.routines import get_routine_manager
-            self._routine_manager = get_routine_manager()
-            self._routine_manager.set_run_callback(self._execute_routine)
-            self._routine_manager.start_scheduler(interval_seconds=60)
-            logger.info("Routine scheduler connected to agent pipeline")
-        except Exception as e:
-            self._routine_manager = None
-            logger.warning(f"Failed to start routine scheduler: {e}")
+        # The API runtime coordinator is the sole scheduler/execution owner.
+        # Individual agents cannot start competing background callback loops.
+        self._routine_manager = None
 
         # Connect heartbeat scheduler (v5.4.0 — Proactive Mode)
         self._heartbeat_manager = None
-        if getattr(config, "heartbeat_enabled", False):
-            try:
-                from agent.heartbeat import HeartbeatManager, get_heartbeat_manager, set_heartbeat_manager
-                hb = get_heartbeat_manager()
-                if hb is None:
-                    hb = HeartbeatManager(agent=self)
-                    set_heartbeat_manager(hb)
-                else:
-                    hb.set_agent(self)
-                    hb.update_config(
-                        interval_minutes=getattr(config, "heartbeat_interval", 30),
-                        prompt=getattr(config, "heartbeat_prompt", ""),
-                        channels=list(getattr(config, "heartbeat_channels", ["web"])),
-                    )
-                self._heartbeat_manager = hb
-                if not hb.is_running:
-                    hb.start()
-                    logger.info("Heartbeat scheduler connected to agent pipeline")
-            except Exception as e:
-                logger.warning(f"Failed to start heartbeat scheduler: {e}")
 
         # Connect proactive engine (v6.1.0 — Autonomous Agent Mode)
         self._proactive_engine = None
-        try:
-            from agent.proactive import ProactiveEngine, get_proactive_engine, set_proactive_engine
-            pe = get_proactive_engine()
-            if pe is None:
-                pe = ProactiveEngine(agent=self)
-                pe.seed_default_tasks()
-                set_proactive_engine(pe)
-            else:
-                pe.set_agent(self)
-            self._proactive_engine = pe
-            if not pe.is_running:
-                pe.start()
-                logger.info("ProactiveEngine started with default autonomous tasks")
-        except Exception as e:
-            logger.warning(f"Failed to start proactive engine: {e}")
 
     def _load_soul(self) -> str:
         """
@@ -3261,9 +3073,10 @@ class EchoSpeakAgent:
         soul_path_str = getattr(soul_config, "path", "./SOUL.md")
         soul_path = Path(soul_path_str).expanduser()
         
-        # Resolve relative paths from backend directory
+        # Packaged desktop defaults must resolve to durable app data rather than
+        # PyInstaller's temporary extraction directory.
         if not soul_path.is_absolute():
-            backend_dir = Path(__file__).parent.parent
+            backend_dir = DATA_DIR if os.getenv("ECHOSPEAK_RUNTIME_KIND", "").strip().lower() == "desktop" else Path(__file__).parent.parent
             soul_path = backend_dir / soul_path
         
         # Check if file exists
@@ -3311,111 +3124,6 @@ class EchoSpeakAgent:
         except Exception as e:
             logger.warning(f"Failed to load SOUL.md: {e}")
             return ""
-
-    def _execute_routine(self, routine) -> None:
-        """Execute a routine by routing its action through the agent pipeline.
-
-        Called by the RoutineManager scheduler when a cron/webhook routine fires.
-        Output is routed to the routine's delivery_channels (discord, telegram, etc.).
-
-        Isolation rules:
-          - dedicated thread_id so chat subject/history is not polluted
-          - source=routine suppresses interactive stream callbacks
-          - snapshot/restore current_subject + last web context for the interactive agent
-        """
-        try:
-            action_type = getattr(routine, "action_type", "query")
-            action_config = getattr(routine, "action_config", {}) or {}
-            routine_name = getattr(routine, "name", "unknown")
-            routine_id = str(getattr(routine, "id", "") or routine_name).strip() or "anon"
-            delivery_channels = getattr(routine, "delivery_channels", None) or ["web"]
-            isolated_thread = f"routine_{routine_id}"
-
-            # Snapshot interactive continuity so a "daily news briefing" never
-            # overwrites the user's current subject after the lock is released.
-            snap_subject = str(getattr(self, "_current_subject_text", "") or "")
-            snap_web = str(getattr(self, "_last_web_query_context", "") or "")
-            snap_partial = list(getattr(self, "_partial_tool_results", []) or [])
-
-            response = None
-
-            try:
-                if action_type == "query":
-                    message = action_config.get("message", "").strip()
-                    if not message:
-                        logger.warning(f"Routine '{routine_name}' has no message configured")
-                        return
-                    logger.info(f"Routine '{routine_name}' firing query: {message[:80]}...")
-                    response, success = self.process_query(
-                        message,
-                        include_memory=False,
-                        source="routine",
-                        thread_id=isolated_thread,
-                        callbacks=[],
-                    )
-                    logger.info(
-                        f"Routine '{routine_name}' completed (success={success}): "
-                        f"{str(response)[:120]}..."
-                    )
-
-                elif action_type == "tool":
-                    tool_name = action_config.get("tool_name", "").strip()
-                    tool_args = action_config.get("args", {})
-                    if not tool_name:
-                        logger.warning(f"Routine '{routine_name}' has no tool_name configured")
-                        return
-                    synthetic_query = f"Run the {tool_name} tool"
-                    if tool_args:
-                        args_str = ", ".join(f"{k}={v}" for k, v in tool_args.items())
-                        synthetic_query += f" with {args_str}"
-                    logger.info(f"Routine '{routine_name}' firing tool: {tool_name}")
-                    response, _ = self.process_query(
-                        synthetic_query,
-                        include_memory=False,
-                        source="routine",
-                        thread_id=isolated_thread,
-                        callbacks=[],
-                    )
-
-                elif action_type == "skill":
-                    skill_name = action_config.get("skill_name", "").strip()
-                    message = action_config.get("message", "").strip()
-                    if message:
-                        logger.info(f"Routine '{routine_name}' firing skill '{skill_name}': {message[:80]}")
-                        response, _ = self.process_query(
-                            message,
-                            include_memory=False,
-                            source="routine",
-                            thread_id=isolated_thread,
-                            callbacks=[],
-                        )
-
-                else:
-                    logger.warning(f"Routine '{routine_name}' has unknown action_type: {action_type}")
-                    return
-            finally:
-                # Always restore interactive chat continuity
-                try:
-                    self._current_subject_text = snap_subject
-                    self._last_web_query_context = snap_web
-                    self._partial_tool_results = snap_partial
-                except Exception:
-                    pass
-
-            # Route the response to the routine's delivery channels
-            if response and str(response).strip():
-                try:
-                    from agent.heartbeat import route_message
-                    route_message(
-                        str(response).strip(),
-                        delivery_channels,
-                        label=f"Routine: {routine_name}",
-                    )
-                except Exception as route_exc:
-                    logger.warning(f"Routine '{routine_name}' routing failed: {route_exc}")
-
-        except Exception as e:
-            logger.error(f"Failed to execute routine '{getattr(routine, 'name', '?')}': {e}")
 
     def _get_active_project(self):
         """Get the currently active project, if any.
@@ -3603,13 +3311,6 @@ class EchoSpeakAgent:
             )
             if aw_block:
                 parts.append(aw_block)
-        except Exception:
-            pass
-        # Video editor structured context — only on video-relevant Turns.
-        try:
-            package = getattr(self, "_video_turn_package", None)
-            if package is not None and getattr(package, "active", False) and getattr(package, "context_prompt_block", ""):
-                parts.append(sanitize_untrusted_context(str(package.context_prompt_block)))
         except Exception:
             pass
         # Selective durable memory (not Session context; not all records).
@@ -4147,20 +3848,37 @@ class EchoSpeakAgent:
             continuation_context=f"User accepted offered action from {offer.get('origin_execution_id') or 'prior turn'}",
         )
 
+    def _resolution_model_adviser(self, request: Dict[str, Any]) -> str:
+        """One tool-free structured second opinion using the configured model."""
+        prompt = (
+            "You are Echo Resolution, a bounded advisory classifier. Return one JSON object only. "
+            "Do not call tools, reveal reasoning, grant permissions, change Project/Session, or claim success. "
+            "Use exactly these keys: recommended_mode, interpreted_objective, subject, project_id, "
+            "session_id, required_capabilities, recommended_skills, recommended_tools, operation_intent, "
+            "risk_level, ambiguities, missing_information, clarification, exclusions, confidence, "
+            "evidence_refs, recommendation. recommendation is proceed, clarify, or block. "
+            "recommended_mode is chat, task_research, or coding. Only recommend tools/skills from the "
+            "provided inventories. Input:\n"
+            + json.dumps(request, ensure_ascii=False, separators=(",", ":"), default=str)
+        )
+        raw = self.llm_wrapper.invoke(prompt)
+        text = str(getattr(raw, "content", raw) or "").strip()
+        fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
+        return fenced.group(1).strip() if fenced else text
+
     def _bind_turn_mode(self, user_input: str, source: Optional[str] = None) -> ModeDecision:
         # Classify this turn once and bind tool/model policy to the request.
         try:
             active_work = self._load_active_work()
         except Exception:
             active_work = None
-        durable_subject = ""
-        try:
-            session = self._session_memory.load(self._current_thread_id or "default")
-            durable_subject = str(getattr(session, "current_subject", "") or "").strip()
-            if durable_subject and not str(getattr(self, "_current_subject_text", "") or "").strip():
-                self._current_subject_text = durable_subject
-        except Exception:
-            pass
+        # ThreadSessionState is the sole continuity owner. SessionMemory may be
+        # selected later as typed context, but never restores or overrides scope.
+        durable_subject = str(
+            getattr(getattr(self, "_execution_context", None), "current_subject", "") or ""
+        ).strip()
+        if durable_subject and not str(getattr(self, "_current_subject_text", "") or "").strip():
+            self._current_subject_text = durable_subject
         decision = classify_turn_mode(user_input, source=source or getattr(self, "_current_source", "") or "web", active_work=active_work)
         # Resolve assistant-offered actions before other referential upgrades.
         try:
@@ -4213,10 +3931,9 @@ class EchoSpeakAgent:
                             if double_check
                             else "referential follow-up to research context"
                         ),
-                        model_provider=RESEARCH_MODEL[0],
-                        model_name=RESEARCH_MODEL[1],
                         verification_required=True,
                         evidence_required=True,
+                        required_capabilities=frozenset({"research"}),
                         user_text=(resolved_q or user_input)[:500],
                         objective=(resolved_q or anchor)[:500],
                         current_subject=(prev_subject or prior_claim)[:280],
@@ -4228,16 +3945,21 @@ class EchoSpeakAgent:
             except Exception:
                 active_relevant = False
         objective = ""
-        if decision.mode == TurnMode.CODING and active_relevant and decision.reason == "local project state inspection":
-            objective = str(getattr(active_work, "goal", "") or "").strip()
-        elif decision.mode == TurnMode.CODING and decision.intent_relation in {"continue", "confirm"}:
-            objective = str(getattr(active_work, "goal", "") or "").strip()
+        if decision.mode == TurnMode.CODING and (
+            (active_relevant and decision.reason == "local project state inspection")
+            or decision.intent_relation in {"continue", "confirm"}
+        ):
+            # ActiveWork is a coding projection, not objective authority. The
+            # Session-owned objective was written when the work was planned.
+            objective = str(
+                getattr(getattr(self, "_execution_context", None), "objective", "") or ""
+            ).strip()
         elif str(decision.reason or "") == "accept_offered_action":
             objective = str(decision.objective or decision.user_text or "").strip()[:500]
         if not objective and decision.mode != TurnMode.CHAT:
             objective = str(decision.user_text or "").strip()[:500]
         active_project_path = (
-            str(getattr(active_work, "project_path", "") or "").strip()
+            str(getattr(getattr(self, "_execution_context", None), "project_path", "") or "").strip()
             if decision.mode == TurnMode.CODING and active_relevant
             else ""
         )
@@ -4275,13 +3997,10 @@ class EchoSpeakAgent:
             decision = self._bind_research_tool_inventory(user_input, decision)
         except Exception as research_bind_exc:
             logger.debug("Research inventory bind failed: {}", research_bind_exc)
-        # Video tools/context only on video-relevant Turns (not a separate runtime).
         try:
-            decision = self._bind_video_turn_to_decision(user_input, decision)
-            allowed = decision.allowed_tool_names
-        except Exception as video_bind_exc:
-            logger.debug("Video turn bind failed: {}", video_bind_exc)
-            self._video_turn_package = None
+            decision = self._bind_pending_confirmation_inventory(decision)
+        except Exception as confirmation_bind_exc:
+            logger.debug("Pending confirmation inventory bind failed closed: {}", confirmation_bind_exc)
         profile = execution_profile_for(decision)
         self._current_mode_decision = decision
         self._current_mode_profile = profile
@@ -4298,6 +4017,59 @@ class EchoSpeakAgent:
         except Exception:
             pass
         return decision
+
+    def _bind_pending_confirmation_inventory(self, decision: ModeDecision) -> ModeDecision:
+        """Expose only the exact currently executable tool for a confirm Turn.
+
+        The ApprovalRecord does not grant authority. It identifies the candidate
+        action whose tool must be re-derived from the current registry, role,
+        constraints, configuration, Session, and Project attachment. Full stable
+        identity and source-version checks still run at the consumption boundary.
+        """
+        if decision.intent_relation != "confirm":
+            return decision
+        pending = dict(getattr(self, "_pending_action", None) or {})
+        approval_id = str(pending.get("approval_id") or "").strip()
+        if not approval_id:
+            return decision
+        approval = self._state_store.get_approval(approval_id)
+        current = self._execution_context
+        if approval is None or str(approval.status or "") != "pending":
+            return decision
+        if str(pending.get("action_id") or "") != str(approval.action_id or ""):
+            return decision
+        if str(pending.get("plan_id") or "") != str(approval.plan_id or ""):
+            return decision
+        if str(approval.thread_id or "") != str(current.thread_id or ""):
+            return decision
+        if str(approval.session_id or "") != str(current.session_id or current.thread_id or ""):
+            return decision
+        if str(approval.project_id or "") != str(current.active_project_id or ""):
+            return decision
+        if str(approval.active_project_id or "") != str(current.active_project_id or ""):
+            return decision
+        tool_name = str(approval.tool or "").strip()
+        if not tool_name or tool_name != str(pending.get("tool") or "").strip():
+            return decision
+        if ToolRegistry.get(tool_name) is None or tool_name not in self._registered_tool_names():
+            return decision
+        required_inventory = {tool_name}
+        if tool_name == "file_write":
+            # Successful mutation claims require an exact post-write read. This
+            # is a verification dependency, not a second approved mutation.
+            required_inventory.add("file_read")
+        for required_name in required_inventory:
+            if ToolRegistry.get(required_name) is None or required_name not in self._registered_tool_names():
+                return decision
+            if not self._tool_available_in_current_context(required_name, respect_turn_mode=False):
+                return decision
+            if not self._constraints_allow_tool(required_name, approved=required_name == tool_name):
+                return decision
+        if self._is_action_tool(tool_name) and not self._action_configured(tool_name):
+            return decision
+        return decision.with_allowed_tools(
+            set(decision.allowed_tool_names or frozenset()) | required_inventory
+        )
 
     def _bind_research_tool_inventory(self, user_input: str, decision: ModeDecision) -> ModeDecision:
         """For public research Turns, prefer web_search over unrelated specialized tools.
@@ -4352,7 +4124,12 @@ class EchoSpeakAgent:
         if want_browse:
             core.add("browse_task")
 
-        available = set(decision.allowed_tool_names or frozenset()) or set(self._all_lc_tool_names())
+        available = set(decision.allowed_tool_names or frozenset())
+        if not available and mode_val not in {"task_research", "research"}:
+            # A chat turn with an explicit research phrase may be upgraded to a
+            # minimal research capability, but an empty turn inventory must
+            # never expand to the complete registry.
+            available = set(self._all_lc_tool_names()) & core
         filtered = available & core
         # Always keep web_search when present in registry for public research.
         if "web_search" in available:
@@ -4361,324 +4138,87 @@ class EchoSpeakAgent:
             return decision
         return decision.with_allowed_tools(filtered)
 
-    def _bind_video_turn_to_decision(self, user_input: str, decision: ModeDecision) -> ModeDecision:
-        """Attach video tools/context only when Session has a video document or intent.
-
-        Non-video Turns must not receive video_* tools or video prompt material.
-        Does not create a separate video runtime or chat endpoint.
-        """
-        from agent.video_editor.chat_integration import (
-            build_video_turn_package,
-            filter_tools_for_turn,
-            is_video_edit_intent,
-        )
+    def _materialize_general_skill_executions(self, user_input: str) -> None:
+        """Bind selected skills to this Turn and canonical ToolRuns."""
+        execution_id = str(getattr(self, "_current_execution_id", "") or "")
+        if not execution_id:
+            return
+        from agent.skill_contract import SkillExecutionStatus
+        from agent.skill_execution import activate_skill_execution, create_skill_execution, update_skill_execution
+        from agent.skill_selection import select_composition
         from agent.skills_registry import SkillsRegistry
 
-        thread_id = str(getattr(self, "_current_thread_id", "") or "default")
-        project_id = ""
-        try:
-            state = getattr(self, "_execution_context", None) or self._state_store.get_thread_state(thread_id)
-            project_id = str(getattr(state, "active_project_id", "") or "").strip()
-            self._execution_context = state
-        except Exception:
-            state = None
-
-        # Always strip video tools unless this Turn is video-relevant.
-        base_tools = set(decision.allowed_tool_names or self._all_lc_tool_names())
-        intent = is_video_edit_intent(user_input)
-        has_project = bool(project_id)
-
-        if not intent and not has_project:
-            filtered = filter_tools_for_turn(base_tools, video_turn=False)
-            self._video_turn_package = None
-            return decision.with_allowed_tools(filtered)
-
-        # Load canonical manifests (package + bridged video skills).
-        try:
-            SkillsRegistry.refresh()
-            manifests = SkillsRegistry.list_manifests()
-        except Exception:
-            manifests = []
-
-        prior_skill = ""
-        try:
-            from agent.skill_execution import list_skill_executions_for_session
-
-            for rec in list_skill_executions_for_session(thread_id, limit=8):
-                if rec.status.value in {"planned", "running", "pending_approval", "partial", "blocked"}:
-                    prior_skill = rec.skill_id
-                    break
-        except Exception:
-            prior_skill = ""
-
-        # Optional client binding: active document + structured selection/revision.
-        binding = dict(getattr(self, "_video_turn_binding", None) or {})
-        bound_doc = str(binding.get("document_id") or "").strip()
-        bound_selection = None
-        try:
-            raw_sel = binding.get("selection")
-            if isinstance(raw_sel, dict) and raw_sel:
-                from agent.video_editor.models import EditorSelectionContext
-
-                bound_selection = EditorSelectionContext.model_validate(raw_sel)
-        except Exception:
-            bound_selection = None
-
-        package = build_video_turn_package(
-            session_id=thread_id,
-            project_id=project_id,
-            user_text=user_input,
-            document_id=bound_doc,
-            selection=bound_selection,
-            thread_state=state,
-            config=config,
-            skill_manifests=manifests,
-            prior_unfinished_skill_id=prior_skill,
-        )
-        self._video_turn_package = package
-
-        if not package.active:
-            filtered = filter_tools_for_turn(base_tools, video_turn=False)
-            return decision.with_allowed_tools(filtered)
-
-        # Video-relevant Turn: keep full inventory including video tools.
-        filtered = filter_tools_for_turn(base_tools | set(package.allowed_video_tools), video_turn=True)
-        caps = set(decision.required_capabilities or frozenset())
-        caps.add("video_editor")
-        updated = decision.with_allowed_tools(filtered)
-        try:
-            from dataclasses import replace as _replace
-
-            updated = _replace(
-                updated,
-                required_capabilities=frozenset(caps),
-                objective=str(decision.objective or user_input)[:500],
-            )
-        except Exception:
-            pass
-
-        # Persist skill selection identity for this Turn when a skill was chosen.
-        try:
-            sel = package.skill_selection
-            if sel is not None and sel.skill_id and sel.outcome.value == "selected":
-                from agent.skill_execution import create_skill_execution
-                from agent.skill_contract import SkillExecutionStatus
-
-                exec_id = str(getattr(self, "_current_execution_id", "") or "")
-                if exec_id:
-                    create_skill_execution(
-                        execution_id=exec_id,
-                        skill_id=sel.skill_id,
-                        skill_version=sel.skill_version or "1.0.0",
-                        project_id=project_id,
-                        session_id=thread_id,
-                        turn_id=exec_id,
-                        input_context_identity={
-                            "document_id": package.document_id,
-                            "document_revision": (
-                                package.context.document_revision if package.context else None
-                            ),
-                            "selection_outcome": sel.outcome.value,
-                        },
-                        status=SkillExecutionStatus.PLANNED,
-                    )
-        except Exception as exc:
-            logger.debug("Skill execution record create failed: {}", exc)
-
-        # Ensure video_editor package skill prompt is available this Turn.
-        try:
-            self._ensure_video_skill_prompt_active()
-        except Exception:
-            pass
-
-        # Mark deterministic direct-tool eligibility for pre-LLM routing.
-        try:
-            from agent.video_editor.deterministic_ops import is_deterministic_video_intent
-            from dataclasses import replace as _pkg_replace
-
-            if is_deterministic_video_intent(user_input):
-                package = _pkg_replace(package, direct_tool="video_propose_operations")
-                self._video_turn_package = package
-        except Exception:
-            pass
-        return updated
-
-    def _try_deterministic_video_proposal(self, user_input: str) -> Optional[tuple]:
-        """Proposal-only direct routing when args are fully structured (no model tool call).
-
-        Never applies mutations. Returns (response, success) when handled, else None.
-        """
-        package = getattr(self, "_video_turn_package", None)
-        if package is None or not getattr(package, "active", False):
-            return None
-        if str(getattr(package, "direct_tool", "") or "") != "video_propose_operations":
-            return None
-        try:
-            from agent.video_editor.deterministic_ops import build_deterministic_operations
-            from agent.video_editor.models import EditOperation
-            from api.video_editor import ProposalRequest, propose_video_transaction_sync
-        except Exception:
-            return None
-
-        ctx = getattr(package, "context", None)
-        if ctx is None:
-            return None
-        selection = getattr(ctx, "selection", None)
-        clip_ids = list(getattr(selection, "selected_clip_ids", None) or []) if selection else []
-        playhead = getattr(selection, "playhead", None) if selection else None
-        ticks = str(getattr(playhead, "ticks", "") or "") if playhead is not None else ""
-        rev = int(getattr(ctx, "document_revision", 0) or 0)
-        built = build_deterministic_operations(
-            user_text=user_input,
-            document_revision=rev,
-            selected_clip_ids=clip_ids,
-            playhead_ticks=ticks,
-        )
-        if not built.get("ok"):
-            # Fail closed with honest reason — do not invent a proposal.
-            code = str(built.get("error_code") or "validation_failed")
-            reason = str(built.get("reason") or "Cannot derive exact video operation")
-            if code == "missing_selection":
-                response_text = (
-                    "I need a selected clip before I can propose that edit. "
-                    "Select a clip in the Video editor and try again."
-                )
-            elif code == "missing_playhead":
-                response_text = (
-                    "I need the playhead position to split the clip. "
-                    "Position the playhead on the selected clip and try again."
-                )
-            elif code == "not_deterministic":
-                return None  # let model / skill path handle creative work
-            else:
-                response_text = f"I cannot propose that edit yet ({reason})."
-            self._last_tts_text = self._clamp_tts_text(response_text)
-            self._record_turn(user_input, response_text)
-            return response_text, False
-
-        ops = []
-        try:
-            for raw in built.get("operations") or []:
-                ops.append(EditOperation.model_validate(raw))
-        except Exception as exc:
-            response_text = f"Could not build a valid video operation: {exc}"
-            self._last_tts_text = self._clamp_tts_text(response_text)
-            self._record_turn(user_input, response_text)
-            return response_text, False
-
-        session_id = str(package.session_id or self._thread_key())
-        project_id = str(package.project_id or "").strip()
-        if not project_id:
-            try:
-                st = self._state_store.get_thread_state(session_id)
-                project_id = str(getattr(st, "active_project_id", "") or "").strip()
-            except Exception:
-                project_id = ""
-        if not project_id:
-            response_text = (
-                "I cannot propose a video edit because no Project is attached to this Session. "
-                "Attach a Project and try again."
-            )
-            self._last_tts_text = self._clamp_tts_text(response_text)
-            self._record_turn(user_input, response_text)
-            return response_text, False
-
-        # One pending video/coding approval at a time — do not overwrite silently.
-        try:
-            st = self._state_store.get_thread_state(session_id)
-            existing_id = str(getattr(st, "pending_approval_id", "") or "").strip()
-            if existing_id:
-                existing = self._state_store.get_approval(existing_id)
-                if existing is not None and str(getattr(existing, "status", "") or "") == "pending":
-                    response_text = (
-                        f"There is already a pending approval for {existing.tool} "
-                        f"(approval {existing_id[:8]}…). "
-                        "Confirm or cancel it before proposing another video change. "
-                        "Nothing new was proposed."
-                    )
-                    self._last_tts_text = self._clamp_tts_text(response_text)
-                    self._record_turn(user_input, response_text)
-                    return response_text, False
-        except Exception:
-            pass
-
-        # Re-assert Session↔Project binding before proposal (kills stale detach races).
-        try:
-            self._state_store.update_thread_state(
-                session_id,
-                active_project_id=project_id,
-            )
-        except Exception:
-            pass
-
-        try:
-            proposed = propose_video_transaction_sync(
-                str(package.document_id or getattr(ctx, "document_id", "") or ""),
-                ProposalRequest(
-                    session_id=session_id,
-                    project_id=project_id,
-                    objective=str(user_input or "")[:500],
-                    operations=ops,
-                ),
-            )
-        except Exception as exc:
-            msg = str(exc)
-            if "pending approval" in msg.lower():
-                response_text = (
-                    "There is already a pending approval in this Session. "
-                    "Confirm or cancel it before proposing another video change. "
-                    "Nothing new was proposed."
-                )
-            elif "not attached" in msg.lower() or "project" in msg.lower() and "session" in msg.lower():
-                response_text = (
-                    f"I could not create a video proposal (stale Project binding: {msg}). "
-                    "Nothing was applied to the timeline."
-                )
-            else:
-                response_text = (
-                    f"I could not create a video proposal ({msg}). "
-                    "Nothing was applied to the timeline."
-                )
-            self._last_tts_text = self._clamp_tts_text(response_text)
-            self._record_turn(user_input, response_text)
-            return response_text, False
-
-        approval = proposed.get("approval") or {}
-        aid = str(approval.get("id") or "")
-        n_ops = len(ops)
-        response_text = (
-            f"I prepared a proposal for {n_ops} video operation(s) "
-            f"(deterministic route: {built.get('reason')}). "
-            f"Nothing has been applied yet. "
-            f"Approve the pending action to commit a new revision"
-            + (f" (approval {aid[:8]}…)." if aid else ".")
-        )
-        self._last_tts_text = self._clamp_tts_text(response_text)
-        self._record_turn(user_input, response_text)
-        self._add_pipeline_reasoning(
-            "🎬 Deterministic video proposal",
-            f"Mapped intent → video_propose_operations without model tool call. "
-            f"Approval required. tool_run={proposed.get('tool_run_id')}",
-        )
-        return response_text, True
-
-    def _ensure_video_skill_prompt_active(self) -> None:
-        """Load video_editor package skill into active skill defs for this process Turn."""
-        skills_dir = Path(getattr(config, "skills_dir", "") or "").expanduser()
-        skills = load_skills(skills_dir)
-        video_pkg = skills.get("video_editor")
-        if video_pkg is None:
+        mode = str(getattr(getattr(self, "_current_mode_decision", None), "mode", "") or "")
+        if hasattr(getattr(self, "_current_mode_decision", None), "mode"):
+            mode = str(getattr(self._current_mode_decision.mode, "value", self._current_mode_decision.mode) or "")
+        SkillsRegistry.refresh()
+        manifests = SkillsRegistry.executable_manifests(mode=mode)
+        if not manifests:
             return
-        active = list(getattr(self, "_active_skill_defs", []) or [])
-        if any(getattr(s, "id", "") == "video_editor" for s in active):
+        state = self._state_store.get_thread_state(self._thread_key())
+        allowed = set(state.allowed_tool_names or [])
+        capabilities = set(state.available_capabilities or []) | set(state.required_capabilities or [])
+        permission_snapshot = dict(state.permissions or {})
+        permissions = {
+            token for key, granted in permission_snapshot.items() if granted
+            for token in (str(key), str(key).lower())
+        }
+        selections = [
+            item for item in select_composition(
+                user_text=user_input,
+                manifests=manifests,
+                available_tools=allowed,
+                available_capabilities=capabilities,
+                available_artifacts=set(),
+                permissions=permissions,
+            )[:4]
+            if item.skill_id and item.outcome.value == "selected"
+        ]
+        if not selections:
             return
-        active.append(video_pkg)
-        self._active_skill_defs = active
-        # Rebuild skills prompt fragment only (full compose happens later).
-        try:
-            self._skills_prompt = build_skills_prompt(active)
-        except Exception:
-            pass
+        primary, *children = selections
+        parent = create_skill_execution(
+            execution_id=execution_id,
+            turn_id=execution_id,
+            session_id=self._thread_key(),
+            project_id=str(state.active_project_id or ""),
+            skill_id=primary.skill_id,
+            skill_version=primary.skill_version or "1.0.0",
+            child_skill_ids=[item.skill_id for item in children],
+            input_context_identity={"objective": str(state.objective or user_input)[:500], "mode": mode},
+            status=SkillExecutionStatus.SELECTED,
+        )
+        activate_skill_execution(
+            parent.id,
+            state_store=self._state_store,
+            allowed_tool_names=allowed,
+            available_capabilities=capabilities,
+            permissions=permissions,
+        )
+        child_ids = []
+        for selection in children:
+            child = create_skill_execution(
+                execution_id=execution_id,
+                turn_id=execution_id,
+                session_id=self._thread_key(),
+                project_id=str(state.active_project_id or ""),
+                skill_id=selection.skill_id,
+                skill_version=selection.skill_version or "1.0.0",
+                parent_execution_id=execution_id,
+                parent_skill_execution_id=parent.id,
+                input_context_identity={"objective": str(state.objective or user_input)[:500], "mode": mode, "composition": True},
+                status=SkillExecutionStatus.SELECTED,
+            )
+            activate_skill_execution(
+                child.id,
+                state_store=self._state_store,
+                allowed_tool_names=allowed,
+                available_capabilities=capabilities,
+                permissions=permissions,
+            )
+            child_ids.append(child.id)
+        if child_ids:
+            update_skill_execution(parent.id, child_execution_ids=child_ids)
 
     def _ensure_active_work_plan_for_mode(self, user_input: str) -> None:
         # Persist coding intent before any scaffold/write path can run.
@@ -4799,7 +4339,7 @@ class EchoSpeakAgent:
             return True
         # This gate is shared with the filesystem allocator. The model/router may
         # be wrong; an information request must still never promote into coding.
-        if is_information_request(text):
+        if is_information_request(text) and not self._is_software_game_coding_context(text):
             return False
 
         # ── Negative gate: information-seeking queries are NEVER coding intent ──
@@ -4839,7 +4379,7 @@ class EchoSpeakAgent:
             r"standings|playoffs?|odds|betting|fifa|nba|nfl|nhl|mlb|"
             r"premier\s+league|champions\s+league|world\s+cup)\b",
             low,
-        ) and not re.search(r"\b(build|create|scaffold|code)\s+", low):
+        ) and not re.search(r"\b(build|create|scaffold|code)\s+", low) and not self._is_software_game_coding_context(text):
             return False
 
         if self._is_local_filesystem_intent(user_input):
@@ -4852,6 +4392,11 @@ class EchoSpeakAgent:
         # structural: the noun can be any app/game/prototype/engine/site/tool form.
         if re.search(r"\b(build|create|scaffold|develop|code|make|write)\b", low) and re.search(
             r"\b(app|application|site|website|game|tool|dashboard|program|script|api|bot|prototype|project|tracker|editor|manager|engine|simulator|simulation|adventure|html|css|javascript|python)\b",
+            low,
+        ):
+            return True
+        if self._is_software_game_coding_context(text) and re.search(
+            r"\b(?:add|implement|change|update|fix|make|remove|work on)\b",
             low,
         ):
             return True
@@ -5202,6 +4747,27 @@ class EchoSpeakAgent:
             return result
 
         pinned = self._try_pin_desktop_project_from_user(user_input)
+        # A Session-bound Project is the authoritative current workspace. When
+        # the user asks to inspect/work on it without naming another Desktop
+        # folder, scan that root instead of falling back to Desktop heuristics.
+        if not pinned and not is_explicit_new_project_request(user_input):
+            try:
+                from agent.projects import get_project_manager
+
+                state = self._state_store.get_thread_state(self._thread_key())
+                project_id = str(state.active_project_id or "").strip()
+                project = get_project_manager().get_project(project_id) if project_id else None
+                authoritative_root = str(getattr(project, "workspace_root", "") or "").strip()
+                session_root = str(state.project_path or state.workspace_root or "").strip()
+                if (
+                    authoritative_root
+                    and session_root
+                    and Path(authoritative_root).resolve() == Path(session_root).resolve()
+                    and Path(authoritative_root).is_dir()
+                ):
+                    pinned = authoritative_root
+            except Exception as exc:
+                logger.debug("Bound Project scan lookup failed: {}", exc)
         # If pin failed or only Desktop was listed earlier, list Desktop then re-match
         if not pinned:
             try:
@@ -6189,6 +5755,33 @@ class EchoSpeakAgent:
         bound_project = str(getattr(getattr(self, "_current_mode_decision", None), "active_project_path", "") or "").strip()
         if is_new_product and bound_project:
             return str(Path(bound_project).resolve())
+
+        # An explicit reference to the Session-bound Project name outranks a
+        # fuzzy Desktop folder match. Validate the Session projection against
+        # ProjectManager before using it so a stale path cannot gain authority.
+        if not is_new_product:
+            try:
+                from agent.projects import get_project_manager
+
+                state = self._state_store.get_thread_state(self._thread_key())
+                project_id = str(state.active_project_id or "").strip()
+                project = get_project_manager().get_project(project_id) if project_id else None
+                project_root = str(getattr(project, "workspace_root", "") or "").strip()
+                session_root = str(state.project_path or state.workspace_root or "").strip()
+                project_name = str(getattr(project, "name", "") or Path(project_root).name).strip().lower()
+                normalized_name = re.sub(r"[-_\s]+", "-", project_name).strip("-")
+                normalized_input = re.sub(r"[-_\s]+", "-", low).strip("-")
+                if (
+                    project_root
+                    and session_root
+                    and normalized_name
+                    and normalized_name in normalized_input
+                    and Path(project_root).resolve() == Path(session_root).resolve()
+                    and Path(project_root).is_dir()
+                ):
+                    return str(Path(project_root).resolve())
+            except Exception as exc:
+                logger.debug("Bound Project path resolution failed: {}", exc)
 
         # 1) Resume active work when relevance gate passes (before fuzzy pin)
         try:
@@ -7399,6 +6992,31 @@ class EchoSpeakAgent:
         except Exception as exc:
             logger.debug("coding_loop unavailable: {}", exc)
             return
+
+        # ThreadSessionState projects the current Session binding, while
+        # ProjectManager owns Project identity and root. ActiveWork, callback
+        # text, and last-used paths are context only and cannot grant scope.
+        state = self._state_store.get_thread_state(self._thread_key())
+        project_id = str(state.active_project_id or "").strip()
+        if not project_id:
+            return
+        try:
+            from agent.projects import get_project_manager
+
+            project = get_project_manager().get_project(project_id)
+        except Exception as exc:
+            logger.debug("coding Project lookup failed: {}", exc)
+            return
+        folder = str(getattr(project, "workspace_root", "") or "").strip()
+        if not folder:
+            return
+        try:
+            if state.project_path and Path(state.project_path).resolve(strict=False) != Path(folder).resolve(strict=False):
+                logger.warning("Coding scope rejected: Session root does not match ProjectManager")
+                return
+        except (OSError, ValueError):
+            return
+
         loop = getattr(self, "_coding_loop", None)
         terminal = False
         if loop is not None:
@@ -7407,32 +7025,6 @@ class EchoSpeakAgent:
             except Exception:
                 terminal = False
         if loop is None or terminal:
-            folder = ""
-            # Prefer durable active-work / last Desktop pin over EchoSpeak-root labels
-            try:
-                aw = self._load_active_work()
-                if aw and getattr(aw, "project_path", ""):
-                    folder = str(aw.project_path)
-            except Exception:
-                pass
-            if not folder:
-                folder = str(getattr(self, "_last_local_project_path", "") or "").strip()
-            if not folder:
-                try:
-                    from agent.tools import get_active_project_root
-
-                    rootp = get_active_project_root()
-                    if rootp is not None:
-                        folder = str(rootp)
-                except Exception:
-                    pass
-            if not folder:
-                folder = str(getattr(self._execution_context, "project_path", "") or "").strip()
-            if not folder:
-                # A coding classification does not itself allocate or attach a
-                # folder. Explicit creation is provisioned earlier by the
-                # authoritative Session/ActiveWork binding.
-                return
             self._coding_loop = CodingLoop(project_folder=folder)
             try:
                 self._coding_loop.start(project_folder=folder, note="coding turn start")
@@ -7443,6 +7035,30 @@ class EchoSpeakAgent:
                 loop.start(note="coding turn resume")
             except Exception:
                 pass
+
+        objective = str(
+            state.objective
+            or getattr(decision, "objective", "")
+            or user_input
+            or "Continue the active coding objective"
+        ).strip()
+        try:
+            from agent.coding_ledger import get_coding_ledger_store
+
+            ledger = get_coding_ledger_store().start_or_resume(
+                session_id=str(state.session_id or state.thread_id or self._thread_key()),
+                project_id=project_id,
+                project_root=folder,
+                objective=objective,
+                constraints=list(state.constraints or []),
+            )
+            self._coding_ledger_id = ledger.id
+        except Exception as exc:
+            # Corrupt authoritative state fails closed in CodingLedgerStore.
+            # Never continue an engineering objective only in process memory.
+            self._coding_loop = None
+            self._coding_ledger_id = None
+            logger.error("Durable coding ledger unavailable: {}", exc)
 
     def _coding_loop_note_tool(
         self,
@@ -7528,16 +7144,61 @@ class EchoSpeakAgent:
         except Exception as exc:
             logger.debug("coding_loop note_tool: {}", exc)
 
+        ledger_id = str(getattr(self, "_coding_ledger_id", "") or "").strip()
+        if ledger_id:
+            try:
+                from agent.coding_ledger import CodingEvidence, get_coding_ledger_store
+
+                reference_id = ""
+                boundary = getattr(self, "_last_boundary_outcome", None)
+                if boundary is not None:
+                    reference_id = str(getattr(boundary, "tool_run_id", "") or "")
+                summary = f"{name} observed"
+                if term_status:
+                    summary += f" ({term_status})"
+                get_coding_ledger_store().append_evidence(
+                    ledger_id,
+                    CodingEvidence(
+                        kind="tool_run",
+                        summary=summary,
+                        reference_id=reference_id,
+                        path=path,
+                        status=term_status or ("pending" if pending_write else "observed"),
+                    ),
+                )
+            except Exception as exc:
+                logger.error("Coding ledger evidence write failed: {}", exc)
+
     def get_coding_loop_state(self) -> Dict[str, Any]:
         loop = getattr(self, "_coding_loop", None)
+        durable: Dict[str, Any] = {}
+        ledger_id = str(getattr(self, "_coding_ledger_id", "") or "").strip()
+        if ledger_id:
+            try:
+                from agent.coding_ledger import get_coding_ledger_store
+
+                ledger = get_coding_ledger_store().get(ledger_id)
+                if ledger is not None:
+                    durable = {
+                        "id": ledger.id,
+                        "session_id": ledger.session_id,
+                        "project_id": ledger.project_id,
+                        "objective": ledger.objective,
+                        "status": ledger.status,
+                        "revision": ledger.revision,
+                        "updated_at": ledger.updated_at,
+                    }
+            except Exception:
+                durable = {}
         if loop is None:
-            return {"active": False, "phase": "idle"}
+            return {"active": False, "phase": "idle", "ledger": durable}
         try:
             d = loop.as_dict()
             d["active"] = True
+            d["ledger"] = durable
             return d
         except Exception:
-            return {"active": False, "phase": "idle"}
+            return {"active": False, "phase": "idle", "ledger": durable}
 
     def _is_capability_question_text(self, query_lower: str) -> bool:
         q = (query_lower or "").strip().lower()
@@ -8683,15 +8344,6 @@ class EchoSpeakAgent:
             "notepad_write",
         }
         if name in project_tools:
-            return True
-        # Video tools are only available when the current Turn bound a video package.
-        if str(name).startswith("video_"):
-            package = getattr(self, "_video_turn_package", None)
-            if package is None or not getattr(package, "active", False):
-                return False
-            allowed_video = set(getattr(package, "allowed_video_tools", None) or [])
-            if allowed_video and name not in allowed_video:
-                return False
             return True
         allowlist = self._tool_allowlist_override
         if allowlist is None:
@@ -11560,53 +11212,10 @@ class EchoSpeakAgent:
             logger.warning(f"Failed to wrap web_search with StructuredTool: {exc}")
             return original
 
-    def _emit_research_model_ack(self, callbacks: Optional[list] = None) -> None:
-        """Surface swap-on-demand research routing before a slow model hop."""
-        if getattr(self, "_research_model_ack_sent", False):
-            return
-        self._research_model_ack_sent = True
-        msg = "Switching to the research model for a deeper evidence pass; this may take a moment."
-        try:
-            self.record_turn_partial_beat(msg)
-        except Exception:
-            pass
-        try:
-            self._push_stream_event(
-                {
-                    "type": "thinking",
-                    "content": msg,
-                    "at": time.time(),
-                    "request_id": getattr(self, "_current_request_id", None),
-                }
-            )
-        except Exception:
-            pass
-        try:
-            if callbacks:
-                for cb in callbacks:
-                    if hasattr(cb, "on_text"):
-                        cb.on_text(msg)
-        except Exception:
-            pass
-
     def _select_research_lane_llm(self, user_text: str, callbacks: Optional[list] = None):
-        """Deterministically route only genuine deep-research turns to the research model."""
-        primary = getattr(self, "llm_wrapper", None)
-        research = getattr(self, "research_llm_wrapper", None)
-        try:
-            from agent.research import is_deep_research_intent
-
-            deep = is_deep_research_intent(user_text)
-        except Exception:
-            deep = False
-        if deep and getattr(config.research_model, "enabled", False) and research is not None:
-            self._last_model_route = "research"
-            strategy = str(getattr(config.research_model, "load_strategy", "swap") or "swap").lower()
-            if strategy not in {"resident", "keep_loaded", "always_loaded"}:
-                self._emit_research_model_ack(callbacks)
-            return research
-        self._last_model_route = "primary"
-        return primary or research
+        """Return the one model selected for this Session and Turn."""
+        self._last_model_route = "session"
+        return getattr(self, "llm_wrapper", None)
 
     def _grounded_web_search(
         self,
@@ -11663,6 +11272,24 @@ class EchoSpeakAgent:
                     f"Listing:\n{listing[:3000]}\n"
                     f"Samples:\n{samples[:4000]}"
                 ).strip()
+
+        # Classify every research request through the provider-neutral live
+        # contract. A missing structured provider is explicit and falls back
+        # to targeted browsing; it never fabricates a structured result.
+        try:
+            from agent.live_retrieval import LiveRetrievalRequest, LiveRetrievalRouter
+
+            live_route = LiveRetrievalRouter().route(
+                LiveRetrievalRequest(
+                    query=hay or raw_q,
+                    project_id=str(getattr(self._execution_context, "active_project_id", "") or ""),
+                    session_id=self._thread_key(),
+                )
+            )
+            self._last_live_retrieval_route = live_route.model_dump(mode="json")
+        except Exception as live_route_exc:
+            logger.debug("Live retrieval classification unavailable: {}", live_route_exc)
+            self._last_live_retrieval_route = {}
 
         # --- Anti-loop: same turn must not re-run near-identical searches ---
         # Live: 3× identical "FIFA match list… today" rows from Stage3 + reflector + keep-trying.
@@ -11767,6 +11394,15 @@ class EchoSpeakAgent:
                     client = get_sports_data_client()
                     live = client.query(sports_src or raw_q)
                     if live.ok:
+                        try:
+                            from agent.live_retrieval import structured_sports_result
+
+                            self._last_structured_live_result = structured_sports_result(
+                                live,
+                                query=sports_src or raw_q,
+                            ).model_dump(mode="json")
+                        except Exception as structured_exc:
+                            logger.debug("Sports common-result projection failed: {}", structured_exc)
                         packet = live.as_tool_text()
                         # When LC already owns a web_search ToolRun, do NOT emit a second
                         # sports_live row — return packet so the outer tool_end is the
@@ -12270,27 +11906,6 @@ class EchoSpeakAgent:
                 callbacks=callbacks,
                 emit_tool_events=emit_tool_events,
             )
-            # Reflector retries are silent — never add extra Search done rows
-            if apply_reflection and hasattr(self, "_task_planner"):
-                try:
-                    retry_task = {
-                        "index": f"ground:{uuid.uuid4()}",
-                        "tool": "web_search",
-                        "params": {
-                            "q": final_query,
-                            "original_request": orig or query_text,
-                            "silent": True,
-                        },
-                    }
-                    tool_output = self._task_planner.web_reflector.reflect_and_retry(
-                        retry_task,
-                        "web_search",
-                        str(tool_output or ""),
-                        self.tools,
-                        callbacks,
-                    )
-                except Exception as exc:
-                    logger.debug("Grounded WebTaskReflector skipped: {}", exc)
             chosen = final_query
             last = getattr(self, "_last_grounded_search_result", None) or {}
             if isinstance(last, dict) and last.get("chosen_query"):
@@ -13112,12 +12727,20 @@ class EchoSpeakAgent:
             if matched_name and self._tool_allowed(matched_name):
                 return frozenset({matched_name})
 
-        # Default fallback for reasoning models: 
-        # If the input is not a simple conversational phrase (e.g. "hey", "bye"), 
-        # expose the FULL allowed toolset. This lets the model use its native 
-        # reasoning to select the best tools (like using system_info or web_search 
-        # to determine location or writing a file autonomously).
-        return all_tool_names
+        # A missing pre-bound decision must still fail to the deterministic mode
+        # controller. Never interpret "unrecognized" as authority to expose the
+        # whole registry; that recreated the empty-Chat => full-inventory bypass.
+        try:
+            fallback_decision = classify_turn_mode(
+                text,
+                source=getattr(self, "_current_source", "") or "web",
+                active_work=self._load_active_work(),
+            )
+            fallback_allowed = allowed_tools_for_mode(fallback_decision, all_tool_names)
+            return self._filter_tool_names_for_current_context(fallback_allowed)
+        except Exception as exc:
+            logger.debug("Mode fallback tool selection failed closed: {}", exc)
+            return frozenset()
 
     def _extract_user_request_text(self, text: str) -> str:
         """Extract the actual user request from Discord bot wrapped inputs.
@@ -13511,7 +13134,13 @@ class EchoSpeakAgent:
         if self.document_store is None:
             return "", []
         try:
-            return self.document_store.query(query, k=4)
+            execution_context = getattr(self, "_execution_context", None)
+            return self.document_store.query(
+                query,
+                k=4,
+                project_id=str(getattr(execution_context, "active_project_id", "") or ""),
+                session_id=str(getattr(execution_context, "thread_id", "") or self._thread_key()),
+            )
         except Exception as exc:
             logger.warning(f"Document RAG query failed: {exc}")
             return "", []
@@ -13834,7 +13463,15 @@ class EchoSpeakAgent:
             except Exception as exc:
                 logger.debug("Memory curator reflection failed: {}", exc)
 
-        if getattr(config, "memory_extraction_async", True):
+        # Explicitly durable identity/relationship signals must be available to
+        # the immediately following turn. Lower-confidence reflection remains
+        # asynchronous when configured.
+        strong_durable_signal = False
+        try:
+            strong_durable_signal = bool(self.memory.importance_should_save(user_input))
+        except Exception:
+            strong_durable_signal = False
+        if getattr(config, "memory_extraction_async", True) and not strong_durable_signal:
             import threading
             threading.Thread(target=_do_extract, daemon=True).start()
         else:
@@ -13960,10 +13597,14 @@ class EchoSpeakAgent:
             self._record_turn(original_input, response_text)
             return response_text, False
 
+        if not approval_id or self._state_store.claim_pending_approval(approval_id) is None:
+            response_text = "Action was not run because its approval was already consumed or is no longer pending."
+            self._pending_action = None
+            self._last_tts_text = self._clamp_tts_text(response_text)
+            self._record_turn(original_input, response_text)
+            return response_text, False
         self._pending_action = None
-        if approval_id:
-            self._state_store.update_approval(approval_id, status="auto_approved", outcome_summary="Auto-approved by source policy")
-        self._active_approved_action = pending
+        self._active_approved_action = decision_action
 
         run_id = str(uuid.uuid4())
         self._emit_tool_start(callbacks, tool.name, original_input, run_id)
@@ -13998,6 +13639,16 @@ class EchoSpeakAgent:
             success = True
         finally:
             self._active_approved_action = None
+
+        self._state_store.update_approval(
+            approval_id,
+            status="auto_approved" if success else "failed",
+            outcome_summary=(
+                "Auto-approved by current source policy and executed successfully"
+                if success
+                else response_text
+            ),
+        )
 
         self._last_tts_text = self._clamp_tts_text(response_text)
         self._record_turn(original_input, response_text)
@@ -14225,18 +13876,27 @@ class EchoSpeakAgent:
                 return str(output)
         return ""
 
-    def _history_as_messages(self) -> list:
+    def _history_as_messages(self, *, max_messages: int = 24, max_tokens: int = 4096) -> list:
+        """Return a bounded recent working set; durable summaries remain separate."""
         msgs: list = []
-        for item in self.conversation_memory.messages:
+        used_tokens = 0
+        rows = list(self.conversation_memory.messages)[-max(1, int(max_messages or 1)) :]
+        for item in reversed(rows):
             role = (item.get("role") or "").lower()
             content = item.get("content") or ""
             if not content:
                 continue
+            token_count = estimate_tokens(str(content))
+            if msgs and used_tokens + token_count > max(128, int(max_tokens or 0)):
+                break
             if role in ("human", "user"):
                 msgs.append(HumanMessage(content=content))
             elif role in ("ai", "assistant"):
                 msgs.append(AIMessage(content=content))
-        return msgs
+            else:
+                continue
+            used_tokens += token_count
+        return list(reversed(msgs))
 
     def _history_as_text(self, messages: list, max_messages: int = 8) -> str:
         lines: list[str] = []
@@ -14280,7 +13940,6 @@ class EchoSpeakAgent:
         # File system — can leak secrets (.env, credentials, code)
         "file_read", "file_list", "file_write", "file_move", "file_copy",
         "file_delete", "file_mkdir", "artifact_write",
-        "video_apply_transaction",
         # Terminal — arbitrary code execution
         "terminal_run",
         # System info — reveals host details
@@ -14307,7 +13966,6 @@ class EchoSpeakAgent:
         "terminal_run",
         # Self-modification — only owner should touch code
         "self_edit", "self_rollback",
-        "video_apply_transaction",
         # Desktop/screen — controls owner's machine
         "desktop_click", "desktop_type_text", "desktop_activate_window",
         "desktop_send_hotkey", "open_chrome", "open_application", "notepad_write",
@@ -14365,7 +14023,7 @@ class EchoSpeakAgent:
                 record = self._state_store.get_approval(approval_id)
                 accepted = {"approved", "auto_approved"}
                 if bool(action.get("_decision_authorized")):
-                    accepted.add("pending")
+                    accepted.update({"pending", "consuming"})
                 if record is None or record.status not in accepted:
                     return False
             except Exception:
@@ -14374,7 +14032,11 @@ class EchoSpeakAgent:
 
     def _constraints_allow_tool(self, tool_name: str, *, approved: bool = False) -> bool:
         constraints = "\n".join(str(item or "").lower() for item in (getattr(self._execution_context, "constraints", []) or []))
-        write_tools = {"file_write", "file_move", "file_copy", "file_delete", "file_mkdir", "artifact_write", "notepad_write", "terminal_run"}
+        write_tools = {
+            "file_write", "file_move", "file_copy", "file_delete", "file_mkdir",
+            "artifact_write", "notepad_write", "terminal_run",
+            "voice_synthesize_speech", "generation_submit",
+        }
         if tool_name in write_tools and any(
             token in constraints
             for token in ("read_only", "read-only", "do not modify", "don't modify", "no_modify", "proposal_only", "proposal only")
@@ -14535,7 +14197,8 @@ class EchoSpeakAgent:
             "whatsapp": bool(getattr(config, "allow_whatsapp", False)),
             "discord_bot": bool(getattr(config, "allow_discord_bot", False)),
             "self_modification": bool(getattr(config, "allow_self_modification", False)),
-            "video_agent_edits": bool(getattr(config, "allow_video_agent_edits", False)),
+            "voice_actions": bool(getattr(config, "allow_voice_actions", False)),
+            "generation_actions": bool(getattr(config, "allow_generation_actions", False)),
         }
 
     def project_scope_report(self, thread_id: Optional[str] = None) -> dict[str, Any]:
@@ -15039,7 +14702,7 @@ class EchoSpeakAgent:
         approval = self._state_store.get_approval(approval_id) if approval_id else None
         accepted_statuses = {"pending"}
         if bool(pending.get("_decision_authorized")):
-            accepted_statuses.update({"approved", "auto_approved"})
+            accepted_statuses.update({"consuming", "approved", "auto_approved"})
         if approval is None or approval.status not in accepted_statuses:
             return False
         if str(pending.get("action_id") or "") != str(approval.action_id or ""):
@@ -15231,10 +14894,9 @@ class EchoSpeakAgent:
     def _restore_execution_context(self, thread_id: Optional[str]) -> ThreadSessionState:
         key = self._thread_key(thread_id)
         state = self._state_store.get_thread_state(key)
-        session = self._session_memory.load(key)
         project_path = str(state.project_path or "").strip()
         objective = str(state.objective or "").strip()
-        subject = str(state.current_subject or getattr(session, "current_subject", "") or "").strip()
+        subject = str(state.current_subject or "").strip()
         workspace_root = str(state.workspace_root or project_path or "").strip()
         pending = self._state_store.get_pending_approval(key)
         return self._state_store.update_thread_state(
@@ -15262,9 +14924,9 @@ class EchoSpeakAgent:
                 respect_turn_mode=False,
             )
         )
-        # Do not re-add a tool merely because an ApprovalRecord exists. The
-        # confirmation Turn must independently expose it through the freshly
-        # calculated executable inventory.
+        # _bind_pending_confirmation_inventory may contribute only the exact
+        # pending tool after independently re-deriving it from current registry,
+        # role, constraints, configuration, Session, and Project identity.
         project_path = str(decision.active_project_path or context.project_path or "").strip()
         workspace_root = str(project_path or context.workspace_root or "").strip()
         pending_actions = list(context.pending_actions or [])
@@ -15516,6 +15178,19 @@ class EchoSpeakAgent:
             success_value = False
             success = False
             status = "failed"
+
+        # SkillExecution is a projection over canonical child ToolRuns. Finalize
+        # wrappers before the generic open-ToolRun gate sees their parent rows.
+        try:
+            from agent.skill_execution import finalize_skill_executions_for_turn
+
+            finalize_skill_executions_for_turn(
+                execution_id,
+                state_store=self._state_store,
+                turn_success=bool(success),
+            )
+        except Exception as exc:
+            logger.debug("SkillExecution finalization failed: {}", exc)
 
         # ToolRun terminal + verification gate (do not mark complete from pipeline prose alone).
         # Close any leftover wrapper/outer ToolRuns so a successful search cannot
@@ -15841,7 +15516,7 @@ class EchoSpeakAgent:
             pass
         # Preserve durable pending approvals (coding/video). finalize used to always
         # pass clear_pending_approval="" for non-pending_approval status, which wiped
-        # video_apply_transaction / file_write approvals created mid-Turn and made
+        # File-write approvals created mid-Turn and made
         # confirm return 409 "stale or is not the current pending action".
         durable_pending_id = ""
         try:
@@ -17565,6 +17240,13 @@ class EchoSpeakAgent:
             finished = self._state_store.finish_tool_run(rid, outcome)
         else:
             finished = None
+        if finished is not None:
+            try:
+                from agent.skill_execution import record_skill_tool_outcome
+
+                record_skill_tool_outcome(self._state_store, finished)
+            except Exception as exc:
+                logger.debug("SkillExecution child ToolRun linkage failed: {}", exc)
         # Research artifact handoff: durable cited record for skills (not prose alone).
         try:
             if (
@@ -17595,8 +17277,10 @@ class EchoSpeakAgent:
                     execution_id=str(getattr(finished, "turn_id", "") or ""),
                     tool_run_id=str(getattr(finished, "id", "") or ""),
                     objective=str(getattr(getattr(self, "_current_mode_decision", None), "objective", "") or query),
+                    model_provider=str(self.llm_provider.value),
+                    model_id=str(getattr(getattr(self, "_active_model_profile", None), "model_id", "") or self.provider_info.get("model") or "default"),
                 )
-                if art.status == "ready":
+                if art.status == "ready" and art.project_id and art.session_id:
                     save_research_artifact(art)
                     try:
                         self._state_store.add_item(
@@ -17609,8 +17293,8 @@ class EchoSpeakAgent:
                         )
                     except Exception:
                         pass
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Research artifact handoff failed: {}", exc)
         # Always clear FIFO registration for this exact id after terminal attempt.
         if rid:
             self._dequeue_tool_run(rid, outcome.tool_name)
@@ -17894,6 +17578,18 @@ class EchoSpeakAgent:
             cached_read = dict(self._request_read_cache.get(cache_key) or {}) or None
 
         mutation_precondition: Dict[str, Any] = {}
+        try:
+            from agent.tools import update_tool_execution_context
+
+            update_tool_execution_context(
+                approval_id=(
+                    str(active_action.get("approval_id") or "")
+                    if isinstance(active_action, dict)
+                    else ""
+                )
+            )
+        except Exception:
+            pass
         if name in {
             "file_write", "file_delete", "file_move", "file_copy", "file_mkdir",
             "artifact_write", "notepad_write", "checkpoint_undo",
@@ -18505,14 +18201,8 @@ class EchoSpeakAgent:
         return str(text or "").strip()
 
     def _visible_llm_wrapper_for_mode(self):
-        decision = getattr(self, "_current_mode_decision", None)
-        if decision is None:
-            return self.llm_wrapper
-        if decision.mode == TurnMode.TASK_RESEARCH and getattr(self, "research_llm_wrapper", None) is not None:
-            return self.research_llm_wrapper
-        # Never silently replace the user-selected model for ordinary chat.
-        # Provider/model switches are explicit runtime events and must match the
-        # model snapshot stored on the Turn.
+        # Provider/model switches are explicit runtime events. Every mode uses
+        # the exact model snapshot stored on the Turn.
         return self.llm_wrapper
 
     def _invoke_visible_llm(self, prompt: str) -> str:
@@ -20126,9 +19816,12 @@ class EchoSpeakAgent:
                     )
                     if approval_id:
                         self._state_store.update_approval(approval_id, status="blocked", outcome_summary=response_text)
+                elif not approval_id or self._state_store.claim_pending_approval(approval_id) is None:
+                    response_text = (
+                        "The pending action was not run because its exact approval was already consumed "
+                        "or is no longer the Session's pending approval."
+                    )
                 else:
-                    if approval_id:
-                        self._state_store.update_approval(approval_id, status="approved", outcome_summary="Approved by user")
                     self._active_approved_action = decision_action
                     run_id = str(uuid.uuid4())
                     tool_input = str(kwargs.get("path") or kwargs.get("src") or kwargs.get("command") or pending.get("original_input") or "")
@@ -20336,6 +20029,16 @@ class EchoSpeakAgent:
                     finally:
                         self._active_approved_action = None
 
+                    self._state_store.update_approval(
+                        approval_id,
+                        status="approved" if action_success else "failed",
+                        outcome_summary=(
+                            "Approved by user and executed successfully"
+                            if action_success
+                            else response_text
+                        ),
+                    )
+
                 self._last_tts_text = self._clamp_tts_text(response_text)
                 if approved_execution_id and approved_execution_id != str(self._current_execution_id or ""):
                     self._state_store.update_execution(
@@ -20430,19 +20133,9 @@ class EchoSpeakAgent:
             self._record_turn(user_input, response_text)
             return response_text, True
 
-        # Deterministic video proposal (structured selection + exact op only).
-        # Runs before the model so prose-only local models still get a real
-        # ApprovalRecord when the action is fully governed.
-        try:
-            det = self._try_deterministic_video_proposal(user_input)
-            if det is not None:
-                return det
-        except Exception as det_exc:
-            logger.debug("Deterministic video proposal skipped: {}", det_exc)
-
         # Memory confirmation / rejection for ask_confirmation candidates.
         # Never intercept when a Session already has a pending tool ApprovalRecord
-        # (coding/video "confirm" must apply that mutation, not a stale memory prompt).
+        # (coding "confirm" must apply that mutation, not a stale memory prompt).
         try:
             from agent.memory_curator import MemoryCurator
 
@@ -20459,7 +20152,11 @@ class EchoSpeakAgent:
             ):
                 if MemoryCurator.is_memory_confirm(query_stripped) and is_owner_request:
                     confirmed = _curator_probe.confirm_pending(
-                        _mem_session, mode=self._memory_mode_default()
+                        _mem_session,
+                        mode=self._memory_mode_default(),
+                        current_project_path=str(
+                            getattr(self._execution_context, "project_path", "") or ""
+                        ),
                     )
                     if confirmed.persisted_ids:
                         for mid, ack in zip(confirmed.persisted_ids, confirmed.acknowledgements):
@@ -20667,7 +20364,7 @@ class EchoSpeakAgent:
                     },
                     session_id=self._thread_key(), project_id=str(getattr(execution, "project_id", "") or ""),
                 )
-                response_text = f"Saved to your account memory: {normalized}"
+                response_text = f"Remembered in your account memory: {normalized}"
             else:
                 self._state_store.add_item(
                     turn_id=str(self._current_execution_id or ""), item_type="memory_write", status="failed",
@@ -20963,7 +20660,11 @@ class EchoSpeakAgent:
                     for task in remaining[:6] if isinstance(task, dict)
                 ]
             )
-        chat_history = self._history_as_messages() if include_memory else []
+        history_limit = min(
+            4096,
+            max(768, int(getattr(getattr(self, "_active_model_profile", None), "context_limit", 32768) or 32768) // 8),
+        )
+        chat_history = self._history_as_messages(max_messages=24, max_tokens=history_limit) if include_memory else []
         graph_thread_id = thread_id if include_memory else None
         allowed_tool_names = self._allowed_lc_tool_names(resolved_input or extracted_input)
         # Stash for post-Stage4 guards (_ensure_live_web_search must honor allowlist)
@@ -21054,7 +20755,78 @@ class EchoSpeakAgent:
             ]
             overhead_tokens = estimate_tokens(self._compose_system_prompt()) + estimate_tokens(context_query) + 256
             manager = self._make_context_budget_manager()
-            context, budget_report = manager.fit_blocks(blocks, overhead_tokens=overhead_tokens)
+            source_types = {
+                "time": "current_turn",
+                "thread_scope": "session_state",
+                "active_work": "pending_work",
+                "continuity": "session_state",
+                "decisions": "session_state",
+                "pending_action": "approval",
+                "active_task_plan": "pending_work",
+                "unfinished_workflow": "pending_work",
+                "profile": "memory",
+                "pinned": "memory",
+                "session": "conversation_summary",
+                "ledger": "tool_outcome",
+                "actions": "tool_outcome",
+                "summary": "conversation_summary",
+                "docs": "document",
+                "memory": "memory",
+            }
+            authoritative = {"thread_scope", "decisions", "pending_action", "ledger", "actions"}
+            project_scoped = {"active_work", "ledger", "docs"}
+            typed_candidates = [
+                ContextItem(
+                    id=f"{self._current_execution_id or 'turn'}:{block.name}",
+                    source_type=source_types.get(block.name, "resource"),
+                    source_id=block.name,
+                    text=str(block.text or ""),
+                    project_id=str(execution_context.active_project_id or "") if block.name in project_scoped else "",
+                    session_id=str(execution_context.thread_id or self._thread_key(thread_id)),
+                    turn_id=str(self._current_execution_id or ""),
+                    scope=("project" if block.name in project_scoped else "session"),
+                    lifetime="turn",
+                    lifecycle=("pending" if block.name in {"pending_action", "active_task_plan", "unfinished_workflow"} else "active"),
+                    trust=(
+                        "authoritative" if block.name in authoritative
+                        else "model" if block.name in {"summary", "session"}
+                        else "untrusted" if block.name in {"docs", "memory"}
+                        else "user"
+                    ),
+                    verified=block.name in {"ledger", "actions", "thread_scope"},
+                    importance=max(0.0, min(1.0, 1.0 - (block.priority - 1) / 10.0)),
+                    confidence=1.0 if block.name in authoritative else 0.7,
+                    relevance=1.0 if block.name in {"continuity", "pending_action", "active_task_plan"} else 0.7,
+                    token_estimate=estimate_tokens(str(block.text or "")),
+                    provenance={"owner": "StateStore" if block.name in authoritative else block.name},
+                )
+                for block in blocks
+                if str(block.text or "").strip()
+            ]
+            typed_budget = manager.injectable_tokens - overhead_tokens
+            if typed_budget <= 0:
+                typed_budget = sum(item.token_estimate for item in typed_candidates)
+            selection = ContextAssembler(
+                project_id=str(execution_context.active_project_id or ""),
+                session_id=str(execution_context.thread_id or self._thread_key(thread_id)),
+                turn_id=str(self._current_execution_id or ""),
+            ).select(typed_candidates, token_budget=typed_budget)
+            selected_names = {item.source_id for item in selection.selected}
+            selected_text = {item.source_id: item.text for item in selection.selected}
+            selected_blocks = [
+                ContextBlock(
+                    name=block.name,
+                    text=selected_text.get(block.name, block.text),
+                    priority=block.priority,
+                    header=block.header,
+                    min_chars=block.min_chars,
+                    protected=block.protected,
+                )
+                for block in blocks
+                if block.name in selected_names
+            ]
+            self._last_typed_context_manifest = selection.redacted_manifest()
+            context, budget_report = manager.fit_blocks(selected_blocks, overhead_tokens=overhead_tokens)
             try:
                 self._last_context_budget_report = asdict(budget_report)
             except Exception:
@@ -21074,6 +20846,7 @@ class EchoSpeakAgent:
             "chat_messages": len(chat_history or []),
             "selected_tools": sorted(allowed_tool_names or []),
             "budget": dict(getattr(self, "_last_context_budget_report", {}) or {}),
+            "typed_selection": dict(getattr(self, "_last_typed_context_manifest", {}) or {}),
             "content_omitted": True,
         }
         return ContextBundle(
@@ -22563,7 +22336,6 @@ class EchoSpeakAgent:
         self._request_read_cache: Dict[str, Dict[str, Any]] = {}
         self._request_mutation_generation: int = 0
         self._last_compiled_context_manifest: Dict[str, Any] = {}
-        self._research_model_ack_sent = False
         self._consuming_offered_action = None
         from agent.model_runtime import resolve_model_profile
         active_model_id = str(self.provider_info.get("model") or "default")
@@ -22615,6 +22387,56 @@ class EchoSpeakAgent:
             "project_root": self._execution_context.project_path,
         })
         mode_decision = self._bind_turn_mode(user_input, source)
+        mode_decision = replace(
+            mode_decision,
+            model_provider=self.llm_provider.value,
+            model_name=active_model_id,
+        )
+        self._current_mode_decision = mode_decision
+        # One pure advisory pass may question an ambiguous/risky deterministic
+        # classification. It cannot execute, persist, approve, or expand scope.
+        try:
+            from agent.skills_registry import SkillsRegistry
+
+            resolution_tools = set(mode_decision.allowed_tool_names or frozenset()) & set(ToolRegistry.get_names())
+            resolution_skills = {
+                item.id
+                for item in SkillsRegistry.list_manifests(include_disabled=False)
+                if item.executable and str(getattr(item.status, "value", item.status)) in {"built_in", "installed"}
+            }
+
+            resolution = EchoResolutionEngine().resolve(
+                user_text=user_input,
+                mode_decision=mode_decision,
+                project_id=str(self._execution_context.active_project_id or ""),
+                session_id=self._thread_key(thread_id),
+                available_tools=resolution_tools,
+                available_skills=resolution_skills,
+                pending_action=bool(self._pending_action),
+                adviser=(
+                    self._resolution_model_adviser
+                    if bool(getattr(config, "echo_resolution_enabled", True))
+                    else None
+                ),
+            )
+            self._last_resolution_projection = resolution.redacted_projection()
+            if resolution.advice and resolution.advice.recommendation in {
+                ResolutionRecommendation.CLARIFY,
+                ResolutionRecommendation.BLOCK,
+            }:
+                mode_decision = replace(
+                    mode_decision,
+                    ambiguous=True,
+                    reason=f"echo_resolution:{resolution.advice.recommendation.value}",
+                )
+                self._current_mode_decision = mode_decision
+        except Exception as exc:
+            logger.debug(f"Echo Resolution advisory unavailable: {exc}")
+            self._last_resolution_projection = {
+                "ran": False,
+                "parse_error": str(exc)[:240],
+                "raw_response_omitted": True,
+            }
         self._supersede_stale_pending_action(mode_decision)
         self._ensure_active_work_plan_for_mode(user_input)
         mode_decision = self._current_mode_decision or mode_decision
@@ -22731,6 +22553,7 @@ class EchoSpeakAgent:
             metadata={
                 "include_memory": bool(include_memory),
                 "mode": mode_decision.as_dict() if mode_decision is not None else None,
+                "echo_resolution": dict(getattr(self, "_last_resolution_projection", {}) or {}),
             },
         )
         self._current_execution_id = execution.id
@@ -22809,6 +22632,10 @@ class EchoSpeakAgent:
         if mode_decision.mode == TurnMode.TASK_RESEARCH and current_ws in {"", "auto", "default", "none", "clear"}:
             self.configure_workspace("research")
         self._bind_execution_context(mode_decision)
+        try:
+            self._materialize_general_skill_executions(user_input)
+        except Exception as exc:
+            logger.debug("SkillExecution materialization failed: {}", exc)
 
         # Immediately push an initial 'Thinking...' event so the UI chat list is responsive
         self._push_stream_event(

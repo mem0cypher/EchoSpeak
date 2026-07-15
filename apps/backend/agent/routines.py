@@ -8,6 +8,7 @@ import json
 import uuid
 import threading
 import time
+import shutil
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Callable
 from pathlib import Path
@@ -21,6 +22,15 @@ except Exception:
 
 
 ROUTINES_DIR = Path(__file__).parent.parent / "routines"
+
+
+def _default_routines_dir() -> Path:
+    """Keep browser storage compatible while desktop follows its owned data root."""
+    if os.getenv("ECHOSPEAK_RUNTIME_KIND", "").strip().lower() == "desktop":
+        from config import DATA_DIR
+
+        return Path(DATA_DIR) / "routines"
+    return ROUTINES_DIR
 
 
 class Routine(BaseModel):
@@ -41,18 +51,24 @@ class Routine(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     metadata: Dict[str, Any] = Field(default_factory=dict)
     delivery_channels: List[str] = Field(default_factory=lambda: ["web"])  # discord, telegram, email, whatsapp, web
+    project_id: str = ""
+    session_id: str = ""
+    missed_run_policy: str = "run_next"
+    last_task_id: str = ""
+    last_result_status: str = ""
+    last_error: str = ""
 
 
 class RoutineManager:
     """Manages routine storage, scheduling, and execution."""
     
     def __init__(self, routines_dir: Optional[Path] = None):
-        self.routines_dir = routines_dir or ROUTINES_DIR
+        self.routines_dir = routines_dir or _default_routines_dir()
         self.routines_dir.mkdir(parents=True, exist_ok=True)
         self._cache: Dict[str, Routine] = {}
         self._scheduler_thread: Optional[threading.Thread] = None
         self._scheduler_stop = threading.Event()
-        self._on_run: Optional[Callable[[Routine], None]] = None
+        self._on_run: Optional[Callable[[Routine], Any]] = None
         self._load_all()
     
     def _routine_path(self, routine_id: str) -> Path:
@@ -67,9 +83,33 @@ class RoutineManager:
                     routine = Routine(**data)
                     self._cache[routine.id] = routine
                 except Exception as e:
-                    logger.warning(f"Failed to load routine {file}: {e}")
+                    self._fail_corrupt_routine(file, e)
         except Exception as e:
-            logger.error(f"Failed to load routines: {e}")
+            if isinstance(e, RuntimeError):
+                raise
+            raise RuntimeError(f"Failed to load Routines from {self.routines_dir}: {e}") from e
+
+    def _fail_corrupt_routine(self, path: Path, error: Exception) -> None:
+        quarantine = self.routines_dir / "corrupt-state" / f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        note = "quarantine copy could not be created"
+        try:
+            quarantine.mkdir(parents=True, exist_ok=False)
+            copy = quarantine / path.name
+            shutil.copy2(path, copy)
+            guide = quarantine / "RECOVERY.txt"
+            guide.write_text(
+                "EchoSpeak Routine recovery\n\n"
+                f"Authoritative file: {path}\nQuarantine copy: {copy}\nError: {error}\n\n"
+                "Keep EchoSpeak stopped, repair or restore the authoritative JSON, then restart. "
+                "The original file was not changed.\n",
+                encoding="utf-8",
+            )
+            note = f"quarantine copy: {copy}; recovery guide: {guide}"
+        except Exception as quarantine_error:
+            note = f"quarantine failed: {quarantine_error}"
+        raise RuntimeError(
+            f"Routine registry is unreadable at {path}; the authoritative file was not overwritten; {note}. ({error})"
+        ) from error
     
     def list_routines(self, enabled_only: bool = False) -> List[Routine]:
         """List all routines."""
@@ -100,6 +140,10 @@ class RoutineManager:
         description: Optional[str] = "",
         enabled: bool = True,
         metadata: Optional[Dict[str, Any]] = None,
+        delivery_channels: Optional[List[str]] = None,
+        project_id: str = "",
+        session_id: str = "",
+        missed_run_policy: str = "run_next",
     ) -> Routine:
         """Create a new routine."""
         routine = Routine(
@@ -112,6 +156,10 @@ class RoutineManager:
             action_type=action_type,
             action_config=action_config or {},
             metadata=metadata or {},
+            delivery_channels=list(delivery_channels or ["web"]),
+            project_id=str(project_id or ""),
+            session_id=str(session_id or ""),
+            missed_run_policy=str(missed_run_policy or "run_next"),
         )
         
         # Calculate next run time for scheduled routines
@@ -139,6 +187,10 @@ class RoutineManager:
         action_type: Optional[str] = None,
         action_config: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        delivery_channels: Optional[List[str]] = None,
+        project_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        missed_run_policy: Optional[str] = None,
     ) -> Optional[Routine]:
         """Update an existing routine."""
         routine = self._cache.get(routine_id)
@@ -163,6 +215,14 @@ class RoutineManager:
             routine.action_config = action_config
         if metadata is not None:
             routine.metadata = metadata
+        if delivery_channels is not None:
+            routine.delivery_channels = list(delivery_channels)
+        if project_id is not None:
+            routine.project_id = str(project_id)
+        if session_id is not None:
+            routine.session_id = str(session_id)
+        if missed_run_policy is not None:
+            routine.missed_run_policy = str(missed_run_policy)
         
         routine.updated_at = datetime.now(timezone.utc).isoformat()
         
@@ -195,7 +255,7 @@ class RoutineManager:
             logger.error(f"Failed to delete routine {routine_id}: {e}")
             return False
     
-    def mark_run(self, routine_id: str) -> None:
+    def mark_run(self, routine_id: str, *, success: bool, task_id: str = "", error: str = "") -> None:
         """Mark a routine as run, updating last_run and next_run."""
         routine = self._cache.get(routine_id)
         if not routine:
@@ -204,6 +264,10 @@ class RoutineManager:
         now = datetime.now(timezone.utc)
         routine.last_run = now.isoformat()
         routine.run_count += 1
+        routine.last_task_id = str(task_id or "")
+        routine.last_result_status = "complete" if success else "failed"
+        routine.last_error = str(error or "")[:1000]
+        routine.updated_at = now.isoformat()
         
         if routine.trigger_type == "schedule" and routine.schedule and croniter:
             try:
@@ -218,15 +282,17 @@ class RoutineManager:
         """Save routine to disk."""
         file_path = self._routine_path(routine.id)
         try:
-            file_path.write_text(
-                routine.model_dump_json(indent=2),
-                encoding="utf-8"
-            )
+            temp = file_path.with_suffix(f".tmp.{os.getpid()}.{time.time_ns()}")
+            with temp.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(routine.model_dump_json(indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, file_path)
         except Exception as e:
             logger.error(f"Failed to save routine {routine.id}: {e}")
             raise
     
-    def set_run_callback(self, callback: Callable[[Routine], None]) -> None:
+    def set_run_callback(self, callback: Callable[[Routine], Any]) -> None:
         """Set callback for routine execution."""
         self._on_run = callback
     
@@ -272,10 +338,17 @@ class RoutineManager:
                 next_run = datetime.fromisoformat(routine.next_run.replace("Z", "+00:00"))
                 if next_run <= now:
                     logger.info(f"Running scheduled routine: {routine.name}")
-                    self._on_run(routine)
-                    self.mark_run(routine.id)
+                    result = self._on_run(routine)
+                    success = isinstance(result, dict) and bool(result.get("success", False))
+                    self.mark_run(
+                        routine.id,
+                        success=success,
+                        task_id=str(result.get("task_id") or "") if isinstance(result, dict) else "",
+                        error=str(result.get("error") or "") if isinstance(result, dict) else "",
+                    )
             except Exception as e:
                 logger.error(f"Error checking routine {routine.id}: {e}")
+                self.mark_run(routine.id, success=False, error=str(e))
     
     def run_routine(self, routine_id: str) -> bool:
         """Manually run a routine."""
@@ -283,19 +356,29 @@ class RoutineManager:
         if not routine:
             return False
         
-        # Execute callback if set, otherwise just log the action
+        # A Routine is a trigger/configuration owner, never an execution owner.
+        # Without the API coordinator callback there is no canonical Task/Turn.
         if self._on_run:
             try:
-                self._on_run(routine)
+                result = self._on_run(routine)
             except Exception as e:
                 logger.error(f"Failed to run routine {routine_id}: {e}")
+                self.mark_run(routine_id, success=False, error=str(e))
                 return False
         else:
-            # No callback set - log the action that would have been taken
-            logger.info(f"Routine '{routine.name}' triggered (no callback set): action_type={routine.action_type}, config={routine.action_config}")
+            error = "Routine coordinator is unavailable; no Product Task or Turn was created"
+            logger.warning(f"Routine '{routine.name}' blocked: {error}")
+            self.mark_run(routine_id, success=False, error=error)
+            return False
         
-        self.mark_run(routine_id)
-        return True
+        success = isinstance(result, dict) and bool(result.get("success", False))
+        self.mark_run(
+            routine_id,
+            success=success,
+            task_id=str(result.get("task_id") or "") if self._on_run and isinstance(result, dict) else "",
+            error=str(result.get("error") or "") if self._on_run and isinstance(result, dict) else "",
+        )
+        return success
 
 
 # Global routine manager instance

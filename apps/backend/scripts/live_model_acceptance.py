@@ -130,9 +130,6 @@ class LiveModelHarness:
         self.model = ""
         self.thread_id = ""
         self.project_id = ""
-        self.video_doc_id = ""
-        self.video_rev = 0
-        self.clip_id = ""
         self._consecutive_http0 = 0
         self._backend_dead = False
 
@@ -186,128 +183,9 @@ class LiveModelHarness:
                 timeout=20,
             )
 
-        # Video document for video scenarios
-        code, doc = http_json(
-            "POST",
-            f"{self.base}/video/documents",
-            {
-                "session_id": self.thread_id,
-                "project_id": self.project_id,
-                "name": "LLM Live Cut",
-            },
-            timeout=30,
-        )
-        self.video_doc_id = str((doc or {}).get("id") or "")
-        self.video_rev = int((doc or {}).get("revision") or 0)
-        if self.video_doc_id:
-            # seed track
-            http_json(
-                "POST",
-                f"{self.base}/video/documents/{self.video_doc_id}/transactions",
-                {
-                    "session_id": self.thread_id,
-                    "project_id": self.project_id,
-                    "operations": [
-                        {
-                            "operation_type": "add_track",
-                            "expected_revision": self.video_rev,
-                            "payload": {"track_id": "v1", "kind": "video", "name": "V1"},
-                        }
-                    ],
-                },
-                timeout=30,
-            )
-            code, doc2 = http_json(
-                "GET",
-                f"{self.base}/video/documents/{self.video_doc_id}"
-                f"?session_id={self.thread_id}&project_id={self.project_id}",
-                timeout=20,
-            )
-            self.video_rev = int((doc2 or {}).get("revision") or self.video_rev)
-            # Import disposable media so selection-based video ops have a real clip.
-            # Prefer project-relative path used by live_api_acceptance.
-            rel = "media/clip_a.mp4"
-            media_abs = self.workspace / rel
-            if not media_abs.exists():
-                alt = str(self.meta.get("video_clip") or "").strip()
-                if alt and Path(alt).exists():
-                    media_abs = Path(alt)
-                    try:
-                        rel = str(media_abs.relative_to(self.workspace)).replace("\\", "/")
-                    except ValueError:
-                        rel = media_abs.name
-            if media_abs.exists():
-                http_json(
-                    "POST",
-                    f"{self.base}/video/documents/{self.video_doc_id}/import",
-                    {
-                        "session_id": self.thread_id,
-                        "project_id": self.project_id,
-                        "project_relative_path": rel.replace("\\", "/"),
-                        "expected_revision": self.video_rev,
-                    },
-                    timeout=60,
-                )
-                code, doc2b = http_json(
-                    "GET",
-                    f"{self.base}/video/documents/{self.video_doc_id}"
-                    f"?session_id={self.thread_id}&project_id={self.project_id}",
-                    timeout=20,
-                )
-                if code == 200 and isinstance(doc2b, dict):
-                    doc2 = doc2b
-                    self.video_rev = int((doc2 or {}).get("revision") or self.video_rev)
-            # Insert synthetic clip if assets exist
-            assets = (doc2 or {}).get("assets") or []
-            if not assets:
-                # Last-resort: register a placeholder asset via transaction if API allows
-                pass
-            if assets:
-                aid = assets[0].get("id")
-                self.clip_id = "clip-llm-1"
-                http_json(
-                    "POST",
-                    f"{self.base}/video/documents/{self.video_doc_id}/transactions",
-                    {
-                        "session_id": self.thread_id,
-                        "project_id": self.project_id,
-                        "operations": [
-                            {
-                                "operation_type": "insert_clip",
-                                "expected_revision": self.video_rev,
-                                "payload": {
-                                    "track_id": "v1",
-                                    "clip_id": self.clip_id,
-                                    "asset_id": aid,
-                                    "timeline_start": {
-                                        "ticks": "0",
-                                        "time_base": {"numerator": 1, "denominator": 1000},
-                                    },
-                                    "duration": {
-                                        "ticks": "6000",
-                                        "time_base": {"numerator": 1, "denominator": 1000},
-                                    },
-                                },
-                            }
-                        ],
-                    },
-                    timeout=30,
-                )
-                code, doc3 = http_json(
-                    "GET",
-                    f"{self.base}/video/documents/{self.video_doc_id}"
-                    f"?session_id={self.thread_id}&project_id={self.project_id}",
-                    timeout=20,
-                )
-                self.video_rev = int((doc3 or {}).get("revision") or self.video_rev)
-                clips = (doc3 or {}).get("clips") or []
-                if clips and not self.clip_id:
-                    self.clip_id = str(clips[0].get("id") or "")
-
         print(
             f"SETUP provider={self.provider!r} model={self.model!r} "
-            f"thread={self.thread_id} project={self.project_id} "
-            f"video_doc={self.video_doc_id} rev={self.video_rev} clip={self.clip_id}"
+            f"thread={self.thread_id} project={self.project_id}"
         )
 
     # -- helpers -------------------------------------------------------------
@@ -318,7 +196,6 @@ class LiveModelHarness:
         *,
         include_memory: bool = False,
         stream: bool = False,
-        video: bool = False,
         timeout: float = 280.0,
     ) -> tuple[int, dict, list[dict]]:
         body: dict[str, Any] = {
@@ -326,18 +203,6 @@ class LiveModelHarness:
             "thread_id": self.thread_id,
             "include_memory": include_memory,
         }
-        if video and self.video_doc_id:
-            body["video_document_id"] = self.video_doc_id
-            body["video_selection"] = {
-                "document_id": self.video_doc_id,
-                "selected_clip_ids": [self.clip_id] if self.clip_id else [],
-                "selected_asset_ids": [],
-                "playhead": {
-                    "ticks": "3000",
-                    "time_base": {"numerator": 1, "denominator": 1000},
-                },
-                "document_revision": self.video_rev,
-            }
         events: list[dict] = []
         if stream:
             events = http_stream(f"{self.base}/query/stream", body, timeout=timeout)
@@ -454,7 +319,6 @@ class LiveModelHarness:
         variation: str = "direct",
         include_memory: bool = False,
         stream: bool = False,
-        video: bool = False,
         expect: Optional[Callable[[ScenarioResult, dict], None]] = None,
         multi_turn_followups: Optional[list[str]] = None,
     ) -> ScenarioResult:
@@ -481,7 +345,6 @@ class LiveModelHarness:
                 prompt,
                 include_memory=include_memory,
                 stream=stream,
-                video=video,
             )
             r.http_status = code
             r.response_text = str((data or {}).get("response") or "")[:2000]
@@ -499,7 +362,7 @@ class LiveModelHarness:
 
             if multi_turn_followups:
                 for fu in multi_turn_followups:
-                    c2, d2, _ = self._query(fu, include_memory=include_memory, video=video)
+                    c2, d2, _ = self._query(fu, include_memory=include_memory)
                     r.response_text = str((d2 or {}).get("response") or r.response_text)[:2000]
                     r.http_status = c2
                     r.execution_id = str((d2 or {}).get("execution_id") or r.execution_id)
@@ -944,89 +807,6 @@ class LiveModelHarness:
         self.results.append(r)
         print(f"<<< {'PASS' if r.passed else 'FAIL'} [research_artifacts_api]")
 
-    def matrix_video(self) -> None:
-        def video_ok(r: ScenarioResult, data: dict, *, allow_clarify: bool = True) -> None:
-            text = r.response_text.lower()
-            if r.http_status != 200:
-                r.failure_reason = f"http {r.http_status}"
-                self._score(r, intent="fail", truth="fail")
-                return
-            pending_video = any(a.get("tool") == "video_apply_transaction" for a in r.approvals)
-            det = "deterministic" in text or "proposal" in text
-            clarify = bool(re.search(r"\b(select|which clip|need a|playhead|cannot|could not)\b", text))
-            blocked = "blocked" in text or "unavailable" in text
-            if pending_video or det or (allow_clarify and clarify) or blocked or len(text) > 30:
-                # Must not claim applied without approval language
-                invented = "applied" in text and "revision" in text and "approve" not in text and not pending_video
-                if invented:
-                    r.failure_reason = "claimed apply without approval"
-                    self._score(r, intent="pass", authority="fail", truth="fail")
-                    return
-                self._score(
-                    r,
-                    intent="pass",
-                    selection="pass",
-                    authority="pass",
-                    truth="pass",
-                    execution="pass",
-                )
-                return
-            r.failure_reason = "empty or unusable video response"
-            self._score(r, intent="fail", truth="fail")
-
-        cases = [
-            ("video_split", "Split the selected clip at the playhead.", "direct", True),
-            ("video_cut_casual", "cut this clip at the playhead", "casual", True),
-            ("video_mute", "Mute the selected clip.", "direct", True),
-            ("video_volume", "Set the selected clip volume to 50 percent.", "direct", True),
-            ("video_delete", "Delete the selected clip.", "direct", True),
-            ("video_silence", "Remove the silent parts from this video.", "direct", True),
-            ("video_captions", "Add captions to this video.", "direct", True),
-            ("video_broll", "Generate B-roll for this section.", "direct", True),
-            ("video_vague", "Make this look better.", "ambiguous", True),
-            ("video_edit_vague", "Edit the video.", "ambiguous", True),
-            ("video_no_selection_style", "Split the selected clip here.", "direct", True),
-        ]
-        for sid, p, var, vid in cases:
-            self.run_scenario(
-                sid,
-                "video",
-                p,
-                variation=var,
-                video=vid,
-                expect=lambda r, d: video_ok(r, d),
-            )
-
-        # Approve video if pending
-        pending = [a for a in self._pending_approvals() if a.get("tool") == "video_apply_transaction"]
-        if pending:
-            aid = pending[0]["id"]
-            c1, b1 = http_json(
-                "POST",
-                f"{self.base}/approvals/{aid}/confirm?expected_session_id={self.thread_id}",
-                timeout=90,
-            )
-            c2, b2 = http_json(
-                "POST",
-                f"{self.base}/approvals/{aid}/confirm?expected_session_id={self.thread_id}",
-                timeout=30,
-            )
-            r = ScenarioResult(
-                id="video_approve_once",
-                archetype="video",
-                prompt="(approve video)",
-                http_status=c1,
-                response_text=str((b1 or {}).get("response") or "")[:300],
-                route="approval",
-            )
-            ok = c1 == 200 and (c2 >= 400 or not (b2 or {}).get("success"))
-            self._score(r, authority="pass" if ok else "fail", execution="pass" if ok else "fail", truth="pass" if ok else "fail")
-            r.passed = ok
-            if not ok:
-                r.failure_reason = f"c1={c1} c2={c2}"
-            self.results.append(r)
-            print(f"<<< {'PASS' if r.passed else 'FAIL'} [video_approve_once]")
-
     def matrix_skills(self) -> None:
         code, skills = http_json("GET", f"{self.base}/skills/status", timeout=20)
         items = (skills or {}).get("items") or []
@@ -1047,10 +827,10 @@ class LiveModelHarness:
         print(f"<<< {'PASS' if r.passed else 'FAIL'} [skills_status_truth]")
 
         cases = [
-            ("skill_split_direct", "Split the selected clip at the playhead.", True),
-            ("skill_silence", "Remove silence and close the gaps in my video.", True),
-            ("skill_research_video", "Research this topic and structure a short video outline.", False),
-            ("skill_continue", "Continue the unfinished editing workflow if any.", True),
+            ("skill_research", "Research local-first architecture and cite the strongest source.", False),
+            ("skill_project_inspection", "Inspect this Project and summarize its architecture without editing files.", False),
+            ("skill_coding_plan", "Plan a safe coding change without mutating files.", False),
+            ("skill_continue", "Continue the unfinished Project workflow if any.", False),
             ("skill_create_workflow", "Create a reusable workflow idea for editing podcast episodes — do not execute it.", False),
         ]
 
@@ -1066,8 +846,8 @@ class LiveModelHarness:
             if not ok:
                 r.failure_reason = f"http={r.http_status} empty"
 
-        for sid, p, vid in cases:
-            self.run_scenario(sid, "skills", p, video=vid, expect=skill_expect)
+        for sid, p, _governed in cases:
+            self.run_scenario(sid, "skills", p, expect=skill_expect)
 
     def matrix_continuation(self) -> None:
         cases = [
@@ -1259,7 +1039,6 @@ class LiveModelHarness:
             ("coding", self.matrix_coding),
             ("memory", self.matrix_memory),
             ("research", self.matrix_research),
-            ("video", self.matrix_video),
             ("skills", self.matrix_skills),
             ("continuation", self.matrix_continuation),
             ("isolation", self.matrix_isolation),

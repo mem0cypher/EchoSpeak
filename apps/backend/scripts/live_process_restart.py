@@ -84,7 +84,6 @@ def start_backend(data_dir: str, port: int) -> subprocess.Popen:
     env["ECHOSPEAK_DATA_DIR"] = data_dir
     env["ENABLE_SYSTEM_ACTIONS"] = "true"
     env["ALLOW_FILE_WRITE"] = "true"
-    env["ALLOW_VIDEO_AGENT_EDITS"] = "true"
     env["USE_LOCAL_MODELS"] = "true"
     env["LOCAL_MODEL_PROVIDER"] = "lmstudio"
     env["LOCAL_MODEL_URL"] = "http://localhost:1234"

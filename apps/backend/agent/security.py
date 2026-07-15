@@ -24,13 +24,15 @@ except ImportError:
     import logging
     logger = logging.getLogger(__name__)
 
+from config import DATA_DIR
+
 
 # ============================================================================
 # CONSTANTS
 # ============================================================================
 
 # Audit log lives alongside other data files
-_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_DATA_DIR = Path(DATA_DIR)
 _DATA_DIR.mkdir(exist_ok=True)
 AUDIT_LOG_PATH = _DATA_DIR / "security_audit.jsonl"
 

@@ -401,6 +401,37 @@ def test_web_task_reflector_skips_double_grounding():
     agent._grounded_web_search.assert_not_called()
 
 
+def test_web_task_reflector_never_invokes_legacy_raw_tool():
+    from agent.core import WebTaskReflector
+
+    canonical = MagicMock(return_value="[GROUNDED_SEARCH] accepted=false\nreason=insufficient")
+    raw_tool = SimpleNamespace(name="web_search", invoke=MagicMock(side_effect=AssertionError("raw search bypass")))
+    reflector = WebTaskReflector(SimpleNamespace(_grounded_web_search=canonical))
+
+    out = reflector.reflect_and_retry(
+        {"index": 0, "params": {"q": "current evidence", "original_request": "current evidence"}},
+        "web_search",
+        "short ungrounded provider output",
+        tools=[raw_tool],
+        callbacks=None,
+    )
+
+    assert "GROUNDED_SEARCH" in out
+    canonical.assert_called_once()
+    raw_tool.invoke.assert_not_called()
+
+
+def test_generic_reflection_excludes_web_search_retries():
+    from agent.reflection import ReflectionEngine
+
+    engine = ReflectionEngine(SimpleNamespace())
+    assert engine.should_reflect(
+        {"index": 0, "tool": "web_search"},
+        "error: provider unavailable",
+        plan_size=3,
+    ) is False
+
+
 def test_lc_tool_wrapper_routes_to_grounded_helper():
     from agent.core import EchoSpeakAgent
 

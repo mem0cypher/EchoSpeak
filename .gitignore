@@ -60,6 +60,10 @@ dist/
 build/
 out/
 
+# Additive desktop build outputs (keep packaged artifacts local, not versioned)
+apps/desktop/.build/
+apps/desktop/src-tauri/target/
+
 *.pem
 *.key
 *.p12
@@ -71,4 +75,9 @@ apps/backend/projects/
 
 # Disposable live acceptance roots (local only)
 .live-acceptance/
+
+
+# Desktop/Tauri build artifacts (do not commit)
+apps/desktop/node_modules/
+apps/desktop/src-tauri/binaries/
 

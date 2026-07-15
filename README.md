@@ -161,6 +161,7 @@ Web UI / Discord / Telegram / Twitter / Twitch / TUI / A2A
 |-------|------------|
 | Backend | Python · FastAPI · LangChain · LangGraph · FAISS |
 | Frontend | React · Vite · Framer Motion · TailwindCSS |
+| Windows desktop | Tauri 2 · Rust host · packaged Python sidecar |
 | TUI | Go · Bubble Tea · Lipgloss |
 | Voice | Browser SpeechRecognition + speech synthesis |
 | LLM | Gemini · OpenAI · Ollama · LM Studio |
@@ -181,6 +182,7 @@ EchoSpeak/
 │   │   ├── twitch_bot.py    # Twitch chat bot
 │   │   └── SOUL.md          # Agent personality
 │   ├── web/                 # React frontend
+│   ├── desktop/             # Additive Tauri Windows host + sidecar packaging
 │   ├── tui/                 # Go terminal UI
 │   └── onboard-tui/         # Setup wizard
 ├── docs/                    # Documentation
@@ -220,6 +222,7 @@ Full contracts: `docs/UNIFIED_COORDINATION.md`, `docs/RUNTIME_CONTRACTS.md`.
 |----------|-------------|
 | [Getting Started](docs/GETTING_STARTED.md) | 5-minute setup guide |
 | [Architecture](ARCHITECTURE.md) | System internals |
+| [Desktop Architecture](docs/DESKTOP_ARCHITECTURE.md) | Windows host, sidecar, transport, lifecycle, and native gates |
 | [Changelog](CHANGES.md) | Full version history |
 | [Roadmap](ROADMAP.md) | What's next |
 | [Agent Guide](docs/AGENT.md) | Extending the agent |

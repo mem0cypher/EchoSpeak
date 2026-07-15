@@ -5,6 +5,7 @@
     "tools": [
         "skill_create",
         "skill_list",
+        "skill_review",
         "skill_enable"
     ]
 }

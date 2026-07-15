@@ -12,10 +12,6 @@ from agent.tool_registry import ToolRegistry
 def _ensure_tools_registered() -> None:
     """Best-effort load of production tool modules so availability is not empty."""
     try:
-        import agent.video_editor.tools  # noqa: F401
-    except Exception:
-        pass
-    try:
         from agent.tools import TOOL_METADATA, get_available_tools
 
         ToolRegistry.register_from_metadata(get_available_tools(), TOOL_METADATA)
@@ -48,10 +44,9 @@ def classify_skill(
         return _row(manifest, "prompt_only", ["no_implementation_entry"])
 
     missing_tools = [t for t in manifest.required_tools if t and t not in registered]
-    is_video_domain = str(manifest.implementation_entry or "").startswith("video_domain:")
-    if missing_tools and not manifest.prompt and not is_video_domain:
+    if missing_tools and not manifest.prompt:
         return _row(manifest, "blocked_missing_tool", [f"tool:{t}" for t in missing_tools])
-    if missing_tools and not is_video_domain:
+    if missing_tools:
         # Any required tool absent → not fully executable (prompt packaging is not authority).
         if not any(t in registered for t in (manifest.required_tools or [])):
             return _row(manifest, "prompt_only", [f"tool:{t}" for t in missing_tools])
@@ -73,11 +68,10 @@ def classify_skill(
             if any(m in ("silence_detection", "transcription", "silence", "transcript") for m in missing_art):
                 return _row(manifest, "blocked_missing_artifact", [f"artifact:{a}" for a in missing_art])
 
-    # Prompt-only packages (no tools, no video_domain impl)
+    # Prompt-only packages (no tool implementation).
     if (
         manifest.prompt
         and not manifest.required_tools
-        and not str(manifest.implementation_entry or "").startswith("video_domain:")
         and not (manifest.package_path and Path_has_tools(manifest.package_path))
     ):
         return _row(manifest, "prompt_only", ["prompt_package_without_tools"])

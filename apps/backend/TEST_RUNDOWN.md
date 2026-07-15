@@ -39,7 +39,7 @@ npx vitest run
 | `test_reflection.py` | Reflection engine + task planner |
 | `test_phase1_integrity.py` | Routes, readiness, memory doctor, terminal denylist, MCP trust honesty, settings |
 | `test_coding_readiness_final.py` | Authoritative coding readiness, raw failure classification, lossless/truncated reads, safe project status and preview |
-| `test_video_editor_foundation.py` | Rational timeline operations, exact-once revisions, undo/redo, corruption quarantine, ffprobe metadata |
+| `test_editor_retirement.py` | Byte-for-byte legacy archive, checksums, missing assets, idempotent Media import plan |
 | `test_phase2_research.py` | Research run parse |
 | `test_router.py` | Intent routing (chat vs search vs Discord vs time vs vision) |
 | `test_echospeak.py` | Config, memory, tools, Discord hardening, coding workspace, TTS, voice/vision stubs, API smoke |

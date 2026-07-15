@@ -13,8 +13,6 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, FrozenSet, Iterable, Optional
 
-from config import ModelProvider
-
 try:
     from agent.active_work import request_approves_plan, request_continues_project
 except Exception:  # pragma: no cover - import-safe fallback for isolated tests
@@ -52,9 +50,14 @@ class CodingPhaseName(str, Enum):
     SUMMARIZE = "summarize"
 
 
-CHAT_MODEL = (ModelProvider.GEMINI.value, "gemini")
-CODING_MODEL = (ModelProvider.LM_STUDIO.value, "deepseek/deepseek-r1-0528-qwen3-8b")
-RESEARCH_MODEL = (ModelProvider.LM_STUDIO.value, "mradermacher/Marco-DeepResearch-8B-i1-GGUF")
+# Mode classification chooses capabilities and evidence policy, never a model.
+# The canonical Session-selected model is bound once by EchoSpeakAgent at Turn
+# creation. Keep these aliases temporarily for import compatibility; blank
+# values explicitly mean "bind the active Session model".
+SESSION_MODEL = ("", "")
+CHAT_MODEL = SESSION_MODEL
+CODING_MODEL = SESSION_MODEL
+RESEARCH_MODEL = SESSION_MODEL
 
 RESEARCH_TOOLS: FrozenSet[str] = frozenset(
     {
@@ -197,6 +200,25 @@ def _has_coding_operation(text: str) -> bool:
         low,
     ):
         return True
+    # Feature work inside software and games is coding even when the request
+    # uses domain nouns (score, enemies, health) that also occur in live-sports
+    # questions.  Require an edit verb and a software/game entity, while
+    # excluding the ordinary live-score phrasing, so this remains structural
+    # rather than a title- or project-specific exception.
+    if (
+        re.search(r"\b(?:add|implement|change|update|fix|make|remove)\b", low)
+        and re.search(
+            r"\b(?:player|enemy|enemies|gameplay|collision|health|score|power[ -]?up|"
+            r"pause button|level|mechanic|spawn|despawn|game object)\b",
+            low,
+        )
+        and not re.search(
+            r"\b(?:live score|what(?:'s| is) the score|score tonight|team score|"
+            r"match score|fixture|standings?)\b",
+            low,
+        )
+    ):
+        return True
     if re.search(r"\b(?:create|make|write)\s+(?:me\s+)?(?:a|an)\s+(?:[a-z0-9_-]+\s+){0,3}(?:script|file)\b", low):
         return True
     if re.search(r"\b[a-z0-9_.-]+\.(py|ts|tsx|js|jsx|json|md|css|html|go|rs|java|cpp|c|cs|yaml|yml)\b", low):
@@ -279,6 +301,11 @@ def _is_checkable_task(text: str) -> bool:
         low,
     ):
         return True
+    if re.search(r"\b(?:today|tonight|tomorrow|later)\b", low) and re.search(
+        r"\b(?:club|clubs|team|teams|match|matches|game|games|fixture|fixtures|pitch|play|playing)\b",
+        low,
+    ):
+        return True
     if re.search(r"\d\s*[+\-*/^]\s*\d", low):
         return True
     if re.search(r"\bwhen\s+(?:does|do|is|are)\b.{0,80}\b(?:play|start|begin|air|release|launch)\b", low):
@@ -324,7 +351,11 @@ def _explicit_read_only_intent(text: str) -> bool:
     if re.search(r"\b(do not modify|don't modify|read[- ]?only|without modifying|wait for (?:my )?approval|proposal only)\b", low):
         return True
     inspect = bool(re.search(r"\b(inspect|check|understand|explain|analy[sz]e|review|tell me|show me)\b", low))
-    modify = bool(re.search(r"\b(implement|apply|edit|modify|write|delete|create|build|fix (?:it|the|this)|make (?:the|this) change)\b", low))
+    modify = bool(re.search(
+        r"\b(implement|apply|edit|modify|change|write|delete|remove|rename|move|copy|"
+        r"create|build|fix (?:it|the|this)|make (?:the|this) change)\b",
+        low,
+    ))
     return inspect and not modify
 
 
@@ -352,7 +383,7 @@ def _explicit_modification_intent(text: str) -> bool:
     return bool(
         re.search(
             r"\b("
-            r"implement|apply|edit|modify|write|delete|create|build|scaffold|"
+            r"implement|apply|edit|modify|change|write|delete|remove|rename|move|copy|create|build|scaffold|"
             r"add|insert|comment|annotate|patch|tweak|refactor|"
             r"update (?:the )?(?:code|file|project)|"
             r"fix (?:it|the|this|bug|issue)|"
@@ -610,32 +641,57 @@ def classify_turn_mode(user_input: str, *, source: str = "", active_work: Any = 
 
 
 def allowed_tools_for_mode(decision: ModeDecision, available_tool_names: Iterable[str]) -> FrozenSet[str]:
-    """Return the authorized tool inventory for this turn.
+    """Bind the least-privilege tool inventory for this classified turn.
 
-    Conversation mode (chat / research / coding) is a routing hint only.
-    It must not permanently empty, hide, or stage-block the inventory.
-    Project scope and permissions are enforced separately at the execution
-    boundary (path roots, policy flags, approvals).
+    This is one input to authority, not the final authority owner: registration,
+    Project scope, role policy, configuration, approval, and tool-boundary
+    validation still apply. A mode can reduce capability but never grant a tool
+    that is absent from the canonical registry inventory.
     """
     available = frozenset(str(n) for n in available_tool_names if str(n or "").strip())
     if not available:
         return frozenset()
-    # Soft preference sets remain for logging / soft ranking only — not as a
-    # permission mask. The full registered inventory is always authorized here.
-    _ = decision  # mode is routing metadata; do not intersect tools by mode
-    return available
+
+    if decision.mode == TurnMode.CHAT:
+        requested = (
+            frozenset({"get_system_time"})
+            if re.search(r"\b(?:time|date|day)\b", decision.user_text, flags=re.IGNORECASE)
+            else frozenset({"calculate"})
+            if _is_utility_tool_request(decision.user_text)
+            else frozenset()
+        )
+    elif decision.mode == TurnMode.TASK_RESEARCH:
+        requested = RESEARCH_TOOLS
+    else:
+        phase = decision.coding_phase or CodingPhaseName.INSPECT
+        selected = set(CODING_READ_TOOLS)
+        if "research" in decision.required_capabilities:
+            selected.update(RESEARCH_TOOLS)
+        if phase == CodingPhaseName.IMPLEMENT:
+            selected.update(CODING_WRITE_TOOLS)
+            selected.update(CODING_VERIFY_TOOLS)
+            selected.update({"image_apply_operations", "image_export"})
+        elif phase == CodingPhaseName.VERIFY:
+            selected.update(CODING_VERIFY_TOOLS)
+        requested = frozenset(selected)
+
+    constraints = set(decision.constraints or frozenset())
+    if "read_only" in constraints or "proposal_only" in constraints:
+        requested = requested - CODING_WRITE_TOOLS - frozenset(
+            {"terminal_run", "image_apply_operations", "image_export"}
+        )
+    if "no_delete" in constraints:
+        requested = requested - frozenset({"file_delete"})
+    if "local_first" in constraints and decision.mode != TurnMode.TASK_RESEARCH:
+        requested = requested - frozenset({"web_search", "browse_task", "youtube_transcript"})
+    return frozenset(available & requested)
 
 
 def tool_allowed_by_mode(decision: Optional[ModeDecision], tool_name: str) -> bool:
-    """Mode must not gate tool permission. Inventory is decided by registration + scope + policy."""
+    """Check the immutable per-turn capability inventory bound after routing."""
     if decision is None:
         return True
     name = str(tool_name or "").strip()
     if not name:
         return False
-    # If a turn already bound an explicit allowlist, honor it; empty legacy masks
-    # must not deny tools (mode is not authority).
-    allowed = decision.allowed_tool_names or frozenset()
-    if not allowed:
-        return True
-    return name in allowed
+    return name in (decision.allowed_tool_names or frozenset())

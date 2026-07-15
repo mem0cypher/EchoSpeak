@@ -28,7 +28,7 @@ from pytesseract import pytesseract
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import config, ModelProvider
+from config import config, ModelProvider, DATA_DIR
 
 
 _tool_execution_context: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
@@ -2652,7 +2652,7 @@ def discord_contacts_add(key: str, url: str = "", message_link: Optional[str] = 
     if not contacts_path:
         root = Path(getattr(config, "artifacts_dir", "") or "").expanduser()
         if not str(root).strip():
-            root = Path(__file__).resolve().parents[1] / "data" / "artifacts"
+            root = Path(DATA_DIR) / "artifacts"
         contacts_path = str(root.parent / "discord_contacts.json")
 
     p = Path(contacts_path).expanduser()
@@ -2714,7 +2714,7 @@ def discord_contacts_discover(key: str, headless: bool = False) -> str:
 
     root = Path(getattr(config, "artifacts_dir", "") or "").expanduser()
     if not str(root).strip():
-        root = Path(__file__).resolve().parents[1] / "data" / "artifacts"
+        root = Path(DATA_DIR) / "artifacts"
     try:
         root.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -3340,7 +3340,7 @@ def discord_web_read_recent(url: str = "", recipient: Optional[str] = None, limi
 
     root = Path(getattr(config, "artifacts_dir", "") or "").expanduser()
     if not str(root).strip():
-        root = Path(__file__).resolve().parents[1] / "data" / "artifacts"
+        root = Path(DATA_DIR) / "artifacts"
     try:
         root.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -3515,7 +3515,7 @@ def discord_web_send(url: str = "", recipient: Optional[str] = None, message: st
 
     root = Path(getattr(config, "artifacts_dir", "") or "").expanduser()
     if not str(root).strip():
-        root = Path(__file__).resolve().parents[1] / "data" / "artifacts"
+        root = Path(DATA_DIR) / "artifacts"
     try:
         root.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -3655,7 +3655,7 @@ def take_screenshot(path: Optional[str] = None) -> str:
         import numpy as np
 
         if path is None:
-            data_dir = Path(__file__).resolve().parent.parent / "data"
+            data_dir = Path(DATA_DIR)
             data_dir.mkdir(exist_ok=True)
             path = str(data_dir / "screenshot.png")
 
@@ -4117,7 +4117,7 @@ def todo_manage(action: str, title: str = "", description: str = "", todo_id: st
     from datetime import datetime as _dt
     from pathlib import Path as _Path
 
-    todo_file = _Path(__file__).parent.parent / "data" / "todos.json"
+    todo_file = _Path(DATA_DIR) / "todos.json"
 
     def _load() -> list:
         if todo_file.exists():

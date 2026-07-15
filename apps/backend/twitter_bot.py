@@ -28,6 +28,7 @@ from urllib.parse import parse_qsl, quote, urlsplit
 
 import httpx
 from loguru import logger
+from config import DATA_DIR
 
 
 # ============================================================================
@@ -38,7 +39,7 @@ TWITTER_API_BASE = "https://api.twitter.com/2"
 TWITTER_OAUTH2_TOKEN_URL = "https://api.twitter.com/2/oauth2/token"
 
 # Polling state file
-_DATA_DIR = Path(__file__).resolve().parent / "data"
+_DATA_DIR = Path(DATA_DIR)
 _DATA_DIR.mkdir(exist_ok=True)
 _TWITTER_STATE_PATH = _DATA_DIR / "twitter_state.json"
 

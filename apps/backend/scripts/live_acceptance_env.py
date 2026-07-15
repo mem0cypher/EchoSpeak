@@ -48,7 +48,6 @@ def build_env(base: Path | None = None) -> dict:
             "enable_system_actions": True,
             "allow_file_write": True,
             "allow_terminal_commands": False,
-            "allow_video_agent_edits": True,
             "allow_self_modification": False,
             "orchestration_enabled": False,
             "api_auth_enabled": False,

@@ -1,0 +1,10 @@
+[[permission]]
+identifier = "desktop-runtime"
+description = "Allows the EchoSpeak renderer to inspect/recover its owned local service, use the owned folder picker, and control its own window."
+commands.allow = [
+  "desktop_runtime",
+  "restart_desktop_backend",
+  "pick_project_folder",
+  "open_desktop_logs",
+  "control_desktop_window"
+]

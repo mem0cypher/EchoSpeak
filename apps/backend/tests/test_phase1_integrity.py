@@ -98,7 +98,7 @@ def test_memory_doctor_flags_duplicates_and_conversation_dominance(monkeypatch):
         memory_count = 4
         _profile = {"user_name": "Ty"}
 
-        def list_items(self, offset=0, limit=300, thread_id=None):
+        def list_items(self, offset=0, limit=300, thread_id=None, project_id="", include_global=False):
             return [
                 {"id": "1", "text": duplicate_text, "timestamp": "1", "metadata": {"type": "conversation"}},
                 {"id": "2", "text": duplicate_text, "timestamp": "2", "metadata": {"type": "conversation"}},
@@ -106,12 +106,15 @@ def test_memory_doctor_flags_duplicates_and_conversation_dominance(monkeypatch):
                 {"id": "4", "text": "Untyped note", "timestamp": "4", "metadata": {}},
             ]
 
+        def count_items(self, **_kwargs):
+            return 4
+
     class FakeAgent:
         memory = FakeMemory()
 
     monkeypatch.setattr(config, "memory_auto_store_conversations", True, raising=False)
 
-    report = server_mod._build_memory_doctor_report(FakeAgent(), thread_id=None, max_scan=10)
+    report = server_mod._build_memory_doctor_report(FakeAgent(), thread_id=None, project_id="project-a", max_scan=10)
 
     assert report.ok is False
     assert report.type_counts["conversation"] == 2
@@ -239,7 +242,7 @@ def test_put_settings_persists_incomplete_draft_and_returns_issues(monkeypatch):
     assert resp.issues == [{"key": "discord_bot_token", "message": "missing", "severity": "error"}]
 
 
-def test_heartbeat_discord_route_uses_shared_queue(monkeypatch):
+def test_heartbeat_discord_route_cannot_use_shared_queue(monkeypatch):
     from agent import heartbeat
     import discord_bot
 
@@ -253,12 +256,12 @@ def test_heartbeat_discord_route_uses_shared_queue(monkeypatch):
     monkeypatch.setattr(config, "discord_bot_allowed_users", ["123"], raising=False)
     monkeypatch.setattr(discord_bot, "queue_discord_dm", fake_queue, raising=True)
 
-    heartbeat._route_discord("hello from routine", label="Routine")
+    heartbeat.route_message("hello from routine", ["discord"], label="Routine")
 
-    assert calls == [("999", "🫀 **EchoSpeak Routine**\nhello from routine")]
+    assert calls == []
 
 
-def test_heartbeat_discord_route_falls_back_to_first_allowed_user(monkeypatch):
+def test_heartbeat_discord_route_cannot_fall_back_to_allowed_user(monkeypatch):
     from agent import heartbeat
     import discord_bot
 
@@ -272,9 +275,9 @@ def test_heartbeat_discord_route_falls_back_to_first_allowed_user(monkeypatch):
     monkeypatch.setattr(config, "discord_bot_allowed_users", ["123"], raising=False)
     monkeypatch.setattr(discord_bot, "queue_discord_dm", fake_queue, raising=True)
 
-    heartbeat._route_discord("hello from routine", label="Routine")
+    heartbeat.route_message("hello from routine", ["discord"], label="Routine")
 
-    assert calls == [("123", "🫀 **EchoSpeak Routine**\nhello from routine")]
+    assert calls == []
 
 
 def test_notify_owner_security_event_queues_owner_dm(monkeypatch):
@@ -424,14 +427,15 @@ def test_memory_compact_accepts_query_params(monkeypatch):
     class FakeMemory:
         memory_count = 0
 
-        def list_items(self, offset=0, limit=250):
+        def list_items(self, offset=0, limit=250, **_kwargs):
             return []
 
     class FakeAgent:
         memory = FakeMemory()
 
     monkeypatch.setattr(server_mod, "get_agent", lambda thread_id=None: FakeAgent(), raising=True)
+    monkeypatch.setattr(server_mod, "_require_automation_project_scope", lambda session_id, project_id: project_id, raising=True)
 
-    resp = asyncio.run(server_mod.compact_memory(request=None, thread_id="t1", similarity=0.94, max_scan=50))
+    resp = asyncio.run(server_mod.compact_memory(request=None, thread_id="t1", project_id="project-a", similarity=0.94, max_scan=50))
     assert resp["success"] is True
     assert resp["deleted"] == 0

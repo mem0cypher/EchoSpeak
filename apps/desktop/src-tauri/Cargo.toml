@@ -1,0 +1,37 @@
+[package]
+name = "echospeak-desktop"
+version = "0.1.0"
+description = "EchoSpeak Windows desktop host"
+authors = ["EchoSpeak Project"]
+edition = "2021"
+rust-version = "1.84"
+
+[lib]
+name = "echospeak_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+log = "0.4.27"
+rfd = "0.15.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "=2.11.5", features = [] }
+tauri-plugin-log = "=2.8.0"
+tauri-plugin-shell = "=2.3.5"
+tauri-plugin-single-instance = "=2.4.2"
+tauri-plugin-window-state = "=2.4.1"
+tokio = { version = "1.46", features = ["time"] }
+uuid = { version = "1.18", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

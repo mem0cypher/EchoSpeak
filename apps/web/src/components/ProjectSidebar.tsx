@@ -4,6 +4,8 @@ type Project = { id: string; name: string; workspace_root?: string; archived?: b
 type Session = { id: string; name: string; at: number; projectId?: string };
 
 type SidebarProps = {
+  desktop?: boolean;
+  hydrating?: boolean;
   collapsed: boolean;
   projects: Project[];
   sessions: Session[];
@@ -17,7 +19,7 @@ type SidebarProps = {
   onRenameSession(id: string, title: string): void;
   onDeleteSession(id: string): void;
   onDeleteProject(id: string): void;
-  onView(view: "avatar" | "research" | "code" | "tasks" | "video" | "studio"): void;
+  onView(view: "chat" | "avatar" | "research" | "code" | "tasks" | "media" | "studio"): void;
 };
 
 const surface = "#0a0a0a";
@@ -38,7 +40,7 @@ function Icon({
     | "research"
     | "code"
     | "tasks"
-    | "video"
+    | "media"
     | "studio"
     | "plus"
     | "more"
@@ -112,11 +114,12 @@ function Icon({
           <rect x="4" y="4" width="16" height="16" rx="2.5" />
         </svg>
       );
-    case "video":
+    case "media":
       return (
         <svg {...common}>
-          <rect x="3.5" y="5" width="17" height="14" rx="2" />
-          <path d="m10 9 5 3-5 3z" />
+          <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
+          <path d="m6.5 16 4-4 2.5 2.5 2-2 2.5 3.5" />
+          <circle cx="15.5" cy="9" r="1.3" />
         </svg>
       );
     case "studio":
@@ -170,17 +173,32 @@ function Icon({
 }
 
 const viewDefs: {
-  id: "avatar" | "research" | "code" | "tasks" | "video" | "studio";
+  id: "avatar" | "research" | "code" | "tasks" | "media" | "studio";
   label: string;
-  icon: "avatar" | "research" | "code" | "tasks" | "video" | "studio";
+  icon: "avatar" | "research" | "code" | "tasks" | "media" | "studio";
   title: string;
 }[] = [
   { id: "avatar", label: "Avatar", icon: "avatar", title: "Avatar" },
   { id: "research", label: "Research", icon: "research", title: "Research" },
   { id: "code", label: "Code", icon: "code", title: "Code" },
   { id: "tasks", label: "Tasks", icon: "tasks", title: "Tasks" },
-  { id: "video", label: "Video", icon: "video", title: "Video Editor" },
+  { id: "media", label: "Media", icon: "media", title: "Media library" },
   { id: "studio", label: "Studio", icon: "studio", title: "Studio · Settings & Models" },
+];
+
+const desktopViewDefs: {
+  id: "chat" | "avatar" | "research" | "code" | "tasks" | "media" | "studio";
+  label: string;
+  icon: "chat" | "avatar" | "research" | "code" | "tasks" | "media" | "studio";
+  title: string;
+}[] = [
+  { id: "chat", label: "Chat", icon: "chat", title: "Conversation" },
+  { id: "avatar", label: "Visualizer", icon: "avatar", title: "Echo Visualizer" },
+  { id: "research", label: "Research", icon: "research", title: "Research workspace" },
+  { id: "code", label: "Code", icon: "code", title: "Code workspace" },
+  { id: "media", label: "Media", icon: "media", title: "Media library" },
+  { id: "tasks", label: "Tasks", icon: "tasks", title: "Tasks workspace" },
+  { id: "studio", label: "Studio", icon: "studio", title: "Studio and settings" },
 ];
 
 export function ProjectSidebar(props: SidebarProps) {
@@ -194,6 +212,7 @@ export function ProjectSidebar(props: SidebarProps) {
   const activeProject = projects.find((project) => project.id === props.activeProjectId);
   const activeSession = sessions.find((session) => session.id === props.activeSessionId);
   const contextLabel = activeProject?.name || "Quick chat";
+  const workspaceViews = props.desktop ? desktopViewDefs : viewDefs;
 
   const railButton = (active = false): React.CSSProperties => ({
     // Do not force width:100% here — row items share space with fixed action buttons.
@@ -431,8 +450,8 @@ export function ProjectSidebar(props: SidebarProps) {
       }
     `}</style>
 
-      {/* Brand + collapse */}
-      <div
+      {/* Browser branding remains here. Desktop identity belongs to the native title bar. */}
+      {!props.desktop ? <div
         className="echo-sidebar-edge-pad"
         style={{
           height: 38,
@@ -499,11 +518,23 @@ export function ProjectSidebar(props: SidebarProps) {
             </button>
           </>
         )}
-      </div>
+      </div> : null}
 
       <div className="echo-sidebar-scroll">
         <section aria-label="Workspace" style={{ padding: iconOnly ? "0 1px" : 0, display: "grid", gap: 7, flex: "0 0 auto" }}>
           <div style={{ display: "grid", gap: 2 }}>
+            {props.desktop && iconOnly ? (
+              <button
+                className="echo-side-button"
+                type="button"
+                style={railButton()}
+                onClick={props.onToggleCollapsed}
+                title="Expand sidebar"
+                aria-label="Expand sidebar"
+              >
+                <span style={iconSlot()}><Icon name="expand" size={16} /></span>
+              </button>
+            ) : null}
             {!iconOnly && (
               <div
                 style={{
@@ -554,6 +585,30 @@ export function ProjectSidebar(props: SidebarProps) {
                 >
                   <Icon name="plus" size={15} />
                 </button>
+                {props.desktop ? (
+                  <button
+                    className="echo-side-button"
+                    type="button"
+                    onClick={props.onToggleCollapsed}
+                    title="Collapse sidebar"
+                    aria-label="Collapse sidebar"
+                    style={{
+                      width: 26,
+                      height: 24,
+                      border: 0,
+                      background: "transparent",
+                      color: "rgba(255,255,255,.7)",
+                      borderRadius: 2,
+                      cursor: "pointer",
+                      display: "grid",
+                      placeItems: "center",
+                      padding: 0,
+                      flex: "0 0 auto",
+                    }}
+                  >
+                    <Icon name="collapse" size={14} />
+                  </button>
+                ) : null}
               </div>
             )}
 
@@ -607,7 +662,7 @@ export function ProjectSidebar(props: SidebarProps) {
               </button>
             )}
 
-            {!iconOnly && projectsOpen && !projects.length && (
+            {!iconOnly && projectsOpen && !projects.length && !props.hydrating && (
               <button
                 className="echo-footer-action"
                 type="button"
@@ -618,6 +673,12 @@ export function ProjectSidebar(props: SidebarProps) {
                 <span style={{ display: "block", marginTop: 4, fontSize: 9, color: "rgba(255,255,255,.36)" }}>Attach a local folder</span>
               </button>
             )}
+
+            {!iconOnly && props.hydrating ? (
+              <div role="status" style={{ padding: "7px 7px 5px", color: muted, fontSize: 9.5 }}>
+                Restoring Projects and Sessions…
+              </div>
+            ) : null}
 
             {(iconOnly || projectsOpen) &&
               projects.map((project) => {
@@ -725,7 +786,7 @@ export function ProjectSidebar(props: SidebarProps) {
             </button>
           )}
           {(iconOnly || viewsOpen) &&
-            viewDefs.map((view) => {
+            workspaceViews.map((view) => {
               const active = props.activeView === view.id;
               return (
                 <button
@@ -786,9 +847,6 @@ export function ProjectSidebar(props: SidebarProps) {
           </button>
           <button className="echo-side-button" type="button" title="Add Project folder" aria-label="Add Project folder" onClick={props.onAddFolder} style={railButton()}>
             <span style={iconSlot()}><Icon name="folder" size={16} /></span>
-          </button>
-          <button className="echo-side-button" type="button" title="Expand sidebar" aria-label="Expand sidebar" onClick={props.onToggleCollapsed} style={railButton()}>
-            <span style={iconSlot()}><Icon name="expand" size={16} /></span>
           </button>
         </div>
       )}

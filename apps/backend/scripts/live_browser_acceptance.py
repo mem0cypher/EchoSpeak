@@ -36,7 +36,7 @@ def main() -> int:
         page.set_default_timeout(45000)
 
         app_url = f"{args.ui.rstrip('/')}/app"
-        video_url = f"{args.ui.rstrip('/')}/app/video"
+        research_url = f"{args.ui.rstrip('/')}/app/research"
 
         # 1) Open marketing first (no session), then app
         try:
@@ -73,24 +73,24 @@ def main() -> int:
             rec("api_threads_before_ui", False, str(exc))
             before_n = -1
 
-        # Navigate to video route without creating session via navigation alone
+        # Workspace navigation must not create a Session by itself.
         try:
-            page.goto(video_url, wait_until="domcontentloaded")
+            page.goto(research_url, wait_until="domcontentloaded")
             page.wait_for_timeout(1500)
-            rec("browser_video_nav", True, page.url)
+            rec("browser_workspace_nav", True, page.url)
         except Exception as exc:
-            rec("browser_video_nav", False, str(exc))
+            rec("browser_workspace_nav", False, str(exc))
 
         try:
             after = api_get("/threads")
             after_n = threads_count(after)
             rec(
-                "no_phantom_session_on_video_nav",
+                "no_phantom_session_on_workspace_nav",
                 before_n < 0 or after_n == before_n,
                 f"before={before_n} after={after_n}",
             )
         except Exception as exc:
-            rec("no_phantom_session_on_video_nav", False, str(exc))
+            rec("no_phantom_session_on_workspace_nav", False, str(exc))
 
         # Go to main chat UI (/app)
         try:

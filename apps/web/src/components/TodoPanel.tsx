@@ -13,6 +13,8 @@ type TodoItem = {
 
 type TodoPanelProps = {
   apiBase: string;
+  projectId: string;
+  sessionId: string;
   colors: {
     bg: string;
     panel: string;
@@ -68,7 +70,7 @@ const StatusIcon: React.FC<{ status: TodoItem["status"] }> = ({ status }) => {
   );
 };
 
-export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, colors, variant = "panel" }) => {
+export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessionId, colors, variant = "panel" }) => {
   const [todos, setTodos] = useState<TodoItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -86,14 +88,19 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, colors, variant =
     setLoading(true);
     setError(null);
     try {
-      const data = await requestJson(`${apiBase}/todos`);
+      if (!projectId || !sessionId) {
+        setTodos([]);
+        return;
+      }
+      const scope = `session_id=${encodeURIComponent(sessionId)}&project_id=${encodeURIComponent(projectId)}`;
+      const data = await requestJson(`${apiBase}/todos?${scope}`);
       setTodos(Array.isArray(data.todos) ? data.todos : []);
     } catch (e: any) {
       setError(e.message || "Failed to load todos");
     } finally {
       setLoading(false);
     }
-  }, [apiBase]);
+  }, [apiBase, projectId, sessionId]);
 
   useEffect(() => {
     refresh();
@@ -110,6 +117,8 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, colors, variant =
           description: newDesc.trim(),
           priority: newPriority,
           status: "pending",
+          project_id: projectId,
+          session_id: sessionId,
         }),
       });
       setNewTitle("");
@@ -124,7 +133,7 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, colors, variant =
 
   const updateStatus = async (todo: TodoItem, status: TodoItem["status"]) => {
     try {
-      await requestJson(`${apiBase}/todos/${todo.id}`, {
+      await requestJson(`${apiBase}/todos/${todo.id}?session_id=${encodeURIComponent(sessionId)}&project_id=${encodeURIComponent(projectId)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status }),
@@ -137,7 +146,7 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, colors, variant =
 
   const saveEdit = async (todo: TodoItem) => {
     try {
-      await requestJson(`${apiBase}/todos/${todo.id}`, {
+      await requestJson(`${apiBase}/todos/${todo.id}?session_id=${encodeURIComponent(sessionId)}&project_id=${encodeURIComponent(projectId)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -156,7 +165,7 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, colors, variant =
 
   const deleteTodo = async (id: string) => {
     try {
-      await requestJson(`${apiBase}/todos/${id}`, { method: "DELETE" });
+      await requestJson(`${apiBase}/todos/${id}?session_id=${encodeURIComponent(sessionId)}&project_id=${encodeURIComponent(projectId)}`, { method: "DELETE" });
       await refresh();
     } catch (e: any) {
       setError(e.message || "Failed to delete todo");

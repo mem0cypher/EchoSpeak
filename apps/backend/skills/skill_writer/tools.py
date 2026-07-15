@@ -53,6 +53,12 @@ class SkillEnableArgs(BaseModel):
     enabled: bool = Field(default=True, description="True to enable, False to disable")
 
 
+class SkillReviewArgs(BaseModel):
+    skill_id: str = Field(description="Candidate skill directory name")
+    disposable_tests_passed: bool = Field(description="True only after isolated validation completed")
+    validation_evidence: str = Field(description="Short review/test evidence recorded with the proposal")
+
+
 # ── skill_create ────────────────────────────────────────────────────
 
 @ToolRegistry.register(
@@ -221,11 +227,88 @@ def skill_list() -> str:
 # ── skill_enable ────────────────────────────────────────────────────
 
 @ToolRegistry.register(
+    name="skill_review",
+    description="Record an approved isolated review and promote a generated skill to installed-but-disabled.",
+    category="self_mod",
+    is_action=True,
+    risk_level="moderate",
+    policy_flags=["ENABLE_SYSTEM_ACTIONS"],
+)
+@tool(args_schema=SkillReviewArgs)
+def skill_review(
+    skill_id: str,
+    disposable_tests_passed: bool,
+    validation_evidence: str,
+) -> str:
+    """Promote a validated proposal without enabling or importing its code."""
+    try:
+        from agent.skill_execution import list_skill_proposals, update_skill_proposal
+        from agent.skills_registry import SkillsRegistry, package_to_manifest
+        from agent.tools import get_tool_execution_context
+
+        safe_id = _slugify(skill_id)
+        skills_dir = _skills_dir().resolve()
+        skill_path = (skills_dir / safe_id).resolve()
+        if not skill_path.is_relative_to(skills_dir) or not skill_path.is_dir():
+            return f"Skill '{safe_id}' was not found."
+        evidence = str(validation_evidence or "").strip()
+        if not disposable_tests_passed or not evidence:
+            return "Skill review blocked: disposable validation evidence is required."
+
+        meta_path = skill_path / "skill.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        prompt_file = str(meta.get("prompt_file") or "SKILL.md")
+        prompt = (skill_path / prompt_file).read_text(encoding="utf-8").strip()
+        manifest = package_to_manifest(skill_path, meta, prompt)
+        if manifest.validation_errors:
+            return f"Skill review blocked by manifest errors: {manifest.validation_errors}"
+
+        proposal = next(
+            (
+                item
+                for item in list_skill_proposals()
+                if any(Path(path).parent.resolve() == skill_path for path in item.files_created)
+            ),
+            None,
+        )
+        if proposal is None or proposal.status not in {"registered_disabled", "reviewed"}:
+            return "Skill review blocked: matching registered-disabled proposal was not found."
+
+        approval_id = str(get_tool_execution_context().get("approval_id") or "")
+        if not approval_id:
+            return "Skill review blocked: an active registration approval is required."
+
+        meta["status"] = "installed"
+        meta["experimental"] = False
+        meta["review_evidence"] = evidence[:1000]
+        meta_path.write_text(json.dumps(meta, indent=4) + "\n", encoding="utf-8")
+        for marker_name in (".draft", ".experimental"):
+            marker = skill_path / marker_name
+            if marker.exists():
+                marker.unlink()
+        update_skill_proposal(
+            proposal.id,
+            status="reviewed",
+            registration_approval_id=approval_id,
+            verification_rules=list(dict.fromkeys([*proposal.verification_rules, evidence[:240]])),
+        )
+        SkillsRegistry.refresh(skills_dir)
+        return (
+            f"Skill **{safe_id}** passed review and remains DISABLED. "
+            "Use a separate approved skill_enable action to activate it."
+        )
+    except Exception as exc:
+        logger.error(f"skill_review failed: {exc}")
+        return f"Failed to review skill: {exc}"
+
+
+@ToolRegistry.register(
     name="skill_enable",
     description="Enable or disable an installed skill by ID. Disabling creates a .disabled marker; enabling removes it.",
     category="self_mod",
     is_action=True,
     risk_level="moderate",
+    policy_flags=["ENABLE_SYSTEM_ACTIONS"],
 )
 @tool(args_schema=SkillEnableArgs)
 def skill_enable(skill_id: str, enabled: bool = True) -> str:
@@ -246,9 +329,23 @@ def skill_enable(skill_id: str, enabled: bool = True) -> str:
         marker = skill_path / ".disabled"
 
         if enabled:
+            from agent.skills_registry import SkillsRegistry, package_to_manifest
+
+            if (skill_path / ".draft").exists() or (skill_path / ".experimental").exists():
+                return (
+                    f"Skill **{safe_id}** is still experimental/draft. "
+                    "Complete an approved skill_review first."
+                )
+            meta = json.loads((skill_path / "skill.json").read_text(encoding="utf-8"))
+            prompt_file = str(meta.get("prompt_file") or "SKILL.md")
+            prompt = (skill_path / prompt_file).read_text(encoding="utf-8").strip()
+            manifest = package_to_manifest(skill_path, meta, prompt)
+            if manifest.status.value not in {"built_in", "installed", "disabled"} or manifest.validation_errors:
+                return f"Skill **{safe_id}** failed activation validation: {manifest.validation_errors}"
             # Enable: remove the .disabled marker
             if marker.exists():
                 marker.unlink()
+                SkillsRegistry.refresh(skills_dir)
                 logger.info(f"Skill enabled: {skill_id}")
                 return f"✅ Skill **{skill_id}** is now enabled. It will be active on the next query."
             else:
@@ -257,6 +354,8 @@ def skill_enable(skill_id: str, enabled: bool = True) -> str:
             # Disable: create the .disabled marker
             if not marker.exists():
                 marker.write_text("disabled\n", encoding="utf-8")
+                from agent.skills_registry import SkillsRegistry
+                SkillsRegistry.refresh(skills_dir)
                 logger.info(f"Skill disabled: {skill_id}")
                 return f"✅ Skill **{skill_id}** is now disabled. It will be inactive on the next query."
             else:
