@@ -117,10 +117,39 @@ New commands and outcomes will be appended after each phase.
 - [x] Completed research/memory and automation/connection caller/data-owner audits.
 - [x] Completed UI/Editor/Chat/coding-harness caller and retention audit.
 - [x] Proved Editor migration inventory: 33 documents, 86 revisions, 10 referenced assets, 9 present/hash-valid assets, 1 missing asset, 1 artifact, and no jobs across two legacy Project identifiers. Source data remains untouched.
-- [ ] Implement shared contracts.
-- [ ] Complete six workstreams.
-- [ ] Run final validation and diff review.
+- [x] Architecture redesign baseline committed and pushed on branch `echospeak-8.0` (`ddec8ea`).
+- [x] Editor routes/UI removed; Media library + generation paths preserved.
+- [x] Chat presentation helpers: calm transcript (errors only), `mergeFinalReply`, stale Session/Project final guard with `activeProjectIdRef` + send-time ownership.
+- [x] Studio navigation: dual scroll arrows restored, overflow scroll for all 14 sections including Automations/Connections/Services.
+- [x] Studio Memory metadata (scope/project/confidence/source), Tools lifecycle badges, Soul identity surface, Automations heartbeat/run honesty, Connections real backend list.
+- [x] Research Feed renders durable ResearchArtifact fields (plan/branches/sources/evidence/claims/gaps/contradictions/synthesis) when present.
+- [x] Full backend suite from disposable root: **580 passed, 1 skipped** (2026-07-14).
+- [x] Frontend: typecheck, 13 files / 48 tests, production build (large-chunk warning only).
+- [x] Desktop: cargo check/clippy/fmt, 10 contract tests; release host launches sidecar on loopback with disposable `ECHOSPEAK_DESKTOP_*` dirs.
+- [ ] Full interactive native Chat (model response / Session switch mid-stream) remains manual — requires configured provider (e.g. LM Studio).
+- [ ] Packaged installer install/uninstall matrix and multi-DPI visual Studio nav proof remain manual.
+
+## Validation results (2026-07-14 finish pass)
+
+| Surface | Result |
+|---------|--------|
+| Web typecheck | pass |
+| Web vitest | 13 files, 48 tests pass |
+| Web `npm run check` | pass |
+| Web production build | pass (~914 kB JS chunk warning) |
+| Backend focused keyword suite | 112 passed / 469 deselected |
+| Backend full suite (disposable `ECHOSPEAK_DATA_DIR`) | **580 passed, 1 skipped**, 1 deprecation warning |
+| Editor retirement + retired architecture | 9 passed (subset of full suite) |
+| Media library tests | 3 passed |
+| Desktop contract tests | 10 passed |
+| Cargo check / clippy `-D warnings` / fmt `--check` | pass |
+| Native release launch | process up; Uvicorn `127.0.0.1:<ephemeral>`; `/health` 200 from host; readiness + hydrate routes 200; unauthenticated protected routes 401 |
 
 ## Changed files for this objective
 
-- `docs/SIX_SYSTEM_IMPLEMENTATION_LEDGER.md` — canonical durable plan, evidence, progress, and validation record.
+- `docs/SIX_SYSTEM_IMPLEMENTATION_LEDGER.md` — progress and validation record.
+- `apps/web/src/index.tsx` — Chat calm timeline, Studio nav, Memory/Tools/Soul/Automations/Research polish, project-ownership refs.
+- `apps/web/src/chatPresentation.ts` / tests — presentation + ownership helpers.
+- `apps/web/src/studioNavigation.ts` / tests — section order + keyboard navigation.
+- `apps/web/src/vitest.d.ts` — expect matchers used by tests.
+- Prior 8.0 baseline commit includes backend Media, Connections, Automations, Editor retirement, desktop shell, and contract docs.

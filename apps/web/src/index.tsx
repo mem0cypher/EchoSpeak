@@ -17,6 +17,8 @@ import { AvatarEditor } from "./components/AvatarEditor";
 import { ProjectSidebar } from "./components/ProjectSidebar";
 import { MediaLibraryView } from "./features/media/MediaLibraryView.tsx";
 import { loadRuntimeLayout, runtimeGridColumns, saveRuntimeLayout } from "./runtimeLayout";
+import { canApplyFinalToChat, mergeFinalReply, shouldPersistChatActivity } from "./chatPresentation";
+import { nextStudioTabIndex, STUDIO_SECTION_ORDER } from "./studioNavigation";
 import { buildResearchRunFromToolEvent, normalizeResearchRun } from "./features/research/buildResearchRun";
 import { useResearchStore } from "./features/research/store";
 import type { ResearchRun } from "./features/research/types";
@@ -409,6 +411,13 @@ type MemoryItem = {
   updated_at?: string;
   index_state?: string;
   supersedes?: string;
+  /** Optional projection fields from MemoryCurator / list API. */
+  project_id?: string;
+  project_path?: string;
+  confidence?: number | string;
+  source?: string;
+  status?: string;
+  provenance?: string;
 };
 
 type MemoryListResponse = {
@@ -1236,12 +1245,15 @@ const globalCss = `
          }
          .studio-nav {
            position: relative;
-           z-index: 2;
+           z-index: 5;
            display: flex;
-           justify-content: center;
+           align-items: stretch;
+           justify-content: stretch;
            border-bottom: 1px solid rgba(255,255,255,0.06);
-           background: rgba(255,255,255,0.015);
+           background: rgba(8,8,8,0.98);
            min-width: 0;
+           width: 100%;
+           flex: 0 0 auto;
          }
          .studio-nav-arrow {
            width: 36px;
@@ -1249,35 +1261,42 @@ const globalCss = `
            border: 0;
            border-left: 1px solid rgba(255,255,255,0.06);
            border-right: 1px solid rgba(255,255,255,0.06);
-           background: rgba(8,8,8,0.96);
+           background: rgba(8,8,8,0.98);
            color: rgba(255,255,255,0.72);
            cursor: pointer;
            font-size: 18px;
+           z-index: 2;
          }
          .studio-nav-arrow:hover { color: #fff; background: rgba(255,255,255,0.06); }
          .studio-nav-inner {
            display: flex;
            gap: 0;
            overflow-x: auto;
-           max-width: 960px;
+           overflow-y: hidden;
            min-width: 0;
-           width: 100%;
-           padding: 0 8px;
-           scrollbar-width: none;
+           flex: 1 1 auto;
+           width: auto;
+           max-width: none;
+           padding: 0 4px;
+           scrollbar-width: thin;
+           scrollbar-color: rgba(255,255,255,0.25) transparent;
+           -webkit-overflow-scrolling: touch;
          }
-         .studio-nav-inner::-webkit-scrollbar { display: none; }
+         .studio-nav-inner::-webkit-scrollbar { height: 4px; }
+         .studio-nav-inner::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.22); border-radius: 999px; }
          .studio-tab {
            height: 44px;
-           padding: 0 16px;
+           padding: 0 14px;
            border: none;
            border-bottom: 2px solid transparent;
            background: transparent;
            color: rgba(255,255,255,0.4);
            font-size: 12px;
            font-weight: 600;
-           letter-spacing: 0.06em;
+           letter-spacing: 0.04em;
            cursor: pointer;
            white-space: nowrap;
+           flex: 0 0 auto;
            transition: color 0.15s ease;
            font-family: Inter, system-ui, sans-serif;
          }
@@ -3255,6 +3274,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     workspace_root?: string; archived?: boolean; git_metadata?: Record<string, any>;
   }[]>(() => (desktopBootstrap?.projects || []) as any[]);
   const [activeProjectId, setActiveProjectId] = useState<string>(() => desktopBootstrap?.active_project_id || "");
+  const activeProjectIdRef = useRef<string>(desktopBootstrap?.active_project_id || "");
   const [folderDropActive, setFolderDropActive] = useState(false);
   const [projectsLoading, setProjectsLoading] = useState<boolean>(false);
   const [initialHydrationComplete, setInitialHydrationComplete] = useState(Boolean(desktopBootstrap));
@@ -3337,6 +3357,10 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     activeThreadIdRef.current = activeThreadId;
     setStreaming(Boolean(activeThreadId && streamControllersRef.current.has(activeThreadId)));
   }, [activeThreadId, inFlightSessionIds, setStreaming]);
+
+  useEffect(() => {
+    activeProjectIdRef.current = activeProjectId;
+  }, [activeProjectId]);
 
   useEffect(() => {
     if (activeThreadId) {
@@ -4704,14 +4728,18 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
           msg: m,
         })
       ),
-      ...activities.filter((item) => item.kind === "error").map(
-        (a): TimelineItem => ({
-          kind: "activity",
-          id: a.id,
-          at: a.at,
-          item: a,
-        })
-      ),
+      // Chat is calm: only durable actionable errors stay in the transcript.
+      // Tool/stage/evidence cards live in Studio Viewer, not permanent Chat chrome.
+      ...activities
+        .filter((item) => shouldPersistChatActivity(String(item.kind || "")))
+        .map(
+          (a): TimelineItem => ({
+            kind: "activity",
+            id: a.id,
+            at: a.at,
+            item: a,
+          })
+        ),
     ];
     // Chronological user/assistant history with persistent error rows.
     const kindRank = (k: TimelineItem["kind"]) =>
@@ -4916,6 +4944,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       }
     }
     if (!streamThreadId) return;
+    const streamProjectId = String(activeProjectIdRef.current || activeProjectId || "").trim();
     streamControllersRef.current.get(streamThreadId)?.abort();
     const streamController = new AbortController();
     streamControllersRef.current.set(streamThreadId, streamController);
@@ -5845,13 +5874,29 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
             finalHandled = true;
 
             const liveDraft = liveReplyDraftRef.current.trim();
-            let reply = String(evt.response || liveDraft || "").trim();
-            const partials = [...partialReplies, ...(Array.isArray(evt.partial_replies) ? evt.partial_replies : [])]
-              .map((part) => String(part || "").trim())
-              .filter(Boolean)
-              .filter((part, index, rows) => rows.indexOf(part) === index);
-            if (partials.length && !partials.some((part) => reply.includes(part))) {
-              reply = [...partials, reply].filter(Boolean).join("\n\n");
+            const reply = mergeFinalReply(
+              evt.response,
+              liveDraft,
+              partialReplies,
+              Array.isArray(evt.partial_replies) ? evt.partial_replies : []
+            );
+
+            // Stale ownership: if the user switched Session/Project mid-stream,
+            // keep durable backend history but do not paint the final into the wrong chat.
+            // Own the Project captured at send time; compare against live refs (not stale closures).
+            if (
+              !canApplyFinalToChat({
+                activeThreadId: String(activeThreadIdRef.current || ""),
+                activeProjectId: String(activeProjectIdRef.current || ""),
+                ownedThreadId: streamThreadId,
+                ownedProjectId: streamProjectId,
+                streamOpen: streamControllersRef.current.get(streamThreadId) === streamController,
+              })
+            ) {
+              liveReplyDraftRef.current = "";
+              setLiveReplyDraft("");
+              setStreaming(false);
+              continue;
             }
 
             if (evt.execution_id) {
@@ -6517,22 +6562,27 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     ? (providerDraft.provider === "openai" ? openaiModelOptions : providerDraft.provider === "gemini" ? geminiModelOptions : providerModels)
     : [providerDraft.model || "Default model"];
   const modelPickerValue = showModelPicker ? providerDraft.model : modelPickerOptions[0];
-  const studioTabs: { id: typeof leftTab; label: string; group: string }[] = [
-    { id: "overview", label: "Overview", group: "Control Center" },
-    { id: "skills", label: "Skills", group: "Capabilities" },
-    { id: "memory", label: "Memory", group: "Knowledge" },
-    { id: "docs", label: "Docs", group: "Knowledge" },
-    { id: "settings", label: "Settings", group: "Config" },
-    { id: "capabilities", label: "Tools", group: "Config" },
-    { id: "soul", label: "Soul", group: "Config" },
-    { id: "avatar_editor", label: "Avatar", group: "Config" },
-    { id: "approvals", label: "Approvals", group: "Automation" },
-    { id: "executions", label: "Viewer", group: "Operations" },
-    { id: "projects", label: "Projects", group: "Automation" },
-    { id: "automations", label: "Automations", group: "Automation" },
-    { id: "connections", label: "Connections", group: "Automation" },
-    { id: "services", label: "Services", group: "Automation" },
-  ];
+  const studioTabMeta: Record<string, { label: string; group: string }> = {
+    overview: { label: "Overview", group: "Control Center" },
+    skills: { label: "Skills", group: "Capabilities" },
+    memory: { label: "Memory", group: "Knowledge" },
+    docs: { label: "Docs", group: "Knowledge" },
+    settings: { label: "Settings", group: "Config" },
+    capabilities: { label: "Tools", group: "Config" },
+    soul: { label: "Soul", group: "Config" },
+    avatar_editor: { label: "Avatar", group: "Config" },
+    approvals: { label: "Approvals", group: "Automation" },
+    executions: { label: "Viewer", group: "Operations" },
+    projects: { label: "Projects", group: "Automation" },
+    automations: { label: "Automations", group: "Automation" },
+    connections: { label: "Connections", group: "Automation" },
+    services: { label: "Services", group: "Automation" },
+  };
+  const studioTabs: { id: typeof leftTab; label: string; group: string }[] = STUDIO_SECTION_ORDER.map((id) => ({
+    id: id as typeof leftTab,
+    label: studioTabMeta[id]?.label || id,
+    group: studioTabMeta[id]?.group || "Studio",
+  }));
   const studioOpen = desktopMode
     ? desktopSurface === "studio"
     : leftTab !== "chat" && leftTab !== "research";
@@ -6551,15 +6601,13 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     });
   }, [leftTab]);
   const moveStudioTabFocus = (currentIndex: number, key: string) => {
-    let nextIndex = currentIndex;
-    if (key === "ArrowRight") nextIndex = (currentIndex + 1) % studioTabs.length;
-    else if (key === "ArrowLeft") nextIndex = (currentIndex - 1 + studioTabs.length) % studioTabs.length;
-    else if (key === "Home") nextIndex = 0;
-    else if (key === "End") nextIndex = studioTabs.length - 1;
-    else return false;
+    const nextIndex = nextStudioTabIndex(currentIndex, studioTabs.length, key);
+    if (nextIndex == null) return false;
     const next = studioTabs[nextIndex];
     setLeftTab(next.id);
-    window.requestAnimationFrame(() => studioNavRef.current?.querySelector<HTMLElement>(`[data-studio-tab="${next.id}"]`)?.focus());
+    window.requestAnimationFrame(() =>
+      studioNavRef.current?.querySelector<HTMLElement>(`[data-studio-tab="${next.id}"]`)?.focus()
+    );
     return true;
   };
   const closeStudio = () => {
@@ -6788,25 +6836,101 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           {researchArtifactsError ? (
                             <div style={{ border: "1px solid rgba(248,113,113,.35)", padding: 12, color: "#fca5a5", fontSize: 11 }}>{researchArtifactsError}</div>
                           ) : null}
-                          {researchArtifacts.slice(0, 6).map((artifact) => (
+                          {researchArtifacts.slice(0, 6).map((artifact) => {
+                            const planSteps = Array.isArray(artifact.plan?.steps)
+                              ? artifact.plan.steps
+                              : Array.isArray(artifact.plan?.queries)
+                                ? artifact.plan.queries
+                                : artifact.plan
+                                  ? [artifact.plan.objective || artifact.plan.summary || JSON.stringify(artifact.plan).slice(0, 200)].filter(Boolean)
+                                  : [];
+                            const branchRows = Array.isArray(artifact.branches) ? artifact.branches : [];
+                            const sourceRows = Array.isArray(artifact.sources) ? artifact.sources : [];
+                            const evidenceRows = Array.isArray(artifact.evidence) ? artifact.evidence : [];
+                            const gapRows = Array.isArray(artifact.coverage_gaps) ? artifact.coverage_gaps : [];
+                            return (
                             <details key={artifact.id} style={{ background: "rgba(255,255,255,.03)", border: "1px solid rgba(255,255,255,.09)", padding: 14 }}>
                               <summary style={{ cursor: "pointer", fontSize: 12, fontWeight: 650 }}>
                                 {artifact.objective || artifact.query || "Research artifact"} · {artifact.status}
                               </summary>
-                              {artifact.summary ? <div style={{ fontSize: 11, color: "rgba(255,255,255,.62)", lineHeight: 1.5, marginTop: 10 }}>{artifact.summary}</div> : null}
-                              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(110px,1fr))", gap: 6, marginTop: 10 }}>
-                                {[['Claims', artifact.claims?.length || 0], ['Sources', artifact.sources?.length || 0], ['Evidence', artifact.evidence?.length || 0], ['Gaps', artifact.coverage_gaps?.length || 0]].map(([label, value]) => (
+                              {artifact.query && artifact.objective && artifact.query !== artifact.objective ? (
+                                <div style={{ fontSize: 11, color: "rgba(255,255,255,.5)", marginTop: 8 }}>Question: {artifact.query}</div>
+                              ) : null}
+                              {artifact.summary ? <div style={{ fontSize: 11, color: "rgba(255,255,255,.72)", lineHeight: 1.55, marginTop: 10 }}><strong style={{ color: "rgba(255,255,255,.85)" }}>Synthesis</strong><div style={{ marginTop: 4 }}>{artifact.summary}</div></div> : null}
+                              {artifact.outcome ? <div style={{ fontSize: 10, color: "rgba(255,255,255,.45)", marginTop: 6 }}>Outcome: {artifact.outcome}</div> : null}
+                              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(100px,1fr))", gap: 6, marginTop: 10 }}>
+                                {[['Branches', branchRows.length], ['Claims', artifact.claims?.length || 0], ['Sources', sourceRows.length], ['Evidence', evidenceRows.length], ['Gaps', gapRows.length], ['Contradictions', artifact.contradictions?.length || 0]].map(([label, value]) => (
                                   <div key={String(label)} style={{ background: "rgba(255,255,255,.035)", padding: 7, fontSize: 10 }}>{label}: <strong>{value}</strong></div>
                                 ))}
                               </div>
+                              {planSteps.length ? (
+                                <div style={{ marginTop: 10 }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,.55)", textTransform: "uppercase", letterSpacing: ".06em" }}>Plan</div>
+                                  {planSteps.slice(0, 6).map((step: any, i: number) => (
+                                    <div key={i} style={{ fontSize: 11, color: "rgba(255,255,255,.62)", marginTop: 4, paddingLeft: 8, borderLeft: "2px solid rgba(255,255,255,.12)" }}>
+                                      {typeof step === "string" ? step : (step.question || step.query || step.objective || step.title || step.summary || String(step.id || i + 1))}
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : null}
+                              {branchRows.length ? (
+                                <div style={{ marginTop: 10 }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,.55)", textTransform: "uppercase", letterSpacing: ".06em" }}>Branches</div>
+                                  {branchRows.slice(0, 6).map((branch: any) => (
+                                    <div key={branch.id || branch.query} style={{ fontSize: 11, marginTop: 4, color: "rgba(255,255,255,.62)" }}>
+                                      {branch.query || branch.objective || branch.title || branch.id}
+                                      {branch.status ? <span style={{ color: "rgba(255,255,255,.4)" }}> · {branch.status}</span> : null}
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : null}
+                              {sourceRows.length ? (
+                                <div style={{ marginTop: 10 }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,.55)", textTransform: "uppercase", letterSpacing: ".06em" }}>Sources</div>
+                                  {sourceRows.slice(0, 6).map((source: any) => (
+                                    <div key={source.id || source.url} style={{ fontSize: 10, marginTop: 4, color: "rgba(96,165,250,.85)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                      {source.title || source.url || source.id}
+                                      {source.freshness ? <span style={{ color: "rgba(255,255,255,.4)" }}> · {source.freshness}</span> : null}
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : null}
+                              {evidenceRows.length ? (
+                                <div style={{ marginTop: 10 }}>
+                                  <div style={{ fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,.55)", textTransform: "uppercase", letterSpacing: ".06em" }}>Evidence</div>
+                                  {evidenceRows.slice(0, 4).map((row: any) => (
+                                    <div key={row.id} style={{ fontSize: 11, marginTop: 4, color: "rgba(255,255,255,.58)", borderLeft: "2px solid rgba(255,255,255,.12)", paddingLeft: 8 }}>
+                                      {(row.content || row.text || "").slice(0, 220)}{(row.content || row.text || "").length > 220 ? "…" : ""}
+                                      {row.confidence != null ? <span style={{ color: "rgba(255,255,255,.35)" }}> · conf {Math.round(Number(row.confidence) * 100)}%</span> : null}
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : null}
                               {(artifact.claims || []).slice(0, 6).map((claim: any) => (
                                 <div key={claim.id} style={{ borderLeft: "2px solid rgba(255,255,255,.22)", paddingLeft: 9, marginTop: 9, fontSize: 11 }}>
                                   {claim.text} <span style={{ color: "rgba(255,255,255,.4)" }}>· {claim.status} · {Math.round(Number(claim.confidence || 0) * 100)}%</span>
                                 </div>
                               ))}
-                              {(artifact.contradictions || []).length ? <div style={{ color: "#fbbf24", fontSize: 10, marginTop: 9 }}>{artifact.contradictions.length} contradiction(s) retained for review.</div> : null}
+                              {gapRows.length ? (
+                                <div style={{ marginTop: 9 }}>
+                                  {gapRows.slice(0, 4).map((gap: any) => (
+                                    <div key={gap.id || gap.question} style={{ fontSize: 10, color: "rgba(251,191,36,.9)", marginTop: 3 }}>
+                                      Gap: {gap.question || gap.reason || gap.id}{gap.severity ? ` (${gap.severity})` : ""}
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : null}
+                              {(artifact.contradictions || []).length ? (
+                                <div style={{ color: "#fbbf24", fontSize: 10, marginTop: 9 }}>
+                                  {(artifact.contradictions || []).slice(0, 3).map((c: any) => (
+                                    <div key={c.id || c.description}>{c.description || c.id || "Contradiction retained"} · {c.status || "open"}</div>
+                                  ))}
+                                  {(artifact.contradictions || []).length > 3 ? <div>{artifact.contradictions.length - 3} more contradiction(s)…</div> : null}
+                                </div>
+                              ) : null}
                             </details>
-                          ))}
+                            );
+                          })}
                           {researchArtifacts.length === 0 && research.length === 0 ? (
                             <div style={{ textAlign: "center", color: "rgba(255,255,255,0.25)", fontSize: 13, padding: 40, fontStyle: "italic" }}>
                               Research results will appear here when the agent searches the web...
@@ -7574,8 +7698,15 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                     </button>
                   </div>
 
-                  <div className="studio-nav">
-                    <button type="button" className="studio-nav-arrow" aria-label="Scroll Studio tabs left" onClick={() => studioNavRef.current?.scrollBy({ left: -280, behavior: "smooth" })}>‹</button>
+                  <div className="studio-nav" data-testid="studio-nav">
+                    <button
+                      type="button"
+                      className="studio-nav-arrow"
+                      aria-label="Scroll Studio tabs left"
+                      onClick={() => studioNavRef.current?.scrollBy({ left: -280, behavior: "smooth" })}
+                    >
+                      ‹
+                    </button>
                     <div className="studio-nav-inner" ref={studioNavRef} role="tablist" aria-label="Studio sections">
                       {studioTabs.map((tab, tabIndex) => (
                         <button
@@ -7590,12 +7721,20 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           aria-selected={leftTab === tab.id}
                           tabIndex={leftTab === tab.id ? 0 : -1}
                           data-studio-tab={tab.id}
-                          title={tab.group}
+                          title={`${tab.group}: ${tab.label}`}
                         >
                           {tab.label}
                         </button>
                       ))}
                     </div>
+                    <button
+                      type="button"
+                      className="studio-nav-arrow"
+                      aria-label="Scroll Studio tabs right"
+                      onClick={() => studioNavRef.current?.scrollBy({ left: 280, behavior: "smooth" })}
+                    >
+                      ›
+                    </button>
                   </div>
 
 
@@ -7646,7 +7785,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                         </div>
                       ))}
                     </div>
-                    <button type="button" className="studio-nav-arrow" aria-label="Scroll Studio tabs right" onClick={() => studioNavRef.current?.scrollBy({ left: 280, behavior: "smooth" })}>›</button>
                   </div>
                   <div className="research-card">
                     <div className="research-title">Recent Tasks</div>
@@ -7914,10 +8052,14 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           const isEditing = editingMemoryId === m.id;
                           const isSelected = selectedMemoryIds.includes(m.id);
                           const indexState = String(m.index_state || m.metadata?.index_state || "pending");
+                          const scope = String(m.scope || m.metadata?.scope || "account");
+                          const projectLabel = String(m.project_id || m.project_path || m.metadata?.project_id || m.metadata?.project_path || "").trim();
+                          const confidence = m.confidence ?? m.metadata?.confidence;
+                          const sourceLabel = String(m.source || m.metadata?.source || "curated");
                           return (
                             <div key={m.id} className="research-card" style={{ border: isSelected ? `1px solid ${colors.accent}` : undefined }}>
                               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 10 }}>
-                                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, flex: 1 }}>
                                   <input
                                     type="checkbox"
                                     checked={isSelected}
@@ -7930,8 +8072,28 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                     }}
                                     style={{ width: 16, height: 16 }}
                                   />
-                                  <div style={{ fontSize: 14, color: colors.textDim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                                    {ts ? ts : "(no timestamp)"}
+                                  <div style={{ minWidth: 0 }}>
+                                    <div style={{ fontSize: 12, color: colors.textDim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                      {ts ? ts : "(no timestamp)"} · {sourceLabel}
+                                    </div>
+                                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 4 }}>
+                                      <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 999, border: `1px solid ${colors.line}`, color: colors.textDim }}>
+                                        scope:{scope}
+                                      </span>
+                                      {projectLabel ? (
+                                        <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 999, border: `1px solid ${colors.line}`, color: colors.textDim }}>
+                                          project:{projectLabel.length > 24 ? `${projectLabel.slice(0, 24)}…` : projectLabel}
+                                        </span>
+                                      ) : null}
+                                      {confidence != null && confidence !== "" ? (
+                                        <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 999, border: `1px solid ${colors.line}`, color: colors.textDim }}>
+                                          conf:{String(confidence)}
+                                        </span>
+                                      ) : null}
+                                      <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 999, border: `1px solid ${colors.line}`, color: colors.textDim }}>
+                                        index:{indexState}
+                                      </span>
+                                    </div>
                                   </div>
                                 </div>
                                 <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
@@ -9882,27 +10044,63 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                             </div>
                           </div>
 
-                          {/* Tools List */}
+                          {/* Tools List — ToolRegistry projection authority */}
                           <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>
                             Tools ({(capabilitiesData.tools?.items || []).length}
                             {typeof capabilitiesData.tools?.count === "number" ? ` of ${capabilitiesData.tools.count}` : ""})
                           </div>
                           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                            {(capabilitiesData.tools?.items || []).map((tool: any) => (
+                            {(capabilitiesData.tools?.items || []).map((tool: any) => {
+                              const trust = String(tool.trust_state || tool.health || "").toLowerCase();
+                              const missingConfig = Boolean(tool.missing_configuration || tool.config_missing || trust === "missing_configuration");
+                              const unhealthy = ["unhealthy", "error", "failed", "degraded"].includes(trust) || Boolean(tool.unhealthy);
+                              const promptOnly = Boolean(tool.prompt_only || tool.mode === "prompt_only");
+                              const disabled = Boolean(tool.disabled || tool.enabled === false);
+                              const providerBacked = Boolean(tool.provider_backed || tool.origin === "provider" || tool.mcp_server || tool.origin === "mcp");
+                              const permissionRestricted = !tool.allowed && (Boolean(tool.blocked_reason) || (tool.policy_flags && tool.policy_flags.length));
+                              let lifecycle = "registered";
+                              if (disabled) lifecycle = "disabled";
+                              else if (missingConfig) lifecycle = "missing configuration";
+                              else if (unhealthy) lifecycle = "unhealthy";
+                              else if (promptOnly) lifecycle = "prompt-only";
+                              else if (permissionRestricted) lifecycle = "permission restricted";
+                              else if (tool.allowed === false) lifecycle = "blocked";
+                              else if (tool.allowed === true && tool.executable === false) lifecycle = "available";
+                              else if (tool.allowed === true || tool.executable === true) lifecycle = "executable";
+                              else lifecycle = "registered";
+                              const lifecycleColor =
+                                lifecycle === "executable" ? "#22c55e"
+                                  : lifecycle === "available" || lifecycle === "registered" ? "rgba(255,255,255,0.65)"
+                                    : lifecycle === "prompt-only" || lifecycle === "missing configuration" ? "#f59e0b"
+                                      : "#ef4444";
+                              return (
                               <div
                                 key={tool.name}
                                 style={{
                                   background: colors.panel2,
                                   padding: 10,
                                   borderRadius: 6,
-                                  border: `1px solid ${tool.allowed ? colors.line : colors.danger}`,
-                                  opacity: tool.allowed ? 1 : 0.6,
+                                  border: `1px solid ${tool.allowed ? colors.line : "rgba(239,68,68,0.45)"}`,
+                                  opacity: disabled ? 0.55 : 1,
                                 }}
                               >
-                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, gap: 8, flexWrap: "wrap" }}>
                                   <span style={{ fontSize: 13, fontWeight: 600, fontFamily: "monospace" }}>{tool.name}</span>
-                                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                                    {/* Risk Level Badge */}
+                                  <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                                    <span
+                                      style={{
+                                        fontSize: 10,
+                                        padding: "2px 6px",
+                                        borderRadius: 4,
+                                        background: `${lifecycleColor}22`,
+                                        color: lifecycleColor,
+                                        fontWeight: 700,
+                                        textTransform: "uppercase",
+                                        letterSpacing: "0.04em",
+                                      }}
+                                    >
+                                      {lifecycle}
+                                    </span>
                                     <span
                                       style={{
                                         fontSize: 10,
@@ -9916,7 +10114,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                     >
                                       {tool.risk_level || "safe"}
                                     </span>
-                                    {/* Confirmation Badge */}
                                     {tool.requires_confirmation && (
                                       <span
                                         style={{
@@ -9929,6 +10126,21 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                         }}
                                       >
                                         CONFIRM
+                                      </span>
+                                    )}
+                                    {providerBacked && (
+                                      <span
+                                        style={{
+                                          fontSize: 10,
+                                          padding: "2px 6px",
+                                          borderRadius: 4,
+                                          background: "rgba(168,85,247,0.14)",
+                                          color: "#c084fc",
+                                          fontWeight: 600,
+                                          textTransform: "uppercase",
+                                        }}
+                                      >
+                                        provider-backed
                                       </span>
                                     )}
                                     <span
@@ -9944,35 +10156,26 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                     >
                                       {tool.origin || "local"}
                                     </span>
-                                    {/* Allowed/Blocked Status */}
-                                    <span
-                                      style={{
-                                        fontSize: 11,
-                                        fontWeight: 600,
-                                        color: tool.allowed ? "#22c55e" : colors.danger,
-                                      }}
-                                    >
-                                      {tool.allowed ? "✓" : "✗"}
-                                    </span>
                                   </div>
                                 </div>
-                                {/* Blocked Reason */}
                                 {!tool.allowed && tool.blocked_reason && (
                                   <div style={{ fontSize: 11, color: colors.danger, marginBottom: 4 }}>
                                     {tool.blocked_reason}
                                   </div>
                                 )}
-                                {/* Policy Flags */}
                                 {tool.policy_flags && tool.policy_flags.length > 0 && (
                                   <div style={{ fontSize: 10, color: colors.textDim }}>
                                     Requires: {tool.policy_flags.join(", ")}
                                   </div>
                                 )}
                                 <div style={{ fontSize: 10, color: colors.textDim }}>
-                                  Trust: {tool.trust_state || "built_in"}{tool.mcp_server ? ` · MCP server: ${tool.mcp_server}` : ""}
+                                  Trust: {tool.trust_state || "built_in"}
+                                  {tool.mcp_server ? ` · MCP server: ${tool.mcp_server}` : ""}
+                                  {tool.description ? ` · ${String(tool.description).slice(0, 120)}` : ""}
                                 </div>
                               </div>
-                            ))}
+                              );
+                            })}
                           </div>
                         </>
                       )}
@@ -10342,14 +10545,47 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                       </div>
                     ))}
                   </div>
-                  {/* Pipeline Status */}
-                  <div style={{ padding: "10px 14px", marginBottom: 4, borderRadius: 10, background: "linear-gradient(135deg, rgba(34,197,94,0.08), rgba(34,197,94,0.02))", border: "1px solid rgba(34,197,94,0.2)" }}>
+                  {/* Pipeline Status — reflect backend heartbeat when known */}
+                  <div style={{ padding: "10px 14px", marginBottom: 4, borderRadius: 10, background: "linear-gradient(135deg, rgba(255,255,255,0.05), rgba(255,255,255,0.01))", border: `1px solid ${colors.line}` }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#22c55e", boxShadow: "0 0 6px rgba(34,197,94,0.5)", animation: "pulse 2s infinite" }} />
-                      <span style={{ fontSize: 11, color: "#22c55e", fontWeight: 600, letterSpacing: "0.03em" }}>SCHEDULER ACTIVE · CONNECTED TO PIPELINE</span>
+                      <span
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: "50%",
+                          background: studioOverview?.heartbeat?.running ? "#22c55e" : studioOverview?.heartbeat?.enabled ? "#f59e0b" : "rgba(255,255,255,0.35)",
+                          boxShadow: studioOverview?.heartbeat?.running ? "0 0 6px rgba(34,197,94,0.5)" : "none",
+                        }}
+                      />
+                      <span style={{ fontSize: 11, color: colors.text, fontWeight: 600, letterSpacing: "0.03em" }}>
+                        {studioOverview?.heartbeat?.running
+                          ? "HEARTBEAT RUNNING"
+                          : studioOverview?.heartbeat?.enabled
+                            ? "SCHEDULER ENABLED · NOT RUNNING"
+                            : "SCHEDULER DISABLED OR UNKNOWN"}
+                      </span>
                     </div>
-                    <div style={{ fontSize: 10, color: colors.textDim, marginTop: 4 }}>Each trigger creates one durable Task and one governed Turn. External delivery remains approval-bound.</div>
+                    <div style={{ fontSize: 10, color: colors.textDim, marginTop: 4 }}>
+                      Scope: Session <code>{activeThreadId || "none"}</code> · Project <code>{activeProjectId || "detached"}</code>. Each trigger must create one durable Task/Run through the backend; external delivery remains approval-bound.
+                    </div>
                   </div>
+                  {(studioOverview?.automation_runs || []).length ? (
+                    <div className="research-card" style={{ marginBottom: 10 }}>
+                      <div className="research-title">Recent Runs</div>
+                      {(studioOverview.automation_runs || []).slice(0, 8).map((run: any) => (
+                        <div key={run.id || `${run.task_id}-${run.started_at}`} style={{ borderTop: `1px solid ${colors.line}`, padding: "8px 0", display: "grid", gridTemplateColumns: "minmax(0,1fr) auto", gap: 10 }}>
+                          <div>
+                            <div style={{ fontSize: 12, fontWeight: 650 }}>{run.objective || run.title || run.task_id || "Run"}</div>
+                            <div style={{ fontSize: 10, color: colors.textDim, marginTop: 3 }}>
+                              {run.source || "automation"} · {run.project_id || "no Project"} · {run.session_id || "no Session"}
+                              {run.error ? ` · ${String(run.error).slice(0, 80)}` : ""}
+                            </div>
+                          </div>
+                          <span style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase" }}>{run.status || "unknown"}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                   <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
                     <button
                       className="icon-button"
@@ -10448,9 +10684,23 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           {routine.description && (
                             <div style={{ fontSize: 12, color: colors.textDim, marginBottom: 6 }}>{routine.description}</div>
                           )}
+                          {(routine as any).objective || (routine as any).action_config?.query ? (
+                            <div style={{ fontSize: 12, color: colors.text, marginBottom: 6, lineHeight: 1.45 }}>
+                              <strong style={{ color: colors.textDim, fontWeight: 600 }}>Objective:</strong>{" "}
+                              {String((routine as any).objective || (routine as any).action_config?.query || "").slice(0, 240)}
+                            </div>
+                          ) : null}
                           <div style={{ fontSize: 11, color: colors.textDim, marginBottom: 4 }}>
                             <strong>Type:</strong> {routine.action_type} | <strong>Runs:</strong> {routine.run_count}
+                            {(routine as any).project_id ? ` | Project: ${String((routine as any).project_id).slice(0, 12)}…` : " | Project: scope-bound"}
                           </div>
+                          {((routine as any).allowed_tools || (routine as any).allowed_skills || (routine as any).allowed_connections) ? (
+                            <div style={{ fontSize: 10, color: colors.textDim, marginBottom: 4 }}>
+                              {((routine as any).allowed_tools || []).length ? `Tools: ${((routine as any).allowed_tools || []).slice(0, 6).join(", ")} ` : ""}
+                              {((routine as any).allowed_skills || []).length ? `Skills: ${((routine as any).allowed_skills || []).slice(0, 4).join(", ")} ` : ""}
+                              {((routine as any).allowed_connections || []).length ? `Connections: ${((routine as any).allowed_connections || []).slice(0, 4).join(", ")}` : ""}
+                            </div>
+                          ) : null}
                           {routine.schedule && (
                             <div style={{ fontSize: 11, color: colors.textDim, marginBottom: 4 }}>
                               <strong>Schedule:</strong> {routine.schedule}
@@ -10575,13 +10825,18 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                 <>
                   <div className="research-scroll">
                     <div className="research-card">
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                        <h3 style={{ margin: 0, fontSize: 16, color: colors.text }}>Agent Soul</h3>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, gap: 12, flexWrap: "wrap" }}>
+                        <div>
+                          <h3 style={{ margin: 0, fontSize: 16, color: colors.text }}>Soul · Identity</h3>
+                          <div style={{ fontSize: 11, color: colors.textDim, marginTop: 4 }}>
+                            Persona, tone, response style, and creator attribution for Echo. Secrets and hidden prompts are not exposed here.
+                          </div>
+                        </div>
                         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                           {soulEnabled ? (
-                            <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "rgba(34,197,94,0.12)", color: "#22c55e" }}>ENABLED</span>
+                            <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "rgba(34,197,94,0.12)", color: "#22c55e", fontWeight: 700 }}>ENABLED</span>
                           ) : (
-                            <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "rgba(107,114,128,0.12)", color: colors.textDim }}>DISABLED</span>
+                            <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "rgba(107,114,128,0.12)", color: colors.textDim, fontWeight: 700 }}>DISABLED</span>
                           )}
                           {soulSavedAt && (
                             <span style={{ fontSize: 10, color: colors.textDim }}>Saved {new Date(soulSavedAt).toLocaleTimeString()}</span>
@@ -10589,8 +10844,23 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                         </div>
                       </div>
 
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 8, marginBottom: 14 }}>
+                        <div style={{ padding: 10, borderRadius: 8, border: `1px solid ${colors.line}`, background: "rgba(255,255,255,0.02)" }}>
+                          <div style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase", letterSpacing: "0.06em" }}>Persistence</div>
+                          <div style={{ fontSize: 12, marginTop: 4, wordBreak: "break-all" }}>{soulPath || "runtime soul file"}</div>
+                        </div>
+                        <div style={{ padding: 10, borderRadius: 8, border: `1px solid ${colors.line}`, background: "rgba(255,255,255,0.02)" }}>
+                          <div style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase", letterSpacing: "0.06em" }}>Budget</div>
+                          <div style={{ fontSize: 12, marginTop: 4 }}>{soulContent.length} / {soulMaxChars} chars</div>
+                        </div>
+                        <div style={{ padding: 10, borderRadius: 8, border: `1px solid ${colors.line}`, background: "rgba(255,255,255,0.02)" }}>
+                          <div style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase", letterSpacing: "0.06em" }}>Applies to</div>
+                          <div style={{ fontSize: 12, marginTop: 4 }}>New turns in this runtime</div>
+                        </div>
+                      </div>
+
                       <div style={{ fontSize: 12, color: colors.textDim, marginBottom: 12 }}>
-                        The soul defines the agent's core identity, values, communication style, and boundaries. Changes apply to new conversations.
+                        Edit the durable identity document below. Changes persist through the Soul API and apply on subsequent conversations — not mid-stream rewrites of private model reasoning.
                       </div>
 
                       {soulLoading ? (

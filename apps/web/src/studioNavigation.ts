@@ -1,5 +1,23 @@
 export type StudioNavigationKey = "ArrowLeft" | "ArrowRight" | "Home" | "End";
 
+/** Canonical Studio section order — every tab must remain reachable via scroll. */
+export const STUDIO_SECTION_ORDER = [
+  "overview",
+  "skills",
+  "memory",
+  "docs",
+  "settings",
+  "capabilities",
+  "soul",
+  "avatar_editor",
+  "approvals",
+  "executions",
+  "projects",
+  "automations",
+  "connections",
+  "services",
+] as const;
+
 export function nextStudioTabIndex(currentIndex: number, tabCount: number, key: string): number | null {
   if (!Number.isInteger(currentIndex) || tabCount <= 0) return null;
   if (key === "ArrowRight") return (currentIndex + 1) % tabCount;
