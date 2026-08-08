@@ -46,8 +46,17 @@ def _agent_stub(tmp_path: Path):
     a._file_inspected_this_turn = EchoSpeakAgent._file_inspected_this_turn.__get__(a)
     a._try_promote_prose_to_file_write_proposal = EchoSpeakAgent._try_promote_prose_to_file_write_proposal.__get__(a)
     a._ensure_mutation_claim_honesty = EchoSpeakAgent._ensure_mutation_claim_honesty.__get__(a)
+    a._turn_contract_requires_file_mutation = EchoSpeakAgent._turn_contract_requires_file_mutation.__get__(a)
     a._ensure_research_evidence_honesty = EchoSpeakAgent._ensure_research_evidence_honesty.__get__(a)
-    a._current_mode_decision = SimpleNamespace(mode=SimpleNamespace(value="coding", name="CODING"))
+    a._active_turn_interpretation = SimpleNamespace(
+        requested_capabilities=["coding_write"], constraints=[]
+    )
+    a._current_mode_decision = SimpleNamespace(
+        mode=SimpleNamespace(value="coding", name="CODING"),
+        allowed_tool_names={"file_write", "file_read"},
+        evidence_required=True,
+        verification_required=True,
+    )
     a._active_project_id = "proj-1"
     a._current_execution_id = "ex1"
     return a
@@ -107,7 +116,11 @@ def test_research_without_toolrun_blocked():
         "The Oilers were founded in 1972 and are a great team.",
         mode_decision=decision,
     )
-    assert "web_search" in out.lower() or "could not complete" in out.lower()
+    assert (
+        "web_search" in out.lower()
+        or "could not complete" in out.lower()
+        or "couldn't complete" in out.lower()
+    )
     assert "founded in 1972" not in out
 
 

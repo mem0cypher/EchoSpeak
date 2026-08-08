@@ -43,12 +43,6 @@ try:
 except Exception:
     BM25Okapi = None
 
-try:
-    from sentence_transformers import CrossEncoder
-except Exception:
-    CrossEncoder = None
-
-
 class DocumentStore:
     """Persistent FAISS-backed document store for RAG."""
 
@@ -56,7 +50,10 @@ class DocumentStore:
         self.embeddings = embeddings
         self.index_dir = Path(index_dir)
         self.meta_path = Path(meta_path)
+        self.content_dir = self.meta_path.parent / "document_content"
         self.enabled = bool(self.embeddings)
+        self.index_health = "disabled" if not self.enabled else "initializing"
+        self.index_detail = "No embeddings available" if not self.enabled else ""
         self.index_dir.mkdir(parents=True, exist_ok=True)
         self._docs: Dict[str, Dict[str, Any]] = {}
         self._chunks: List[Document] = []
@@ -82,7 +79,8 @@ class DocumentStore:
         self.doc_context_max_chars = int(getattr(config, "doc_context_max_chars", 2800) or 2800)
         self.doc_context_show_labels = bool(getattr(config, "doc_context_show_labels", True))
         self.doc_preview_chars = int(getattr(config, "doc_source_preview_chars", 160) or 160)
-        self.hybrid_enabled = bool(getattr(config, "doc_hybrid_enabled", False))
+        self.hybrid_requested = bool(getattr(config, "doc_hybrid_enabled", False))
+        self.hybrid_enabled = self.hybrid_requested
         self.vector_k = int(getattr(config, "doc_vector_k", 30) or 30)
         self.bm25_k = int(getattr(config, "doc_bm25_k", 30) or 30)
         self.final_k = int(getattr(config, "doc_final_k", 5) or 5)
@@ -216,10 +214,9 @@ class DocumentStore:
             return None
         if self._reranker is not None:
             return self._reranker
-        if CrossEncoder is None:
-            logger.warning("Reranker requested but sentence-transformers is unavailable.")
-            return None
         try:
+            from sentence_transformers import CrossEncoder
+
             self._reranker = CrossEncoder(self.rerank_model)
         except Exception as exc:
             logger.warning(f"Failed to load reranker model: {exc}")
@@ -418,10 +415,93 @@ class DocumentStore:
                     allow_dangerous_deserialization=True,
                 )
                 logger.info("Loaded existing document index")
+                self.index_health = "healthy"
+                self.index_detail = "Index loaded"
                 return vs
             except Exception as exc:
                 logger.warning(f"Failed to load document index: {exc}. Rebuilding.")
+                rebuilt = self._build_vectorstore_from_canonical()
+                if rebuilt is not None:
+                    self.index_health = "healthy"
+                    self.index_detail = "Index rebuilt from canonical document text"
+                    return rebuilt
+                self.index_health = "degraded"
+                self.index_detail = f"Index is corrupt and canonical text is incomplete: {exc}"
+        self.index_health = "healthy" if not self._docs else "degraded"
+        self.index_detail = "Empty index ready" if not self._docs else "Canonical text required to rebuild index"
         return FAISS.from_texts(["bootstrap"], self.embeddings, metadatas=[{"bootstrap": True}])
+
+    def _canonical_content_path(self, doc_id: str) -> Path:
+        return self.content_dir / f"{str(doc_id)}.txt"
+
+    def _write_canonical_content(self, doc_id: str, text: str) -> None:
+        self.content_dir.mkdir(parents=True, exist_ok=True)
+        path = self._canonical_content_path(doc_id)
+        temp = path.with_suffix(f".tmp.{os.getpid()}.{time.time_ns()}")
+        try:
+            with temp.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(str(text))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+        except Exception:
+            temp.unlink(missing_ok=True)
+            raise
+
+    def _build_vectorstore_from_canonical(self) -> Optional[FAISS]:
+        texts = ["bootstrap"]
+        metadatas: list[dict[str, Any]] = [{"bootstrap": True}]
+        for doc_id, meta in self._docs.items():
+            path = self._canonical_content_path(doc_id)
+            if not path.exists():
+                return None
+            content = path.read_text(encoding="utf-8")
+            chunks = self._split_text(content)
+            for index, chunk in enumerate(chunks):
+                texts.append(chunk)
+                metadatas.append({**dict(meta), "doc_id": doc_id, "chunk": index})
+        rebuilt = FAISS.from_texts(texts, self.embeddings, metadatas=metadatas)
+        rebuilt.save_local(str(self.index_dir))
+        return rebuilt
+
+    def rebuild_index(self) -> dict[str, Any]:
+        """Rebuild the disposable vector index without mutating canonical metadata/text."""
+        if not self.enabled or self.embeddings is None:
+            return {"ok": False, "rebuilt": False, "reason": "embeddings_unavailable"}
+        missing = [doc_id for doc_id in self._docs if not self._canonical_content_path(doc_id).exists()]
+        if missing:
+            self.index_health = "degraded"
+            self.index_detail = f"Canonical text missing for {len(missing)} legacy document(s)"
+            return {"ok": False, "rebuilt": False, "reason": "canonical_text_missing", "missing_ids": missing}
+        rebuilt = self._build_vectorstore_from_canonical()
+        if rebuilt is None:
+            return {"ok": False, "rebuilt": False, "reason": "rebuild_failed"}
+        self.vector_store = rebuilt
+        self.index_health = "healthy"
+        self.index_detail = "Index rebuilt from canonical document text"
+        self._refresh_indices()
+        return {"ok": True, "rebuilt": True, "documents": len(self._docs), "chunks": len(self._chunks)}
+
+    def capability_status(self) -> dict[str, Any]:
+        missing = [doc_id for doc_id in self._docs if not self._canonical_content_path(doc_id).exists()]
+        ready = bool(self.enabled and self.vector_store is not None and self.index_health == "healthy")
+        hybrid_ready = bool(not self.hybrid_requested or self.hybrid_enabled)
+        detail = self.index_detail
+        if ready and not hybrid_ready:
+            detail = "Vector retrieval ready; requested BM25 hybrid retrieval is unavailable"
+        return {
+            "enabled": self.enabled,
+            "ready": ready,
+            "degraded": bool(not ready or not hybrid_ready),
+            "health": self.index_health,
+            "detail": detail,
+            "hybrid_requested": self.hybrid_requested,
+            "hybrid_ready": hybrid_ready,
+            "document_count": len(self._docs),
+            "chunk_count": len(self._chunks),
+            "index_rebuildable": not missing,
+            "legacy_documents_missing_canonical_text": len(missing),
+        }
 
     def _split_text(self, text: str) -> List[str]:
         clean = (text or "").strip()
@@ -485,6 +565,7 @@ class DocumentStore:
             "freshness": str(freshness or "unknown"),
         }
 
+        self._write_canonical_content(doc_id, text)
         documents = [
             Document(
                 page_content=chunk,
@@ -605,6 +686,8 @@ class DocumentStore:
             if doc_id in id_set:
                 self._docs.pop(doc_id, None)
         self._save_meta()
+        for doc_id in id_set:
+            self._canonical_content_path(doc_id).unlink(missing_ok=True)
         self._refresh_indices()
         return deleted
 
@@ -613,8 +696,11 @@ class DocumentStore:
             return
         self.vector_store = FAISS.from_texts(["bootstrap"], self.embeddings, metadatas=[{"bootstrap": True}])
         self.vector_store.save_local(str(self.index_dir))
+        ids = list(self._docs)
         self._docs = {}
         self._save_meta()
+        for doc_id in ids:
+            self._canonical_content_path(doc_id).unlink(missing_ok=True)
         self._refresh_indices()
 
     def clear_scope(self, *, project_id: str = "", session_id: str = "") -> int:

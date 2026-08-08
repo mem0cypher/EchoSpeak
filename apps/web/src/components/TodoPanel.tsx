@@ -5,10 +5,13 @@ type TodoItem = {
   id: string;
   title: string;
   description: string;
-  status: "pending" | "in_progress" | "done";
+  status: "pending" | "in_progress" | "needs_permission" | "blocked" | "failed" | "cancelled" | "complete" | "done";
   priority: "low" | "medium" | "high";
   created_at: string;
   updated_at: string;
+  source?: string;
+  automation_run_ids?: string[];
+  task_run_ids?: string[];
 };
 
 type TodoPanelProps = {
@@ -33,6 +36,11 @@ const mono = "'JetBrains Mono', ui-monospace, monospace";
 const STATUS_LABELS: Record<TodoItem["status"], string> = {
   pending: "Pending",
   in_progress: "In Progress",
+  needs_permission: "Needs Permission",
+  blocked: "Blocked",
+  failed: "Failed",
+  cancelled: "Cancelled",
+  complete: "Complete",
   done: "Done",
 };
 
@@ -47,7 +55,7 @@ async function requestJson(url: string, init?: RequestInit) {
 
 /** Monochrome status mark — Echo style, no green/amber chrome */
 const StatusIcon: React.FC<{ status: TodoItem["status"] }> = ({ status }) => {
-  if (status === "done") {
+  if (status === "done" || status === "complete") {
     return (
       <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden>
         <circle cx="10" cy="10" r="8.5" fill="rgba(255,255,255,0.92)" stroke="rgba(255,255,255,0.92)" strokeWidth="1.2" />
@@ -132,6 +140,7 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
   };
 
   const updateStatus = async (todo: TodoItem, status: TodoItem["status"]) => {
+    if (todo.source !== "user" || todo.automation_run_ids?.length || todo.task_run_ids?.length) return;
     try {
       await requestJson(`${apiBase}/todos/${todo.id}?session_id=${encodeURIComponent(sessionId)}&project_id=${encodeURIComponent(projectId)}`, {
         method: "PUT",
@@ -145,6 +154,7 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
   };
 
   const saveEdit = async (todo: TodoItem) => {
+    if (todo.source !== "user" || todo.automation_run_ids?.length || todo.task_run_ids?.length) return;
     try {
       await requestJson(`${apiBase}/todos/${todo.id}?session_id=${encodeURIComponent(sessionId)}&project_id=${encodeURIComponent(projectId)}`, {
         method: "PUT",
@@ -195,34 +205,22 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
         display: "flex",
         flexDirection: "column",
         gap: 0,
-        padding: "14px 16px 18px",
-        background: "#000",
+        padding: "12px 14px 16px",
+        background: "#080809",
         color: colors.text,
       }
     : {};
 
-  const monoLabel: React.CSSProperties = {
-    fontFamily: mono,
-    fontSize: 9,
-    fontWeight: 600,
-    letterSpacing: "0.12em",
-    textTransform: "uppercase",
-    color: "rgba(255,255,255,0.35)",
-  };
-
   const filterBtnStyle = (active: boolean): React.CSSProperties => ({
-    padding: "5px 11px",
+    padding: "5px 10px",
     borderRadius: 3,
-    border: active ? "1px solid rgba(255,255,255,0.22)" : "1px solid rgba(255,255,255,0.10)",
-    background: active ? "rgba(255,255,255,0.1)" : "transparent",
+    border: active ? "1px solid rgba(255,255,255,0.24)" : "1px solid rgba(255,255,255,0.10)",
+    background: active ? "rgba(255,255,255,0.08)" : "transparent",
     color: active ? "#fff" : "rgba(255,255,255,0.48)",
     fontSize: 11,
     fontWeight: 600,
     cursor: "pointer",
     transition: "background 0.15s, border-color 0.15s, color 0.15s",
-    letterSpacing: "0.04em",
-    textTransform: "uppercase",
-    fontFamily: mono,
   });
 
   const inputStyle: React.CSSProperties = {
@@ -231,7 +229,7 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
     background: "rgba(255,255,255,0.03)",
     border: "1px solid rgba(255,255,255,0.12)",
     borderRadius: 3,
-    padding: "9px 12px",
+    padding: "8px 11px",
     color: colors.text,
     fontSize: 13,
     outline: "none",
@@ -241,98 +239,47 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
   const softChip = (active = false): React.CSSProperties => ({
     fontSize: 10,
     fontWeight: 600,
-    letterSpacing: 0.5,
+    letterSpacing: 0.3,
     textTransform: "uppercase",
-    padding: "3px 7px",
+    padding: "2px 6px",
     borderRadius: 3,
     fontFamily: mono,
-    background: active ? "rgba(255,255,255,0.1)" : "rgba(255,255,255,0.04)",
-    color: active ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.45)",
-    border: active ? "1px solid rgba(255,255,255,0.22)" : "1px solid rgba(255,255,255,0.1)",
+    background: active ? "rgba(255,255,255,0.1)" : "rgba(255,255,255,0.03)",
+    color: active ? "rgba(255,255,255,0.85)" : "rgba(255,255,255,0.4)",
+    border: active ? "1px solid rgba(255,255,255,0.2)" : "1px solid rgba(255,255,255,0.08)",
   });
 
   const priorityWeight: Record<TodoItem["priority"], number> = { high: 3, medium: 2, low: 1 };
 
   const content = (
-    <div style={{ display: "flex", flexDirection: "column", gap: 14, height: isViz ? "100%" : undefined, minHeight: 0 }}>
-      {/* Header */}
-      <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12 }}>
-        <div>
-          <div style={{ fontSize: 13, fontWeight: 700, color: "#fff", letterSpacing: -0.2 }}>Tasks</div>
-          <div style={{ ...monoLabel, marginTop: 4 }}>Echo workspace checklist</div>
+    <div style={{ display: "flex", flexDirection: "column", gap: 10, height: isViz ? "100%" : undefined, minHeight: 0 }}>
+      {/* Toolbar: filters + actions */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
+          {(["all", "pending", "in_progress", "done"] as const).map((f) => (
+            <button key={f} type="button" onClick={() => setFilter(f)} style={filterBtnStyle(filter === f)}>
+              {f === "all" ? `All${counts.all ? ` ${counts.all}` : ""}` : f === "in_progress" ? "Active" : f[0].toUpperCase() + f.slice(1)}
+            </button>
+          ))}
         </div>
-        <div style={{ display: "flex", gap: 6 }}>
-          <button type="button" onClick={refresh} disabled={loading} style={{ ...filterBtnStyle(false), opacity: loading ? 0.5 : 1 }}>
-            {loading ? "…" : "Refresh"}
+        <div style={{ display: "flex", gap: 4 }}>
+          <button type="button" onClick={refresh} disabled={loading} title="Refresh" style={{ ...filterBtnStyle(false), opacity: loading ? 0.5 : 1, minWidth: 32 }}>
+            {loading ? "…" : "↻"}
           </button>
-          <button
-            type="button"
-            onClick={() => setShowAdd((v) => !v)}
-            style={{
-              ...filterBtnStyle(showAdd),
-              background: showAdd ? "rgba(255,255,255,0.1)" : "rgba(255,255,255,0.06)",
-              borderColor: showAdd ? "rgba(255,255,255,0.28)" : "rgba(255,255,255,0.14)",
-              color: "#fff",
-            }}
-          >
-            {showAdd ? "Close" : "+ Add"}
+          <button type="button" onClick={() => setShowAdd((v) => !v)} style={filterBtnStyle(showAdd)}>
+            {showAdd ? "Close" : "+"}
           </button>
         </div>
-      </div>
-
-      {/* Counts — monochrome rail */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
-          gap: 1,
-          background: "rgba(255,255,255,0.08)",
-          border: "1px solid rgba(255,255,255,0.1)",
-          borderRadius: 3,
-          overflow: "hidden",
-        }}
-      >
-        {(
-          [
-            ["All", counts.all],
-            ["Pending", counts.pending],
-            ["Working", counts.in_progress],
-            ["Done", counts.done],
-          ] as const
-        ).map(([label, val]) => (
-          <div
-            key={label}
-            style={{
-              padding: "10px 12px",
-              background: "#0a0a0a",
-              display: "flex",
-              flexDirection: "column",
-              gap: 4,
-            }}
-          >
-            <div style={monoLabel}>{label}</div>
-            <div style={{ fontSize: 20, fontWeight: 700, color: "#fff", lineHeight: 1, fontFamily: mono }}>{val}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Filters */}
-      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-        {(["all", "pending", "in_progress", "done"] as const).map((f) => (
-          <button key={f} type="button" onClick={() => setFilter(f)} style={filterBtnStyle(filter === f)}>
-            {f === "all" ? "All" : f === "in_progress" ? "In Progress" : f[0].toUpperCase() + f.slice(1)}
-          </button>
-        ))}
       </div>
 
       {error ? (
         <div
           style={{
-            color: "rgba(255,255,255,0.75)",
-            background: "rgba(255,255,255,0.04)",
-            border: "1px solid rgba(255,255,255,0.14)",
+            color: "rgba(255,255,255,0.7)",
+            background: "rgba(255,255,255,0.03)",
+            border: "1px solid rgba(255,255,255,0.12)",
             borderRadius: 3,
-            padding: "10px 12px",
+            padding: "8px 11px",
             fontSize: 12,
           }}
         >
@@ -340,7 +287,6 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
         </div>
       ) : null}
 
-      {/* Add form */}
       <AnimatePresence initial={false}>
         {showAdd ? (
           <motion.div
@@ -352,13 +298,13 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
           >
             <div
               style={{
-                padding: 14,
-                background: "rgba(255,255,255,0.03)",
-                border: "1px solid rgba(255,255,255,0.12)",
+                padding: 12,
+                background: "rgba(255,255,255,0.025)",
+                border: "1px solid rgba(255,255,255,0.1)",
                 borderRadius: 3,
                 display: "flex",
                 flexDirection: "column",
-                gap: 10,
+                gap: 8,
               }}
             >
               <input
@@ -367,19 +313,19 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
                 onKeyDown={(e) => {
                   if (e.key === "Enter") addTodo();
                 }}
-                placeholder="Task title..."
+                placeholder="Task title"
                 autoFocus
                 style={inputStyle}
               />
               <textarea
                 value={newDesc}
                 onChange={(e) => setNewDesc(e.target.value)}
-                placeholder="Description / context for Echo (optional)"
+                placeholder="Notes (optional)"
                 rows={2}
-                style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5 }}
+                style={{ ...inputStyle, resize: "vertical", lineHeight: 1.45 }}
               />
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
-                <div style={{ display: "flex", gap: 6 }}>
+                <div style={{ display: "flex", gap: 4 }}>
                   {(["low", "medium", "high"] as const).map((p) => (
                     <button key={p} type="button" onClick={() => setNewPriority(p)} style={softChip(newPriority === p)}>
                       {p}
@@ -391,19 +337,18 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
                   onClick={addTodo}
                   disabled={!newTitle.trim()}
                   style={{
-                    padding: "7px 16px",
+                    padding: "6px 14px",
                     borderRadius: 3,
-                    border: "1px solid rgba(255,255,255,0.22)",
+                    border: "1px solid rgba(255,255,255,0.2)",
                     background: "rgba(255,255,255,0.08)",
                     color: "#fff",
                     fontSize: 12,
-                    fontWeight: 700,
+                    fontWeight: 600,
                     cursor: newTitle.trim() ? "pointer" : "not-allowed",
                     opacity: newTitle.trim() ? 1 : 0.45,
-                    fontFamily: mono,
                   }}
                 >
-                  Create
+                  Add
                 </button>
               </div>
             </div>
@@ -411,46 +356,32 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
         ) : null}
       </AnimatePresence>
 
-      {/* List */}
       <div
         style={{
           display: "flex",
           flexDirection: "column",
-          gap: 6,
+          gap: 4,
           flex: isViz ? 1 : undefined,
           overflowY: isViz ? "auto" : undefined,
           minHeight: 0,
         }}
       >
         {loading && todos.length === 0 ? (
-          <div style={{ padding: "24px 0", textAlign: "center", color: "rgba(255,255,255,0.35)", fontSize: 12, fontFamily: mono }}>
-            Loading tasks…
-          </div>
+          <div style={{ padding: "28px 0", textAlign: "center", color: "rgba(255,255,255,0.32)", fontSize: 12 }}>Loading…</div>
         ) : null}
 
         {!loading && filteredTodos.length === 0 ? (
           <div
             style={{
-              padding: "36px 20px",
+              padding: "40px 16px",
               textAlign: "center",
-              background: "rgba(255,255,255,0.02)",
-              border: "1px solid rgba(255,255,255,0.08)",
+              color: "rgba(255,255,255,0.35)",
+              fontSize: 12,
+              border: "1px dashed rgba(255,255,255,0.08)",
               borderRadius: 3,
             }}
           >
-            <div
-              style={{
-                width: 28,
-                height: 28,
-                margin: "0 auto 12px",
-                borderRadius: 3,
-                border: "1px solid rgba(255,255,255,0.12)",
-                background: "rgba(255,255,255,0.03)",
-              }}
-            />
-            <div style={{ fontSize: 13, color: "rgba(255,255,255,0.45)" }}>
-              {filter === "all" ? "No tasks yet — add one above" : `No ${filter.replace("_", " ")} tasks`}
-            </div>
+            {filter === "all" ? "No tasks yet" : `No ${filter === "in_progress" ? "active" : filter} tasks`}
           </div>
         ) : null}
 
@@ -465,20 +396,20 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
               <motion.div
                 key={todo.id}
                 layout
-                initial={{ opacity: 0, y: 4 }}
+                initial={{ opacity: 0, y: 3 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0 }}
-                transition={{ duration: 0.15 }}
+                transition={{ duration: 0.12 }}
               >
                 {editingId === todo.id ? (
                   <div
                     style={{
                       display: "flex",
                       flexDirection: "column",
-                      gap: 10,
-                      padding: "12px 14px",
+                      gap: 8,
+                      padding: "10px 12px",
                       background: "rgba(255,255,255,0.03)",
-                      border: "1px solid rgba(255,255,255,0.16)",
+                      border: "1px solid rgba(255,255,255,0.14)",
                       borderRadius: 3,
                     }}
                   >
@@ -494,83 +425,53 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
                       value={editDesc}
                       onChange={(e) => setEditDesc(e.target.value)}
                       rows={2}
-                      style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5 }}
+                      style={{ ...inputStyle, resize: "vertical", lineHeight: 1.45 }}
                     />
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
-                      <div style={{ display: "flex", gap: 6 }}>
+                      <div style={{ display: "flex", gap: 4 }}>
                         {(["low", "medium", "high"] as const).map((p) => (
                           <button key={p} type="button" onClick={() => setEditPriority(p)} style={softChip(editPriority === p)}>
                             {p}
                           </button>
                         ))}
                       </div>
-                      <div style={{ display: "flex", gap: 6 }}>
-                        <button
-                          type="button"
-                          onClick={() => saveEdit(todo)}
-                          style={{
-                            padding: "5px 12px",
-                            borderRadius: 3,
-                            border: "1px solid rgba(255,255,255,0.22)",
-                            background: "rgba(255,255,255,0.08)",
-                            color: "#fff",
-                            fontSize: 11,
-                            fontWeight: 700,
-                            cursor: "pointer",
-                            fontFamily: mono,
-                          }}
-                        >
+                      <div style={{ display: "flex", gap: 4 }}>
+                        <button type="button" onClick={() => saveEdit(todo)} style={{ ...filterBtnStyle(true), padding: "5px 12px" }}>
                           Save
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => setEditingId(null)}
-                          style={{
-                            padding: "5px 12px",
-                            borderRadius: 3,
-                            border: "1px solid rgba(255,255,255,0.1)",
-                            background: "transparent",
-                            color: "rgba(255,255,255,0.5)",
-                            fontSize: 11,
-                            fontWeight: 600,
-                            cursor: "pointer",
-                            fontFamily: mono,
-                          }}
-                        >
+                        <button type="button" onClick={() => setEditingId(null)} style={{ ...filterBtnStyle(false), padding: "5px 12px" }}>
                           Cancel
                         </button>
                       </div>
                     </div>
                   </div>
                 ) : (
+                  (() => {
+                  const readOnlyProjection = todo.source !== "user" || Boolean(todo.automation_run_ids?.length || todo.task_run_ids?.length);
+                  return (
                   <div
                     style={{
                       display: "flex",
                       alignItems: "flex-start",
-                      gap: 12,
-                      padding: "12px 14px",
-                      background: todo.status === "done" ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.03)",
-                      border: "1px solid rgba(255,255,255,0.1)",
-                      borderLeft:
-                        todo.status === "done"
-                          ? "2px solid rgba(255,255,255,0.35)"
-                          : todo.status === "in_progress"
-                            ? "2px solid rgba(255,255,255,0.7)"
-                            : "2px solid rgba(255,255,255,0.12)",
+                      gap: 10,
+                      padding: "10px 12px",
+                      background: "transparent",
+                      border: "1px solid rgba(255,255,255,0.08)",
                       borderRadius: 3,
-                      transition: "border-color 0.15s, background 0.15s",
+                      opacity: todo.status === "done" ? 0.55 : 1,
                     }}
                   >
                     <button
                       type="button"
                       onClick={() => updateStatus(todo, cycleStatus(todo.status))}
-                      title={`Cycle status (currently ${STATUS_LABELS[todo.status]})`}
+                      disabled={readOnlyProjection}
+                      title={STATUS_LABELS[todo.status]}
                       style={{
                         flexShrink: 0,
                         marginTop: 1,
                         background: "none",
                         border: "none",
-                        cursor: "pointer",
+                        cursor: readOnlyProjection ? "default" : "pointer",
                         padding: 0,
                         lineHeight: 0,
                       }}
@@ -578,12 +479,12 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
                       <StatusIcon status={todo.status} />
                     </button>
 
-                    <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 5 }}>
+                    <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 3 }}>
                       <div
                         style={{
                           fontSize: 13,
                           fontWeight: 600,
-                          color: todo.status === "done" ? "rgba(255,255,255,0.4)" : "#fff",
+                          color: todo.status === "done" ? "rgba(255,255,255,0.45)" : "#fff",
                           textDecoration: todo.status === "done" ? "line-through" : "none",
                           lineHeight: 1.35,
                           wordBreak: "break-word",
@@ -592,22 +493,20 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
                         {todo.title}
                       </div>
                       {todo.description ? (
-                        <div style={{ fontSize: 12, color: "rgba(255,255,255,0.42)", lineHeight: 1.5, wordBreak: "break-word" }}>
+                        <div style={{ fontSize: 12, color: "rgba(255,255,255,0.38)", lineHeight: 1.45, wordBreak: "break-word" }}>
                           {todo.description}
                         </div>
                       ) : null}
-                      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", marginTop: 2 }}>
-                        <span style={softChip(todo.priority === "high")}>{todo.priority}</span>
-                        <span style={softChip(todo.status === "in_progress")}>{STATUS_LABELS[todo.status]}</span>
-                        {todo.updated_at ? (
-                          <span style={{ fontSize: 10, color: "rgba(255,255,255,0.22)", fontFamily: mono }}>
-                            {new Date(todo.updated_at).toLocaleDateString()}
-                          </span>
-                        ) : null}
-                      </div>
+                      {todo.priority === "high" || todo.status === "in_progress" ? (
+                        <div style={{ display: "flex", gap: 4, marginTop: 2 }}>
+                          {todo.priority === "high" ? <span style={softChip(true)}>high</span> : null}
+                          {todo.status === "in_progress" ? <span style={softChip(true)}>active</span> : null}
+                        </div>
+                      ) : null}
+                      {readOnlyProjection ? <div><span style={softChip(false)}>runtime projection</span></div> : null}
                     </div>
 
-                    <div style={{ display: "flex", gap: 2, flexShrink: 0, alignItems: "flex-start" }}>
+                    {!readOnlyProjection ? <div style={{ display: "flex", gap: 0, flexShrink: 0 }}>
                       <button
                         type="button"
                         onClick={() => {
@@ -619,18 +518,10 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
                         style={{
                           background: "none",
                           border: "none",
-                          color: "rgba(255,255,255,0.4)",
+                          color: "rgba(255,255,255,0.35)",
                           fontSize: 11,
                           cursor: "pointer",
-                          padding: "3px 7px",
-                          borderRadius: 3,
-                          fontFamily: mono,
-                        }}
-                        onMouseEnter={(e) => {
-                          e.currentTarget.style.color = "#fff";
-                        }}
-                        onMouseLeave={(e) => {
-                          e.currentTarget.style.color = "rgba(255,255,255,0.4)";
+                          padding: "2px 6px",
                         }}
                       >
                         Edit
@@ -641,24 +532,19 @@ export const TodoPanel: React.FC<TodoPanelProps> = ({ apiBase, projectId, sessio
                         style={{
                           background: "none",
                           border: "none",
-                          color: "rgba(255,255,255,0.35)",
-                          fontSize: 11,
+                          color: "rgba(255,255,255,0.3)",
+                          fontSize: 14,
                           cursor: "pointer",
-                          padding: "3px 7px",
-                          borderRadius: 3,
-                          fontFamily: mono,
-                        }}
-                        onMouseEnter={(e) => {
-                          e.currentTarget.style.color = "rgba(255,255,255,0.85)";
-                        }}
-                        onMouseLeave={(e) => {
-                          e.currentTarget.style.color = "rgba(255,255,255,0.35)";
+                          padding: "0 4px",
+                          lineHeight: 1,
                         }}
                       >
                         ×
                       </button>
-                    </div>
+                    </div> : null}
                   </div>
+                  );
+                  })()
                 )}
               </motion.div>
             ))}

@@ -1,4 +1,39 @@
-# UI Agent State Map (from live code — v7.4+)
+# Historical UI Agent State Map (v7.4)
+
+## Current EchoSpeak 8.0 activity contract
+
+`POST /query/stream` remains the only live Chat execution stream. Every
+user-facing lifecycle packet passes through `_StreamingHandler._put`, which adds
+the request identity, monotonic sequence, timestamp, and a versioned `activity`
+projection. The projection is semantic and bounded: it may describe the current
+objective, requirement states, attempts, retries, source counts, missing fields,
+recovery, next action, model, tool state, and completion disposition. It never
+contains private reasoning, raw prompts, policy text, tracebacks, secrets, or
+durable persistence IDs.
+
+`agentActivity.ts::activityActionsFromStreamEvent()` is the single browser-side
+decoder. Chat, the main Echo avatar, Visualizer, and the optional desktop
+companion use its shared reducer. Raw NDJSON fields remain a compatibility and
+mechanical projection for reply tokens and exact ToolRun pairing; they are not a
+second source of user-facing status. Visualizer additionally rehydrates the same
+truth from the exact-scope durable TaskRun projection after refresh or restart.
+
+The current ownership chain is therefore:
+
+```text
+TaskRun / ToolRun / lifecycle authority
+  -> ordered query stream packet
+  -> bounded semantic activity projection
+  -> one shared frontend reducer
+  -> Chat, Visualizer, avatar, companion
+```
+
+The remainder of this document records the pre-v8 inventory for migration
+history only.
+
+> This is a historical event inventory, not the current EchoSpeak 8.0 UI
+> contract. The current product has Chat and Visualizer primary views; see
+> `SYSTEM_ARCHITECTURE.md` and `RUNTIME_CONTRACTS.md`.
 
 Research pass before UI work. Sources: `agent/stream_events.py`, `api/server.py`
 `_StreamingHandler` + `/query/stream`, frontend `index.tsx` consumer.

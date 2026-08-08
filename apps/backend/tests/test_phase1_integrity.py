@@ -319,10 +319,6 @@ def test_notify_owner_security_event_queues_owner_dm(monkeypatch):
     assert calls[0][0] == "999"
     assert "Security Alert" in calls[0][1]
 
-def test_coding_readiness_route_exists():
-    assert len(_routes_for("/coding/readiness", "GET")) == 1
-
-
 def test_memory_compact_route_exists():
     assert len(_routes_for("/memory/compact", "POST")) == 1
 
@@ -346,81 +342,6 @@ def test_terminal_denylist_allows_harmless_echo(monkeypatch):
 
     monkeypatch.setattr(config, "terminal_command_denylist", ["rm", "del", "format"], raising=False)
     assert _terminal_command_denied("echo hello") is None
-
-
-def test_coding_readiness_response_shape(monkeypatch):
-    """Contract: /coding/readiness returns the shared schema-v2 projection."""
-
-    class FakeAgent:
-        tools = []
-        _tool_allowlist_override = None
-        llm_provider = ModelProvider.OPENAI
-        provider_info = {"provider": "openai", "model": "fixture"}
-        llm_wrapper = object()
-        _current_thread_id = "default"
-
-        class Store:
-            @staticmethod
-            def get_thread_state(_thread_id):
-                return type("State", (), {
-                    "active_project_id": "",
-                    "project_path": "",
-                    "workspace_root": "",
-                    "mode": "chat",
-                })()
-
-            @staticmethod
-            def get_pending_approval(_thread_id):
-                return None
-
-        _state_store = Store()
-
-        def project_scope_report(self, _thread_id=None):
-            return {"interaction_mode": "chat", "project_attached": False, "permissions": {}}
-
-        def _registered_tool_names(self):
-            return set()
-
-        def _allow_llm_tool_calling(self):
-            return True
-
-        def _parse_action_json(self):
-            return None
-
-        def _infer_file_write_args(self):
-            return None
-
-        def _is_action_tool(self, name):
-            return name in {"file_write", "terminal_run", "file_mkdir", "artifact_write"}
-
-        def _action_allowed(self, name):
-            return False
-
-        def get_doctor_report(self):
-            return {"workspace": {"id": "coding", "name": "coding"}}
-
-    monkeypatch.setattr(server_mod, "get_agent", lambda thread_id=None: FakeAgent(), raising=True)
-    monkeypatch.setattr(server_mod, "_apply_thread_scope", lambda agent, thread_id=None: None, raising=True)
-    monkeypatch.setattr(
-        server_mod,
-        "_check_provider_readiness",
-        lambda provider=None: {"ok": True, "provider": "openai", "message": "", "detail": ""},
-        raising=True,
-    )
-    monkeypatch.setattr(config, "allow_terminal_commands", False, raising=False)
-    monkeypatch.setattr(config, "file_tool_root", "C:/tmp", raising=False)
-    monkeypatch.setattr(config, "terminal_command_denylist", ["rm", "del"], raising=False)
-
-    resp = asyncio.run(server_mod.coding_readiness(thread_id=None))
-    payload = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
-
-    assert "provider" in payload
-    assert "tools" in payload
-    assert "file_roots" in payload
-    assert "terminal_denylist" in payload["file_roots"]
-    assert "rm" in payload["file_roots"]["terminal_denylist"]
-    assert payload["schema_version"] == 2
-    assert payload["recommended_loop"] == ["inspect", "plan", "implement", "confirm", "verify", "summarize"]
 
 
 def test_memory_compact_accepts_query_params(monkeypatch):

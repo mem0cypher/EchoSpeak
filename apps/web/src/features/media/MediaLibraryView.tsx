@@ -53,7 +53,7 @@ export const MediaLibraryView: React.FC<{
       setAssets(Array.isArray(data.items) ? data.items : []);
       const generation = generationResponse.ok ? await generationResponse.json() as MediaRuntimeJobsResponse : { items: [], count: 0 };
       const voice = voiceResponse.ok ? await voiceResponse.json() as MediaRuntimeJobsResponse : { items: [], count: 0 };
-      setJobs([...generation.items, ...voice.items].sort((left, right) => right.created_at - left.created_at).slice(0, 20));
+      setJobs([...generation.items, ...voice.items].sort((left, right) => right.created_at - left.created_at).slice(0, 12));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally { setLoading(false); }
@@ -61,44 +61,63 @@ export const MediaLibraryView: React.FC<{
 
   useEffect(() => { void refresh(); }, [apiBase, projectId, sessionId]);
   const visible = useMemo(() => filter === "all" ? assets : assets.filter((item) => item.media_kind === filter), [assets, filter]);
+  const activeJobs = useMemo(
+    () => jobs.filter((j) => !["completed", "failed", "cancelled", "done"].includes(String(j.status || "").toLowerCase())),
+    [jobs],
+  );
 
   return (
     <section className="media-library" aria-label="Media library">
-      <header className="media-library-header">
-        <div><span className="media-kicker">Assets</span><h2>Media</h2><p>Immutable generated and imported sources owned by EchoSpeak.</p></div>
-        <button type="button" onClick={() => void refresh()} disabled={loading}>{loading ? "Refreshing…" : "Refresh"}</button>
-      </header>
-      <div className="media-filters" role="group" aria-label="Media filters">
-        {(["all", "image", "video", "audio"] as const).map((value) => (
-          <button type="button" key={value} className={filter === value ? "is-active" : ""} onClick={() => setFilter(value)}>{value}</button>
-        ))}
+      <div className="media-toolbar">
+        <div className="media-filters" role="group" aria-label="Media filters">
+          {(["all", "image", "video", "audio"] as const).map((value) => (
+            <button type="button" key={value} className={filter === value ? "is-active" : ""} onClick={() => setFilter(value)}>
+              {value}
+            </button>
+          ))}
+        </div>
+        <div className="media-toolbar-meta">
+          {visible.length > 0 ? <span className="media-count">{visible.length}</span> : null}
+          <button type="button" onClick={() => void refresh()} disabled={loading} title="Refresh">
+            {loading ? "…" : "↻"}
+          </button>
+        </div>
       </div>
-      {jobs.length > 0 ? (
-        <section className="media-jobs" aria-label="Recent media jobs">
-          <div className="media-jobs-title"><span>Recent jobs</span><span>{jobs.length}</span></div>
-          <div className="media-jobs-list">
-            {jobs.map((job) => (
-              <article key={job.id} className={`media-job is-${job.status}`} title={job.error || job.id}>
-                <div><strong>{job.kind || job.operation || "media"}</strong><span>{job.provider_id}{job.model ? ` · ${job.model}` : ""}</span></div>
-                <div className="media-job-status"><span>{job.status}</span><span>{Math.round(job.progress * 100)}%</span></div>
-                <div className="media-job-progress"><i style={{ width: `${Math.max(0, Math.min(100, job.progress * 100))}%` }} /></div>
-              </article>
-            ))}
-          </div>
-        </section>
+
+      {activeJobs.length > 0 ? (
+        <div className="media-jobs" aria-label="Active media jobs">
+          {activeJobs.map((job) => (
+            <article key={job.id} className={`media-job is-${job.status}`} title={job.error || job.id}>
+              <div className="media-job-row">
+                <strong>{job.kind || job.operation || "job"}</strong>
+                <span>{job.status}{job.progress != null ? ` · ${Math.round(job.progress * 100)}%` : ""}</span>
+              </div>
+              <div className="media-job-progress"><i style={{ width: `${Math.max(0, Math.min(100, (job.progress || 0) * 100))}%` }} /></div>
+            </article>
+          ))}
+        </div>
       ) : null}
+
       {error ? <div className="media-empty is-error">{error}</div> : null}
-      {!error && !sessionId ? <div className="media-empty">Select or create a Session to view its governed Media assets.</div> : null}
-      {!error && sessionId && !loading && visible.length === 0 ? <div className="media-empty">No verified Media assets in this {projectId ? "Project" : "Session"} yet.</div> : null}
+      {!error && !sessionId ? <div className="media-empty">Select a session to view media.</div> : null}
+      {!error && sessionId && !loading && visible.length === 0 ? (
+        <div className="media-empty">No media yet.</div>
+      ) : null}
+
       <div className="media-grid">
         {visible.map((asset) => (
           <article className="media-card" key={asset.id}>
             <Preview apiBase={apiBase} sessionId={sessionId} asset={asset} />
             <div className="media-card-body">
-              <div className="media-card-title"><strong title={asset.name}>{asset.name}</strong><span>{asset.source_kind}</span></div>
-              <p>{asset.provider ? `${asset.provider}${asset.model ? ` · ${asset.model}` : ""}` : asset.project_relative_path}</p>
+              <div className="media-card-title">
+                <strong title={asset.name}>{asset.name}</strong>
+                <span>{asset.media_kind}</span>
+              </div>
               {asset.prompt ? <p className="media-prompt">{asset.prompt}</p> : null}
-              <div className="media-meta"><span>{asset.media_kind}</span><span>{Math.max(1, Math.round(asset.size_bytes / 1024))} KB</span><span>{new Date(asset.created_at * 1000).toLocaleString()}</span></div>
+              <div className="media-meta">
+                <span>{Math.max(1, Math.round(asset.size_bytes / 1024))} KB</span>
+                {asset.provider ? <span>{asset.provider}</span> : null}
+              </div>
             </div>
           </article>
         ))}

@@ -313,7 +313,7 @@ pub fn launch_backend(app: AppHandle, state: DesktopState) -> Result<(), String>
                     log::info!(target: "echospeak_backend", "{}", String::from_utf8_lossy(&bytes));
                 }
                 CommandEvent::Stderr(bytes) => {
-                    log::warn!(target: "echospeak_backend", "{}", String::from_utf8_lossy(&bytes));
+                    forward_backend_stderr(&bytes);
                 }
                 CommandEvent::Error(error) => {
                     log::error!(target: "echospeak_backend", "{error}");
@@ -454,6 +454,45 @@ pub fn launch_backend(app: AppHandle, state: DesktopState) -> Result<(), String>
     });
 
     Ok(())
+}
+
+fn backend_stderr_level(line: &str) -> log::Level {
+    let upper = line.trim_start().to_ascii_uppercase();
+    if upper.starts_with("CRITICAL")
+        || upper.starts_with("ERROR")
+        || upper.contains("| CRITICAL ")
+        || upper.contains("| ERROR ")
+    {
+        log::Level::Error
+    } else if upper.starts_with("WARNING")
+        || upper.starts_with("WARN")
+        || upper.contains("| WARNING ")
+        || upper.contains("| WARN ")
+    {
+        log::Level::Warn
+    } else if upper.starts_with("DEBUG") || upper.contains("| DEBUG ") {
+        log::Level::Debug
+    } else if upper.starts_with("INFO") || upper.contains("| INFO ") {
+        log::Level::Info
+    } else {
+        // Unknown stderr remains warning-level; only recognized Python/uvicorn
+        // severity formats are safely downgraded.
+        log::Level::Warn
+    }
+}
+
+fn forward_backend_stderr(bytes: &[u8]) {
+    for line in String::from_utf8_lossy(bytes).lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match backend_stderr_level(line) {
+            log::Level::Error => log::error!(target: "echospeak_backend", "{line}"),
+            log::Level::Warn => log::warn!(target: "echospeak_backend", "{line}"),
+            log::Level::Debug => log::debug!(target: "echospeak_backend", "{line}"),
+            _ => log::info!(target: "echospeak_backend", "{line}"),
+        }
+    }
 }
 
 fn fail_generation(app: AppHandle, state: DesktopState, generation: u64, reason: String) {
@@ -611,4 +650,33 @@ fn terminate_process_tree(child: CommandChild) {
             .status();
     }
     let _ = child.kill();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backend_stderr_level;
+
+    #[test]
+    fn backend_stderr_uses_embedded_python_severity() {
+        assert_eq!(
+            backend_stderr_level("2026-07-17 | INFO     | agent.core - ready"),
+            log::Level::Info
+        );
+        assert_eq!(
+            backend_stderr_level("DEBUG:    waiting for application startup"),
+            log::Level::Debug
+        );
+        assert_eq!(
+            backend_stderr_level("WARNING: provider retry scheduled"),
+            log::Level::Warn
+        );
+        assert_eq!(
+            backend_stderr_level("ERROR: application startup failed"),
+            log::Level::Error
+        );
+        assert_eq!(
+            backend_stderr_level("unclassified stderr"),
+            log::Level::Warn
+        );
+    }
 }

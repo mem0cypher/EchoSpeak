@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -73,7 +74,6 @@ def _agent(tmp_path: Path) -> EchoSpeakAgent:
     agent._active_user_query = "write file"
     agent._current_mode_decision = None
     agent._tool_allowlist_override = None
-    agent._coding_loop_note_tool = lambda *_args, **_kwargs: None
     agent.llm_provider = SimpleNamespace(value="test")
     agent.tools = [
         SimpleNamespace(name=name)
@@ -274,7 +274,10 @@ def test_undo_runs_through_authority_outcome_verification_and_ledger(tmp_path, m
         agent._register_tool_run("checkpoint_undo", "undo-run")
         outcome = agent._invoke_authorized_raw_tool(raw, {})
         assert outcome.success is True
-        assert outcome.verification == {"checkpoint_restored": True}
+        assert outcome.verification["checkpoint_restored"] is True
+        assert outcome.verification["runtime_boundary"] == "EchoSpeakAgent._persist_tool_outcome"
+        assert outcome.verification["status_observed"] == "success"
+        assert outcome.verification["arguments_hash"] == hashlib.sha256(b"{}").hexdigest()
         assert target.read_text(encoding="utf-8") == "before"
         ledger = agent._state_store.get_thread_state("thread-a").ledger
         assert ledger[-1].tool == "checkpoint_undo"
@@ -385,6 +388,18 @@ def test_retry_rejects_project_or_argument_change(tmp_path):
     agent._state_store.update_thread_state("thread-a", project_path=target["project_path"], retry_target={**target, "kwargs": {"path": "OTHER.md"}})
     response, success = agent._retry_last_action()
     assert success is False and "arguments changed" in response
+
+
+def test_expired_retry_is_retired_before_it_can_execute(tmp_path):
+    agent = _agent(tmp_path)
+    target = _retry_target(agent, "file_read", {"path": "README.md"})
+    agent._state_store.update_thread_state(
+        "thread-a", retry_target={**target, "schema_version": 1, "expires_at": time.time() - 1}
+    )
+    response, success = agent._retry_last_action()
+    assert success is False
+    assert "expired" in response.lower()
+    assert agent._state_store.get_thread_state("thread-a").retry_target == {}
 
 
 def test_mutating_plugin_hooks_are_rejected():

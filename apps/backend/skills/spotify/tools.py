@@ -3,9 +3,7 @@ Spotify tools — playback control, search, and queue management.
 
 Requires:
   pip install spotipy
-  ALLOW_SPOTIFY=true
-  SPOTIFY_CLIENT_ID=...
-  SPOTIFY_CLIENT_SECRET=...
+  Active scoped Spotify Connection
 """
 
 from __future__ import annotations
@@ -37,9 +35,6 @@ def _get_spotify_client():
         from config import config
     except ImportError:
         raise RuntimeError("Config not available")
-
-    if not getattr(config, "allow_spotify", False):
-        raise RuntimeError("Spotify integration is disabled. Set ALLOW_SPOTIFY=true in .env")
 
     client_id = getattr(config, "spotify_client_id", "")
     client_secret = getattr(config, "spotify_client_secret", "")

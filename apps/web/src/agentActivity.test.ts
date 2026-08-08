@@ -7,9 +7,9 @@ import {
 } from "./agentActivity";
 
 describe("agentActivityReducer", () => {
-  it("starts in thinking on stream_start", () => {
+  it("waits for a real backend phase after stream_start", () => {
     const s = agentActivityReducer(initialAgentActivity(), { type: "stream_start" });
-    expect(s.phase).toEqual("thinking");
+    expect(s.phase).toEqual("waiting_for_model");
     expect(s.streaming).toEqual(true);
   });
 

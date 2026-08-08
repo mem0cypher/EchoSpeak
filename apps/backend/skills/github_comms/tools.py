@@ -3,8 +3,7 @@ GitHub tools — issues, PRs, comments, and repo info.
 
 Requires:
   pip install PyGithub
-  ALLOW_GITHUB=true
-  GITHUB_TOKEN=ghp_...
+  Active scoped GitHub Connection
 """
 
 from __future__ import annotations
@@ -25,9 +24,6 @@ def _get_github_client():
         from config import config
     except ImportError:
         raise RuntimeError("Config not available")
-
-    if not getattr(config, "allow_github", False):
-        raise RuntimeError("GitHub integration is disabled. Set ALLOW_GITHUB=true in .env")
 
     token = getattr(config, "github_token", "")
     if not token:

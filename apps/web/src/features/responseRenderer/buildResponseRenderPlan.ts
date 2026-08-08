@@ -224,9 +224,13 @@ export const buildResponseRenderPlan = (input: BuildResponseRenderPlanInput): Re
     .filter((block): block is ResponseRenderBlock => Boolean(block));
   const inferredTables = explicitBlocks.some((block) => block.kind === "table") ? [] : parseMarkdownTables(answerText);
   const inferredSections = explicitBlocks.length || inferredTables.length ? [] : sectionsFromText(answerText);
-  const evidence = explicitBlocks.some((block) => block.kind === "evidence") ? null : evidenceFromResearch(input);
-  const blocks = [...explicitBlocks, ...inferredTables, ...inferredSections];
-  if (evidence) blocks.push(evidence);
+  // Chat never shows an Evidence card/bar. Evidence remains durable in backend,
+  // Studio Viewer, and Research artifacts — not permanent chat chrome.
+  const blocks = [
+    ...explicitBlocks.filter((block) => block.kind !== "evidence"),
+    ...inferredTables,
+    ...inferredSections,
+  ];
   return {
     summaryText: inferredTables.length ? stripRenderedMarkdownTables(answerText) : answerText,
     blocks,

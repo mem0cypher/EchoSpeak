@@ -68,10 +68,13 @@ def test_named_edit_never_targets_game_js(tmp_path, monkeypatch):
     agent._session_memory = SessionMemoryDistiller(tmp_path / "sessions")
     agent._active_work_store = ActiveWorkStore(tmp_path / "active-work")
     agent._allow_llm_tool_calling = lambda: False
-    agent.graph_agent = None
-    agent.agent_executor = None
-    agent.fallback_executor = None
     agent.select_thread_runtime("s1")
+    runtime.ensure_session_model_binding(
+        "s1",
+        provider_id=agent.llm_provider.value,
+        model_id=agent.model_runtime.model_id,
+        provider_configuration_id="test",
+    )
     agent.activate_project(project.id)
 
     class LLM:
@@ -88,7 +91,7 @@ def test_named_edit_never_targets_game_js(tmp_path, monkeypatch):
         def invoke_with_reasoning(self, prompt: str):
             return self.invoke(prompt), ""
 
-    agent.llm_wrapper = LLM()
+    agent.model_runtime = LLM()
     game_before = (project_root / "game.js").read_bytes()
     agent.process_query(
         "Change the title in index.html only. Do not edit game.js.",
@@ -125,6 +128,7 @@ def test_research_artifact_ownership_and_lookup(tmp_path, monkeypatch):
         execution_id="e1",
         tool_run_id="tr1",
         objective="research oilers",
+        verified=True,
     )
     saved = ra.save_research_artifact(art)
     assert saved.status == "ready"
@@ -137,7 +141,7 @@ def test_research_artifact_ownership_and_lookup(tmp_path, monkeypatch):
     assert ra.find_compatible_research_artifact(project_id="p2", objective="oilers") is None
 
 
-def test_orchestrator_disabled_by_default():
-    from config import config
+def test_parallel_orchestrator_route_is_retired():
+    from api.server import app
 
-    assert bool(getattr(config, "orchestration_enabled", False)) is False
+    assert "/orchestrate" not in {route.path for route in app.routes}

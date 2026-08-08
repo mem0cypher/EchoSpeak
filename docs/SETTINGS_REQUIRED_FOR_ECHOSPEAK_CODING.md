@@ -10,7 +10,7 @@ second answer.
 
 1. In the sidebar, select an existing Session.
 2. Attach a folder as a **Project** to that Session.
-3. Open **Studio → Tools** and refresh.
+3. Open **Settings → Local Tools → Inventory** and refresh.
 
 There is no separate “Allow File Read” toggle. Safe reads require all of:
 
@@ -25,7 +25,7 @@ Project owns path scope.
 
 ## File writing
 
-In **Studio → Settings → System Actions (Safety Gates)** enable:
+In **Settings → Privacy & Permissions → System Actions (Safety Gates)** enable:
 
 - **Enable System Actions** (`enable_system_actions`, default `false`);
 - **Allow File Write** (`allow_file_write`, default `false`).
@@ -110,4 +110,3 @@ Common messages are deliberately specific:
   diff; stale authority is never reused.
 - “Docker terminal unavailable” → start Docker only if terminal verification is
   needed; file editing can continue without it.
-

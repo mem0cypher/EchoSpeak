@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sys
 from pathlib import Path
 
@@ -45,7 +46,9 @@ def _mock_server_cfg(name: str = "mock", trust: str = "trusted", **extra):
         "command": PY,
         "args": [str(FIXTURE_SERVER)],
         "transport": "stdio",
-        "trust": trust,
+        "capability_policies": (
+            {"echo": "read", "add": "read"} if trust == "trusted" else {}
+        ),
         "enabled": True,
         "timeout_s": 10,
     }
@@ -75,10 +78,10 @@ def test_mock_server_list_and_call():
     assert entry.is_action is False  # trust=trusted
 
     # Direct call path
-    out = mgr.call("mcp__mock__echo", {"text": "hello"})
-    assert out == "echo:hello"
-    out2 = mgr.call("mcp__mock__add", {"a": 2, "b": 3})
-    assert out2.strip() == "5"
+    out = json.loads(mgr.call("mcp__mock__echo", {"text": "hello"}))
+    assert out["structuredContent"]["text"] == "echo:hello"
+    out2 = json.loads(mgr.call("mcp__mock__add", {"a": 2, "b": 3}))
+    assert out2["structuredContent"]["value"] == 5
 
     # Tool invoke path
     tool = entry.func
@@ -181,7 +184,7 @@ def test_unsupported_transport_fails_loud():
     )
     assert status["loaded_tool_count"] == 0
     err = status["servers"][0]["last_error"]
-    assert "Unsupported transport" in err or "stdio" in err.lower()
+    assert "url" in err.lower() or "http" in err.lower()
 
 
 def test_re_sub_safe():

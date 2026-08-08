@@ -19,7 +19,9 @@ type SidebarProps = {
   onRenameSession(id: string, title: string): void;
   onDeleteSession(id: string): void;
   onDeleteProject(id: string): void;
-  onView(view: "chat" | "avatar" | "research" | "code" | "tasks" | "media" | "studio"): void;
+  onView(view: "chat" | "avatar"): void;
+  onSettings(): void;
+  settingsOpen?: boolean;
 };
 
 const surface = "#0a0a0a";
@@ -34,14 +36,10 @@ function Icon({
 }: {
   name:
     | "chat"
-    | "session"
-    | "folder"
-    | "avatar"
-    | "research"
-    | "code"
-    | "tasks"
-    | "media"
-    | "studio"
+     | "session"
+     | "folder"
+     | "avatar"
+     | "studio"
     | "plus"
     | "more"
     | "trash"
@@ -91,35 +89,6 @@ function Icon({
           <circle cx="9.5" cy="11" r="1.15" fill={stroke} stroke="none" />
           <circle cx="14.5" cy="11" r="1.15" fill={stroke} stroke="none" />
           <path d="M9.2 15c.7 1 1.8 1.5 2.8 1.5s2.1-.5 2.8-1.5" />
-        </svg>
-      );
-    case "research":
-      return (
-        <svg {...common}>
-          <circle cx="11" cy="11" r="6" />
-          <path d="M20 20l-3.5-3.5" />
-        </svg>
-      );
-    case "code":
-      return (
-        <svg {...common}>
-          <path d="M9 7.5 4.5 12 9 16.5" />
-          <path d="M15 7.5 19.5 12 15 16.5" />
-        </svg>
-      );
-    case "tasks":
-      return (
-        <svg {...common}>
-          <path d="M9.5 12.5 11.5 14.5 16 9.5" />
-          <rect x="4" y="4" width="16" height="16" rx="2.5" />
-        </svg>
-      );
-    case "media":
-      return (
-        <svg {...common}>
-          <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
-          <path d="m6.5 16 4-4 2.5 2.5 2-2 2.5 3.5" />
-          <circle cx="15.5" cy="9" r="1.3" />
         </svg>
       );
     case "studio":
@@ -172,47 +141,23 @@ function Icon({
   }
 }
 
-const viewDefs: {
-  id: "avatar" | "research" | "code" | "tasks" | "media" | "studio";
+const primaryViewDefs: {
+  id: "chat" | "avatar";
   label: string;
-  icon: "avatar" | "research" | "code" | "tasks" | "media" | "studio";
-  title: string;
-}[] = [
-  { id: "avatar", label: "Avatar", icon: "avatar", title: "Avatar" },
-  { id: "research", label: "Research", icon: "research", title: "Research" },
-  { id: "code", label: "Code", icon: "code", title: "Code" },
-  { id: "tasks", label: "Tasks", icon: "tasks", title: "Tasks" },
-  { id: "media", label: "Media", icon: "media", title: "Media library" },
-  { id: "studio", label: "Studio", icon: "studio", title: "Studio · Settings & Models" },
-];
-
-const desktopViewDefs: {
-  id: "chat" | "avatar" | "research" | "code" | "tasks" | "media" | "studio";
-  label: string;
-  icon: "chat" | "avatar" | "research" | "code" | "tasks" | "media" | "studio";
+  icon: "chat" | "avatar";
   title: string;
 }[] = [
   { id: "chat", label: "Chat", icon: "chat", title: "Conversation" },
   { id: "avatar", label: "Visualizer", icon: "avatar", title: "Echo Visualizer" },
-  { id: "research", label: "Research", icon: "research", title: "Research workspace" },
-  { id: "code", label: "Code", icon: "code", title: "Code workspace" },
-  { id: "media", label: "Media", icon: "media", title: "Media library" },
-  { id: "tasks", label: "Tasks", icon: "tasks", title: "Tasks workspace" },
-  { id: "studio", label: "Studio", icon: "studio", title: "Studio and settings" },
 ];
 
 export function ProjectSidebar(props: SidebarProps) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [projectsOpen, setProjectsOpen] = useState(true);
-  const [viewsOpen, setViewsOpen] = useState(true);
   const iconOnly = props.collapsed;
   const projects = useMemo(() => props.projects.filter((project) => !project.archived), [props.projects]);
   const sessions = props.sessions;
   const looseSessions = sessions.filter((session) => !session.projectId);
-  const activeProject = projects.find((project) => project.id === props.activeProjectId);
-  const activeSession = sessions.find((session) => session.id === props.activeSessionId);
-  const contextLabel = activeProject?.name || "Quick chat";
-  const workspaceViews = props.desktop ? desktopViewDefs : viewDefs;
 
   const railButton = (active = false): React.CSSProperties => ({
     // Do not force width:100% here — row items share space with fixed action buttons.
@@ -231,8 +176,8 @@ export function ProjectSidebar(props: SidebarProps) {
     gap: 8,
     padding: iconOnly ? 0 : "0 8px",
     cursor: "pointer",
-    fontFamily: "'JetBrains Mono', ui-monospace, monospace",
-    fontSize: 12.5,
+    fontFamily: "'Inter', 'Segoe UI Variable', 'Segoe UI', sans-serif",
+    fontSize: 12,
     textAlign: "left",
     minWidth: 0,
     boxSizing: "border-box",
@@ -427,18 +372,18 @@ export function ProjectSidebar(props: SidebarProps) {
       }
       .echo-sidebar-footer {
         flex: 0 0 auto;
-        border: 1px solid rgba(255,255,255,.085);
-        background: linear-gradient(145deg, rgba(255,255,255,.045), rgba(255,255,255,.012));
-        box-shadow: inset 0 1px 0 rgba(255,255,255,.025), 0 12px 28px rgba(0,0,0,.18);
+        border: 0;
+        background: transparent;
+        box-shadow: none;
       }
       .echo-footer-action {
         border: 1px solid rgba(255,255,255,.09);
-        background: rgba(255,255,255,.025);
+        background: #0b0b0b;
         color: rgba(255,255,255,.72);
         transition: background .14s ease, border-color .14s ease, color .14s ease;
       }
       .echo-footer-action:hover {
-        background: rgba(255,255,255,.075);
+        background: #121212;
         border-color: rgba(255,255,255,.16);
         color: #fff;
       }
@@ -521,6 +466,45 @@ export function ProjectSidebar(props: SidebarProps) {
       </div> : null}
 
       <div className="echo-sidebar-scroll">
+        <nav
+          aria-label="Primary views"
+          style={{
+            display: "grid",
+            gridTemplateColumns: iconOnly ? "1fr" : "1fr 1fr",
+            gap: 3,
+            padding: iconOnly ? "0 1px 5px" : "0 1px 7px",
+            flex: "0 0 auto",
+          }}
+        >
+          {primaryViewDefs.map((view) => {
+            const active = props.activeView === view.id;
+            return (
+              <button
+                className={`echo-side-button ${active ? "is-active" : ""}`}
+                type="button"
+                key={view.id}
+                style={{
+                  ...railButton(active),
+                  width: "100%",
+                  justifyContent: "center",
+                  border: `1px solid ${active ? "rgba(255,255,255,.18)" : "rgba(255,255,255,.08)"}`,
+                  background: active ? "rgba(255,255,255,.09)" : "rgba(255,255,255,.018)",
+                }}
+                onClick={() => props.onView(view.id)}
+                title={view.title}
+                aria-label={view.title}
+              >
+                <span style={iconSlot(active)}>
+                  <Icon name={view.icon} size={iconOnly ? 16 : 15} active={active} />
+                </span>
+                {!iconOnly && <span style={titleEllipsis}>{view.label}</span>}
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="echo-rail-divider" />
+
         <section aria-label="Workspace" style={{ padding: iconOnly ? "0 1px" : 0, display: "grid", gap: 7, flex: "0 0 auto" }}>
           <div style={{ display: "grid", gap: 2 }}>
             {props.desktop && iconOnly ? (
@@ -560,7 +544,7 @@ export function ProjectSidebar(props: SidebarProps) {
                     whiteSpace: "nowrap",
                   }}
                 >
-                  Quick Chats
+                  Chats
                 </span>
                 <button
                   className="echo-side-button"
@@ -570,11 +554,11 @@ export function ProjectSidebar(props: SidebarProps) {
                   aria-label="Start new chat"
                   style={{
                     width: 26,
-                    height: 24,
-                    border: 0,
-                    background: "transparent",
-                    color: "rgba(255,255,255,.7)",
-                    borderRadius: 2,
+                    height: 26,
+                    border: "1px solid rgba(255,255,255,.09)",
+                    background: "rgba(255,255,255,.025)",
+                    color: "rgba(255,255,255,.78)",
+                    borderRadius: 3,
                     cursor: "pointer",
                     display: "grid",
                     placeItems: "center",
@@ -583,7 +567,7 @@ export function ProjectSidebar(props: SidebarProps) {
                     flexShrink: 0,
                   }}
                 >
-                  <Icon name="plus" size={15} />
+                  <Icon name="plus" size={14} />
                 </button>
                 {props.desktop ? (
                   <button
@@ -627,39 +611,35 @@ export function ProjectSidebar(props: SidebarProps) {
               </button>
             )}
 
-            <button
-              className={`echo-side-button ${!props.activeProjectId ? "is-active" : ""}`}
-              type="button"
-              style={{ ...railButton(!props.activeProjectId), width: "100%" }}
-              onClick={() => {
-                const existing = looseSessions[0];
-                if (existing) props.onSelectSession(existing.id);
-              }}
-              title={looseSessions.length ? "Open the latest Quick Chat" : "No Quick Chats yet · use + to create one"}
-              aria-label="Quick chats outside projects"
-            >
-              <span style={iconSlot(!props.activeProjectId)}>
-                <Icon name="chat" size={iconOnly ? 16 : 15} active={!props.activeProjectId} />
-              </span>
-              {!iconOnly && <span style={titleEllipsis}>Outside Projects</span>}
-            </button>
-
             {looseSessions.map((session) => sessionRow(session))}
 
             <div className="echo-rail-divider" />
 
             {!iconOnly && (
-              <button
-                className="echo-side-button"
-                type="button"
-                onClick={() => setProjectsOpen((value) => !value)}
-                aria-expanded={projectsOpen}
-                style={{ ...railButton(), minHeight: 28, padding: "0 4px", color: muted }}
-              >
-                <span style={{ flex: 1, fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase" }}>Projects</span>
-                <span style={{ minWidth: 18, height: 18, padding: "0 5px", display: "inline-grid", placeItems: "center", borderRadius: 9, background: "rgba(255,255,255,.045)", color: "rgba(255,255,255,.45)", fontSize: 9 }}>{projects.length}</span>
-                <span style={{ display: "grid", placeItems: "center", transform: projectsOpen ? "rotate(0deg)" : "rotate(-90deg)", transition: "transform .15s ease" }}><Icon name="chevron" size={13} /></span>
-              </button>
+              <div style={{ display: "flex", alignItems: "center", minWidth: 0 }}>
+                <button
+                  className="echo-side-button"
+                  type="button"
+                  onClick={() => setProjectsOpen((value) => !value)}
+                  aria-expanded={projectsOpen}
+                  style={{ ...railButton(), flex: "1 1 auto", minWidth: 0, minHeight: 28, padding: "0 4px", color: muted }}
+                >
+                  <span style={{ flex: 1, fontSize: 10, letterSpacing: ".1em", textTransform: "uppercase" }}>Projects</span>
+                  <span style={{ minWidth: 18, height: 18, padding: "0 5px", display: "inline-grid", placeItems: "center", borderRadius: 9, background: "rgba(255,255,255,.045)", color: "rgba(255,255,255,.45)", fontSize: 9 }}>{projects.length}</span>
+                  <span style={{ display: "grid", placeItems: "center", transform: projectsOpen ? "rotate(0deg)" : "rotate(-90deg)", transition: "transform .15s ease" }}><Icon name="chevron" size={13} /></span>
+                </button>
+                <button
+                  className="echo-side-button"
+                  type="button"
+                  onClick={props.onAddFolder}
+                  title="Add Project folder"
+                  aria-label="Add Project folder"
+                  style={{ ...railButton(), width: "auto", minHeight: 28, padding: "0 5px", justifyContent: "center", flex: "0 0 auto", fontSize: 10.5 }}
+                >
+                  <Icon name="plus" size={14} />
+                  <span>New Project</span>
+                </button>
+              </div>
             )}
 
             {!iconOnly && projectsOpen && !projects.length && !props.hydrating && (
@@ -667,7 +647,7 @@ export function ProjectSidebar(props: SidebarProps) {
                 className="echo-footer-action"
                 type="button"
                 onClick={props.onAddFolder}
-                style={{ margin: "2px 3px 4px", minHeight: 46, borderRadius: 3, padding: "8px 10px", cursor: "pointer", textAlign: "left", fontFamily: "'JetBrains Mono', ui-monospace, monospace" }}
+                style={{ margin: "2px 3px 4px", minHeight: 46, borderRadius: 3, padding: "8px 10px", cursor: "pointer", textAlign: "left", fontFamily: "'Inter', 'Segoe UI', sans-serif" }}
               >
                 <span style={{ display: "block", fontSize: 10.5, color: "rgba(255,255,255,.72)" }}>Add your first Project</span>
                 <span style={{ display: "block", marginTop: 4, fontSize: 9, color: "rgba(255,255,255,.36)" }}>Attach a local folder</span>
@@ -770,83 +750,27 @@ export function ProjectSidebar(props: SidebarProps) {
           </div>
         </section>
 
-        <div className="echo-rail-divider" />
-
-        <nav aria-label="Workspace views" style={{ display: "grid", gap: 3, flex: "0 0 auto" }}>
-          {!iconOnly && (
-            <button
-              className="echo-side-button"
-              type="button"
-              onClick={() => setViewsOpen((value) => !value)}
-              aria-expanded={viewsOpen}
-              style={{ ...railButton(), minHeight: 28, padding: "0 4px", color: muted }}
-            >
-              <span style={{ flex: 1, fontSize: 10, letterSpacing: ".12em", textTransform: "uppercase" }}>Views</span>
-              <span style={{ display: "grid", placeItems: "center", transform: viewsOpen ? "rotate(0deg)" : "rotate(-90deg)", transition: "transform .15s ease" }}><Icon name="chevron" size={13} /></span>
-            </button>
-          )}
-          {(iconOnly || viewsOpen) &&
-            workspaceViews.map((view) => {
-              const active = props.activeView === view.id;
-              return (
-                <button
-                  className={`echo-side-button ${active ? "is-active" : ""}`}
-                  type="button"
-                  key={view.id}
-                  style={{ ...railButton(active), width: "100%" }}
-                  onClick={() => props.onView(view.id)}
-                  title={view.title}
-                  aria-label={view.title}
-                >
-                  <span style={iconSlot(active)}>
-                    <Icon name={view.icon} size={iconOnly ? 16 : 15} active={active} />
-                  </span>
-                  {!iconOnly && <span style={titleEllipsis}>{view.label}</span>}
-                </button>
-              );
-            })}
-        </nav>
       </div>
 
       {!iconOnly ? (
-        <footer className="echo-sidebar-footer" style={{ borderRadius: 4, padding: 10, marginRight: 10 }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-            <span style={{ color: "rgba(255,255,255,.35)", fontSize: 8.5, letterSpacing: ".13em", textTransform: "uppercase" }}>Active context</span>
-            <span style={{ color: "rgba(255,255,255,.28)", fontSize: 8 }}>{projects.length} projects · {sessions.length} sessions</span>
-          </div>
-          <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8, minWidth: 0 }}>
-            <span aria-hidden style={{ width: 6, height: 6, flex: "0 0 auto", borderRadius: "50%", background: "rgba(255,255,255,.72)", boxShadow: "0 0 0 3px rgba(255,255,255,.05)" }} />
-            <div style={{ minWidth: 0, lineHeight: 1.15 }}>
-              <div title={activeProject?.workspace_root || contextLabel} style={{ ...titleEllipsis, display: "block", color: "rgba(255,255,255,.86)", fontSize: 11.5, fontWeight: 600 }}>{contextLabel}</div>
-              <div style={{ ...titleEllipsis, display: "block", marginTop: 4, color: "rgba(255,255,255,.38)", fontSize: 9.5 }}>{activeSession?.name || "No active Session"}</div>
-            </div>
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 10 }}>
-            <button
-              className="echo-footer-action"
-              type="button"
-              onClick={() => props.onNewSession(props.activeProjectId || undefined)}
-              style={{ minHeight: 30, borderRadius: 3, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, fontFamily: "'JetBrains Mono', ui-monospace, monospace", fontSize: 9.5 }}
-            >
-              <Icon name="plus" size={13} /> New Session
-            </button>
-            <button
-              className="echo-footer-action"
-              type="button"
-              onClick={props.onAddFolder}
-              style={{ minHeight: 30, borderRadius: 3, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, fontFamily: "'JetBrains Mono', ui-monospace, monospace", fontSize: 9.5 }}
-            >
-              <Icon name="folder" size={13} /> Add Project
-            </button>
-          </div>
+        <footer className="echo-sidebar-footer" style={{ padding: "6px 10px 0 0" }}>
+          <button
+            className={`echo-footer-action ${props.settingsOpen ? "is-active" : ""}`}
+            type="button"
+            onClick={props.onSettings}
+            aria-pressed={props.settingsOpen}
+            style={{ width: "100%", minHeight: 36, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "flex-start", gap: 9, padding: "0 11px", fontFamily: "'Inter', 'Segoe UI', sans-serif", fontSize: 11.5 }}
+          >
+            <Icon name="studio" size={14} active={props.settingsOpen} /> Settings
+          </button>
         </footer>
       ) : (
         <div className="echo-sidebar-edge-pad" style={{ display: "grid", gap: 4, flexShrink: 0, paddingTop: 5, borderTop: "1px solid rgba(255,255,255,.07)" }}>
-          <button className="echo-side-button" type="button" title="New Session" aria-label="New Session" onClick={() => props.onNewSession(props.activeProjectId || undefined)} style={railButton()}>
-            <span style={iconSlot()}><Icon name="plus" size={16} /></span>
-          </button>
           <button className="echo-side-button" type="button" title="Add Project folder" aria-label="Add Project folder" onClick={props.onAddFolder} style={railButton()}>
             <span style={iconSlot()}><Icon name="folder" size={16} /></span>
+          </button>
+          <button className="echo-side-button" type="button" title="Settings" aria-label="Settings" aria-pressed={props.settingsOpen} onClick={props.onSettings} style={railButton(Boolean(props.settingsOpen))}>
+            <span style={iconSlot(Boolean(props.settingsOpen))}><Icon name="studio" size={16} active={Boolean(props.settingsOpen)} /></span>
           </button>
         </div>
       )}

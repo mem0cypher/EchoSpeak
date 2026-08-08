@@ -1,7 +1,9 @@
 """Versioned canonical research artifacts and exact-scope access helpers.
 
-SearchGrounder remains the production search orchestrator.  This module owns
-only durable research records and their migration/access contract.
+The canonical semantic runtime and research runtime own planning, acquisition,
+and completion. SearchGrounder is a bounded compatibility acquisition adapter;
+this module owns only durable research records and their migration/access
+contract.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ except Exception:
 
 _ROOT = Path(DATA_DIR) / "research_artifacts"
 _LOCK = threading.RLock()
-CURRENT_RESEARCH_SCHEMA_VERSION = 2
+CURRENT_RESEARCH_SCHEMA_VERSION = 3
 
 
 ResearchMode = Literal[
@@ -106,6 +108,10 @@ class EvidenceRecord(BaseModel):
     confidence: float = Field(default=0.5, ge=0, le=1)
     exact: bool = False
     provenance: Dict[str, Any] = Field(default_factory=dict)
+    requirement_id: str = ""
+    attempt_id: str = ""
+    covered_fields: List[str] = Field(default_factory=list)
+    unavailable_fields: List[str] = Field(default_factory=list)
 
 
 class ClaimRecord(BaseModel):
@@ -156,6 +162,8 @@ class ResearchArtifact(BaseModel):
     session_id: str = ""
     execution_id: str = ""
     tool_run_id: str = ""
+    requirement_id: str = ""
+    attempt_id: str = ""
     objective: str = ""
     query: str = ""
     resolved_scope: str = ""
@@ -174,6 +182,11 @@ class ResearchArtifact(BaseModel):
     source_urls: List[str] = Field(default_factory=list)
     status: ResearchStatus = "ready"
     outcome: str = ""
+    execution_status: str = ""
+    result_state: str = ""
+    provider: str = ""
+    observed_at: Optional[float] = None
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
 
@@ -228,12 +241,14 @@ def _migrate_payload_in_memory(payload: Any) -> Dict[str, Any]:
         raise ValueError(f"unsupported future research schema version: {version}")
     if version == CURRENT_RESEARCH_SCHEMA_VERSION:
         return dict(payload)
-    if version != 1:
+    if version not in {1, 2}:
         raise ValueError(f"unsupported research schema version: {version}")
 
     migrated = dict(payload)
     migrated["schema_version"] = CURRENT_RESEARCH_SCHEMA_VERSION
-    migrated["migrated_from_schema"] = 1
+    migrated["migrated_from_schema"] = version
+    migrated.setdefault("requirement_id", "")
+    migrated.setdefault("attempt_id", "")
     migrated.setdefault("resolved_scope", "")
     migrated.setdefault("model_provider", "")
     migrated.setdefault("model_id", "")
@@ -302,11 +317,10 @@ def get_research_artifact(artifact_id: str) -> Optional[ResearchArtifact]:
 
 
 def artifact_has_exact_scope(artifact: ResearchArtifact, *, project_id: str, session_id: str) -> bool:
-    project = str(project_id or "").strip()
     session = str(session_id or "").strip()
-    if not project or not session:
+    if not session:
         return False
-    return artifact.project_id == project and artifact.session_id == session
+    return artifact.project_id == str(project_id or "").strip() and artifact.session_id == session
 
 
 def require_exact_artifact_scope(
@@ -315,8 +329,8 @@ def require_exact_artifact_scope(
     project_id: str,
     session_id: str,
 ) -> ResearchArtifact:
-    if not str(project_id or "").strip() or not str(session_id or "").strip():
-        raise ResearchArtifactAccessError("Both Project and Session identity are required")
+    if not str(session_id or "").strip():
+        raise ResearchArtifactAccessError("Session identity is required")
     if not artifact_has_exact_scope(artifact, project_id=project_id, session_id=session_id):
         raise ResearchArtifactAccessError("Research artifact does not belong to the exact Project/Session scope")
     return artifact
@@ -362,8 +376,8 @@ def list_research_artifacts(
 def list_research_artifacts_for_scope(
     *, project_id: str, session_id: str, limit: int = 50
 ) -> List[ResearchArtifact]:
-    if not str(project_id or "").strip() or not str(session_id or "").strip():
-        raise ResearchArtifactAccessError("Both Project and Session identity are required")
+    if not str(session_id or "").strip():
+        raise ResearchArtifactAccessError("Session identity is required")
     return list_research_artifacts(project_id=project_id, session_id=session_id, limit=limit)
 
 
@@ -460,6 +474,17 @@ def build_research_artifact_from_tool_output(
     objective: str = "",
     model_provider: str = "",
     model_id: str = "",
+    execution_status: str = "",
+    result_state: str = "",
+    provider: str = "",
+    observed_at: Optional[float] = None,
+    confidence: Optional[float] = None,
+    requirement_id: str = "",
+    attempt_id: str = "",
+    evidence_id: str = "",
+    covered_fields: Optional[List[str]] = None,
+    unavailable_fields: Optional[List[str]] = None,
+    verified: bool = False,
 ) -> ResearchArtifact:
     """Compatibility builder for the existing SearchGrounder ToolRun path."""
     text = str(output or "").strip()
@@ -475,13 +500,38 @@ def build_research_artifact_from_tool_output(
         )
         for url in urls
     ]
+    if not sources and tool_run_id:
+        sources = [ResearchSource(
+            provider=provider or "runtime_tool",
+            source_identifier=tool_run_id,
+            source_type="tool",
+            retrieved_at=observed_at or time.time(),
+            provenance={"tool_run_id": tool_run_id},
+        )]
+    evidence = []
+    if text and sources:
+        evidence = [EvidenceRecord(
+            id=evidence_id or str(uuid.uuid4()),
+            source_id=sources[0].id,
+            content=re.sub(r"\s+", " ", text)[:12000],
+            exact=bool(verified and result_state == "data_found"),
+            confidence=float(confidence if confidence is not None else 0.5),
+            requirement_id=requirement_id,
+            attempt_id=attempt_id,
+            covered_fields=list(covered_fields or []),
+            unavailable_fields=list(unavailable_fields or []),
+            provenance={"tool_run_id": tool_run_id},
+        )]
     summary = re.sub(r"\s+", " ", text)[:1600]
-    status: ResearchStatus = "ready" if (summary or citations) else "failed"
+    usable = bool(verified and str(result_state or "data_found") == "data_found")
+    status: ResearchStatus = "ready" if usable and (summary or citations) else "failed"
     return ResearchArtifact(
         project_id=project_id,
         session_id=session_id,
         execution_id=execution_id,
         tool_run_id=tool_run_id,
+        requirement_id=requirement_id,
+        attempt_id=attempt_id,
         objective=objective or query,
         query=query,
         model_provider=model_provider,
@@ -490,5 +540,11 @@ def build_research_artifact_from_tool_output(
         citations=citations,
         source_urls=urls,
         sources=sources,
+        evidence=evidence,
         status=status,
+        execution_status=execution_status,
+        result_state=result_state,
+        provider=provider,
+        observed_at=observed_at,
+        confidence=confidence,
     )

@@ -1,7 +1,10 @@
 from typing import Callable, Optional
 
 
-_REMOVED_MESSAGE = "Wake listener voice activation has been removed. Use browser speech controls instead."
+_REMOVED_MESSAGE = (
+    "Wake-word activation is not implemented. Use EchoSpeak's explicit local "
+    "microphone control until the Phase 6 single-microphone owner is available."
+)
 
 
 class WakeListener:

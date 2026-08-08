@@ -11,7 +11,7 @@ The implemented foundation includes:
 - a Rust-owned Python sidecar lifecycle with health-gated startup, bounded
   automatic recovery, manual recovery, log capture, and process-tree shutdown;
 - a per-launch authenticated loopback transport and a typed renderer bridge;
-- a desktop-only adaptive workspace with one active surface at a time;
+- a desktop-only Chat/Visualizer workspace with Settings in a centered modal;
 - PyInstaller and Tauri packaging scripts for NSIS and MSI outputs; and
 - static contract, frontend, and focused backend tests.
 
@@ -82,9 +82,9 @@ The installed toolchains produced these local, uncommitted artifacts:
   `src-tauri/binaries/echospeak-backend-x86_64-pc-windows-msvc.exe`;
 - release host at `src-tauri/target/release/echospeak-desktop.exe`;
 - NSIS current-user installer at
-  `src-tauri/target/release/bundle/nsis/EchoSpeak_0.1.0_x64-setup.exe`; and
+  `src-tauri/target/release/bundle/nsis/EchoSpeak_8.0.0_x64-setup.exe`; and
 - MSI at
-  `src-tauri/target/release/bundle/msi/EchoSpeak_0.1.0_x64_en-US.msi`.
+  `src-tauri/target/release/bundle/msi/EchoSpeak_8.0.0_x64_en-US.msi`.
 
 The release executable was exercised with disposable data. Startup reached a
 healthy authenticated loopback sidecar, a bootloader-only crash retired its
@@ -129,8 +129,8 @@ Expected artifacts after a successful x64 build:
   `apps/desktop/src-tauri/target/release/bundle/nsis/`
 - an MSI below `apps/desktop/src-tauri/target/release/bundle/msi/`
 
-Typical installer names are `EchoSpeak_0.1.0_x64-setup.exe` and
-`EchoSpeak_0.1.0_x64_en-US.msi`; treat the actual files emitted by Tauri as
+Typical installer names are `EchoSpeak_8.0.0_x64-setup.exe` and
+`EchoSpeak_8.0.0_x64_en-US.msi`; treat the actual files emitted by Tauri as
 authoritative. Publisher metadata does not sign an installer. Code signing and
 release provenance remain separate release gates.
 
@@ -168,10 +168,11 @@ After both bundles exist:
 6. Request `/health` without the per-launch key and confirm only that public
    health route is reachable. Request a protected route without a key and
    confirm HTTP 401. Confirm the renderer can hydrate through its bridge.
-7. Exercise Chat, Visualizer, Research, Code, Video, Tasks, and Studio. Confirm
-   only one primary surface owns the workspace and the composer remains
-   contextual. Confirm selecting a Project or Quick Chat does not create a
-   Session; only an explicit plus/new-session action does.
+7. Exercise Chat and Visualizer, including the Work, Research, Code, Checklist,
+   and Media panels, then open and close Settings. Confirm panel navigation is
+   projection-only and the composer remains usable. Confirm selecting a Project
+   or Quick Chat does not create a Session; only an explicit plus/new-session
+   action does.
 8. Use the native Project folder picker. Confirm canceled selection is inert and
    a selected folder still passes the existing backend Project/path policy.
 9. Terminate only the sidecar. Confirm the recovery banner appears, workspace

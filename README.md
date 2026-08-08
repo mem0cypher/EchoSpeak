@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="docs/GETTING_STARTED.md">Getting Started</a> ·
-  <a href="ARCHITECTURE.md">Architecture</a> ·
+  <a href="docs/SYSTEM_ARCHITECTURE.md">Architecture</a> ·
   <a href="CHANGES.md">Changelog</a> ·
   <a href="ROADMAP.md">Roadmap</a> ·
   <a href="docs/AGENT.md">Agent Guide</a> ·
@@ -87,12 +87,12 @@ On Arch/CachyOS with PEP 668, use `./.venv/bin/python -m pip install -r requirem
 
 ### Core platform
 
-- **5-stage query pipeline** — parse → context → shortcuts → LLM agents → finalize.
-- **Reflection engine** — per-step evaluation with retry and post-plan reflection.
-- **Multi-step task planner** — decomposes complex queries into tool chains with dependency ordering.
-- **Multi-agent orchestrator** — parallel sub-task execution with result passing.
-- **Intent router** — deterministic fast paths for chat, help, memory, and tool routing.
-- **Streaming events** — NDJSON event stream with live task checklist in the Web UI.
+- **Canonical semantic runtime** — Turn Understanding separates lightweight conversation from durable actionable work.
+- **TaskRun execution graph** — one durable objective owner tracks requirements, dependencies, progress, waits, evidence, and completion.
+- **Bounded model loop** — native tool calls, structured observations, malformed-output repair, provider retry, and no-progress protection.
+- **Specialist delegation** — coding work is correlated to real Codex or OpenCode sessions and returns through TaskRun.
+- **Single completion gate** — verified requirement sufficiency, not prose or tool execution alone, controls finalization.
+- **Projection-only UI** — Chat stays conversational while Visualizer reads the same TaskRun, ToolRun, evidence, and specialist records.
 
 ### Memory + knowledge
 
@@ -106,7 +106,7 @@ On Arch/CachyOS with PEP 668, use `./.venv/bin/python -m pip install -r requirem
 
 | Channel | How it connects |
 |---------|----------------|
-| **Web UI** | React/Vite — streaming chat, inline code diffs, research panel, todos, avatar editor, workspace explorer |
+| **Web/Desktop UI** | React/Vite — Chat plus a read-only Visualizer for TaskRuns, research, specialist Code, checklist, media, and approvals |
 | **Discord** | Bot account for server channels + DMs; Playwright bridge for personal sessions |
 | **Telegram** | Native bot via grammY-style integration |
 | **Twitter/X** | Autonomous tweets (grounded by git diffs), changelog tweets, mention replies |
@@ -116,8 +116,8 @@ On Arch/CachyOS with PEP 668, use `./.venv/bin/python -m pip install -r requirem
 
 ### Tools + automation
 
-- **Web search** — Tavily-powered with reflection and recency filtering.
-- **File operations** — read, write (SEARCH/REPLACE blocks), grep, workspace browsing.
+- **Web research** — provider-backed discovery, safe page retrieval, provenance, and requirement-level evidence evaluation.
+- **File operations** — Project-scoped reads and governed writes through durable ToolRuns.
 - **Terminal** — denylisted dangerous commands with confirmation (not a narrow allowlist).
 - **Browser** — Playwright-driven page control, screenshots, form filling.
 - **Email** — send and compose via SMTP integration.
@@ -159,7 +159,7 @@ Web UI / Discord / Telegram / Twitter / Twitch / TUI / A2A
 
 | Layer | Technology |
 |-------|------------|
-| Backend | Python · FastAPI · LangChain · LangGraph · FAISS |
+| Backend | Python · FastAPI · canonical semantic runtime · FAISS |
 | Frontend | React · Vite · Framer Motion · TailwindCSS |
 | Windows desktop | Tauri 2 · Rust host · packaged Python sidecar |
 | TUI | Go · Bubble Tea · Lipgloss |
@@ -221,7 +221,7 @@ Full contracts: `docs/UNIFIED_COORDINATION.md`, `docs/RUNTIME_CONTRACTS.md`.
 | Document | Description |
 |----------|-------------|
 | [Getting Started](docs/GETTING_STARTED.md) | 5-minute setup guide |
-| [Architecture](ARCHITECTURE.md) | System internals |
+| [Architecture](docs/SYSTEM_ARCHITECTURE.md) | Current system internals |
 | [Desktop Architecture](docs/DESKTOP_ARCHITECTURE.md) | Windows host, sidecar, transport, lifecycle, and native gates |
 | [Changelog](CHANGES.md) | Full version history |
 | [Roadmap](ROADMAP.md) | What's next |

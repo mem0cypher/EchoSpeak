@@ -267,13 +267,14 @@ const WeatherStat: React.FC<{
 }> = ({ embed, colors }) => {
   const unit = embed.unit ? `°${embed.unit}` : "°";
   return (
-    <div style={{ padding: "8px 0 2px", display: "flex", alignItems: "stretch", gap: 12 }}>
+    <div className="chat-embed-weather" style={{ padding: "8px 0 2px", display: "flex", alignItems: "stretch", gap: 12 }}>
       <div
         style={{
           width: 36,
           height: 36,
           borderRadius: 8,
-          background: "rgba(120,180,255,0.1)",
+          background: "rgba(255,255,255,0.055)",
+          border: "1px solid rgba(255,255,255,0.07)",
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
@@ -333,7 +334,7 @@ const ScheduleList: React.FC<{
   embed: Extract<ChatEmbed, { kind: "schedule_list" }>;
   colors: Palette;
 }> = ({ embed, colors }) => (
-  <div style={{ padding: "6px 0 2px" }}>
+  <div className="chat-embed-schedule" style={{ padding: "6px 0 2px" }}>
     <div
       style={{
         fontSize: 11,
@@ -349,6 +350,7 @@ const ScheduleList: React.FC<{
       {embed.items.map((item, i) => (
         <div
           key={`${item.matchup}-${i}`}
+          className="chat-embed-schedule-row"
           style={{ display: "flex", gap: 10, alignItems: "baseline", padding: "3px 0" }}
         >
           {item.when ? (
@@ -404,6 +406,7 @@ export const ChatEmbeds: React.FC<{ embeds?: ChatEmbed[]; colors: Palette }> = (
           return (
             <div
               key={embed.id}
+              className="chat-embed-stat"
               style={{
                 padding: "6px 0",
                 display: "flex",
@@ -425,87 +428,56 @@ export const ChatEmbeds: React.FC<{ embeds?: ChatEmbed[]; colors: Palette }> = (
 };
 
 /**
- * Footer meta inline with time/tokens: "· sources · N · searched · M".
- * Expand panels open on the next line (flex-basis 100% when parent is flex-wrap).
+ * Compact meta chips only: "· Sources · N · Search · M".
+ * No expandable Evidence/source boxes under the bubble — full evidence lives in Studio/Viewer/Research.
  */
-export const ChatEmbedFooter: React.FC<{ embeds?: ChatEmbed[]; colors: Palette }> = ({ embeds }) => {
-  const [openSources, setOpenSources] = useState(false);
-  const [openSearched, setOpenSearched] = useState(false);
+export const ChatEmbedFooter: React.FC<{ embeds?: ChatEmbed[]; colors: Palette; extraSources?: number }> = ({
+  embeds,
+  extraSources = 0,
+}) => {
+  if ((!embeds || !embeds.length) && !extraSources) return null;
 
-  if (!embeds || !embeds.length) return null;
-
-  const hasSources = embeds.some((e) => e.kind === "sources");
-  const footer = embeds.filter((e) => {
+  const hasSources = embeds?.some((e) => e.kind === "sources");
+  const footer = (embeds || []).filter((e) => {
     if (!FOOTER_KINDS.has(e.kind)) return false;
     if (e.kind === "link_card" && hasSources) return false;
     return true;
   });
-  if (!footer.length) return null;
 
   const sources = footer.find((e): e is Extract<ChatEmbed, { kind: "sources" }> => e.kind === "sources");
   const searched = footer.find(
     (e): e is Extract<ChatEmbed, { kind: "query_chip" }> => e.kind === "query_chip"
   );
-  const linkOnly = !sources
-    ? footer.find((e): e is Extract<ChatEmbed, { kind: "link_card" }> => e.kind === "link_card")
-    : undefined;
+  const sourceCount = Math.max(sources?.items.length || 0, Number(extraSources) || 0);
+  const searchCount = searched?.queries?.length || 0;
 
-  if (!sources && !searched && !linkOnly) return null;
-
-  const expandedOpen = (openSources && sources) || (openSearched && searched);
+  if (!sourceCount && !searchCount) return null;
 
   return (
     <>
-      <span style={{ opacity: 0.45 }}>·</span>
-      <div
-        className="chat-embed-footer"
-        style={{
-          display: "inline-flex",
-          flexWrap: "wrap",
-          alignItems: "center",
-          gap: 6,
-          ...metaFont,
-          minWidth: 0,
-        }}
-      >
-        {sources ? (
-          <SourcesToggle
-            embed={sources}
-            open={openSources}
-            onToggle={() => {
-              setOpenSources((v) => !v);
-            }}
-          />
-        ) : null}
-        {sources && searched ? <span style={{ opacity: 0.45 }}>·</span> : null}
-        {searched ? (
-          <SearchedToggle
-            embed={searched}
-            open={openSearched}
-            onToggle={() => setOpenSearched((v) => !v)}
-          />
-        ) : null}
-        {linkOnly ? (
-          <>
-            {(sources || searched) && <span style={{ opacity: 0.45 }}>·</span>}
-            <a
-              href={linkOnly.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ ...metaFont, color: "rgba(255,255,255,0.38)", textDecoration: "none" }}
-              className="chat-embed-source-link"
-              title={linkOnly.title}
-            >
-              {(linkOnly.domain || "link").replace(/^www\./, "")} ↗
-            </a>
-          </>
-        ) : null}
-      </div>
-      {expandedOpen ? (
-        <div style={{ flexBasis: "100%", width: "100%", minWidth: 0 }}>
-          {openSources && sources ? <SourcesExpanded embed={sources} /> : null}
-          {openSearched && searched ? <SearchedExpanded embed={searched} /> : null}
-        </div>
+      {sourceCount ? (
+        <>
+          <span style={{ opacity: 0.45 }}>·</span>
+          <span
+            data-testid="chat-meta-sources"
+            title={sources?.items.map((s) => s.title || s.domain || s.url).filter(Boolean).join(" · ") || "Sources"}
+            style={{ ...metaFont, color: "rgba(255,255,255,0.34)" }}
+          >
+            Sources · {sourceCount}
+          </span>
+        </>
+      ) : null}
+      {searchCount ? (
+        <>
+          <span style={{ opacity: 0.45 }}>·</span>
+          <span
+            data-testid="chat-meta-search"
+            title={(searched?.queries || []).join(" · ") || "Search"}
+            style={{ ...metaFont, color: "rgba(255,255,255,0.34)" }}
+          >
+            Search · {searchCount}
+          </span>
+        </>
       ) : null}
     </>
   );

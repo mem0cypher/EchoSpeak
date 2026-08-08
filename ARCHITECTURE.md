@@ -1,5 +1,14 @@
 # EchoSpeak Architecture
 
+> **Superseded historical document.** The production architecture changed
+> during the EchoSpeak 8.0 consolidation. The authoritative current system is
+> documented in
+> [`docs/SYSTEM_ARCHITECTURE.md`](docs/SYSTEM_ARCHITECTURE.md),
+> [`docs/RUNTIME_CONTRACTS.md`](docs/RUNTIME_CONTRACTS.md), and
+> [`docs/DESKTOP_ARCHITECTURE.md`](docs/DESKTOP_ARCHITECTURE.md).
+> Sections below this notice describe earlier implementations and must not be
+> used to infer a reachable production path.
+
 The canonical domain ownership and lifecycle invariants are maintained in [docs/ECHO_CORE_CONTRACT_MATRIX.md](docs/ECHO_CORE_CONTRACT_MATRIX.md).
 
 The additive Windows desktop host, its native/sidecar ownership boundary,

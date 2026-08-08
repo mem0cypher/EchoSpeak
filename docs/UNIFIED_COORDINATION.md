@@ -14,30 +14,32 @@ or truth are not.
 ```text
 User or trigger
   -> exact Session and Project
-  -> objective and capability resolution
-  -> structured plan
-  -> current policy / permission / revision checks
-  -> one Execution and canonical ToolRuns
-  -> verification and durable domain state
-  -> Studio/Viewer/Chat projection
-  -> final response from recorded truth
+  -> Turn Understanding
+  -> optional TaskRun with TaskRun-owned execution graph
+  -> bounded model loop and current capability authority
+  -> durable ToolRuns or correlated SpecialistRuns
+  -> evidence verification and requirement evaluation
+  -> the existing single finalization gate
+  -> Chat response plus Visualizer projection
 ```
 
 ## One owner per concept
 
 | Concept | Authority | Projections only |
 |---|---|---|
-| Project attachment/root | `ThreadSessionState` + `ProjectManager` | sidebar, workspace chrome |
-| Session identity/current execution | `StateStore` | frontend stores and streams |
-| Pending mutation | `ApprovalRecord` | pending-action response and approval card |
-| ToolRun outcome | durable `StateStore` ToolRun | callback queues, activity cards |
-| Personal semantic memory | `MemoryCurator` / `AgentMemory` | indexes, profiles, Obsidian, Memory Studio |
-| Coding objective and checkpoints | `ThreadSessionState` + `CodingExecutionLedger` | ActiveWork and Code UI |
-| Research evidence | `ResearchArtifactStore` | Research workspace |
-| Task/Routine definition | `TaskStore` / `RoutineManager` | Automations cards |
+| Project identity/root | `ProjectManager` | sidebar and Settings |
+| Session identity, attachment, model binding | `ThreadSessionState` + `ThreadManager` | frontend stores and streams |
+| Actionable objective and graph | `TaskRun` | Chat progress and Visualizer |
+| Pending mutation | `ApprovalRecord` | approval card |
+| Tool execution truth | durable `ToolRun` / `ToolOutcome` | callback queues and activity cards |
+| Specialist delegation | `SpecialistRun` | specialist activity panel |
+| Personal semantic memory | `MemoryCurator` / `AgentMemory` | indexes and profile views |
+| Research evidence | `ResearchArtifactStore` referenced by `TaskRun` | structured results and Visualizer |
+| Research sufficiency | `RequirementCompletionEvaluator` updating `TaskRun` | completion summary |
+| Task/Routine definition | `TaskStore` / `RoutineManager` | Visualizer schedules |
 | Automation execution | `AutomationRunStore` | scheduler callbacks and health |
-| Connection capability | `ConnectionRegistry` | Connections UI |
-| Media asset | `MediaLibraryStore` | Media cards and generation results |
+| Connection capability | `ConnectionRegistry` / external MCP server | Settings and Visualizer |
+| Media asset | `MediaLibraryStore` | Visualizer media |
 
 If two modules can change the meaning or lifecycle of one row, that is an
 ownership defect.
@@ -88,10 +90,11 @@ prices, scores, flights, weather, schedules, or other fast-changing facts.
 ## Frontend truth
 
 Chat stays conversational: normal completion shows the user message and Echo's
-synthesis, with one transient status while active. Approval, clarification,
-conflict, and recoverable failure remain actionable. Studio and Viewer expose
-durable evidence, ToolRuns, tasks/runs, research, memory provenance,
-connections, failures, health, and verification.
+synthesis, with compact status only while work is active. Approval,
+clarification, conflict, and recoverable failure remain actionable.
+Visualizer exposes durable TaskRuns, graph nodes, evidence, ToolRuns,
+specialists, research, schedules, media, failures, and verification. Settings
+configures providers, models, connectors, voice, privacy, and advanced controls.
 
 The frontend must not infer completion from prose, a stopped spinner, an
 optimistic flag, or a nearby card. It refreshes from canonical backend owners.

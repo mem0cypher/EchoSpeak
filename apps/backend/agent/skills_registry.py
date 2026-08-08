@@ -180,6 +180,7 @@ def package_to_manifest(entry: Path, meta: Dict[str, object], prompt: str) -> Sk
         supported_modes=modes,
         required_project_state=[str(x) for x in (meta.get("required_project_state") or [])],
         required_context_fields=[str(x) for x in (meta.get("required_context_fields") or [])],
+        permitted_tools=[str(x) for x in (meta.get("permitted_tools") or [])],
         required_tools=tool_allowlist,
         optional_tools=optional_tools,
         required_capabilities=[str(x) for x in (meta.get("required_capabilities") or [])],
@@ -191,6 +192,7 @@ def package_to_manifest(entry: Path, meta: Dict[str, object], prompt: str) -> Sk
         permissions=[str(x) for x in (meta.get("permissions") or [])],
         approval_policy=dict(meta.get("approval_policy") or meta.get("approval_rules") or {}),
         verification_rules=[str(x) for x in (meta.get("verification_rules") or [])],
+        completion_criteria=[str(x) for x in (meta.get("completion_criteria") or [])],
         retry_policy=dict(meta.get("retry_policy") or {}),
         resource_limits=dict(meta.get("resource_limits") or {}),
         dependency_metadata=dict(meta.get("dependency_metadata") or {}),
@@ -350,6 +352,96 @@ def merge_tool_allowlists(
 
 _loaded_skill_tool_modules: set[str] = set()
 
+_SKILL_CONNECTION_PROVIDER = {
+    "github_comms": "github",
+    "notion_comms": "notion",
+    "calendar": "google_calendar",
+    "spotify": "spotify",
+    "smart_home": "home_assistant",
+}
+
+
+def _provider_capability_id(provider_id: str, tool_name: str, *, is_action: bool, risk: str) -> str:
+    if provider_id == "google_calendar":
+        if "delete" in tool_name or str(risk).casefold() in {"high", "destructive"}:
+            return "calendar.delete"
+        return "calendar.write" if is_action else "calendar.read"
+    if provider_id == "home_assistant":
+        return "home_assistant.control" if is_action else "home_assistant.read"
+    if provider_id == "spotify":
+        return "spotify.control" if is_action else "spotify.read"
+    return f"{provider_id}.{'write' if is_action else 'read'}"
+
+
+def _bind_skill_tool_to_connection(
+    tool: Any,
+    *,
+    provider_id: str,
+    capability_id: str,
+) -> Any:
+    """Require one current scoped Connection before a provider Skill executes."""
+
+    class _ConnectionBoundSkillTool:
+        name = str(getattr(tool, "name", "") or "")
+        description = str(getattr(tool, "description", "") or "")
+        args_schema = getattr(tool, "args_schema", None)
+
+        @staticmethod
+        def _revalidate() -> None:
+            from agent.connections import ConnectionRegistryError, get_connection_registry
+            from agent.tools import get_tool_execution_context
+
+            context = dict(get_tool_execution_context() or {})
+            project_id = str(context.get("active_project_id") or context.get("project_id") or "")
+            session_id = str(context.get("session_id") or context.get("thread_id") or "")
+            if not project_id or not session_id:
+                raise ConnectionRegistryError(
+                    f"{provider_id} requires an active Project and Session Connection scope"
+                )
+            registry = get_connection_registry()
+            candidates = [
+                projection
+                for projection in registry.list(project_id=project_id, session_id=session_id)
+                if projection.provider == provider_id
+                and projection.enabled
+                and any(
+                    str(item.get("id") or "") == capability_id
+                    for item in projection.capabilities
+                )
+            ]
+            if len(candidates) != 1:
+                raise ConnectionRegistryError(
+                    f"{provider_id} requires exactly one active scoped Connection "
+                    f"with capability {capability_id}"
+                )
+            registry.resolve_references(
+                [{
+                    "connection_id": candidates[0].id,
+                    "capability_ids": [capability_id],
+                }],
+                project_id=project_id,
+                session_id=session_id,
+            )
+
+        def invoke(self, input: Any = None, config: Any = None, **kwargs: Any) -> Any:  # noqa: A002
+            self._revalidate()
+            payload = input if isinstance(input, dict) else dict(kwargs)
+            if hasattr(tool, "invoke"):
+                return tool.invoke(payload, config=config) if config is not None else tool.invoke(payload)
+            if isinstance(payload, dict):
+                return tool(**payload)
+            return tool(payload)
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            self._revalidate()
+            if args:
+                return tool(*args, **kwargs)
+            if hasattr(tool, "invoke"):
+                return tool.invoke(kwargs)
+            return tool(**kwargs)
+
+    return _ConnectionBoundSkillTool()
+
 
 def load_skill_tools(skill_dir: Path) -> List[str]:
     """Load custom tools from a skill's ``tools.py`` file.
@@ -417,17 +509,58 @@ def load_skill_tools(skill_dir: Path) -> List[str]:
             )
             return []
 
-        # Package code is always treated as an action-capable authority surface.
-        # Runtime policy and approval gates may narrow it further, never widen it.
+        # Preserve each tool's reviewed capability-level risk declaration.
+        # A Skill is a workflow/package origin, not a security classification:
+        # safe reads must not inherit write approval merely because the tool was
+        # loaded from a Skill. Current runtime policy may still narrow access.
         for tool_name in new_tools:
             entry = ToolRegistry.get(tool_name)
             if entry is not None:
-                ToolRegistry._entries[tool_name] = replace(
+                provider_id = _SKILL_CONNECTION_PROVIDER.get(manifest.id, "")
+                bound_tool = entry.func
+                connection_id = entry.connection_id
+                available = entry.available
+                unavailable_reason = entry.unavailable_reason
+                if provider_id:
+                    capability_id = _provider_capability_id(
+                        provider_id,
+                        tool_name,
+                        is_action=entry.is_action,
+                        risk=entry.risk_level,
+                    )
+                    bound_tool = _bind_skill_tool_to_connection(
+                        entry.func,
+                        provider_id=provider_id,
+                        capability_id=capability_id,
+                    )
+                    connection_id = f"provider:{provider_id}"
+                    try:
+                        from agent.connections import get_connection_registry
+
+                        provider_connections = [
+                            record
+                            for record in get_connection_registry().list_unscoped()
+                            if record.provider == provider_id and record.enabled
+                        ]
+                        available = bool(provider_connections)
+                        unavailable_reason = (
+                            ""
+                            if available
+                            else f"No active {provider_id} Connection is registered"
+                        )
+                    except Exception as exc:
+                        available = False
+                        unavailable_reason = f"Connection authority unavailable: {exc}"
+                ToolRegistry._put(replace(
                     entry,
-                    is_action=True,
-                    risk_level="destructive" if entry.risk_level == "destructive" else "moderate",
+                    func=bound_tool,
                     owner=f"skill:{manifest.id}",
-                )
+                    origin="skill",
+                    connection_id=connection_id,
+                    policy_flags=() if provider_id else entry.policy_flags,
+                    available=available,
+                    unavailable_reason=unavailable_reason,
+                ))
 
         # Enforce policy_flags — remove tools whose config flags aren't enabled
         if new_tools:

@@ -132,7 +132,19 @@ export const restartDesktopBackend = (): Promise<DesktopRuntime> =>
 export const pickDesktopProjectFolder = (): Promise<string | null> =>
   invoke<string | null>("pick_project_folder");
 
+export const pickDesktopConnectionFolder = (providerName: string): Promise<string | null> =>
+  invoke<string | null>("pick_connection_folder", { providerName });
+
 export const openDesktopLogs = (): Promise<void> => invoke<void>("open_desktop_logs");
+
+export const openDesktopSettingsWindow = (): Promise<void> => invoke<void>("open_settings_window");
+
+export const openDesktopCompanionWindow = (): Promise<void> => invoke<void>("open_companion_window");
+
+export const setDesktopCompanionAlwaysOnTop = (enabled: boolean): Promise<void> =>
+  invoke<void>("set_companion_always_on_top", { enabled });
+
+export const readDesktopWindowLabel = (): Promise<string> => invoke<string>("desktop_window_label");
 
 export const controlDesktopWindow = (action: "minimize" | "toggle_maximize" | "close"): Promise<void> =>
   invoke<void>("control_desktop_window", { action });

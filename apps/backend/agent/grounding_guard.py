@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List, Optional
 
 from loguru import logger
 
@@ -24,6 +24,7 @@ class GroundingResult:
     is_grounded: bool = True
     ungrounded_claims: List[str] = field(default_factory=list)
     grounded_claims: List[str] = field(default_factory=list)
+    claim_provenance: Dict[str, str] = field(default_factory=dict)
 
 
 # ── Claim extraction patterns ──
@@ -149,7 +150,13 @@ def _claim_in_sources(claim: str, sources_normalized: List[str]) -> bool:
     return False
 
 
-def check_grounding(response: str, sources: List[str]) -> GroundingResult:
+def check_grounding(
+    response: str,
+    sources: List[str],
+    *,
+    user_constraints: Optional[List[str]] = None,
+    source_records: Optional[List[Dict[str, str]]] = None,
+) -> GroundingResult:
     """Check if factual claims in the response are grounded in source material.
 
     Args:
@@ -163,20 +170,53 @@ def check_grounding(response: str, sources: List[str]) -> GroundingResult:
     if not claims:
         return GroundingResult(is_grounded=True)
 
-    sources_normalized = [_normalize_for_match(s) for s in sources if s]
+    typed_sources: List[tuple[str, str]] = [
+        ("verified_tool_outcome", _normalize_for_match(s)) for s in sources if s
+    ]
+    for record in source_records or []:
+        provenance = str(record.get("provenance") or "").strip()
+        content = str(record.get("content") or "").strip()
+        if provenance in {
+            "user_input", "authorized_memory", "project_context",
+            "verified_tool_outcome", "assistant_inference",
+        } and content:
+            typed_sources.append((provenance, _normalize_for_match(content)))
+    constraints_normalized = [_normalize_for_match(s) for s in (user_constraints or []) if s]
 
     result = GroundingResult()
     for claim in claims:
-        if _claim_in_sources(claim, sources_normalized):
+        claim_norm = _normalize_for_match(claim)
+        # Repeating an exact user-supplied constraint is not a new assistant
+        # factual assertion. It remains tagged as user_input, not verified evidence.
+        if any(claim_norm in item for item in constraints_normalized):
             result.grounded_claims.append(claim)
+            result.claim_provenance[claim] = "user_input"
         else:
-            result.ungrounded_claims.append(claim)
+            matched_provenance = next(
+                (
+                    provenance for provenance, content in typed_sources
+                    if provenance != "assistant_inference" and _claim_in_sources(claim, [content])
+                ),
+                "",
+            )
+            if matched_provenance:
+                result.grounded_claims.append(claim)
+                result.claim_provenance[claim] = matched_provenance
+            else:
+                result.ungrounded_claims.append(claim)
+                result.claim_provenance[claim] = "assistant_inference"
 
     result.is_grounded = len(result.ungrounded_claims) == 0
     return result
 
 
-def apply_grounding_guard(response: str, sources: List[str]) -> str:
+def apply_grounding_guard(
+    response: str,
+    sources: List[str],
+    *,
+    user_constraints: Optional[List[str]] = None,
+    source_records: Optional[List[Dict[str, str]]] = None,
+) -> str:
     """Main entry point: validate and optionally modify the response.
 
     If ungrounded specific claims are detected, appends a caveat rather
@@ -193,7 +233,12 @@ def apply_grounding_guard(response: str, sources: List[str]) -> str:
     if not response or not response.strip():
         return response
 
-    result = check_grounding(response, sources)
+    result = check_grounding(
+        response,
+        sources,
+        user_constraints=user_constraints,
+        source_records=source_records,
+    )
 
     if result.is_grounded:
         return response

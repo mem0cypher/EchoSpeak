@@ -169,18 +169,22 @@ layout. Under Tauri, a MemoryRouter mounts `DesktopApp`, and the Dashboard uses 
 desktop-only explicit surface union:
 
 ```text
-Chat | Visualizer | Research | Code | Video | Tasks | Studio
+Chat | Visualizer
 ```
 
-Exactly one primary surface owns the main workspace. Research, Code, Tasks, and
-Visualizer reuse the existing visualizer modes; Video and Studio use their
-existing components; Chat uses the full conversation surface. The composer is
-the bottom row for contextual surfaces instead of a permanent third column.
+Exactly one primary surface owns the main workspace. Work, Research, Code,
+Checklist, and Media are internal Visualizer panels over the same canonical
+Session/TaskRun state. Settings is a centered modal and not a third workspace.
+Chat uses the full conversation surface and may show compact durable-work
+status. Navigation never creates a Session, TaskRun, Execution, or handoff.
+The composer remains the bottom row instead of a permanent third column.
 Desktop CSS is scoped beneath `html.echospeak-desktop-root` and
 `.desktop-window`, so the browser build does not inherit native-shell behavior.
 
-The native folder picker returns a path only. Attaching it remains an existing
-backend API action, preserving Project and path validation authority.
+Native Project and local-Connection folder pickers return a path only after an
+explicit user gesture. Attaching a Project or authorizing the selected local
+folder remains an existing backend API action, preserving Project, Connection,
+scope, revision, and path-validation authority.
 
 ## Build and release boundary
 

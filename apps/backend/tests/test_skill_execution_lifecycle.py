@@ -103,6 +103,33 @@ def test_prompt_only_skill_blocks_and_terminal_transition_cannot_reopen(tmp_path
     assert get_skill_execution(blocked.id).status == SkillExecutionStatus.COMPLETED
 
 
+def test_explicit_empty_turn_inventory_blocks_registered_skill_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import agent.skill_execution as execution_module
+
+    monkeypatch.setattr(execution_module, "_EXEC_DIR", tmp_path / "skill-executions")
+    manifest = SkillManifest(
+        id="prohibited_fixture_skill",
+        name="Prohibited fixture",
+        origin=SkillOrigin.BUILT_IN,
+        status=SkillStatus.BUILT_IN,
+        executable=True,
+        implementation_entry="fixture:run",
+        required_tools=["fixture_skill_tool"],
+    )
+    monkeypatch.setattr(SkillsRegistry, "_manifests", {manifest.id: manifest})
+    runtime = StateStore(tmp_path / "runtime")
+    turn = runtime.create_execution(thread_id="session-1", source="test", status="running")
+    record = create_skill_execution(execution_id=turn.id, session_id="session-1", skill_id=manifest.id)
+
+    blocked = activate_skill_execution(record.id, state_store=runtime, allowed_tool_names=set())
+
+    assert blocked.status == SkillExecutionStatus.BLOCKED
+    assert blocked.permitted_tool_ids == []
+    assert runtime.list_tool_runs(turn.id) == []
+
+
 def test_composed_skill_records_keep_bounded_parent_child_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import agent.skill_execution as execution_module
 
@@ -121,3 +148,40 @@ def test_composed_skill_records_keep_bounded_parent_child_identity(tmp_path: Pat
     loaded = get_skill_execution(parent.id)
     assert loaded.child_skill_ids == ["child-a", "child-b"]
     assert loaded.child_execution_ids == [child.id]
+
+
+def test_skill_completion_fails_closed_without_verified_tool_outcome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import agent.skill_execution as execution_module
+
+    monkeypatch.setattr(execution_module, "_EXEC_DIR", tmp_path / "skill-executions")
+    manifest = SkillManifest(
+        id="verified_fixture_skill",
+        name="Verified fixture",
+        origin=SkillOrigin.BUILT_IN,
+        status=SkillStatus.BUILT_IN,
+        executable=True,
+        implementation_entry="fixture:run",
+        required_tools=["fixture_skill_tool"],
+        verification_rules=["child_tool_succeeded"],
+        completion_criteria=["required_tools_succeeded"],
+    )
+    monkeypatch.setattr(SkillsRegistry, "_manifests", {manifest.id: manifest})
+    runtime = StateStore(tmp_path / "runtime")
+    turn = runtime.create_execution(thread_id="session-1", source="test", status="running")
+    record = create_skill_execution(execution_id=turn.id, session_id="session-1", skill_id=manifest.id)
+    running = activate_skill_execution(record.id, state_store=runtime, allowed_tool_names={"fixture_skill_tool"})
+    child = runtime.create_tool_run(
+        turn_id=turn.id,
+        session_id="session-1",
+        run_id="unverified-child",
+        tool_name="fixture_skill_tool",
+    )
+    child = runtime.finish_tool_run(child.id, {"success": True, "status": "complete"})
+    record_skill_tool_outcome(runtime, child)
+
+    finalized = finalize_skill_executions_for_turn(turn.id, state_store=runtime, turn_success=True)[0]
+    assert finalized.status == SkillExecutionStatus.PARTIAL
+    assert finalized.verification["passed"] is False
+    assert "child_tool_succeeded" in finalized.verification["unmet_rules"]
+    assert finalized.workflow_stage.value == "verifying"
+    assert running.permitted_tool_ids == ["fixture_skill_tool"]

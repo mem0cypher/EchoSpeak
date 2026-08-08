@@ -30,6 +30,24 @@ async fn pick_project_folder() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
+async fn pick_connection_folder(provider_name: String) -> Result<Option<String>, String> {
+    let provider = provider_name.trim().chars().take(80).collect::<String>();
+    tauri::async_runtime::spawn_blocking(move || {
+        let title = if provider.is_empty() {
+            "Connect a local folder to EchoSpeak".to_string()
+        } else {
+            format!("Connect {provider} to EchoSpeak")
+        };
+        Ok(rfd::FileDialog::new()
+            .set_title(&title)
+            .pick_folder()
+            .map(|path| path.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|error| format!("Connection folder picker failed: {error}"))?
+}
+
+#[tauri::command]
 fn open_desktop_logs(state: State<'_, DesktopState>) -> Result<(), String> {
     let path = state.log_dir();
     #[cfg(windows)]
@@ -61,10 +79,54 @@ fn control_desktop_window(action: String, window: Window) -> Result<(), String> 
                 window.maximize()
             }
         }
-        "close" => window.close(),
+        "close" if matches!(window.label(), "settings" | "companion") => window.hide(),
+        "close" => {
+            if let Some(settings) = window.app_handle().get_webview_window("settings") {
+                let _ = settings.close();
+            }
+            if let Some(companion) = window.app_handle().get_webview_window("companion") {
+                let _ = companion.close();
+            }
+            window.close()
+        }
         _ => return Err(format!("Unsupported desktop window action: {action}")),
     }
     .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("settings")
+        .ok_or_else(|| "The packaged Settings window is unavailable.".to_string())?;
+    window.unminimize().map_err(|error| error.to_string())?;
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_companion_window(app: tauri::AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("companion")
+        .ok_or_else(|| "The packaged Echo companion is unavailable.".to_string())?;
+    window.unminimize().map_err(|error| error.to_string())?;
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_companion_always_on_top(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    let window = app
+        .get_webview_window("companion")
+        .ok_or_else(|| "The packaged Echo companion is unavailable.".to_string())?;
+    window
+        .set_always_on_top(enabled)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn desktop_window_label(window: Window) -> String {
+    window.label().to_string()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -101,8 +163,13 @@ pub fn run() {
             desktop_runtime,
             restart_desktop_backend,
             pick_project_folder,
+            pick_connection_folder,
             open_desktop_logs,
-            control_desktop_window
+            control_desktop_window,
+            open_settings_window,
+            open_companion_window,
+            set_companion_always_on_top,
+            desktop_window_label
         ])
         .setup(|app| {
             // Host-controlled override supports disposable development and

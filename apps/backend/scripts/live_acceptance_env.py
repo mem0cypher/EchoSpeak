@@ -49,7 +49,6 @@ def build_env(base: Path | None = None) -> dict:
             "allow_file_write": True,
             "allow_terminal_commands": False,
             "allow_self_modification": False,
-            "orchestration_enabled": False,
             "api_auth_enabled": False,
             "api_auth_localhost_bypass": True,
             "file_tool_root": str(base / "workspace"),

@@ -23,7 +23,7 @@ test("desktop window is a bounded native shell over the shared frontend", () => 
 });
 
 test("renderer capability cannot spawn arbitrary shell commands", () => {
-  assert.deepEqual(capability.windows, ["main"]);
+  assert.deepEqual(capability.windows, ["main", "settings", "companion"]);
   assert.ok(!capability.permissions.some((permission) => String(permission).startsWith("shell:")));
   assert.ok(config.app.security.csp.includes("http://127.0.0.1:*"));
   assert.ok(!config.app.security.csp.includes("http://0.0.0.0"));
@@ -33,21 +33,21 @@ test("custom chrome can drag while controls and composer remain interactive", ()
   assert.ok(capability.permissions.includes("core:window:allow-start-dragging"));
   assert.ok(desktopApp.includes('className="desktop-titlebar" data-tauri-drag-region'));
   assert.ok(!desktopApp.includes('className="desktop-window-controls" data-tauri-drag-region'));
-  const composer = dashboard.match(/<textarea[\s\S]{0,1200}aria-label="Ask Echo anything"/i)?.[0] || "";
+  const composer = dashboard.match(/<textarea[\s\S]{0,1600}aria-label="Ask Echo anything"/i)?.[0] || "";
   assert.ok(composer, "canonical composer textarea was not found");
-  assert.ok(!/\bdisabled=/.test(composer), "composer must accept a draft without creating a Session");
+  assert.ok(composer.includes("disabled={!activeThreadId}"), "composer must require an explicitly created Session");
   assert.ok(desktopCss.includes("pointer-events: auto"));
   assert.ok(desktopCss.includes("user-select: text"));
 });
 
-test("desktop composer submits explicit drafts without creating passive placeholder sessions", () => {
-  assert.ok(dashboard.includes('const title = raw.replace(/\\s+/g, " ").trim().slice(0, 72) || "Quick Chat"'));
-  assert.ok(dashboard.includes('streamThreadId = await createNewThread("", title)'));
-  assert.ok(dashboard.includes("sessionCreationForSendRef.current"));
+test("desktop composer submits only into an explicitly selected Session", () => {
+  assert.ok(dashboard.includes("Session creation has one explicit owner: the + controls in the sidebar."));
+  assert.ok(dashboard.includes('const streamThreadId = String(activeThreadIdRef.current || activeThreadId || "").trim()'));
+  assert.ok(dashboard.includes("if (!streamThreadId) return"));
   assert.ok(dashboard.includes('e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing'));
   assert.ok(dashboard.includes("void sendText()"));
-  assert.ok(dashboard.includes("disabled={!input.trim()}"));
-  assert.ok(!dashboard.includes("disabled={!activeThreadId}"));
+  assert.ok(dashboard.includes("disabled={!activeThreadId || !input.trim()}"));
+  assert.ok(dashboard.includes("disabled={!activeThreadId}"));
 });
 
 test("desktop startup and sidebar use one monochrome Echo identity", () => {

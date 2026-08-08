@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
 from pydantic import BaseModel, Field
 
 from .research_artifacts import ResearchMode
+from .retrieval_contracts import ExecutionStatus, ResultState
 
 
 class LiveDomain(str, Enum):
@@ -74,6 +75,8 @@ class StructuredLiveResult(BaseModel):
     """Stable result shape shared by every configured live-data provider."""
 
     schema_version: int = 1
+    execution_status: ExecutionStatus = ExecutionStatus.SUCCESS
+    result_state: ResultState = ResultState.DATA_FOUND
     domain: LiveDomain
     resolved_entities: List[ResolvedEntity] = Field(default_factory=list)
     exact_values: List[ExactValue] = Field(default_factory=list)
@@ -227,10 +230,13 @@ def classify_live_intent(query: str, domain: LiveDomain) -> LiveIntent:
 
 
 def unavailable_live_result(
-    *, domain: LiveDomain, provider: str = "unavailable", error: str
+    *, domain: LiveDomain, provider: str = "unavailable", error: str,
+    result_state: ResultState = ResultState.PROVIDER_UNAVAILABLE,
 ) -> StructuredLiveResult:
     return StructuredLiveResult(
         domain=domain,
+        execution_status=ExecutionStatus.SUCCESS,
+        result_state=result_state,
         provider=provider,
         freshness="unavailable",
         confidence=0.0,
@@ -260,6 +266,8 @@ def structured_sports_result(result: Any, *, query: str) -> StructuredLiveResult
         provider_timestamp = None
     return StructuredLiveResult(
         domain=LiveDomain.SPORTS,
+        execution_status=ExecutionStatus.SUCCESS,
+        result_state=ResultState(str(getattr(result, "result_state", "data_found") or "data_found")),
         resolved_entities=[
             ResolvedEntity(name=sport_key, entity_type="sport", resolution_confidence=1.0)
         ] if sport_key else [],
@@ -369,6 +377,11 @@ class LiveRetrievalRouter:
             return unavailable_live_result(
                 domain=route.domain,
                 error="No configured structured provider is available; targeted browsing is required",
+                result_state=(
+                    ResultState.UNSUPPORTED_INTENT
+                    if route.domain == LiveDomain.FLIGHTS_AIRPORTS
+                    else ResultState.PROVIDER_UNAVAILABLE
+                ),
             )
         routed_request = request.model_copy(update={"domain": route.domain})
         try:

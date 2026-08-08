@@ -1,5 +1,9 @@
 # EchoSpeak Six-System Implementation Ledger
 
+> Historical implementation ledger. Current EchoSpeak 8.0 runtime and UI
+> ownership are documented in `SYSTEM_ARCHITECTURE.md` and
+> `ECHO_CORE_CONTRACT_MATRIX.md`.
+
 Last updated: 2026-07-14
 
 ## Objective

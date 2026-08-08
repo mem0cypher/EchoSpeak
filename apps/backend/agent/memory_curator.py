@@ -57,6 +57,50 @@ _EXPLICIT_INLINE = re.compile(
     r")\b"
 )
 
+# Commands / tool intents that must never become personal memory text.
+# Includes convert/calculate so multi-intent "remember X and also convert Y" splits cleanly.
+_ACTION_VERBS = (
+    r"try|retry|search|look\s+up|continue|proceed|confirm|cancel|"
+    r"run|do|go\s+ahead|start|stop|forget|delete|open|write|edit|send|"
+    r"convert|calculate|compute|solve|evaluate|multiply|divide"
+)
+
+_ACTION_TAIL = re.compile(
+    r"(?i)\s*(?:,|;|\.|!|\?|\band\b|\bthen\b|\bplus\b|\balso\b)\s*"
+    r"(?:"
+    r"(?:please\s+)?(?:" + _ACTION_VERBS + r")"
+    r".*)$"
+)
+
+_COMMANDISH = re.compile(
+    r"(?i)^\s*(?:"
+    r"(?:and|then|plus|also)\s+)*"
+    r"(?:please\s+)?(?:"
+    r"try|retry|search|look\s+up|continue|proceed|confirm|cancel|run|do\s+it|"
+    r"go\s+ahead|open|write|edit|send|forget|convert|calculate|compute|solve|"
+    r"evaluate|multiply|divide"
+    r")\b"
+)
+
+_BARE_ANAPHORA = re.compile(r"(?i)^\s*(?:that|this|it)\s*$")
+
+
+def _is_residual_action(text: str) -> bool:
+    """True when a clause is a separate tool/command intent, not durable memory."""
+    s = str(text or "").strip()
+    if not s:
+        return False
+    if _COMMANDISH.search(s) or is_search_retry_like(s):
+        return True
+    return bool(
+        re.match(
+            r"(?i)^\s*(?:please\s+)?(?:"
+            + _ACTION_VERBS
+            + r"|do\b)\b",
+            s,
+        )
+    )
+
 _TEMPORARY_PATTERNS = re.compile(
     r"(?i)\b("
     r"playhead|selected\s+clip|current\s+selection|right\s+now|"
@@ -172,36 +216,183 @@ class MemoryCurator:
         for p in _EXPLICIT_PREFIXES:
             if low.startswith(p):
                 return True
+        # "Remember: …" / "Remember, …" (colon or comma after marker)
+        if re.match(r"(?i)^remember\s*[:,\-]", s):
+            return True
         return bool(_EXPLICIT_INLINE.search(s))
 
     @staticmethod
+    def strip_action_tail(text: str) -> str:
+        """Remove trailing multi-intent command clauses from a memory proposition."""
+        s = str(text or "").strip()
+        if not s:
+            return ""
+        # Cut at first conjunction that introduces a non-memory action.
+        # Handles ", and then search…", "and also convert…", "then retry…".
+        action_lookahead = (
+            r"(?=(?:please\s+)?(?:" + _ACTION_VERBS + r"|do\b)\b)"
+        )
+        cut = re.split(
+            r"(?i)\s*(?:,|\.|!|\?|;)\s*(?:(?:and|then|plus|also)\s+)*" + action_lookahead,
+            s,
+            maxsplit=1,
+        )[0]
+        cut = re.split(
+            r"(?i)\s+(?:(?:and|then|plus|also)\s+)+" + action_lookahead,
+            cut,
+            maxsplit=1,
+        )[0]
+        return cut.strip(" ,.;!?\t\r\n")
+
+    @staticmethod
+    def split_memory_and_residual(text: str) -> tuple[str, str]:
+        """Split a multi-intent utterance into (memory_source_span, residual_action).
+
+        The residual is everything after the remember clause that looks like a
+        separate command (e.g. \"and retry that search\"). Empty residual means
+        the whole message is a pure memory request.
+        """
+        s = re.sub(r"(?i)^\s*please\s+", "", str(text or "")).strip()
+        if not s or not MemoryCurator.is_explicit_memory_request(s):
+            return s, ""
+        # Find remember/keep/note markers and peel a trailing action clause.
+        m = re.search(
+            r"(?i)(.*?)(?:\b(?:please\s+)?(?:remember\s+(?:this|that)|keep\s+(?:this|that)\s+in\s+mind|"
+            r"don'?t\s+forget(?:\s+that)?|do\s+not\s+forget(?:\s+that)?|note\s+that|"
+            r"from\s+now\s+on|save\s+(?:this|that|to\s+memory))\b)(.*)$",
+            s,
+        )
+        if not m:
+            # Prefix form: "remember that X and retry..." / "remember X then search..."
+            low = s.lower()
+            for p in _EXPLICIT_PREFIXES:
+                if low.startswith(p):
+                    rest = s[len(p):].strip()
+                    fact = MemoryCurator.strip_action_tail(rest)
+                    if fact and not _BARE_ANAPHORA.match(fact):
+                        residual = rest[len(fact):].strip(" ,.;") if len(rest) > len(fact) else ""
+                        residual = re.sub(
+                            r"(?i)^\s*(?:(?:and|then|plus|also)\s+)+", "", residual
+                        ).strip(" ,.;")
+                        if residual and _is_residual_action(residual):
+                            return f"remember that {fact}".strip(), residual
+                        return s, residual if residual and _is_residual_action(residual) else ""
+                    # Marker only / command tail only
+                    residual = re.sub(
+                        r"(?i)^\s*(?:(?:and|then|plus|also)\s+)+", "", rest
+                    ).strip(" ,.;")
+                    if residual and _is_residual_action(residual):
+                        return "", residual
+                    return s, ""
+            return s, ""
+        before, after = m.group(1).strip(" ,.;"), m.group(2).strip(" ,.;")
+        # Anaphoric: "I'm from Edmonton, remember that, and retry..."
+        after_fact = MemoryCurator.strip_action_tail(after) if after else ""
+        if after_fact and _BARE_ANAPHORA.match(after_fact):
+            after_fact = ""
+        residual = ""
+        if after:
+            # Residual = original after minus fact portion / pure command tail
+            if after_fact and after_fact.casefold() != after.casefold():
+                residual = after[len(after_fact):].strip(" ,.;")
+                # strip_action_tail may leave conjunction words on residual start
+            elif _COMMANDISH.search(after) or is_search_retry_like(after) or _is_residual_action(after):
+                residual = after
+                after_fact = ""
+            else:
+                # Substantive payload after remember that
+                residual = ""
+        residual = re.sub(
+            r"(?i)^\s*(?:(?:and|then|plus|also)\s+)+", "", residual or ""
+        ).strip(" ,.;")
+        if residual and not _is_residual_action(residual):
+            # Non-command tail is still part of the memory proposition
+            if after_fact:
+                after_fact = f"{after_fact} {residual}".strip()
+            residual = ""
+        # Build memory-only source span for curation (fact + remember marker).
+        if before and not after_fact:
+            memory_span = f"{before}, remember that"
+        elif after_fact and not before:
+            memory_span = f"remember that {after_fact}"
+        elif before and after_fact:
+            # Prefer the more substantive side for the durable proposition source
+            memory_span = (
+                f"{before}, remember that"
+                if len(before) >= len(after_fact)
+                else f"remember that {after_fact}"
+            )
+        else:
+            memory_span = before or ""
+        return memory_span.strip(" ,.;"), residual
+
+    @staticmethod
     def extract_explicit_payload(text: str) -> str:
-        """Strip explicit-remember phrasing; return content to curate."""
+        """Extract the durable proposition the user asked to store.
+
+        Handles:
+        - prefix: \"remember that I prefer dark mode\"
+        - anaphoric: \"I'm from Edmonton, remember that\"
+        - multi-intent: \"I'm from Edmonton, remember that, and retry that search\"
+          → \"I'm from Edmonton\" (not \"and retry that search\")
+
+        Never returns bare anaphora (\"that\"/\"this\"/\"it\"), command tails,
+        or arbitrary substrings after the marker when the fact is empty/ambiguous.
+        """
         s = re.sub(r"(?i)^\s*please\s+", "", str(text or "")).strip()
         if not s:
             return ""
-        low = s.lower()
+        memory_span, _residual = MemoryCurator.split_memory_and_residual(s)
+        source = memory_span or s
+        low = source.lower().strip()
+
+        def _clean_payload(raw: str) -> str:
+            payload = MemoryCurator.strip_action_tail(str(raw or "").strip(" .!?\t,"))
+            payload = re.sub(
+                r"(?i)^\s*(?:sorry[, ]+|hey[, ]+|ok(?:ay)?[, ]+|well[, ]+)+",
+                "",
+                payload,
+            ).strip(" .!?\t,")
+            if not payload or _BARE_ANAPHORA.match(payload):
+                return ""
+            if _COMMANDISH.search(payload) or is_search_retry_like(payload):
+                return ""
+            return payload
+
+        # Prefix forms (longest first — _EXPLICIT_PREFIXES is ordered that way)
         for p in _EXPLICIT_PREFIXES:
             if low.startswith(p):
-                return s[len(p):].strip(" .!?\t")
-        # Inline: "From now on, prefer X" → keep full useful sentence after marker
+                return _clean_payload(source[len(p):])
+
+        # "Remember: fact" / "Remember, fact"
+        m_colon = re.match(r"(?i)^remember\s*[:,\-]\s*(.+)$", source)
+        if m_colon:
+            return _clean_payload(m_colon.group(1))
+
+        # Anaphoric: fact BEFORE "remember that/this" (optionally trailing punctuation)
         m = re.search(
-            r"(?i)\b(?:remember\s+(?:this|that)[,:]?\s*|keep\s+(?:this|that)\s+in\s+mind[,:]?\s*|"
-            r"from\s+now\s+on[,:]?\s*|note\s+that[,:]?\s*|don'?t\s+forget\s+(?:that\s+)?)(.+)$",
-            s,
+            r"(?i)^(.+?)[,\s]+(?:please\s+)?(?:remember\s+(?:this|that)|keep\s+(?:this|that)\s+in\s+mind|"
+            r"don'?t\s+forget(?:\s+that)?|note\s+that)\s*$",
+            source,
         )
         if m:
-            return m.group(1).strip(" .!?\t")
-        # Fallback: use existing AgentMemory extractor if available
-        try:
-            payload = s
-            # "Remember I like X" — keep full after remember
-            m2 = re.match(r"(?i)^\s*remember\s+(.+)$", s)
-            if m2:
-                return m2.group(1).strip(" .!?\t")
-            return payload
-        except Exception:
-            return s
+            payload = _clean_payload(m.group(1))
+            if payload:
+                return payload
+
+        # Inline with substantive clause AFTER marker
+        m = re.search(
+            r"(?i)\b(?:remember\s+(?:this|that)[,:]?\s+|keep\s+(?:this|that)\s+in\s+mind[,:]?\s+|"
+            r"from\s+now\s+on[,:]?\s+|note\s+that[,:]?\s+|don'?t\s+forget\s+(?:that\s+)?)(.+)$",
+            source,
+        )
+        if m:
+            return _clean_payload(m.group(1))
+
+        m2 = re.match(r"(?i)^\s*remember\s+(.+)$", source)
+        if m2:
+            return _clean_payload(m2.group(1))
+        return ""
 
     # ── Proposal (LLM + deterministic fallback) ─────────────────────
 
@@ -227,6 +418,44 @@ class MemoryCurator:
         meta: Dict[str, Any] = meta_out if meta_out is not None else {}
         candidates: List[MemoryCandidate] = []
         llm_ok = False
+        # For explicit requests, curate only the durable proposition — never residual commands.
+        explicit_payload = ""
+        if explicit:
+            explicit_payload = self.extract_explicit_payload(source)
+            if explicit_payload:
+                source = explicit_payload
+            else:
+                # Fallback: strip markers + action tails from the full text (supports
+                # "Remember: …" and forced-explicit project conventions). Never keep
+                # bare anaphora or pure command residuals.
+                span, residual = self.split_memory_and_residual(source)
+                cleaned = self.strip_action_tail(span or source)
+                cleaned = re.sub(
+                    r"(?i)^\s*(?:please\s+)?(?:remember(?:\s+(?:this|that))?|note(?:\s+that)?|"
+                    r"keep\s+(?:this|that)\s+in\s+mind|from\s+now\s+on|save\s+(?:this|that|"
+                    r"to\s+memory)|don'?t\s+forget(?:\s+that)?)\s*[:,\-]?\s*",
+                    "",
+                    cleaned,
+                ).strip(" .!?\t,")
+                cleaned = re.sub(
+                    r"(?i)^\s*(?:sorry[, ]+|hey[, ]+|ok(?:ay)?[, ]+|well[, ]+)+",
+                    "",
+                    cleaned,
+                ).strip(" .!?\t,")
+                if (
+                    not cleaned
+                    or _BARE_ANAPHORA.match(cleaned)
+                    or _COMMANDISH.search(cleaned)
+                    or is_search_retry_like(cleaned)
+                    or (residual and not cleaned)
+                ):
+                    meta["used_deterministic_fallback"] = True
+                    meta.setdefault("errors", []).append(
+                        "explicit_payload_empty_or_ambiguous"
+                    )
+                    return []
+                explicit_payload = cleaned
+                source = cleaned
 
         # 1) LLM primary for explicit always, and for nuanced implicit scans.
         want_llm = self.llm_invoke is not None and (
@@ -236,7 +465,7 @@ class MemoryCurator:
             meta["llm_invoked"] = True
             try:
                 llm_cands, llm_errors = self._llm_propose_strict(
-                    user_text=source if not explicit else (self.extract_explicit_payload(source) or source),
+                    user_text=source,
                     response_text=response_text,
                     explicit=explicit,
                     owner_id=owner_id,
@@ -264,7 +493,10 @@ class MemoryCurator:
         if not candidates:
             meta["used_deterministic_fallback"] = True
             if explicit:
-                payload = self.extract_explicit_payload(source) or source
+                payload = explicit_payload or self.extract_explicit_payload(source)
+                if not payload:
+                    meta.setdefault("errors", []).append("explicit_payload_empty_or_ambiguous")
+                    return []
                 candidates.extend(
                     self._deterministic_rewrite(
                         payload,
@@ -532,6 +764,47 @@ class MemoryCurator:
                 )
             )
 
+        # Location / home city / default departure (account scope personal fact)
+        loc = re.search(
+            r"(?i)\b(?:i(?:'m|\s+am)|im)\s+from\s+([A-Za-z][A-Za-z .'-]{1,64})\b",
+            clean,
+        )
+        if not loc:
+            loc = re.search(
+                r"(?i)\b(?:i\s+live\s+in|based\s+in|my\s+(?:home\s+)?city\s+is|"
+                r"my\s+(?:default\s+)?(?:departure|origin)\s+(?:city\s+)?is)\s+"
+                r"([A-Za-z][A-Za-z .'-]{1,64})\b",
+                clean,
+            )
+        if loc:
+            city = re.sub(r"\s+", " ", loc.group(1)).strip(" .,!?")
+            if city and not _COMMANDISH.search(city):
+                candidates.append(
+                    MemoryCandidate(
+                        owner_id=owner_id,
+                        type="preference",
+                        scope="account",
+                        subject="home_city",
+                        text=(
+                            f"The user's home city / default flight departure city is {city}."
+                        ),
+                        structured_attributes={
+                            "home_city": city,
+                            "default_departure_city": city,
+                        },
+                        source_session_id=session_id,
+                        source_execution_id=execution_id,
+                        source_item_id=item_id,
+                        source_text=source_text[:500],
+                        explicit=explicit,
+                        confidence=1.0 if explicit else 0.85,
+                        importance=0.9,
+                        action="create",
+                        semantic_key="preference:home_city",
+                        reason="User stated home or default departure city",
+                    )
+                )
+
         # Prefer / dislike patterns → semantic preference
         if re.search(r"(?i)\b(prefer|dislike|don't like|do not like|hate huge|concise|short prompts|manual testing)\b", clean):
             # Rewrite to third-person durable form
@@ -790,6 +1063,30 @@ class MemoryCurator:
             c.action = "ignore"
             c.reason = "empty text"
             return c
+
+        # Never persist residual tool/command clauses as personal memory.
+        scrubbed = MemoryCurator.strip_action_tail(c.text)
+        if scrubbed and scrubbed.casefold() != c.text.strip().casefold():
+            c.text = scrubbed
+        if (
+            _COMMANDISH.search(c.text)
+            or is_search_retry_like(c.text)
+            or _is_residual_action(c.text)
+            or re.search(r"(?i)\bretry\s+(?:that|the|this)\s+search\b", c.text)
+        ):
+            # If the whole text is a command, ignore; if mixed, already scrubbed above.
+            if not scrubbed or _is_residual_action(scrubbed) or is_search_retry_like(scrubbed):
+                c.action = "ignore"
+                c.reason = "command or residual action is not durable memory"
+                return c
+            c.text = scrubbed
+        # Provenance may record the marker clause but must not include residual command tails.
+        if c.source_text:
+            span, _res = MemoryCurator.split_memory_and_residual(c.source_text)
+            if span:
+                c.source_text = span[:500]
+            else:
+                c.source_text = MemoryCurator.strip_action_tail(c.source_text)[:500]
 
         if c.scope not in {"account", "project", "session"}:
             c.scope = "account"
@@ -1405,6 +1702,22 @@ class MemoryCurator:
             )
         finally:
             self._reflection_guard.active = False
+
+
+def is_search_retry_like(text: str) -> bool:
+    """Local check so memory_curator does not hard-import mode_controller cycles."""
+    low = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not low:
+        return False
+    return bool(
+        re.search(
+            r"(?i)\b("
+            r"(?:try|retry).{0,48}search|search.{0,24}again|retry\s+(?:the\s+|that\s+)?search|"
+            r"look\s+(?:it|that)\s+up\s+again"
+            r")\b",
+            low,
+        )
+    )
 
 
 def build_memory_context_for_turn(

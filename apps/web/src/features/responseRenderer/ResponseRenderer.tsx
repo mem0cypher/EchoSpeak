@@ -146,7 +146,8 @@ const BlockView: React.FC<{ block: ResponseRenderBlock; colors: Palette }> = ({ 
   }
   if (block.kind === "table") return <TableBlock block={block} colors={colors} />;
   if (block.kind === "chart") return <ChartBlock block={block} colors={colors} />;
-  if (block.kind === "evidence") return <EvidenceBlock block={block} colors={colors} />;
+  // Evidence is never rendered in Chat (Studio/Viewer/Research only).
+  if (block.kind === "evidence") return null;
   if (block.kind === "timeline") {
     return (
       <Panel title={block.title || "Timeline"} colors={colors}>

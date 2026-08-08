@@ -33,16 +33,30 @@ for distribution in (
     "langchain-core",
     "langchain-community",
     "langchain-openai",
-    "langgraph",
     "transformers",
     "sentence-transformers",
+    "langchain-huggingface",
+    "mcp",
 ):
     try:
         datas += copy_metadata(distribution)
     except Exception:
         pass
 
-hiddenimports = collect_submodules("agent") + collect_submodules("api")
+hiddenimports = (
+    collect_submodules("agent")
+    + collect_submodules("api")
+    + collect_submodules("mcp")
+    + [
+        "langchain_huggingface",
+        "langchain_huggingface.embeddings",
+        "langchain_huggingface.embeddings.huggingface",
+        "torch",
+        "torch.autograd",
+        "torch.autograd.graph",
+        "sentence_transformers",
+    ]
+)
 
 a = Analysis(
     [str(desktop_dir / "backend" / "echospeak_backend.py")],
@@ -53,7 +67,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest", "unittest.mock"],
+    excludes=["pytest"],
     noarchive=False,
     optimize=1,
 )

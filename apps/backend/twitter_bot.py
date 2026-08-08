@@ -429,8 +429,8 @@ class EchoSpeakTwitterBot:
     def _generate_tweet_text(self, prompt: str) -> str:
         if not self._agent:
             return ""
-        llm = getattr(self._agent, "llm_wrapper", None)
-        if llm is None:
+        runtime = getattr(self._agent, "model_runtime", None)
+        if runtime is None:
             return ""
         full_prompt = "\n\n".join(
             [
@@ -444,7 +444,7 @@ class EchoSpeakTwitterBot:
             ]
         )
         try:
-            raw = str(llm.invoke(full_prompt) or "").strip()
+            raw = str(runtime.invoke(full_prompt) or "").strip()
         except Exception as e:
             logger.warning(f"Twitter generation failed: {e}")
             return ""

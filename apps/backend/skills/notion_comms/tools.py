@@ -3,8 +3,7 @@ Notion tools — search, read, create, and append to Notion pages.
 
 Requires:
   pip install notion-client
-  ALLOW_NOTION=true
-  NOTION_TOKEN=secret_...
+  Active scoped Notion Connection
 """
 
 from __future__ import annotations
@@ -26,9 +25,6 @@ def _get_notion_client():
         from config import config
     except ImportError:
         raise RuntimeError("Config not available")
-
-    if not getattr(config, "allow_notion", False):
-        raise RuntimeError("Notion integration is disabled. Set ALLOW_NOTION=true in .env")
 
     token = getattr(config, "notion_token", "")
     if not token:
