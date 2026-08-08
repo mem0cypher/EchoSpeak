@@ -16,7 +16,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from agent.skill_contract import SkillExecutionRecord, SkillExecutionStatus, SkillProposal
+from agent.skill_contract import (
+    SkillExecutionRecord,
+    SkillExecutionStatus,
+    SkillProposal,
+    SkillWorkflowStage,
+)
 
 
 class SkillExecutionError(RuntimeError):
@@ -136,6 +141,18 @@ def update_skill_execution(execution_record_id: str, **updates: Any) -> Optional
         if "status" in updates:
             updates["status"] = SkillExecutionStatus(updates["status"])
             _validate_transition(record.status, updates["status"])
+            if "workflow_stage" not in updates:
+                updates["workflow_stage"] = {
+                    SkillExecutionStatus.SELECTED: SkillWorkflowStage.SELECTING,
+                    SkillExecutionStatus.PLANNED: SkillWorkflowStage.AUTHORIZING,
+                    SkillExecutionStatus.RUNNING: SkillWorkflowStage.EXECUTING,
+                    SkillExecutionStatus.PENDING_APPROVAL: SkillWorkflowStage.AWAITING_APPROVAL,
+                    SkillExecutionStatus.PARTIAL: SkillWorkflowStage.VERIFYING,
+                    SkillExecutionStatus.COMPLETED: SkillWorkflowStage.COMPLETE,
+                    SkillExecutionStatus.BLOCKED: SkillWorkflowStage.BLOCKED,
+                    SkillExecutionStatus.FAILED: SkillWorkflowStage.FAILED,
+                    SkillExecutionStatus.CANCELED: SkillWorkflowStage.CANCELED,
+                }[updates["status"]]
         safe = {k: v for k, v in updates.items() if k not in {"id", "skill_id", "skill_version", "execution_id"}}
         safe["updated_at"] = time.time()
         record = record.model_copy(update=safe)
@@ -228,10 +245,17 @@ def activate_skill_execution(
         if not manifest.executable:
             blocks.append("manifest:prompt_only_or_unavailable")
         registered = set(ToolRegistry.get_names())
-        inventory = set(allowed_tool_names or registered)
+        # None means the caller did not supply a Turn-scoped inventory.  An
+        # explicit empty set means tools are prohibited and must stay empty.
+        inventory = registered if allowed_tool_names is None else set(allowed_tool_names)
+        permitted = set(manifest.tool_allowlist())
+        authorized_permitted = permitted & inventory
         for tool in manifest.required_tools:
-            if tool not in registered or tool not in inventory:
+            entry = ToolRegistry.get(tool)
+            if tool not in registered or tool not in inventory or entry is None or not entry.available:
                 blocks.append(f"tool:{tool}")
+        if permitted and not authorized_permitted:
+            blocks.append("tool_policy:no_authorized_skill_tools")
         caps = set(available_capabilities or set())
         for capability in [*manifest.required_capabilities, *manifest.required_models]:
             if capability not in caps:
@@ -245,6 +269,17 @@ def activate_skill_execution(
                 blocks.append(f"permission:{permission}")
         if manifest.required_project_state and not record.project_id:
             blocks.append("project:not_attached")
+        collected = {
+            key: value
+            for key, value in dict(record.input_context_identity or {}).items()
+            if key in set(manifest.required_context_fields) and value not in {None, ""}
+        }
+        missing_inputs = [
+            key for key in manifest.required_context_fields
+            if key not in collected
+        ]
+        if missing_inputs:
+            blocks.extend(f"input:{key}" for key in missing_inputs)
         blocks.extend(_dependency_blocks(manifest))
     if blocks:
         updated = update_skill_execution(
@@ -253,6 +288,13 @@ def activate_skill_execution(
             failure_reason="; ".join(blocks),
             prompt_only=bool(manifest is not None and not manifest.executable),
             verification={"passed": False, "blocks": blocks},
+            workflow_stage=SkillWorkflowStage.BLOCKED,
+            permitted_tool_ids=sorted(authorized_permitted) if manifest is not None else [],
+            required_inputs=list(manifest.required_context_fields) if manifest is not None else [],
+            collected_inputs=collected if manifest is not None else {},
+            missing_inputs=missing_inputs if manifest is not None else [],
+            verification_rules=list(manifest.verification_rules) if manifest is not None else [],
+            completion_criteria=list(manifest.completion_criteria) if manifest is not None else [],
         )
         if updated is None:
             raise SkillExecutionError("SkillExecutionRecord disappeared")
@@ -262,6 +304,13 @@ def activate_skill_execution(
         record.id,
         status=SkillExecutionStatus.PLANNED,
         selected_tool_ids=list(manifest.required_tools),
+        workflow_stage=SkillWorkflowStage.AUTHORIZING,
+        permitted_tool_ids=sorted(authorized_permitted),
+        required_inputs=list(manifest.required_context_fields),
+        collected_inputs=collected,
+        missing_inputs=[],
+        verification_rules=list(manifest.verification_rules),
+        completion_criteria=list(manifest.completion_criteria or manifest.verification_rules),
         input_context_identity={
             **dict(record.input_context_identity or {}),
             "manifest_id": manifest.id,
@@ -301,6 +350,37 @@ def activate_skill_execution(
     if running is None:
         raise SkillExecutionError("SkillExecutionRecord disappeared")
     return running
+
+
+def _evaluate_verification_rules(
+    rules: list[str],
+    *,
+    successes: list[Any],
+    failures: list[Any],
+    missing_required_tools: list[str],
+    artifact_ids: list[str],
+) -> tuple[bool, list[str]]:
+    """Evaluate the small canonical rule vocabulary; unknown rules fail closed."""
+    unmet: list[str] = []
+    for raw in rules:
+        rule = str(raw or "").strip().lower()
+        if not rule:
+            continue
+        if rule in {"child_tool_succeeded", "tool_succeeded", "verified_tool_outcome"}:
+            if not successes or not any(bool(getattr(run, "verification", None)) for run in successes):
+                unmet.append(raw)
+        elif rule in {"required_tool_success", "required_tools_succeeded"}:
+            if missing_required_tools:
+                unmet.append(raw)
+        elif rule in {"no_tool_failures", "all_tool_runs_succeeded"}:
+            if failures:
+                unmet.append(raw)
+        elif rule in {"artifact_required", "produced_artifact"}:
+            if not artifact_ids:
+                unmet.append(raw)
+        else:
+            unmet.append(f"unsupported:{raw}")
+    return not unmet, unmet
 
 
 def record_skill_tool_outcome(state_store: Any, tool_run: Any, *, owner_execution_id: str = "") -> None:
@@ -398,17 +478,29 @@ def finalize_skill_executions_for_turn(execution_id: str, *, state_store: Any, t
         required = set(manifest.required_tools if manifest is not None else [])
         successful_names = {str(run.tool_name) for run in successes}
         missing = sorted(required - successful_names)
+        verification_rules = list(manifest.verification_rules if manifest is not None else [])
+        completion_criteria = list(manifest.completion_criteria if manifest is not None else [])
+        enforced_rules = list(dict.fromkeys([*verification_rules, *completion_criteria]))
+        rules_passed, unmet_rules = _evaluate_verification_rules(
+            enforced_rules,
+            successes=successes,
+            failures=failures,
+            missing_required_tools=missing,
+            artifact_ids=list(record.artifact_ids),
+        )
         if pending:
             target = SkillExecutionStatus.PENDING_APPROVAL
         elif failures:
             target = SkillExecutionStatus.FAILED
-        elif turn_success and not missing:
+        elif turn_success and not missing and rules_passed:
             target = SkillExecutionStatus.COMPLETED
         else:
             target = SkillExecutionStatus.PARTIAL
         verification = {
             "passed": target == SkillExecutionStatus.COMPLETED,
-            "required_rules": list(manifest.verification_rules if manifest is not None else []),
+            "required_rules": verification_rules,
+            "completion_criteria": completion_criteria,
+            "unmet_rules": unmet_rules,
             "successful_tool_runs": [run.id for run in successes],
             "failed_tool_runs": [run.id for run in failures],
             "missing_required_tools": missing,

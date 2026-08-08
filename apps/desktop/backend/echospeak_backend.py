@@ -56,6 +56,10 @@ def _seed_mutable_defaults(data_dir: Path) -> None:
     if not target_soul.exists() and source_soul.is_file():
         shutil.copyfile(source_soul, target_soul)
     os.environ["SOUL_PATH"] = str(target_soul)
+    # Surface packaged identity in logs so stale AppData installs are obvious.
+    if not os.environ.get("ECHOSPEAK_BUILD_ID"):
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        os.environ["ECHOSPEAK_BUILD_ID"] = f"desktop-sidecar-8.0.0+{stamp}"
 
 
 def _watch_windows_parent(parent_pid: int) -> None:
@@ -88,6 +92,14 @@ def _start_parent_watchdog(parent_pid: int, name: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows packaged logs often default to a legacy code page; force UTF-8
+    # so pipeline markers and tool names are not replaced with U+FFFD.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     args = _parser().parse_args(argv)
     data_dir, logs_dir = _validate_desktop_contract(args)
     os.environ["ECHOSPEAK_RUNTIME_KIND"] = "desktop"

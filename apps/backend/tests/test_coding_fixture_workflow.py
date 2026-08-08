@@ -34,9 +34,6 @@ def test_disposable_fixture_named_edit_lifecycle(tmp_path, monkeypatch):
     agent._session_memory = SessionMemoryDistiller(tmp_path / "sessions")
     agent._active_work_store = ActiveWorkStore(tmp_path / "active-work")
     agent._allow_llm_tool_calling = lambda: False
-    agent.graph_agent = None
-    agent.agent_executor = None
-    agent.fallback_executor = None
     agent.select_thread_runtime("fixture-session")
     assert agent.activate_project(project.id)
 
@@ -57,7 +54,7 @@ def test_disposable_fixture_named_edit_lifecycle(tmp_path, monkeypatch):
             return self.invoke(prompt), ""
 
     llm = EditLLM()
-    agent.llm_wrapper = llm
+    agent.model_runtime = llm
     source = project_root / "index.html"
     original = source.read_text(encoding="utf-8")
 

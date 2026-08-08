@@ -20,10 +20,11 @@ from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 from collections import deque, OrderedDict
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from contextlib import asynccontextmanager
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import URLError, HTTPError
+from urllib.parse import urlparse
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 # Avoid Tk/matplotlib GUI backends on worker threads (Tcl_AsyncDelete process death).
@@ -58,11 +59,13 @@ from config import (
     ModelProvider,
     SECRET_NESTED_SETTINGS,
     SECRET_TOP_LEVEL_SETTINGS,
+    _strip_mcp_secret_overrides,
     read_runtime_override_payload,
     write_runtime_override_payload,
 )
 from agent.research import build_research_run
 from agent.state import get_state_store
+from agent.stream_events import semantic_activity_from_stream_payload
 
 # Base directory for relative path resolution
 BASE_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -118,8 +121,57 @@ def _default_cloud_provider() -> "ModelProvider":
     return ModelProvider.OPENAI
 
 
-def _resolve_runtime_provider() -> "ModelProvider":
+def _default_model_for_provider(provider: "ModelProvider") -> str:
+    if provider == ModelProvider.OPENAI:
+        return str(config.openai.model or "").strip()
+    if provider == ModelProvider.GEMINI:
+        return str(config.gemini.model or "").strip()
+    return str(config.local.model_name or "").strip()
+
+
+def _ensure_session_model_binding(session_id: str):
+    key = _normalize_thread_id(session_id)
+    if _is_lmstudio_only_enabled():
+        provider = ModelProvider.LM_STUDIO
+    elif _runtime_provider is not None:
+        provider = _runtime_provider
+    else:
+        provider = config.local.provider if config.use_local_models else _default_cloud_provider()
+    store = get_state_store()
+    binding = store.ensure_session_model_binding(
+        key,
+        provider_id=provider.value,
+        model_id=_default_model_for_provider(provider) or "default",
+        provider_configuration_id="global-default",
+    )
+    if (
+        _is_lmstudio_only_enabled()
+        and binding.provider_id != ModelProvider.LM_STUDIO.value
+    ):
+        previous_revision = binding.binding_revision
+        binding = store.update_session_model_binding(
+            key,
+            provider_id=ModelProvider.LM_STUDIO.value,
+            model_id=_default_model_for_provider(ModelProvider.LM_STUDIO) or "default",
+            expected_revision=binding.binding_revision,
+            provider_configuration_id="global-default",
+        )
+        cancel_incompatible = globals().get("_cancel_incompatible_session_work")
+        if callable(cancel_incompatible):
+            cancel_incompatible(
+                key,
+                reason=(
+                    "LM Studio-only configuration changed Session provider binding from revision "
+                    f"{previous_revision} to {binding.binding_revision}"
+                ),
+            )
+    return binding
+
+
+def _resolve_runtime_provider(session_id: Optional[str] = None) -> "ModelProvider":
     """Resolve the provider the next query would use without creating an agent."""
+    if session_id:
+        return ModelProvider(_ensure_session_model_binding(session_id).provider_id)
     if _is_lmstudio_only_enabled():
         return ModelProvider.LM_STUDIO
     if _runtime_provider is not None:
@@ -128,15 +180,16 @@ def _resolve_runtime_provider() -> "ModelProvider":
 
 
 def _provider_default_base_url(provider: "ModelProvider") -> str:
-    if provider == ModelProvider.OLLAMA:
-        return "http://localhost:11434"
-    if provider == ModelProvider.LM_STUDIO:
-        return LM_STUDIO_DEFAULT_URL
-    if provider == ModelProvider.LOCALAI:
-        return "http://localhost:8080"
-    if provider == ModelProvider.VLLM:
-        return "http://localhost:8000"
-    return ""
+    from agent.model_runtime import resolve_local_provider_base_url
+
+    return resolve_local_provider_base_url(provider)
+
+
+def _provider_configured_base_url(provider: "ModelProvider") -> str:
+    from agent.model_runtime import resolve_local_provider_base_url
+
+    configured = str(getattr(getattr(config, "local", None), "base_url", "") or "")
+    return resolve_local_provider_base_url(provider, configured)
 
 
 def _local_provider_models_url(provider: "ModelProvider", base_url: str) -> str:
@@ -175,7 +228,12 @@ def _provider_recovery_message(provider: "ModelProvider", detail: str = "") -> s
     return f"Model provider {name} is not ready. {detail}".strip()
 
 
-def _check_provider_readiness(provider: Optional["ModelProvider"] = None, timeout: float = 1.5) -> dict[str, Any]:
+def _check_provider_readiness(
+    provider: Optional["ModelProvider"] = None,
+    timeout: float = 1.5,
+    *,
+    model_id: str = "",
+) -> dict[str, Any]:
     """Fast query preflight so provider outages become clear user-facing failures."""
     p = provider or _resolve_runtime_provider()
     try:
@@ -207,7 +265,7 @@ def _check_provider_readiness(provider: Optional["ModelProvider"] = None, timeou
         }
 
     if p == ModelProvider.LLAMA_CPP:
-        model_path = str(getattr(getattr(config, "local", None), "model_name", "") or "").strip()
+        model_path = str(model_id or getattr(getattr(config, "local", None), "model_name", "") or "").strip()
         ok = bool(model_path and Path(model_path).exists())
         return {
             "ok": ok,
@@ -217,9 +275,7 @@ def _check_provider_readiness(provider: Optional["ModelProvider"] = None, timeou
         }
 
     if p in (ModelProvider.OLLAMA, ModelProvider.LM_STUDIO, ModelProvider.LOCALAI, ModelProvider.VLLM):
-        base_url = str(getattr(getattr(config, "local", None), "base_url", "") or "").strip()
-        if not base_url or (_is_lmstudio_only_enabled() and p == ModelProvider.LM_STUDIO):
-            base_url = _provider_default_base_url(p)
+        base_url = _provider_configured_base_url(p)
         url = _local_provider_models_url(p, base_url)
         try:
             req = UrlRequest(url, headers={"Accept": "application/json"})
@@ -241,7 +297,7 @@ def _check_provider_readiness(provider: Optional["ModelProvider"] = None, timeou
                         if isinstance(item, dict)
                     }
                     available_ids.discard("")
-                    configured_model = str(getattr(getattr(config, "local", None), "model_name", "") or "").strip().lower()
+                    configured_model = str(model_id or getattr(getattr(config, "local", None), "model_name", "") or "").strip().lower()
                     model_loaded = bool(
                         configured_model
                         and any(
@@ -288,31 +344,6 @@ def _should_preflight_provider(message: str) -> bool:
     if low in {"confirm", "cancel", "yes", "no", "approve", "reject"}:
         return False
     return True
-
-
-def _coding_preflight_requirement(agent: Any, message: str) -> str:
-    """Return ``read``/``write`` only for an unambiguous Project coding turn."""
-    text = str(message or "").strip()
-    if not text:
-        return ""
-    try:
-        coding = bool(agent._is_coding_project_intent(text))  # type: ignore[attr-defined]
-        writing = bool(agent._is_coding_implement_intent(text))  # type: ignore[attr-defined]
-    except Exception:
-        coding = bool(re.search(r"(?i)\b(?:read|edit|change|fix|update|modify|refactor)\b.*\.[a-z0-9]{1,8}\b", text))
-        writing = bool(re.search(r"(?i)\b(?:edit|change|fix|update|modify|rewrite|refactor|add|remove)\b", text))
-    return "write" if writing else "read" if coding else ""
-
-
-def _coding_preflight_payload(agent: Any, thread_id: Optional[str], message: str) -> tuple[dict[str, Any], str]:
-    requirement = _coding_preflight_requirement(agent, message)
-    if not requirement:
-        return {}, ""
-    from agent.coding_readiness import build_coding_readiness, first_coding_blocker
-
-    _apply_thread_scope(agent, thread_id)
-    report = build_coding_readiness(agent, thread_id, _check_provider_readiness())
-    return report, first_coding_blocker(report, require_write=requirement == "write")
 
 
 def _provider_unavailable_payload(request_id: str, readiness: dict[str, Any]) -> dict[str, Any]:
@@ -387,6 +418,8 @@ def _redact_settings_payload(payload: dict) -> dict:
         for secret_key in secret_keys:
             if secret_key in patch:
                 patch[secret_key] = "" if str(patch.get(secret_key) or "").strip() == "" else "***"
+    if isinstance(out.get("mcp_servers"), dict):
+        out["mcp_servers"] = _strip_mcp_secret_overrides(out["mcp_servers"])
     return out
 
 
@@ -488,8 +521,10 @@ def _validate_settings_effective(effective: dict) -> list[dict]:
             issues.append({"key": "cron_enabled", "message": "Cron enabled but croniter is not installed on the backend.", "severity": "warning"})
 
     if bool(s.get("allow_open_application")):
-        allowlist = s.get("open_application_allowlist")
-        if not isinstance(allowlist, list) or not any(str(x).strip() for x in allowlist):
+        from config import _normalize_open_application_allowlist
+
+        allowlist = _normalize_open_application_allowlist(s.get("open_application_allowlist"))
+        if not allowlist:
             issues.append({"key": "open_application_allowlist", "message": "Application launching is enabled but OPEN_APPLICATION_ALLOWLIST is empty.", "severity": "error"})
 
     if bool(s.get("allow_self_modification")):
@@ -568,7 +603,6 @@ def _sanitize_incoming_settings(patch: dict) -> dict:
         "openai": set(getattr(config.openai, "model_dump")().keys()),
         "gemini": set(getattr(config.gemini, "model_dump")().keys()),
         "local": set(getattr(config.local, "model_dump")().keys()),
-        "research_model": set(getattr(config.research_model, "model_dump")().keys()),
         "patches": set(getattr(config.patches, "model_dump")().keys()),
         "embedding": set(getattr(config.embedding, "model_dump")().keys()),
         "voice": set(getattr(config.voice, "model_dump")().keys()),
@@ -612,6 +646,13 @@ def _sanitize_incoming_settings(patch: dict) -> dict:
         if isinstance(val, str) and val.strip() == "***":
             out.pop(secret_key, None)
 
+    if "open_application_allowlist" in out:
+        from config import _normalize_open_application_allowlist
+
+        out["open_application_allowlist"] = _normalize_open_application_allowlist(
+            out.get("open_application_allowlist")
+        )
+
     return out
 
 
@@ -632,42 +673,31 @@ def _normalize_thread_id(thread_id: Optional[str]) -> str:
 def get_agent(thread_id: Optional[str] = None):
     """Get or create the agent instance.
 
-    When MULTI_AGENT_ENABLED=true, agents are pooled per thread_id.
+    Canonical Turns always use a Session-keyed agent actor. The pre-8.0 shared
+    mutable agent switch is ignored because it cannot safely run unrelated
+    Sessions concurrently under separate Session locks.
     """
     global _agent
     global _runtime_provider
     from agent.core import EchoSpeakAgent
 
-    if not bool(getattr(config, "multi_agent_enabled", True)):
-        if _agent is None:
-            if _is_lmstudio_only_enabled():
-                _force_lmstudio_config()
-                provider = ModelProvider.LM_STUDIO
-            elif _runtime_provider is not None:
-                provider = _runtime_provider
-            else:
-                provider = config.local.provider if config.use_local_models else _default_cloud_provider()
-            _agent = EchoSpeakAgent(llm_provider=provider, manage_background_services=True)
-        return _agent
-
     key = _normalize_thread_id(thread_id)
     with _agent_pool_lock:
+        binding = _ensure_session_model_binding(key)
         existing = _agent_pool.pop(key, None)
         if existing is not None:
-            _agent_pool[key] = existing
-            return existing
-
-        if _is_lmstudio_only_enabled():
-            _force_lmstudio_config()
-            provider = ModelProvider.LM_STUDIO
-        elif _runtime_provider is not None:
-            provider = _runtime_provider
-        else:
-            provider = config.local.provider if config.use_local_models else _default_cloud_provider()
+            existing_provider = str(getattr(getattr(existing, "llm_provider", None), "value", "") or "")
+            existing_model = str(getattr(getattr(existing, "model_runtime", None), "model_id", "") or "")
+            if existing_provider == binding.provider_id and existing_model == binding.model_id:
+                _agent_pool[key] = existing
+                return existing
+            logger.info("Recreating Session agent because its model binding changed: {}", key)
+        provider = ModelProvider(binding.provider_id)
 
         agent = EchoSpeakAgent(
             llm_provider=provider,
             manage_background_services=(key == "default"),
+            model_id=binding.model_id,
         )
         _agent_pool[key] = agent
         while len(_agent_pool) > _agent_pool_max:
@@ -677,11 +707,6 @@ def get_agent(thread_id: Optional[str] = None):
 
 def get_existing_agent(thread_id: Optional[str] = None):
     """Get an already-initialized agent without creating a new one."""
-    global _agent
-
-    if not bool(getattr(config, "multi_agent_enabled", True)):
-        return _agent
-
     key = _normalize_thread_id(thread_id)
     with _agent_pool_lock:
         existing = _agent_pool.get(key)
@@ -990,6 +1015,87 @@ def _classify_agent_mode(tool_name: str) -> str:
     return "working"
 
 
+_STREAM_SECRET_KEY = re.compile(
+    r"(?i)(api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|password|secret|cookie)"
+)
+
+
+def _redact_stream_text(value: str, limit: int = 280) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(
+        r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+",
+        r"\1[redacted]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\s*[:=]\s*[^,\s}\]]+",
+        r"\1=[redacted]",
+        text,
+    )
+    return text if len(text) <= limit else text[:limit].rstrip() + "â€¦"
+
+
+def _safe_tool_input_preview(tool_name: str, raw_input: str) -> str:
+    """Return bounded user-useful arguments without file bodies or secrets."""
+    raw = str(raw_input or "")
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        parsed = None
+    if isinstance(parsed, dict):
+        projected: dict[str, Any] = {}
+        visible_keys = {
+            "query", "url", "path", "source", "destination", "target",
+            "operation", "location", "city", "league", "team", "ticker",
+            "date", "date_from", "date_to", "provider", "model",
+        }
+        for key, value in parsed.items():
+            key_text = str(key)
+            if _STREAM_SECRET_KEY.search(key_text):
+                projected[key_text] = "[redacted]"
+            elif key_text.casefold() in {"content", "text", "body", "data", "patch"}:
+                projected[key_text] = f"<{len(str(value or ''))} chars>"
+            elif key_text.casefold() in visible_keys and isinstance(value, (str, int, float, bool)):
+                projected[key_text] = _redact_stream_text(str(value), 140)
+        if projected:
+            return _redact_stream_text(json.dumps(projected, ensure_ascii=False), 320)
+    name = str(tool_name or "").casefold()
+    if name in {"file_write", "artifact_write", "notepad_write"}:
+        return "Writing governed content"
+    if name == "terminal_run":
+        return _redact_stream_text(raw, 180)
+    return _redact_stream_text(raw, 260)
+
+
+def _safe_tool_result_summary(tool_name: str, output: Any, *, success: bool = True) -> str:
+    name = str(tool_name or "tool").casefold()
+    if not success:
+        return "Tool failed â€” trying another approach."
+    if name == "web_search":
+        return "Search results received."
+    if name == "terminal_run":
+        return "Terminal action completed."
+    if name in {
+        "file_write", "file_read", "file_list", "file_move", "file_copy",
+        "file_delete", "file_mkdir", "artifact_write", "notepad_write",
+    }:
+        return f"{name.replace('_', ' ').capitalize()} completed."
+    text = _redact_stream_text(str(output or ""), 280)
+    return text or f"{name.replace('_', ' ').capitalize()} completed."
+
+
+def _safe_stream_failure(exc: BaseException) -> str:
+    name = type(exc).__name__.casefold()
+    detail = str(exc or "").casefold()
+    if "cancel" in name or "cancel" in detail:
+        return "Stopped by Ty."
+    if "timeout" in name or "stall" in name or "timed out" in detail:
+        return "The selected provider stalled. This run stopped cleanly."
+    if "connect" in name or "unavailable" in detail:
+        return "The selected model is unavailable right now."
+    return "Echo stopped this run safely after an internal problem."
+
+
 class _StreamingHandler(BaseCallbackHandler):
     def __init__(self, q: queue.Queue, request_id: str):
         self._q = q
@@ -1008,7 +1114,8 @@ class _StreamingHandler(BaseCallbackHandler):
         self.partial_replies: list[str] = []
         # One guaranteed preamble beat per LLM generation that invokes tools.
         self._preamble_done_this_gen = False
-        # One spoken pre-tool beat per *request* (ReAct loops reset gen flag; never double-greet).
+        # One spoken pre-tool beat per request; bounded model-loop iterations
+        # must never produce duplicate greetings.
         self._preamble_done_this_request = False
         # Optional: agent generates free-form wording when the model produced none.
         self._preamble_fn = None  # type: ignore[assignment]
@@ -1018,14 +1125,30 @@ class _StreamingHandler(BaseCallbackHandler):
         self._visible_tool_keys: dict[str, str] = {}
         self._hidden_duplicate_tool_ids: set[str] = set()
         self._loop_warning_sent = False
+        # Private model reasoning is not part of the frontend stream contract.
+        self._expose_model_reasoning = False
+        # Durable lifecycle and tool events replace synthetic spoken preambles
+        # in the canonical runtime, avoiding an extra free-form model call.
+        self._emit_synthetic_preamble = False
+        self._iteration_count = 0
+        self._seen_llm_run_ids: set[str] = set()
+        self._token_usage = {"prompt": 0, "completion": 0, "total": 0}
 
     def _put(self, event: dict) -> None:
         """Emit a stream event with monotonic seq for reconnect/reorder guards."""
         self._event_seq += 1
         payload = dict(event or {})
         payload.setdefault("request_id", self._request_id)
+        if str(payload.get("type") or "") == "turn_bound":
+            _bind_query_execution(
+                self._request_id,
+                str(payload.get("execution_id") or payload.get("turn_id") or ""),
+            )
         payload["seq"] = self._event_seq
         payload.setdefault("at", time.time())
+        activity = semantic_activity_from_stream_payload(payload)
+        if activity is not None:
+            payload["activity"] = activity
         self._q.put(payload)
 
     @property
@@ -1204,7 +1327,13 @@ class _StreamingHandler(BaseCallbackHandler):
 
         self._emit_partial(text, reason)
 
-    def _start_new_generation(self):
+    def _start_new_generation(self, run_id: Any = None):
+        run_key = str(run_id or "").strip()
+        if run_key and run_key in self._seen_llm_run_ids:
+            return
+        if run_key:
+            self._seen_llm_run_ids.add(run_key)
+        self._iteration_count += 1
         # Save previous loop's reasoning before starting a new one
         if self._current_reasoning.strip():
             loop_idx = len(self._loop_blocks) + 1
@@ -1216,9 +1345,20 @@ class _StreamingHandler(BaseCallbackHandler):
         self._visible_gen = ""
         self._in_think_block = False
         self._preamble_done_this_gen = False
-        # NOTE: do NOT reset _preamble_done_this_request — second ReAct tool loops
-        # must not emit another "Doing good — checking…" spoken beat.
+        # Do not reset _preamble_done_this_request: later canonical model-loop
+        # iterations must not emit another spoken pre-tool beat.
         # Reliable phase signal for avatar/chat (was only set on tool_start before).
+        self._put({
+            "type": "iteration_boundary",
+            "iteration": self._iteration_count,
+            "phase": "model_call",
+            "model": str(
+                getattr(getattr(self, "_agent_ref", None), "_selected_model_id", lambda: "")()
+                or ""
+            ),
+            "at": time.time(),
+            "request_id": self._request_id,
+        })
         self._put({
             "type": "status",
             "agent_mode": "thinking",
@@ -1227,10 +1367,109 @@ class _StreamingHandler(BaseCallbackHandler):
         })
 
     def on_llm_start(self, serialized: dict, prompts: Any, run_id: str, parent_run_id: Optional[str] = None, **kwargs):
-        self._start_new_generation()
+        self._start_new_generation(run_id)
 
     def on_chat_model_start(self, serialized: dict, messages: Any, run_id: str, parent_run_id: Optional[str] = None, **kwargs):
-        self._start_new_generation()
+        self._start_new_generation(run_id)
+
+    @staticmethod
+    def _usage_from_response(response: Any) -> dict[str, int]:
+        def as_non_negative_int(value: Any) -> int:
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        candidates: list[Any] = []
+        llm_output = getattr(response, "llm_output", None)
+        if isinstance(llm_output, dict):
+            candidates.extend([
+                llm_output.get("token_usage"),
+                llm_output.get("usage"),
+                llm_output.get("usage_metadata"),
+            ])
+        for generation_group in list(getattr(response, "generations", None) or []):
+            for generation in list(generation_group or []):
+                message = getattr(generation, "message", None)
+                candidates.extend([
+                    getattr(message, "usage_metadata", None),
+                    getattr(message, "response_metadata", None),
+                    getattr(generation, "generation_info", None),
+                ])
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            nested = candidate.get("token_usage") or candidate.get("usage")
+            if isinstance(nested, dict):
+                candidate = nested
+            prompt = as_non_negative_int(
+                candidate.get("prompt_tokens")
+                or candidate.get("input_tokens")
+                or candidate.get("prompt_token_count")
+                or 0
+            )
+            completion = as_non_negative_int(
+                candidate.get("completion_tokens")
+                or candidate.get("output_tokens")
+                or candidate.get("candidates_token_count")
+                or 0
+            )
+            total = as_non_negative_int(
+                candidate.get("total_tokens") or candidate.get("total_token_count") or 0
+            )
+            if prompt or completion or total:
+                return {
+                    "prompt": prompt,
+                    "completion": completion,
+                    "total": total or prompt + completion,
+                }
+        return {}
+
+    @staticmethod
+    def _reasoning_summary_from_response(response: Any) -> str:
+        """Read only explicit provider summary fields, never reasoning_content."""
+        candidates: list[Any] = []
+        llm_output = getattr(response, "llm_output", None)
+        if isinstance(llm_output, dict):
+            candidates.extend([
+                llm_output.get("reasoning_summary"),
+                llm_output.get("summary"),
+            ])
+        for generation_group in list(getattr(response, "generations", None) or []):
+            for generation in list(generation_group or []):
+                message = getattr(generation, "message", None)
+                additional = getattr(message, "additional_kwargs", None)
+                if isinstance(additional, dict):
+                    candidates.append(additional.get("reasoning_summary"))
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return _redact_stream_text(candidate, 600)
+            if isinstance(candidate, list):
+                text = " ".join(
+                    str(item.get("text") or item.get("summary") or "")
+                    if isinstance(item, dict) else str(item)
+                    for item in candidate
+                ).strip()
+                if text:
+                    return _redact_stream_text(text, 600)
+        return ""
+
+    def on_llm_end(self, response: Any, run_id: str, parent_run_id: Optional[str] = None, **kwargs):
+        usage = self._usage_from_response(response)
+        if usage:
+            for key in self._token_usage:
+                self._token_usage[key] += int(usage.get(key) or 0)
+            self._put({"type": "token_usage", **self._token_usage})
+        expose_summary = bool(
+            getattr(getattr(self, "_agent_ref", None), "_turn_thinking_enabled", True)
+        )
+        summary = self._reasoning_summary_from_response(response) if expose_summary else ""
+        if summary:
+            self._put({
+                "type": "reasoning_summary",
+                "content": summary,
+                "iteration": self._iteration_count,
+            })
 
     def _process_token_or_reasoning(self, token: str, reasoning: str):
         # 1. Extract inline <think> tags from main content stream if no native reasoning is provided
@@ -1253,7 +1492,7 @@ class _StreamingHandler(BaseCallbackHandler):
                 visible_token = ""
 
         # 2. Push accumulated loops + current reasoning to UI
-        if reasoning:
+        if reasoning and self._expose_model_reasoning:
             self._current_reasoning += reasoning
             blocks = list(self._loop_blocks)
             loop_idx = len(self._loop_blocks) + 1
@@ -1340,7 +1579,11 @@ class _StreamingHandler(BaseCallbackHandler):
             pass
         # Deterministic beat only for user-facing tools — never for silent injects
         # like get_system_time (that was firing "Checking that now." then skipping weather).
-        if call_id not in self._hidden_duplicate_tool_ids and self._tool_requires_preamble(str(tool_name or "")):
+        if (
+            self._emit_synthetic_preamble
+            and call_id not in self._hidden_duplicate_tool_ids
+            and self._tool_requires_preamble(str(tool_name or ""))
+        ):
             self._flush_partial_reply(
                 "tool_start",
                 tool_name=str(tool_name or ""),
@@ -1367,17 +1610,9 @@ class _StreamingHandler(BaseCallbackHandler):
             })
             logger.warning("No-progress detected: tool '{}' called {} times with identical input", tool_name, repeat_count)
 
-        inp = raw_input
-        # Coding tools need full path/content for the Code visualizer — do not collapse to 600 chars.
-        tname = str(tool_name or "")
-        if tname in {"file_write", "file_read", "artifact_write", "notepad_write", "terminal_run"}:
-            # Keep structure; only hard-cap huge writes for stream safety
-            if len(inp) > 120_000:
-                inp = inp[:120_000] + "…"
-        else:
-            inp = " ".join((inp or "").split())
-            if len(inp) > 600:
-                inp = inp[:600] + "…"
+        # Chat receives only a bounded preview. Full arguments stay on the
+        # governed ToolRun projection for authorized inspectors.
+        inp = _safe_tool_input_preview(str(tool_name or ""), raw_input)
         if call_id not in self._hidden_duplicate_tool_ids:
             self._put(
             {
@@ -1402,15 +1637,6 @@ class _StreamingHandler(BaseCallbackHandler):
             self._hidden_duplicate_tool_ids.discard(call_id)
             self._tool_started_at.pop(call_id, None)
             return
-        # File/terminal payloads must reach the Code visualizer intact
-        if tool_name in {"file_read", "file_write", "artifact_write", "notepad_write", "terminal_run"}:
-            max_len = 120_000
-        elif tool_name == "web_search":
-            max_len = 8000
-        else:
-            max_len = 800
-        if len(out) > max_len:
-            out = out[:max_len] + "…"
         started = self._tool_started_at.pop(call_id, None)
         if started is not None:
             _record_tool_latency((time.perf_counter() - started) * 1000.0)
@@ -1450,12 +1676,25 @@ class _StreamingHandler(BaseCallbackHandler):
                 return
         except Exception:
             pass
-        event = {"type": "tool_end", "id": call_id, "name": tool_name, "output": out, "at": time.time(), "request_id": self._request_id}
+        event = {
+            "type": "tool_end",
+            "id": call_id,
+            "name": tool_name,
+            "output": _safe_tool_result_summary(tool_name, out),
+            "at": time.time(),
+            "request_id": self._request_id,
+        }
         try:
             agent = getattr(self, "_agent_ref", None)
             outcome = agent.get_tool_outcome(call_id) if agent is not None and hasattr(agent, "get_tool_outcome") else None
             if outcome is not None:
-                event["outcome"] = outcome.model_dump()
+                event["outcome"] = {
+                    "success": bool(outcome.success),
+                    "status": str(outcome.status or ""),
+                    "error_message": (
+                        "" if outcome.success else "Tool failed — trying another approach."
+                    ),
+                }
         except Exception:
             pass
         research_run = build_research_run(run_id=call_id, tool_name=tool_name, tool_input=raw_input, output=output if isinstance(output, str) else str(output), at=event["at"])
@@ -1478,7 +1717,14 @@ class _StreamingHandler(BaseCallbackHandler):
         if started is not None:
             _record_tool_latency((time.perf_counter() - started) * 1000.0)
         tool_name = self._tool_run_map.get(call_id, "")
-        self._put({"type": "tool_error", "id": call_id, "name": tool_name, "error": str(error), "at": time.time(), "request_id": self._request_id})
+        self._put({
+            "type": "tool_error",
+            "id": call_id,
+            "name": tool_name,
+            "error": "Tool failed — trying another approach.",
+            "at": time.time(),
+            "request_id": self._request_id,
+        })
         self._put({
             "type": "status",
             "agent_mode": "thinking",
@@ -1496,8 +1742,14 @@ def _start_agent_thread(
     workspace: Optional[str],
     request_id: str,
     q: queue.Queue,
+    cancel_event: threading.Event,
+    thinking_enabled: bool = True,
+    reasoning_effort: str = "medium",
+    source: str = "web",
+    voice_turn_id: str = "",
 ) -> None:
     def run_agent():
+        handler: Optional[_StreamingHandler] = None
         try:
             handler = _StreamingHandler(q, request_id)
             handler._agent_ref = agent  # social-aware last-resort preambles
@@ -1506,14 +1758,6 @@ def _start_agent_thread(
                 # Fresh multi-beat state for this turn
                 agent._turn_partial_beats = []
                 agent._active_user_query = message
-                handler.set_preamble_fn(
-                    lambda tool_name, tool_input, model_text="": agent.generate_tool_preamble_beat(
-                        tool_name=tool_name,
-                        tool_input=tool_input,
-                        user_query=message,
-                        model_text=model_text,
-                    )
-                )
                 handler.set_on_partial(lambda text: agent.record_turn_partial_beat(text))
             except Exception:
                 pass
@@ -1526,11 +1770,36 @@ def _start_agent_thread(
                 include_memory=include_memory,
                 callbacks=[handler],
                 thread_id=thread_id,
+                source=source,
+                cancel_event=cancel_event,
+                request_id=request_id,
+                thinking_enabled=thinking_enabled,
+                reasoning_effort=reasoning_effort,
             )
             doc_sources = agent.get_last_doc_sources() if include_memory else []
             state_store = get_state_store()
             latest_state = state_store.get_thread_state(thread_id).model_dump()
-            execution = state_store.get_execution(latest_state.get("last_execution_id") or "") if latest_state.get("last_execution_id") else None
+            worker_execution_id = str(
+                getattr(agent, "completed_execution_id_for_current_worker", lambda: "")() or ""
+            )
+            if not worker_execution_id and not voice_turn_id:
+                worker_execution_id = str(latest_state.get("last_execution_id") or "")
+            if voice_turn_id and not worker_execution_id:
+                raise RuntimeError("Voice query completed without an exact worker Execution identity")
+            execution = state_store.get_execution(worker_execution_id) if worker_execution_id else None
+            if voice_turn_id and execution is None:
+                raise RuntimeError("Voice query completed without its durable Execution")
+            if voice_turn_id and execution is not None:
+                from agent.voice_transport import bind_voice_turn_submission
+
+                bind_voice_turn_submission(
+                    voice_turn_id,
+                    session_id=str(thread_id or ""),
+                    request_id=request_id,
+                    execution_id=execution.id,
+                    task_run_id=str(execution.task_run_id or ""),
+                    query_completed=True,
+                )
             turn_projection = state_store.turn_projection(execution.id) if execution is not None else None
             execution_projection = dict((turn_projection or {}).get("execution_projection") or {})
             response_render = None
@@ -1568,8 +1837,8 @@ def _start_agent_thread(
                 # else keep original response (better than empty)
             memory_after = int(agent.memory.count_items(thread_id=thread_id) or 0)
             if memory_after > memory_before or bool(execution_projection.get("memory_records")):
-                q.put({"type": "memory_saved", "memory_count": memory_after, "at": time.time(), "request_id": request_id})
-            q.put(
+                handler._put({"type": "memory_saved", "memory_count": memory_after, "at": time.time()})
+            handler._put(
                 {
                     "type": "final",
                     "response": final_response,
@@ -1582,18 +1851,60 @@ def _start_agent_thread(
                     "partial_replies": list(handler.partial_replies),
                     "execution_id": execution.id if execution else None,
                     "trace_id": execution.trace_id if execution else None,
-                    "thread_state": latest_state or thread_state,
+                    # A newer Turn may already own Session state. In that case,
+                    # this older stream receives its own Turn projection but no
+                    # stale Session projection capable of overwriting the UI.
+                    "thread_state": (
+                        latest_state
+                        if execution is not None
+                        and str(latest_state.get("last_execution_id") or latest_state.get("current_execution_id") or "") == execution.id
+                        else {}
+                    ),
                     "execution_projection": execution_projection,
-                    "request_id": request_id,
+                    "voice_turn_id": voice_turn_id or None,
                     "at": time.time(),
                 }
             )
-            # Reset visualizer to idle
-            q.put({"type": "status", "agent_mode": "idle", "at": time.time(), "request_id": request_id})
         except Exception as e:
+            if voice_turn_id:
+                try:
+                    from agent.voice_transport import fail_voice_turn
+
+                    fail_voice_turn(
+                        voice_turn_id,
+                        session_id=str(thread_id or ""),
+                        error_code="voice_query_failed",
+                    )
+                except Exception:
+                    pass
             _metric_inc("errors", 1)
-            q.put({"type": "error", "message": str(e), "at": time.time(), "request_id": request_id})
+            diagnostic_id = hashlib.sha256(
+                f"{request_id}:{type(e).__name__}:{e}".encode("utf-8", errors="ignore")
+            ).hexdigest()[:12]
+            logger.exception(
+                "Query stream worker failed request_id={} diagnostic_id={}",
+                request_id,
+                diagnostic_id,
+            )
+            event = {
+                "type": "error",
+                "message": _safe_stream_failure(e),
+                "diagnostic_id": diagnostic_id,
+                "at": time.time(),
+                "request_id": request_id,
+            }
+            if handler is not None:
+                handler._put(event)
+            else:
+                q.put(event)
         finally:
+            # Provider, parser, and lifecycle failures must close the same UI
+            # activity state as successful turns.
+            idle_event = {"type": "status", "agent_mode": "idle", "at": time.time(), "request_id": request_id}
+            if handler is not None:
+                handler._put(idle_event)
+            else:
+                q.put(idle_event)
             q.put(None)
 
     threading.Thread(target=run_agent, daemon=True).start()
@@ -1630,9 +1941,67 @@ async def lifespan(app: FastAPI):
     # The API lifespan is the sole scheduler/coordinator owner in server and
     # desktop processes. Agent instances must not start competing daemons.
     os.environ["ECHOSPEAK_API_RUNTIME"] = "1"
-    logger.info("Starting Echo Speak API server...")
+    build_id = (
+        os.environ.get("ECHOSPEAK_BUILD_ID")
+        or os.environ.get("ECHOSPEAK_DESKTOP_INSTANCE_ID")
+        or "dev"
+    )
+    logger.info(
+        "Starting Echo Speak API server build_id={} pid={} data_dir={}",
+        build_id,
+        os.getpid(),
+        os.environ.get("ECHOSPEAK_DATA_DIR") or "",
+    )
     global _gateway_loop
     _gateway_loop = asyncio.get_running_loop()
+    # Build the shared memory/embedding owner during readiness so the first
+    # user Turn never pays model-load or vector-store initialization latency.
+    # Note: prewarm owns the "default" Session agent only. Other Sessions still
+    # construct Session-scoped agents on first use; they share StateStore via
+    # get_state_store() singleton + phase3 process lock (not duplicate writers).
+    if bool(getattr(config, "enable_prewarm", False)):
+        try:
+            prewarmed_agent = await asyncio.to_thread(get_agent, "default")
+            if prewarmed_agent.llm_provider == ModelProvider.LM_STUDIO:
+                from agent.model_runtime import (
+                    ensure_selected_model_ready,
+                    resolve_model_profile,
+                    resolve_structured_output_capability,
+                )
+                model_id = str(prewarmed_agent._selected_model_id() or "default")
+                profile = resolve_model_profile(
+                    ModelProvider.LM_STUDIO.value,
+                    model_id,
+                    {"context_limit": int(getattr(config.local, "context_length", 0) or 32768)},
+                )
+                await asyncio.to_thread(
+                    ensure_selected_model_ready,
+                    ModelProvider.LM_STUDIO.value,
+                    model_id,
+                    llm=prewarmed_agent.model_runtime.llm,
+                    profile=profile,
+                    timeout=float(
+                        getattr(config, "turn_understanding_cold_start_timeout_seconds", 120.0)
+                        or 120.0
+                    ),
+                )
+                capability = await asyncio.to_thread(
+                    resolve_structured_output_capability,
+                    ModelProvider.LM_STUDIO.value,
+                    model_id,
+                    llm=prewarmed_agent.model_runtime.llm,
+                    profile=profile,
+                    probe_timeout=float(getattr(config, "turn_understanding_probe_timeout_seconds", 8.0) or 8.0),
+                )
+                if capability.probed and capability.mode == "native_json_schema":
+                    prewarmed_agent._turn_understanding_warmed_models = {
+                        f"{ModelProvider.LM_STUDIO.value}:{model_id}"
+                    }
+            logger.info("Default Session runtime and embeddings prewarmed")
+        except Exception as exc:
+            logger.warning("Runtime prewarm degraded; startup continues honestly: {}", exc)
+    else:
+        logger.info("Model prewarming disabled on startup; model loads on demand.")
     await _reconcile_discord_bot_runtime()
     await _reconcile_heartbeat_runtime()
     
@@ -1676,6 +2045,60 @@ async def lifespan(app: FastAPI):
 
         def _routine_callback(routine):
             """Claim one durable Run, then execute one governed Turn."""
+            from agent.automation_runtime import (
+                AutomationModelBinding,
+                AutomationRunStatus,
+                ModelBindingPolicy,
+                get_automation_run_store,
+            )
+            from agent.projects import get_project_manager
+            from agent.task_store import get_task_store
+
+            scheduled_for = str(getattr(routine, "next_run", "") or f"run:{int(getattr(routine, 'run_count', 0)) + 1}")
+            session_id = str(getattr(routine, "session_id", "") or "").strip()
+            project_id = str(getattr(routine, "project_id", "") or "").strip()
+            query = str(routine.action_config.get("query") or routine.action_config.get("message") or routine.name).strip()
+            if not project_id or not session_id:
+                return {
+                    "success": False,
+                    "error": "Routine requires an explicit Project and Session",
+                }
+            project = get_project_manager().get_project(project_id)
+            session = get_state_store().get_thread_state(session_id)
+            if project is None or str(session.active_project_id or "") != project_id:
+                return {
+                    "success": False,
+                    "error": "Routine Project/Session binding is missing or stale",
+                }
+            task = get_task_store().create(
+                title=f"Routine: {routine.name}",
+                description=query,
+                objective=query,
+                project_id=project_id,
+                session_id=session_id,
+                source="routine",
+                source_id=routine.id,
+                scheduled_for=scheduled_for,
+                idempotency_key=f"routine:{routine.id}:{scheduled_for}",
+            )
+            if task.status in {"complete", "done"}:
+                return {"success": True, "task_id": task.id}
+            run_store = get_automation_run_store()
+            run = run_store.create_run(
+                idempotency_key=f"routine:{routine.id}:{scheduled_for}",
+                project_id=project_id,
+                session_id=session_id,
+                task_id=task.id,
+                routine_id=str(routine.id),
+                trigger_id=scheduled_for,
+                source="routine",
+                source_id=str(routine.id),
+                objective=query,
+                model_binding=AutomationModelBinding(
+                    policy=ModelBindingPolicy.SESSION_DEFAULT,
+                    source_session_id=session_id,
+                ),
+            )
             from agent.automation_runtime import (
                 AutomationModelBinding,
                 AutomationRunStatus,
@@ -1782,23 +2205,32 @@ async def lifespan(app: FastAPI):
                     query, source="routine", thread_id=session_id, callbacks=[],
                 )
                 state = get_state_store().get_thread_state(session_id)
+                from agent.automation_projection import project_execution
                 channels = list(getattr(routine, "delivery_channels", None) or ["web"])
                 blocked_channels = [channel for channel in channels if str(channel).lower() != "web"]
-                verified = bool(success and response and not blocked_channels)
-                status = "complete" if verified else "needs_permission" if blocked_channels else "failed"
                 execution_id = str(state.last_execution_id or state.current_execution_id or "")
-                tool_run_ids = [
-                    item.id for item in get_state_store().list_tool_runs(execution_id)
-                ] if execution_id else []
+                canonical = project_execution(
+                    project_id=project_id,
+                    session_id=session_id,
+                    execution_id=execution_id,
+                    occurrence_id=run.id,
+                )
+                tool_run_ids = list(canonical.tool_run_ids) if canonical else []
                 approval_ids = [str(state.pending_approval_id)] if state.pending_approval_id else []
-                if verified:
-                    run_status = AutomationRunStatus.COMPLETED
-                elif state.pending_approval_id:
-                    run_status = AutomationRunStatus.WAITING_FOR_APPROVAL
-                elif blocked_channels:
-                    run_status = AutomationRunStatus.BLOCKED
-                else:
-                    run_status = AutomationRunStatus.FAILED
+                verified = bool(canonical and canonical.verified and response and not blocked_channels)
+                status = (
+                    "complete" if verified
+                    else "needs_permission" if canonical and canonical.automation_status == "waiting_for_approval"
+                    else "blocked" if blocked_channels or (canonical and canonical.product_task_status == "blocked")
+                    else "cancelled" if canonical and canonical.product_task_status == "cancelled"
+                    else "failed"
+                )
+                run_status = AutomationRunStatus(
+                    "completed" if verified
+                    else "blocked" if blocked_channels
+                    else canonical.automation_status if canonical
+                    else "failed"
+                )
                 run_store.transition(
                     run.id,
                     run_status,
@@ -1809,8 +2241,13 @@ async def lifespan(app: FastAPI):
                     execution_id=execution_id,
                     tool_run_ids=tool_run_ids,
                     approval_ids=approval_ids,
+                    artifact_ids=list(canonical.artifact_ids) if canonical else [],
+                    task_run_id=str(canonical.task_run_id) if canonical else "",
                     outcome={
                         "verified": verified,
+                        "completion_authority": "task_run",
+                        "canonical_task_status": canonical.canonical_status.value if canonical else "missing",
+                        "canonical_completion_disposition": canonical.completion_disposition if canonical else "pending",
                         "response_present": bool(response),
                         "blocked_delivery_channels": blocked_channels,
                     },
@@ -1820,10 +2257,13 @@ async def lifespan(app: FastAPI):
                     task.id,
                     status=status,
                     execution_ids=[execution_id] if execution_id else [],
+                    task_run_ids=[canonical.task_run_id] if canonical else [],
                     tool_run_ids=tool_run_ids,
                     approval_ids=approval_ids,
                     verification={
                         "verified": verified,
+                        "completion_authority": "task_run",
+                        "canonical_task_status": canonical.canonical_status.value if canonical else "missing",
                         "response_present": bool(response),
                         "blocked_delivery_channels": blocked_channels,
                         "reason": (
@@ -2116,7 +2556,13 @@ def _mcp_trust_summary(
         "mcp_available": mcp_available,
         "mcp_status": status,
         "warnings": warnings,
-        "client_version": "7.6.0" if mcp_client_present else "",
+        "client_version": (
+            str(manager_status.get("client_version") or "official-python-sdk")
+            if mcp_client_present and isinstance(manager_status, dict)
+            else "official-python-sdk"
+            if mcp_client_present
+            else ""
+        ),
     }
     if isinstance(manager_status, dict):
         out["mcp_running_count"] = int(manager_status.get("running_count") or 0)
@@ -2348,12 +2794,85 @@ async def get_restart_status(_: str = Depends(_verify_admin_key)):
         )
 
 
+def _cancel_incompatible_session_work(session_id: str, *, reason: str) -> dict[str, int]:
+    """Terminalize only work bound to the Session's previous model revision."""
+    from agent.task_runs import TERMINAL_TASK_STATUSES, TaskRunStatus, get_task_run_store
+
+    key = _normalize_thread_id(session_id)
+    approval_count = 0
+    for approval in get_state_store().list_approvals(thread_id=key, limit=1000):
+        if approval.status not in {"pending", "consuming"}:
+            continue
+        get_state_store().update_approval(
+            approval.id, status="canceled", outcome_summary=reason
+        )
+        approval_count += 1
+    task_count = 0
+    store = get_task_run_store()
+    for task in store.list_for_session(key, include_terminal=False):
+        if task.status in TERMINAL_TASK_STATUSES:
+            continue
+        try:
+            store.update(
+                task.id,
+                session_id=task.session_id,
+                project_id=task.project_id,
+                expected_revision=task.revision,
+                status=TaskRunStatus.CANCELLED,
+                workflow_stage="cancelled:model_binding_changed",
+                last_execution_id=task.last_execution_id,
+            )
+            task_count += 1
+        except Exception as exc:
+            logger.warning("Model-binding cancellation raced for TaskRun {}: {}", task.id, exc)
+    state = get_state_store().get_thread_state(key)
+    get_state_store().update_thread_state(
+        key,
+        foreground_task_id="",
+        suspended_task_ids=[],
+        pending_approval_id="",
+        pending_actions=[],
+        execution_status="cancelled",
+        safest_next_action="Start new work under the selected Session model",
+        source_metadata={
+            **dict(state.source_metadata or {}),
+            "model_binding_cancellation_reason": reason,
+            "model_binding_cancelled_at": time.time(),
+        },
+    )
+    return {"approvals": approval_count, "task_runs": task_count}
+
+
 class QueryRequest(BaseModel):
     """Request model for query endpoint."""
     message: str = Field(..., description="User message to process", max_length=50000)
     include_memory: bool = Field(default=True, description="Include conversation memory")
-    thread_id: Optional[str] = Field(default=None, description="Conversation thread id for LangGraph persistence")
+    thread_id: Optional[str] = Field(default=None, description="Conversation Session id")
     workspace: Optional[str] = Field(default=None, description="Optional workspace/mode override (ex: auto|chat|coding|research)")
+    thinking_enabled: bool = Field(
+        default=True,
+        description="Request provider-native reasoning controls when the selected provider supports them",
+    )
+    reasoning_effort: Literal[
+        "minimal", "low", "medium", "high", "extra_high", "max", "ultra"
+    ] = Field(default="medium")
+    client_request_id: Optional[str] = Field(
+        default=None,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        description="Client-owned cancellation identity for this exact Turn",
+    )
+    transport: Literal["chat", "voice"] = Field(
+        default="chat",
+        description="User-input transport only; it never changes semantic or execution authority",
+    )
+    voice_turn_id: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        description="Durable local Voice transport turn whose final transcript equals message",
+    )
 
 
 class QueryResponse(BaseModel):
@@ -2367,7 +2886,287 @@ class QueryResponse(BaseModel):
     execution_id: Optional[str] = None
     trace_id: Optional[str] = None
     thread_state: Optional[dict[str, Any]] = None
+    voice_turn_id: Optional[str] = None
 
+
+def _prepare_query_transport(request: QueryRequest, request_id: str) -> str:
+    """Validate user-input transport without creating another intent router."""
+
+    voice_turn_id = str(request.voice_turn_id or "").strip()
+    if request.transport != "voice":
+        if voice_turn_id:
+            raise HTTPException(status_code=400, detail="voice_turn_id requires the Voice transport")
+        return "web"
+    if not voice_turn_id:
+        raise HTTPException(status_code=400, detail="Voice transport requires a durable voice_turn_id")
+    try:
+        from agent.voice_transport import prepare_voice_turn_submission
+
+        prepare_voice_turn_submission(
+            voice_turn_id,
+            session_id=_normalize_thread_id(request.thread_id),
+            request_id=request_id,
+            transcript=request.message,
+        )
+    except Exception as exc:
+        from agent.voice_transport import VoiceTransportError
+
+        if isinstance(exc, VoiceTransportError):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise
+    return "voice"
+
+
+class QueryCancelRequest(BaseModel):
+    request_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    thread_id: str = Field(min_length=1, max_length=200)
+    execution_id: str = Field(default="", max_length=128, pattern=r"^[A-Za-z0-9._:-]*$")
+    voice_turn_id: Optional[str] = Field(default=None, max_length=200, pattern=r"^[A-Za-z0-9._:-]+$")
+    voice_transcript: Optional[str] = Field(default=None, max_length=10000)
+
+
+class QuerySteerRequest(BaseModel):
+    thread_id: str = Field(min_length=1, max_length=200)
+    instruction: str = Field(min_length=1, max_length=10000)
+    task_run_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    client_request_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    voice_turn_id: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        description="Optional exact Voice transport turn containing this steering instruction",
+    )
+
+
+class QueryQueueRequest(BaseModel):
+    thread_id: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=50000)
+    client_request_id: Optional[str] = Field(default=None)
+
+
+_ACTIVE_QUERY_CANCEL_LOCK = threading.RLock()
+_ACTIVE_QUERY_CANCELLATIONS: Dict[str, tuple[str, threading.Event, str]] = {}
+
+
+def _register_query_cancellation(request_id: str, thread_id: str, event: threading.Event) -> None:
+    with _ACTIVE_QUERY_CANCEL_LOCK:
+        _ACTIVE_QUERY_CANCELLATIONS[str(request_id)] = (_normalize_thread_id(thread_id), event, "")
+
+
+def _bind_query_execution(request_id: str, execution_id: str) -> None:
+    rid = str(request_id or "").strip()
+    eid = str(execution_id or "").strip()
+    if not rid or not eid:
+        return
+    with _ACTIVE_QUERY_CANCEL_LOCK:
+        current = _ACTIVE_QUERY_CANCELLATIONS.get(rid)
+        if current is not None:
+            _ACTIVE_QUERY_CANCELLATIONS[rid] = (current[0], current[1], eid)
+
+
+def _release_query_cancellation(request_id: str, event: threading.Event) -> None:
+    with _ACTIVE_QUERY_CANCEL_LOCK:
+        current = _ACTIVE_QUERY_CANCELLATIONS.get(str(request_id))
+        if current is not None and current[1] is event:
+            _ACTIVE_QUERY_CANCELLATIONS.pop(str(request_id), None)
+
+
+def _cancel_all_active_queries() -> int:
+    """Signal every registered query without changing its ownership record."""
+    with _ACTIVE_QUERY_CANCEL_LOCK:
+        active = list(_ACTIVE_QUERY_CANCELLATIONS.values())
+    for _session_id, event, _execution_id in active:
+        event.set()
+    return len(active)
+
+
+def _cancel_active_queries_for_session(session_id: str) -> int:
+    """Signal only queries owned by one exact Session."""
+    key = _normalize_thread_id(session_id)
+    with _ACTIVE_QUERY_CANCEL_LOCK:
+        active = [
+            row
+            for row in _ACTIVE_QUERY_CANCELLATIONS.values()
+            if row[0] == key
+        ]
+    for _owner, event, _execution_id in active:
+        event.set()
+    return len(active)
+
+
+@app.post("/query/steer")
+async def steer_query(request: QuerySteerRequest):
+    """Steer an ongoing TaskRun with a new instruction without losing progress."""
+    from agent.task_runs import get_task_run_store, TaskRunStatus
+
+    thread_id = _normalize_thread_id(request.thread_id)
+    with _ACTIVE_QUERY_CANCEL_LOCK:
+        active = _ACTIVE_QUERY_CANCELLATIONS.get(request.client_request_id)
+    if active is None or active[0] != thread_id:
+        raise HTTPException(status_code=409, detail="The requested Turn is no longer active in this Session.")
+    execution_id = str(active[2] or "")
+    if not execution_id:
+        raise HTTPException(status_code=409, detail="The active Turn has not bound a durable Execution yet.")
+    execution = get_state_store().get_execution(execution_id)
+    if execution is None or str(execution.task_run_id or "") != request.task_run_id:
+        raise HTTPException(status_code=409, detail="Steering identity does not match the active TaskRun.")
+
+    store = get_task_run_store()
+    task = store.get(request.task_run_id, session_id=thread_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="The active TaskRun no longer exists.")
+    if task.status != TaskRunStatus.RUNNING or str(task.last_execution_id or task.created_by_execution_id) != execution_id:
+        raise HTTPException(status_code=409, detail="The TaskRun is not owned by this active Execution.")
+
+    if request.voice_turn_id:
+        try:
+            from agent.voice_transport import prepare_voice_turn_submission
+
+            prepare_voice_turn_submission(
+                request.voice_turn_id,
+                session_id=thread_id,
+                request_id=request.client_request_id,
+                transcript=request.instruction,
+            )
+        except Exception as exc:
+            from agent.voice_transport import VoiceTransportError
+
+            if isinstance(exc, VoiceTransportError):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
+
+    task.steer(request.instruction)
+    updated = store.update(
+        task.id,
+        session_id=thread_id,
+        project_id=task.project_id,
+        expected_revision=task.revision - 1,
+        steering_instructions=task.steering_instructions,
+        status=task.status,
+        workflow_stage="steered_at_next_model_boundary",
+    )
+
+    if request.voice_turn_id:
+        from agent.voice_transport import bind_voice_turn_submission
+
+        bind_voice_turn_submission(
+            request.voice_turn_id,
+            session_id=thread_id,
+            request_id=request.client_request_id,
+            execution_id=execution_id,
+            task_run_id=updated.id,
+            query_completed=True,
+        )
+
+    logger.info("Steered TaskRun id={} session={} revision={}", updated.id, thread_id, updated.revision)
+    return {
+        "steered": True,
+        "task_run_id": updated.id,
+        "revision": updated.revision,
+        "applies_at": "next_model_boundary",
+    }
+
+
+@app.post("/query/queue")
+async def queue_query(request: QueryQueueRequest):
+    """Queue a follow-up prompt to run after the active turn finishes."""
+    thread_id = _normalize_thread_id(request.thread_id)
+    store = get_state_store()
+    item = store.enqueue_turn(
+        thread_id,
+        message=request.message,
+        client_request_id=request.client_request_id or str(uuid.uuid4()),
+    )
+    queue_length = len(store.list_queued_turns(thread_id))
+    return {
+        "queued": True,
+        "thread_id": thread_id,
+        "queue_length": queue_length,
+        "client_request_id": item["client_request_id"],
+    }
+
+
+@app.get("/query/queue")
+async def get_queued_queries(thread_id: str):
+    """List pending queued turns for a Session."""
+    key = _normalize_thread_id(thread_id)
+    items = get_state_store().list_queued_turns(key)
+    return {"thread_id": key, "queue": items}
+
+
+@app.post("/query/queue/claim")
+async def claim_queued_query(thread_id: str):
+    """Claim one durable follow-up only after the Session has no active Turn."""
+    key = _normalize_thread_id(thread_id)
+    with _ACTIVE_QUERY_CANCEL_LOCK:
+        session_active = any(owner == key for owner, _event, _execution in _ACTIVE_QUERY_CANCELLATIONS.values())
+    if session_active:
+        raise HTTPException(status_code=409, detail="This Session still has an active Turn.")
+    item = get_state_store().claim_queued_turn(key)
+    return {
+        "thread_id": key,
+        "claimed": item is not None,
+        "item": item,
+        "queue_length": len(get_state_store().list_queued_turns(key)),
+    }
+
+
+@app.post("/query/cancel")
+async def cancel_query(request: QueryCancelRequest):
+    """Cancel one exact request; never infer by newest Session activity."""
+    with _ACTIVE_QUERY_CANCEL_LOCK:
+        active = _ACTIVE_QUERY_CANCELLATIONS.get(request.request_id)
+    if active is None:
+        return {"cancelled": False, "request_id": request.request_id, "reason": "not_active"}
+    owner_session, event, execution_id = active
+    if owner_session != _normalize_thread_id(request.thread_id):
+        raise HTTPException(status_code=409, detail="Cancellation request belongs to a different Session")
+    if request.execution_id and execution_id and request.execution_id != execution_id:
+        raise HTTPException(status_code=409, detail="Cancellation request belongs to a different Execution")
+    if request.voice_turn_id:
+        if not str(request.voice_transcript or "").strip():
+            raise HTTPException(status_code=400, detail="Voice cancellation requires its exact final transcript")
+        try:
+            from agent.voice_transport import (
+                bind_voice_turn_submission,
+                cancel_voice_playback,
+                prepare_voice_turn_submission,
+            )
+
+            prepare_voice_turn_submission(
+                request.voice_turn_id,
+                session_id=owner_session,
+                request_id=request.request_id,
+                transcript=str(request.voice_transcript or ""),
+            )
+            if execution_id:
+                execution = get_state_store().get_execution(execution_id)
+                if execution is None or execution.session_id != owner_session:
+                    raise HTTPException(status_code=409, detail="Voice cancellation Execution is unavailable")
+                bind_voice_turn_submission(
+                    request.voice_turn_id,
+                    session_id=owner_session,
+                    request_id=request.request_id,
+                    execution_id=execution.id,
+                    task_run_id=str(execution.task_run_id or ""),
+                    query_completed=True,
+                )
+            cancel_voice_playback(request.voice_turn_id, session_id=owner_session)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            from agent.voice_transport import VoiceTransportError
+
+            if isinstance(exc, VoiceTransportError):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
+    event.set()
+    return {
+        "cancelled": True,
+        "request_id": request.request_id,
+        "execution_id": execution_id,
+        "thread_id": owner_session,
+    }
 
 class ThreadSessionStateResponse(BaseModel):
     thread_id: str
@@ -2377,6 +3176,12 @@ class ThreadSessionStateResponse(BaseModel):
     active_project_id: str = ""
     workspace_root: str = ""
     project_path: str = ""
+    foreground_task_id: str = ""
+    suspended_task_ids: List[str] = Field(default_factory=list)
+    pending_approval_ids: List[str] = Field(default_factory=list)
+    source_metadata: Dict[str, Any] = Field(default_factory=dict)
+    semantic_schema_version: int = 0
+    semantic_state_migrated_at: float = 0.0
     objective: str = ""
     current_subject: str = ""
     mode: str = "chat"
@@ -2400,6 +3205,7 @@ class ThreadSessionStateResponse(BaseModel):
     current_execution_id: str = ""
     active_turn_id: str = ""
     selected_model_id: str = ""
+    model_binding: Optional[Dict[str, Any]] = None
     model_profile: Dict[str, Any] = Field(default_factory=dict)
     context_budget: Dict[str, Any] = Field(default_factory=dict)
     unfinished_workflow: Dict[str, Any] = Field(default_factory=dict)
@@ -2411,6 +3217,315 @@ class ThreadSessionStateResponse(BaseModel):
     updated_at: float = 0.0
 
 
+class TaskRunSummaryResponse(BaseModel):
+    id: str
+    project_id: str = ""
+    session_id: str
+    objective: str
+    status: str
+    workflow_stage: str
+    execution_profile: str
+    parent_task_run_id: str = ""
+    handoff_context_id: str = ""
+    requirement_statuses: Dict[str, str] = Field(default_factory=dict)
+    active_graph_node_ids: List[str] = Field(default_factory=list)
+    completion_finalizable: bool = False
+    completion_disposition: str = "pending"
+    next_runtime_action: str = ""
+    active_requirement_id: str = ""
+    preferred_tool_name: str = ""
+    recovery_epoch: int = 0
+    revision: int
+    updated_at: float
+
+
+class TaskRunHandoffRequest(BaseModel):
+    session_id: str
+    project_id: str = ""
+    execution_id: str = Field(min_length=1)
+    expected_revision: int = Field(ge=1)
+    target_profile: Literal["chat", "work", "code"]
+    objective: str = ""
+    expected_model_binding_revision: int = Field(ge=1)
+
+
+class TaskRunDetailResponse(BaseModel):
+    task: Dict[str, Any]
+    requirements: List[Dict[str, Any]] = Field(default_factory=list)
+    requirement_states: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    completion: Optional[Dict[str, Any]] = None
+    stage: Dict[str, Any] = Field(default_factory=dict)
+    approvals: List[Dict[str, Any]] = Field(default_factory=list)
+    executions: List[Dict[str, Any]] = Field(default_factory=list)
+    tool_runs: List[Dict[str, Any]] = Field(default_factory=list)
+    research_artifacts: List[Dict[str, Any]] = Field(default_factory=list)
+    media_jobs: List[Dict[str, Any]] = Field(default_factory=list)
+    specialist_runs: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+def _task_run_summary(task: Any) -> TaskRunSummaryResponse:
+    verdict = getattr(task, "completion_evaluation", None)
+    liveness = getattr(task, "liveness_decision", None)
+    graph_state = getattr(task, "execution_graph_state", None)
+    return TaskRunSummaryResponse(
+        id=task.id,
+        project_id=str(task.project_id or ""),
+        session_id=task.session_id,
+        objective=task.objective,
+        status=str(getattr(task.status, "value", task.status)),
+        workflow_stage=task.workflow_stage,
+        execution_profile=str(getattr(task.execution_profile, "value", task.execution_profile)),
+        parent_task_run_id=str(task.parent_task_run_id or ""),
+        handoff_context_id=str(task.handoff_context_id or ""),
+        requirement_statuses={
+            key: str(getattr(value.status, "value", value.status))
+            for key, value in task.requirement_states.items()
+        },
+        active_graph_node_ids=list(getattr(graph_state, "active_node_ids", None) or []),
+        completion_finalizable=bool(verdict and verdict.finalizable),
+        completion_disposition=str(
+            getattr(getattr(verdict, "disposition", None), "value", "") or "pending"
+        ),
+        next_runtime_action=str(
+            getattr(getattr(liveness, "next_action", None), "value", "") or ""
+        ),
+        active_requirement_id=str(
+            getattr(liveness, "active_requirement_id", "") or ""
+        ),
+        preferred_tool_name=str(
+            getattr(liveness, "preferred_tool_name", "") or ""
+        ),
+        recovery_epoch=int(getattr(task, "recovery_epoch", 0) or 0),
+        revision=task.revision,
+        updated_at=task.updated_at,
+    )
+
+
+@app.get("/task-runs", response_model=List[TaskRunSummaryResponse])
+async def list_task_runs(
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+    include_terminal: bool = Query(default=False),
+):
+    """List canonical TaskRuns in one exact Session/Project scope."""
+
+    from agent.task_runs import get_task_run_store
+    from agent.threads import get_thread_manager
+
+    if get_thread_manager().get_thread(session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    state = get_state_store().get_thread_state(session_id)
+    if str(state.active_project_id or "") != str(project_id or ""):
+        raise HTTPException(status_code=409, detail="Session is not bound to the requested Project")
+    rows = get_task_run_store().list_for_session(
+        session_id,
+        project_id=project_id,
+        include_terminal=include_terminal,
+    )
+    return [_task_run_summary(item) for item in rows]
+
+
+@app.get("/task-runs/{task_run_id}", response_model=TaskRunDetailResponse)
+async def get_task_run_detail(
+    task_run_id: str,
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
+    """Bounded, read-only projection of one canonical TaskRun owner."""
+
+    from agent.task_runs import TaskRunScopeError, get_task_run_store
+
+    state = get_state_store().get_thread_state(session_id)
+    if str(state.active_project_id or "") != str(project_id or ""):
+        raise HTTPException(status_code=409, detail="Session is not bound to the requested Project")
+    try:
+        task = get_task_run_store().get(
+            task_run_id, session_id=session_id, project_id=project_id
+        )
+    except TaskRunScopeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="TaskRun not found")
+
+    executions = [
+        row for row in get_state_store().list_executions(session_id, limit=200)
+        if row.task_run_id == task.id
+    ]
+    execution_ids = {row.id for row in executions}
+    tool_runs = [
+        row for row in get_state_store().list_tool_runs_for_session(session_id, limit=240)
+        if row.id in set(task.tool_run_ids) or row.turn_id in execution_ids
+    ]
+    approvals = [
+        row for row in get_state_store().list_approvals(thread_id=session_id, limit=200)
+        if row.task_run_id == task.id
+    ]
+    artifacts: list[dict[str, Any]] = []
+    try:
+        from agent.research_artifacts import get_research_artifact_for_scope
+        for artifact_id in task.research_artifact_ids[:80]:
+            artifact = get_research_artifact_for_scope(
+                artifact_id, project_id=project_id, session_id=session_id
+            )
+            if artifact is not None:
+                artifacts.append(artifact.model_dump(mode="json"))
+    except Exception as exc:
+        logger.warning("TaskRun research projection unavailable: {}", exc)
+    media_jobs: list[dict[str, Any]] = []
+    try:
+        from agent.generation_runtime import get_generation_job_store
+        from agent.media_jobs import project_generation_job, project_voice_job
+        from agent.voice_runtime import get_voice_job_store
+        projected = [
+            *(project_generation_job(row) for row in get_generation_job_store().list(session_id=session_id, limit=100)),
+            *(project_voice_job(row) for row in get_voice_job_store().list(session_id=session_id, limit=100)),
+        ]
+        media_jobs = [
+            row.model_dump(mode="json") for row in projected
+            if row.task_run_id == task.id
+        ][:80]
+    except Exception:
+        media_jobs = []
+    specialist_runs: list[dict[str, Any]] = []
+    try:
+        from agent.specialist_store import get_specialist_run_store
+        specialist_runs = [
+            row.model_dump(mode="json")
+            for row in get_specialist_run_store().list(
+                session_id=session_id,
+                project_id=project_id,
+                task_run_id=task.id,
+                limit=100,
+            )
+        ]
+    except Exception as exc:
+        logger.warning("TaskRun specialist projection unavailable: {}", exc)
+    graph_state = task.execution_graph_state
+    graph = task.execution_graph
+    node_states = dict(getattr(graph_state, "node_states", None) or {})
+    return TaskRunDetailResponse(
+        task={
+            **_task_run_summary(task).model_dump(mode="json"),
+            "requested_operation": task.requested_operation,
+            "missing_inputs": list(task.missing_inputs),
+            "created_at": task.created_at,
+            "created_by_execution_id": task.created_by_execution_id,
+            "last_execution_id": task.last_execution_id,
+            "trigger_occurrence_id": task.trigger_occurrence_id,
+            "research_depth": str(getattr(task.research_depth, "value", task.research_depth or "")),
+            "recovery_epoch_started_at": float(
+                task.recovery_epoch_started_at or 0.0
+            ),
+            "recovery_history": list(task.recovery_history or []),
+            "liveness": (
+                task.liveness_decision.model_dump(mode="json")
+                if task.liveness_decision else None
+            ),
+        },
+        requirements=[item.model_dump(mode="json") for item in task.requirements],
+        requirement_states={
+            key: value.model_dump(mode="json")
+            for key, value in task.requirement_states.items()
+        },
+        completion=(task.completion_evaluation.model_dump(mode="json") if task.completion_evaluation else None),
+        stage={
+            "workflow_stage": task.workflow_stage,
+            "graph_id": str(getattr(graph, "graph_id", "") or ""),
+            "source": str(getattr(getattr(graph, "source", None), "value", getattr(graph, "source", "")) or ""),
+            "active_node_ids": list(getattr(graph_state, "active_node_ids", None) or []),
+            "checkpoint_count": len(list(getattr(graph_state, "checkpoints", None) or [])),
+            "nodes": [
+                {
+                    "node_id": node.node_id,
+                    "kind": str(getattr(node.kind, "value", node.kind)),
+                    "label": node.label,
+                    "requirement_id": node.requirement_id,
+                    "depends_on": list(node.depends_on),
+                    "status": str(
+                        getattr(
+                            getattr(node_states.get(node.node_id), "status", "pending"),
+                            "value",
+                            getattr(node_states.get(node.node_id), "status", "pending"),
+                        )
+                    ),
+                    "attempt_count": int(
+                        getattr(node_states.get(node.node_id), "attempt_count", 0) or 0
+                    ),
+                    "outcome_code": str(
+                        getattr(node_states.get(node.node_id), "outcome_code", "") or ""
+                    ),
+                }
+                for node in list(getattr(graph, "nodes", None) or [])[:128]
+            ],
+            "edges": [
+                {
+                    "source_node_id": edge.source_node_id,
+                    "target_node_id": edge.target_node_id,
+                    "kind": str(getattr(edge.kind, "value", edge.kind)),
+                }
+                for edge in list(getattr(graph, "edges", None) or [])[:512]
+            ],
+        },
+        approvals=[row.model_dump(mode="json") for row in approvals],
+        executions=[row.model_dump(mode="json") for row in executions],
+        tool_runs=[row.model_dump(mode="json") for row in tool_runs],
+        research_artifacts=artifacts,
+        media_jobs=media_jobs,
+        specialist_runs=specialist_runs,
+    )
+
+
+@app.post("/task-runs/{task_run_id}/handoff", response_model=TaskRunSummaryResponse)
+async def handoff_task_run(task_run_id: str, request: TaskRunHandoffRequest):
+    """Explicitly hand current work to another surface without creating a Session."""
+
+    from agent.execution_graph import ExecutionProfile
+    from agent.task_runs import TaskRunConflictError, get_task_run_store
+    from agent.threads import get_thread_manager
+
+    if get_thread_manager().get_thread(request.session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    state = get_state_store().get_thread_state(request.session_id)
+    if str(state.active_project_id or "") != str(request.project_id or ""):
+        raise HTTPException(status_code=409, detail="Session Project changed before handoff")
+    binding = _ensure_session_model_binding(request.session_id)
+    if binding.binding_revision != request.expected_model_binding_revision:
+        raise HTTPException(status_code=409, detail="Session model binding changed before handoff")
+    execution = get_state_store().get_execution(request.execution_id)
+    if execution is None:
+        raise HTTPException(status_code=404, detail="Handoff Execution not found")
+    if execution.session_id != request.session_id or execution.thread_id != request.session_id:
+        raise HTTPException(status_code=409, detail="Handoff Execution belongs to another Session")
+    if str(execution.project_id or execution.active_project_id or "") != str(request.project_id or ""):
+        raise HTTPException(status_code=409, detail="Handoff Execution belongs to another Project")
+    execution_id = execution.id
+    try:
+        _previous, replacement = get_task_run_store().handoff_to_profile(
+            task_run_id,
+            session_id=request.session_id,
+            project_id=request.project_id,
+            expected_revision=request.expected_revision,
+            execution_id=execution_id,
+            target_profile=ExecutionProfile(request.target_profile),
+            objective=request.objective,
+        )
+    except TaskRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    get_state_store().update_thread_state(
+        request.session_id,
+        foreground_task_id=replacement.id,
+        source_metadata={
+            **dict(state.source_metadata or {}),
+            "last_surface_handoff": request.target_profile,
+            "handoff_task_run_id": replacement.id,
+            "updated_at": time.time(),
+        },
+    )
+    return _task_run_summary(replacement)
+
+
 class ApprovalResponse(BaseModel):
     id: str
     thread_id: str
@@ -2419,6 +3534,11 @@ class ApprovalResponse(BaseModel):
     original_turn_id: str = ""
     tool_run_id: str = ""
     execution_id: Optional[str] = None
+    task_run_id: str = ""
+    requirement_id: str = ""
+    attempt_id: str = ""
+    task_run_revision: int = 0
+    model_binding_revision: int = 0
     status: str
     tool: str
     kwargs: Dict[str, Any] = Field(default_factory=dict)
@@ -2458,6 +3578,8 @@ class ApprovalDecisionResponse(BaseModel):
     response: str = ""
     execution_id: Optional[str] = None
     thread_state: Dict[str, Any] = Field(default_factory=dict)
+    task_run: Optional[TaskRunSummaryResponse] = None
+    tool_run_id: str = ""
 
 
 class ExecutionResponse(BaseModel):
@@ -2952,11 +4074,15 @@ class ProviderInfoResponse(BaseModel):
     readiness_message: str = ""
     readiness_detail: str = ""
     model_profile: Dict[str, Any] = Field(default_factory=dict)
+    session_id: str = "default"
+    binding_revision: int = 1
 
 
 class SwitchProviderRequest(BaseModel):
     """Request model for switching provider."""
     provider: str = Field(..., description="Provider ID (openai, gemini, ollama, lmstudio, localai, llama_cpp, vllm)")
+    session_id: str = Field(min_length=1, max_length=200)
+    expected_revision: int = Field(ge=1)
     model: Optional[str] = Field(default=None, description="Model name (or path for llama.cpp)")
     base_url: Optional[str] = Field(default=None, description="Base URL for local servers (Ollama/LM Studio/LocalAI/vLLM)")
     openai_model: Optional[str] = Field(default=None, description="OpenAI model override when provider=openai")
@@ -2973,35 +4099,6 @@ class CapabilitiesResponse(BaseModel):
     trust: Dict[str, Any] = Field(default_factory=dict)
     capability_registry: Dict[str, Any] = Field(default_factory=dict)
     thread_context: Dict[str, Any] = Field(default_factory=dict)
-
-
-class CodingReadinessResponse(BaseModel):
-    schema_version: int = 2
-    session_id: str
-    ok: bool
-    ready_for_reading: bool
-    ready_for_editing: bool
-    project: Dict[str, Any]
-    model: Dict[str, Any]
-    provider: Dict[str, Any]
-    workspace: Dict[str, Any]
-    file_roots: Dict[str, Any]
-    tools: Dict[str, str]
-    tool_details: Dict[str, str] = Field(default_factory=dict)
-    tool_rows: List[Dict[str, Any]] = Field(default_factory=list)
-    permissions: Dict[str, bool]
-    approval: Dict[str, Any]
-    terminal: Dict[str, Any]
-    blockers: List[Dict[str, str]] = Field(default_factory=list)
-    warnings: List[Dict[str, str]] = Field(default_factory=list)
-    blocked_tools: List[str]
-    missing_tools: List[str]
-    recommended_loop: List[str]
-    recommendations: List[str]
-    # v7.5.0: terminal sandbox status (host vs docker; never implies available if probe fails)
-    sandbox: Dict[str, Any] = Field(default_factory=dict)
-    # v7.5.2: live coding-loop state machine snapshot
-    coding_loop: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PendingActionResponse(BaseModel):
@@ -3037,9 +4134,14 @@ async def query(request: QueryRequest):
     Returns:
         Agent response.
     """
-    request_id = str(uuid.uuid4())
+    request_id = str(request.client_request_id or "").strip() or str(uuid.uuid4())
+    cancel_event = threading.Event()
+    _register_query_cancellation(
+        request_id, request.thread_id or "default", cancel_event
+    )
     _metric_inc("requests", 1)
     try:
+        source = _prepare_query_transport(request, request_id)
         logger.debug(
             "Query request_id={} thread_id={} include_memory={} msg_len={}",
             request_id,
@@ -3047,45 +4149,11 @@ async def query(request: QueryRequest):
             bool(request.include_memory),
             len((request.message or "")),
         )
-        # The explicit Session exists independently of optional model readiness.
-        # Record its real user activity before provider/coding preflight so a
-        # blocked first Turn never leaves a misleading zero-message placeholder.
+        # The explicit Session exists independently of model readiness. Every
+        # accepted message proceeds to process_query so the canonical runtime
+        # creates an Execution before provider/understanding failure is recorded.
         _record_session_message(request.thread_id, request.message)
-        if _should_preflight_provider(request.message):
-            readiness = _check_provider_readiness()
-            if not bool(readiness.get("ok")):
-                logger.warning(
-                    "Provider preflight failed for /query request_id={} provider={} detail={}",
-                    request_id,
-                    readiness.get("provider"),
-                    readiness.get("detail"),
-                )
-                payload = _provider_unavailable_payload(request_id, readiness)
-                return QueryResponse(
-                    response=str(payload["response"]),
-                    success=False,
-                    memory_count=0,
-                    request_id=request_id,
-                    doc_sources=[],
-                    research=[],
-                    execution_id=None,
-                    trace_id=None,
-                    thread_state=None,
-                )
         agent = get_agent(request.thread_id)
-        _coding_report, coding_blocker = _coding_preflight_payload(agent, request.thread_id, request.message)
-        if coding_blocker:
-            return QueryResponse(
-                response=coding_blocker,
-                success=False,
-                memory_count=0,
-                request_id=request_id,
-                doc_sources=[],
-                research=[],
-                execution_id=None,
-                trace_id=None,
-                thread_state=get_state_store().get_thread_state(request.thread_id).model_dump(),
-            )
         # process_query restores Session scope under its request lock. Query
         # payloads do not override backend-selected workspace/mode.
         thread_state = get_state_store().get_thread_state(request.thread_id).model_dump()
@@ -3096,11 +4164,36 @@ async def query(request: QueryRequest):
             include_memory=request.include_memory,
             callbacks=[handler],
             thread_id=request.thread_id,
+            source=source,
+            cancel_event=cancel_event,
+            request_id=request_id,
+            thinking_enabled=request.thinking_enabled,
+            reasoning_effort=request.reasoning_effort,
         )
         doc_sources = agent.get_last_doc_sources() if request.include_memory else []
         store = get_state_store()
         latest_state = store.get_thread_state(request.thread_id).model_dump()
-        execution = store.get_execution(latest_state.get("last_execution_id") or "") if latest_state.get("last_execution_id") else None
+        worker_execution_id = str(
+            getattr(agent, "completed_execution_id_for_current_worker", lambda: "")() or ""
+        )
+        if not worker_execution_id and not request.voice_turn_id:
+            worker_execution_id = str(latest_state.get("last_execution_id") or "")
+        if request.voice_turn_id and not worker_execution_id:
+            raise RuntimeError("Voice query completed without an exact worker Execution identity")
+        execution = store.get_execution(worker_execution_id) if worker_execution_id else None
+        if request.voice_turn_id and execution is None:
+            raise RuntimeError("Voice query completed without its durable Execution")
+        if request.voice_turn_id and execution is not None:
+            from agent.voice_transport import bind_voice_turn_submission
+
+            bind_voice_turn_submission(
+                request.voice_turn_id,
+                session_id=_normalize_thread_id(request.thread_id),
+                request_id=request_id,
+                execution_id=execution.id,
+                task_run_id=str(execution.task_run_id or ""),
+                query_completed=True,
+            )
 
         return QueryResponse(
             response=response,
@@ -3112,11 +4205,33 @@ async def query(request: QueryRequest):
             execution_id=execution.id if execution else None,
             trace_id=execution.trace_id if execution else None,
             thread_state=latest_state or thread_state,
+            voice_turn_id=request.voice_turn_id,
         )
     except Exception as e:
+        if request.voice_turn_id:
+            try:
+                from agent.voice_transport import fail_voice_turn
+
+                fail_voice_turn(
+                    request.voice_turn_id,
+                    session_id=_normalize_thread_id(request.thread_id),
+                    error_code="voice_query_failed",
+                )
+            except Exception:
+                pass
         _metric_inc("errors", 1)
-        logger.error(f"Query error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        diagnostic_id = hashlib.sha256(
+            f"{request_id}:{type(e).__name__}:{e}".encode("utf-8", errors="ignore")
+        ).hexdigest()[:12]
+        logger.exception(
+            "Query failed request_id={} diagnostic_id={}", request_id, diagnostic_id
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={"message": _safe_stream_failure(e), "diagnostic_id": diagnostic_id},
+        )
+    finally:
+        _release_query_cancellation(request_id, cancel_event)
 
 
 @app.post("/memory/compact")
@@ -3334,14 +4449,24 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
                                 server_cfg = sv
                                 break
                 if isinstance(server_cfg, dict):
-                    trust_state = str(server_cfg.get("trust") or server_cfg.get("trust_state") or "configured").strip() or "configured"
+                    trust_state = (
+                        "capability_destructive"
+                        if risk_level == "destructive"
+                        else "capability_governed"
+                        if is_action
+                        else "capability_read"
+                    )
                     transport = str(server_cfg.get("transport") or "stdio")
                 else:
                     # Loaded tool without matching config key — infer from registry risk
                     if entry is not None and not entry.is_action:
-                        trust_state = "trusted"
+                        trust_state = "capability_read"
                     else:
-                        trust_state = "configured"
+                        trust_state = (
+                            "capability_destructive"
+                            if risk_level == "destructive"
+                            else "capability_governed"
+                        )
                     transport = "stdio"
                 if not mcp_client_present:
                     allowed_by_policy = False
@@ -3518,25 +4643,6 @@ async def capabilities(thread_id: Optional[str] = Query(default=None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/coding/readiness", response_model=CodingReadinessResponse)
-async def coding_readiness(thread_id: Optional[str] = Query(default=None)):
-    """Report whether Echo is ready to execute the coding-agent lifecycle."""
-    try:
-        agent = get_agent(thread_id)
-        _apply_thread_scope(agent, thread_id)
-        from agent.coding_readiness import build_coding_readiness
-
-        report = build_coding_readiness(agent, thread_id, _check_provider_readiness())
-        try:
-            report["coding_loop"] = agent.get_coding_loop_state() if hasattr(agent, "get_coding_loop_state") else {}
-        except Exception:
-            report["coding_loop"] = {"active": False}
-        return CodingReadinessResponse(**report)
-    except Exception as e:
-        logger.error(f"Coding readiness error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.get("/pending-action", response_model=PendingActionResponse)
 async def get_pending_action(thread_id: Optional[str] = Query(default=None)):
     """Get structured pending action info for confirmation UI with risk levels and session permissions."""
@@ -3544,7 +4650,7 @@ async def get_pending_action(thread_id: Optional[str] = Query(default=None)):
         store = get_state_store()
         pending_record = store.get_pending_approval(thread_id)
         pending = pending_record.model_dump() if pending_record else None
-        
+
         if not pending:
             return PendingActionResponse(
                 has_pending=False,
@@ -3556,16 +4662,16 @@ async def get_pending_action(thread_id: Optional[str] = Query(default=None)):
                 session_permissions={},
                 dry_run_available=False,
             )
-        
+
         tool_name = str(pending.get("tool") or "").strip()
-        
+
         # Import tool metadata
         from agent.tools import TOOL_METADATA
-        
+
         meta = TOOL_METADATA.get(tool_name, {})
         risk_level = meta.get("risk_level", "safe")
         policy_flags = meta.get("policy_flags", [])
-        
+
         # Risk color mapping for UI
         risk_colors = {
             "safe": "#22c55e",      # green
@@ -3573,11 +4679,11 @@ async def get_pending_action(thread_id: Optional[str] = Query(default=None)):
             "destructive": "#ef4444",  # red
         }
         risk_color = risk_colors.get(risk_level, "#6b7280")
-        
+
         # Check dry-run availability (desktop automation tools support dry_run)
         dry_run_tools = {"desktop_click", "desktop_type_text", "desktop_activate_window", "desktop_send_hotkey"}
         dry_run_available = tool_name in dry_run_tools
-        
+
         # Session permissions - what actions are allowed this session
         session_permissions = {
             "system_actions": bool(getattr(config, "enable_system_actions", False)),
@@ -3586,7 +4692,7 @@ async def get_pending_action(thread_id: Optional[str] = Query(default=None)):
             "desktop": bool(getattr(config, "allow_desktop_automation", False)),
             "playwright": bool(getattr(config, "allow_playwright", False)),
         }
-        
+
         return PendingActionResponse(
             has_pending=True,
             action=pending,
@@ -3602,10 +4708,474 @@ async def get_pending_action(thread_id: Optional[str] = Query(default=None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class SpecialistRunCreateRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+    project_id: str = Field(min_length=1)
+    runtime_id: Literal["codex", "opencode"]
+    objective: str = Field(min_length=1, max_length=8000)
+    task_run_id: str = ""
+    requirement_id: str = ""
+    expected_task_revision: Optional[int] = Field(default=None, ge=1)
+    expected_model_binding_revision: int = Field(ge=1)
+    model_provider: str = ""
+    model_id: str = ""
+    local_base_url: str = ""
+
+
+class SpecialistTurnRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+    project_id: str = Field(min_length=1)
+    prompt: str = Field(min_length=1, max_length=32000)
+
+
+class SpecialistDecisionRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+    project_id: str = Field(min_length=1)
+    decision: Literal["approve", "deny"]
+
+
+class SpecialistScopeRequest(BaseModel):
+    session_id: str = Field(min_length=1)
+    project_id: str = Field(min_length=1)
+
+
+def _specialist_project_scope(session_id: str, project_id: str):
+    from agent.specialist_authority import (
+        SpecialistAuthorityError,
+        resolve_specialist_scope,
+    )
+
+    try:
+        return resolve_specialist_scope(session_id, project_id)
+    except SpecialistAuthorityError as exc:
+        status = 404 if str(exc) in {"Session not found", "Project not found"} else 409
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+def _specialist_local_base_url(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if (
+        parsed.scheme != "http"
+        or parsed.username
+        or parsed.password
+        or str(parsed.hostname or "").casefold() not in {
+            "127.0.0.1", "localhost", "::1",
+        }
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Local model base URL must be unauthenticated HTTP loopback",
+        )
+    return text.rstrip("/")
+
+
+def _validate_specialist_run_authority(run: Any, operation: str) -> None:
+    """Fresh Echo-level validation before each specialist lifecycle action."""
+
+    from agent.specialist_authority import (
+        SpecialistAuthorityError,
+        validate_specialist_run_authority,
+    )
+
+    try:
+        validate_specialist_run_authority(run, operation)
+    except SpecialistAuthorityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/specialist-runtimes")
+async def list_specialist_runtimes_api():
+    """Discover configured specialist agents; raw model providers are not listed."""
+
+    from agent.specialist_runtime import get_specialist_runtime_manager
+
+    items = get_specialist_runtime_manager().catalog()
+    return {
+        "items": [item.model_dump(mode="json") for item in items],
+        "count": len(items),
+        "owner": "SpecialistRuntimeManager",
+    }
+
+
+@app.get("/specialist-runs")
+async def list_specialist_runs_api(
+    session_id: str = Query(...),
+    project_id: str = Query(...),
+    task_run_id: str = Query(default=""),
+):
+    _specialist_project_scope(session_id, project_id)
+    from agent.specialist_store import get_specialist_run_store
+
+    rows = get_specialist_run_store().list(
+        session_id=session_id,
+        project_id=project_id,
+        task_run_id=task_run_id,
+        limit=200,
+    )
+    return {
+        "items": [row.model_dump(mode="json") for row in rows],
+        "count": len(rows),
+    }
+
+
+@app.get("/specialist-runs/{run_id}")
+async def get_specialist_run_api(
+    run_id: str,
+    session_id: str = Query(...),
+    project_id: str = Query(...),
+    after: int = Query(default=0, ge=0),
+):
+    _specialist_project_scope(session_id, project_id)
+    from agent.specialist_runtime import get_specialist_runtime_manager
+
+    projection = get_specialist_runtime_manager().projection(
+        run_id,
+        session_id=session_id,
+        project_id=project_id,
+        after=after,
+        limit=1000,
+    )
+    if projection is None:
+        raise HTTPException(status_code=404, detail="SpecialistRun not found")
+    return projection.model_dump(mode="json")
+
+
+@app.get("/specialist-runs/{run_id}/stream")
+async def stream_specialist_run_api(
+    run_id: str,
+    request: Request,
+    session_id: str = Query(...),
+    project_id: str = Query(...),
+    after: int = Query(default=0, ge=0),
+):
+    """Stream exact-scope SpecialistRun projections on durable revision changes."""
+
+    _specialist_project_scope(session_id, project_id)
+    from agent.specialist_contracts import TERMINAL_SPECIALIST_STATUSES
+    from agent.specialist_store import get_specialist_run_store
+
+    store = get_specialist_run_store()
+    initial = store.get(
+        run_id, session_id=session_id, project_id=project_id
+    )
+    if initial is None:
+        raise HTTPException(status_code=404, detail="SpecialistRun not found")
+
+    async def generate():
+        last_sequence = int(after)
+        current = initial
+        while True:
+            events = store.list_events(
+                current.id, after=last_sequence, limit=2000
+            )
+            if events:
+                last_sequence = max(item.sequence for item in events)
+            yield json.dumps(
+                {
+                    "type": "specialist_projection",
+                    "run": current.model_dump(mode="json"),
+                    "events": [
+                        item.model_dump(mode="json") for item in events
+                    ],
+                },
+                ensure_ascii=False,
+            ) + "\n"
+            if current.status in TERMINAL_SPECIALIST_STATUSES:
+                return
+            revision = current.revision
+            current = await asyncio.to_thread(
+                store.wait_for_revision,
+                current.id,
+                after_revision=revision,
+                timeout=15.0,
+            )
+            if current is None or await request.is_disconnected():
+                return
+            if current.revision == revision:
+                yield json.dumps({
+                    "type": "keepalive",
+                    "run_id": current.id,
+                    "revision": current.revision,
+                }) + "\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/specialist-runs")
+async def create_specialist_run_api(request: SpecialistRunCreateRequest):
+    """Explicit Code action; opening/navigating the Code view never calls this."""
+
+    from agent.execution_graph import ExecutionProfile
+    from agent.research_runtime import RequirementKind, TurnRequirement
+    from agent.semantic_runtime import get_canonical_semantic_runtime
+    from agent.specialist_authority import (
+        SpecialistAuthorityError,
+        validate_specialist_delegation_policy,
+    )
+    from agent.specialist_contracts import SpecialistAuthoritySnapshot
+    from agent.specialist_runtime import get_specialist_runtime_manager
+    from agent.task_runs import TERMINAL_TASK_STATUSES, get_task_run_store
+
+    _state, _project, root = _specialist_project_scope(
+        request.session_id, request.project_id
+    )
+    binding = _ensure_session_model_binding(request.session_id)
+    if binding.binding_revision != request.expected_model_binding_revision:
+        raise HTTPException(
+            status_code=409,
+            detail="Session model binding changed before specialist delegation",
+        )
+    manager = get_specialist_runtime_manager()
+    descriptor = manager.descriptor(request.runtime_id)
+    if descriptor.state.value != "available":
+        raise HTTPException(
+            status_code=409,
+            detail=descriptor.reason or "Specialist runtime is unavailable",
+        )
+    try:
+        validate_specialist_delegation_policy(request.runtime_id)
+    except SpecialistAuthorityError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    store = get_task_run_store()
+    task = None
+    requirement_id = str(request.requirement_id or "").strip()
+    if request.task_run_id:
+        task = store.get(
+            request.task_run_id,
+            session_id=request.session_id,
+            project_id=request.project_id,
+        )
+        if task is None:
+            raise HTTPException(status_code=404, detail="TaskRun not found")
+        if request.expected_task_revision is None:
+            raise HTTPException(
+                status_code=422,
+                detail="expected_task_revision is required for an existing TaskRun",
+            )
+        if task.revision != request.expected_task_revision:
+            raise HTTPException(
+                status_code=409,
+                detail="TaskRun changed before specialist delegation",
+            )
+        if task.status in TERMINAL_TASK_STATUSES:
+            raise HTTPException(status_code=409, detail="TaskRun is terminal")
+        requirement = next(
+            (
+                item for item in task.requirements
+                if item.requirement_id == requirement_id
+            ),
+            None,
+        )
+        if requirement is None or requirement.kind != RequirementKind.SPECIALIST:
+            raise HTTPException(
+                status_code=409,
+                detail="Selected TaskRun requirement is not specialist-owned",
+            )
+    else:
+        task = store.create(
+            session_id=request.session_id,
+            project_id=request.project_id,
+            objective=request.objective,
+            requested_operation="coding_write",
+            permitted_capabilities=["specialist_code"],
+            requirements=[TurnRequirement(
+                kind=RequirementKind.SPECIALIST,
+                objective=request.objective,
+                acceptance_criteria=[
+                    "A configured specialist runtime must return one verified terminal outcome."
+                ],
+            )],
+            execution_profile=ExecutionProfile.CODE,
+            source="code",
+            workflow_stage="specialist_requested",
+        )
+        requirement_id = task.requirements[0].requirement_id
+    graph_node = next(
+        (
+            item
+            for item in list(getattr(task.execution_graph, "nodes", []) or [])
+            if item.requirement_id == requirement_id
+        ),
+        None,
+    )
+    if graph_node is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Specialist requirement has no owning TaskRun graph node",
+        )
+    authority = SpecialistAuthoritySnapshot(
+        session_id=request.session_id,
+        project_id=request.project_id,
+        project_root=str(root),
+        task_run_id=task.id,
+        requirement_id=requirement_id,
+        graph_node_id=graph_node.node_id,
+        model_binding_revision=binding.binding_revision,
+        approval_policy="on_request",
+        sandbox_mode="read_only",
+    )
+    local_base_url = _specialist_local_base_url(request.local_base_url)
+    try:
+        run = manager.create_and_start(
+            runtime_id=request.runtime_id,
+            task=task,
+            requirement_id=requirement_id,
+            project_root=str(root),
+            objective=request.objective,
+            authority=authority,
+            model_provider=request.model_provider,
+            model_id=request.model_id,
+            local_base_url=local_base_url,
+            authority_validator=_validate_specialist_run_authority,
+            continuation_scheduler=lambda finished: (
+                get_canonical_semantic_runtime().schedule_specialist_continuation(
+                    get_agent(request.session_id), finished
+                )
+            ),
+        )
+    except HTTPException:
+        raise
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "run": run.model_dump(mode="json"),
+        "task_run_id": task.id,
+        "requirement_id": requirement_id,
+    }
+
+
+@app.post("/specialist-runs/{run_id}/turn")
+async def continue_specialist_run_api(
+    run_id: str, request: SpecialistTurnRequest
+):
+    _specialist_project_scope(request.session_id, request.project_id)
+    from agent.semantic_runtime import get_canonical_semantic_runtime
+    from agent.specialist_runtime import get_specialist_runtime_manager
+    from agent.specialist_store import get_specialist_run_store
+
+    run = get_specialist_run_store().get(
+        run_id,
+        session_id=request.session_id,
+        project_id=request.project_id,
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="SpecialistRun not found")
+    try:
+        updated = get_specialist_runtime_manager().continue_run(
+            run.id,
+            prompt=request.prompt,
+            authority_validator=_validate_specialist_run_authority,
+            continuation_scheduler=lambda finished: (
+                get_canonical_semantic_runtime().schedule_specialist_continuation(
+                    get_agent(request.session_id), finished
+                )
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"run": updated.model_dump(mode="json")}
+
+
+@app.post("/specialist-runs/{run_id}/interrupt")
+async def interrupt_specialist_run_api(
+    run_id: str, request: SpecialistScopeRequest
+):
+    _specialist_project_scope(request.session_id, request.project_id)
+    from agent.specialist_runtime import get_specialist_runtime_manager
+
+    try:
+        run = get_specialist_runtime_manager().interrupt(
+            run_id, authority_validator=_validate_specialist_run_authority
+        )
+    except HTTPException:
+        raise
+    except (KeyError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"run": run.model_dump(mode="json")}
+
+
+@app.post("/specialist-runs/{run_id}/approvals/{request_id}")
+async def resolve_specialist_approval_api(
+    run_id: str,
+    request_id: str,
+    request: SpecialistDecisionRequest,
+):
+    from agent.specialist_runtime import get_specialist_runtime_manager
+    from agent.specialist_store import get_specialist_run_store
+
+    _specialist_project_scope(request.session_id, request.project_id)
+    run = get_specialist_run_store().get(
+        run_id,
+        session_id=request.session_id,
+        project_id=request.project_id,
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="SpecialistRun not found")
+    # Denial executes no action and remains safe even when current authority was
+    # reduced. Approval must revalidate both Echo ownership and the relevant
+    # high-level permission before the specialist receives a one-shot decision.
+    validator = None
+    if request.decision == "approve":
+        from agent.specialist_authority import (
+            SpecialistAuthorityError,
+            validate_specialist_approval_authority,
+        )
+        try:
+            validate_specialist_approval_authority(run, request_id)
+        except SpecialistAuthorityError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        validator = _validate_specialist_run_authority
+    try:
+        updated = get_specialist_runtime_manager().resolve_approval(
+            run.id,
+            request_id,
+            request.decision,
+            authority_validator=validator,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"run": updated.model_dump(mode="json")}
+
+
 @app.get("/threads/{thread_id}/state", response_model=ThreadSessionStateResponse)
 async def get_thread_state(thread_id: str):
     store = get_state_store()
     return ThreadSessionStateResponse(**store.get_thread_state(thread_id).model_dump())
+
+
+class SessionModelBindingResponse(BaseModel):
+    session_id: str
+    provider_id: str
+    model_id: str
+    provider_configuration_id: str
+    binding_revision: int
+    created_at: float
+    updated_at: float
+
+
+@app.get("/sessions/{session_id}/model-binding", response_model=SessionModelBindingResponse)
+async def get_session_model_binding(session_id: str):
+    from agent.threads import get_thread_manager
+
+    if get_thread_manager().get_thread(session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return SessionModelBindingResponse(**_ensure_session_model_binding(session_id).model_dump())
 
 
 @app.get("/sessions/{session_id}/runtime")
@@ -3640,12 +5210,28 @@ async def confirm_approval(
     if approval.status != "pending" or state.pending_approval_id != approval_id:
         raise HTTPException(status_code=409, detail="Approval is stale or is not the current pending action")
     agent = get_agent(approval.thread_id)
-    agent._requested_approval_id = approval_id
-    response, success = agent.process_query("confirm", include_memory=False, thread_id=approval.thread_id)
+    response, success = agent.process_query(
+        "confirm",
+        include_memory=False,
+        thread_id=approval.thread_id,
+        requested_approval_id=approval_id,
+    )
     updated = store.get_approval(approval_id)
     if updated is None:
         raise HTTPException(status_code=500, detail="Approval missing after confirm")
     thread_state = store.get_thread_state(approval.thread_id)
+    task_summary = None
+    if updated.task_run_id:
+        try:
+            from agent.task_runs import get_task_run_store
+            resumed = get_task_run_store().get(
+                updated.task_run_id,
+                session_id=updated.session_id,
+                project_id=updated.project_id,
+            )
+            task_summary = _task_run_summary(resumed) if resumed is not None else None
+        except Exception as exc:
+            logger.warning("Approval TaskRun response projection failed: {}", exc)
     try:
         from agent.skill_execution import (
             finalize_skill_executions_for_turn,
@@ -3677,6 +5263,8 @@ async def confirm_approval(
         response=str(response or ""),
         execution_id=thread_state.last_execution_id or None,
         thread_state=thread_state.model_dump(),
+        task_run=task_summary,
+        tool_run_id=str(updated.tool_run_id or ""),
     )
 
 
@@ -3707,12 +5295,39 @@ async def cancel_approval(
     if updated is None:
         raise HTTPException(status_code=500, detail="Approval missing after cancel")
     thread_state = store.get_thread_state(approval.thread_id)
+    task_summary = None
+    if approval.task_run_id:
+        try:
+            from agent.task_runs import TaskRunStatus, get_task_run_store
+            task_store = get_task_run_store()
+            task = task_store.get(
+                approval.task_run_id,
+                session_id=approval.session_id,
+                project_id=approval.project_id,
+            )
+            if (
+                task is not None
+                and task.status == TaskRunStatus.SUSPENDED_WAITING_FOR_APPROVAL
+                and task.revision == approval.task_run_revision
+            ):
+                task = task_store.update(
+                    task.id,
+                    session_id=task.session_id,
+                    project_id=task.project_id,
+                    expected_revision=task.revision,
+                    status=TaskRunStatus.CANCELLED,
+                    workflow_stage="approval_cancelled",
+                )
+                task_summary = _task_run_summary(task)
+        except Exception as exc:
+            logger.warning("Approval cancellation TaskRun reconciliation failed: {}", exc)
     return ApprovalDecisionResponse(
         approval=ApprovalResponse(**updated.model_dump()),
         success=True,
         response=f"Canceled: {updated.summary or updated.tool}.",
         execution_id=thread_state.last_execution_id or None,
         thread_state=thread_state.model_dump(),
+        task_run=task_summary,
     )
 
 
@@ -4044,325 +5659,6 @@ async def deactivate_project(thread_id: Optional[str] = Query(default=None)):
     return {"ok": True, "deactivated": True, "thread_state": get_state_store().get_thread_state(thread_id).model_dump()}
 
 
-# === Code workspace (project-scoped Preview / Files / Terminal / Changes) ===
-
-@app.get("/code/workspace")
-async def code_workspace(thread_id: Optional[str] = Query(default=None)):
-    """Project-aware workspace snapshot for the Code view.
-
-    Source of truth: attached Project + Session thread state. Never invents a project.
-    """
-    from agent.code_workspace import (
-        build_file_tree,
-        detect_project,
-        get_preview_manager,
-        resolve_project_context,
-    )
-    from pathlib import Path as _Path
-
-    tid = _normalize_thread_id(thread_id)
-    ctx = resolve_project_context(tid)
-    root_str = str(ctx.get("root") or "").strip()
-    if not root_str:
-        return {
-            "ok": False,
-            "attached": False,
-            "thread_id": tid,
-            "project_id": ctx.get("project_id") or "",
-            "project_name": "",
-            "root": "",
-            "display_name": "",
-            "files": [],
-            "detection": {
-                "kind": "none",
-                "label": "No project attached",
-                "preview_available": False,
-                "reason": "Attach a Project folder to this Session to use the Code workspace.",
-                "entrypoints": [],
-                "preview_strategy": "none",
-                "preview_command": "",
-                "run_command_hint": "",
-                "signals": [],
-            },
-            "preview": get_preview_manager().status(tid),
-            "mode": ctx.get("mode") or "",
-            "phase": ctx.get("phase") or "",
-            "objective": ctx.get("objective") or "",
-            "writable": bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_file_write", False)),
-            "terminal_enabled": bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_terminal_commands", False)),
-            "message": "No project attached to this session.",
-        }
-
-    root = _Path(root_str)
-    if not root.exists() or not root.is_dir():
-        return {
-            "ok": False,
-            "attached": True,
-            "thread_id": tid,
-            "project_id": ctx.get("project_id") or "",
-            "project_name": ctx.get("project_name") or root.name,
-            "root": root_str,
-            "display_name": ctx.get("project_name") or root.name,
-            "files": [],
-            "detection": {
-                "kind": "missing",
-                "label": "Missing project folder",
-                "preview_available": False,
-                "reason": f"Project root does not exist: {root_str}",
-                "entrypoints": [],
-                "preview_strategy": "none",
-                "preview_command": "",
-                "run_command_hint": "",
-                "signals": [],
-            },
-            "preview": get_preview_manager().status(tid),
-            "mode": ctx.get("mode") or "",
-            "phase": ctx.get("phase") or "",
-            "objective": ctx.get("objective") or "",
-            "writable": bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_file_write", False)),
-            "terminal_enabled": bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_terminal_commands", False)),
-            "message": f"Project root missing on disk: {root_str}",
-        }
-
-    detection = detect_project(root)
-    files = build_file_tree(root, max_depth=3, max_items=250)
-    preview = get_preview_manager().status(tid)
-    # Drop stale preview if it points at a different project root
-    if preview.get("running") and preview.get("project_root"):
-        try:
-            if os.path.normcase(str(preview.get("project_root"))) != os.path.normcase(str(root.resolve())):
-                get_preview_manager().stop(tid)
-                preview = get_preview_manager().status(tid)
-        except Exception:
-            pass
-
-    return {
-        "ok": True,
-        "attached": True,
-        "thread_id": tid,
-        "project_id": ctx.get("project_id") or "",
-        "project_name": ctx.get("project_name") or root.name,
-        "root": str(root.resolve()),
-        "display_name": ctx.get("project_name") or root.name,
-        "files": files,
-        "detection": detection.as_dict(),
-        "preview": preview,
-        "mode": ctx.get("mode") or "",
-        "phase": ctx.get("phase") or "",
-        "objective": ctx.get("objective") or "",
-        "current_subject": ctx.get("current_subject") or "",
-        "execution_status": ctx.get("execution_status") or "",
-        "active_turn_id": ctx.get("active_turn_id") or "",
-        "writable": bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_file_write", False)),
-        "terminal_enabled": bool(getattr(config, "enable_system_actions", False) and getattr(config, "allow_terminal_commands", False)),
-        "message": "",
-    }
-
-
-@app.get("/code/file")
-async def code_file(
-    path: str = Query(..., description="Relative path within the attached project"),
-    thread_id: Optional[str] = Query(default=None),
-):
-    """Read a real file from the attached project root only."""
-    from agent.code_workspace import read_text_file, resolve_project_context, resolve_under_root
-    from pathlib import Path as _Path
-
-    tid = _normalize_thread_id(thread_id)
-    ctx = resolve_project_context(tid)
-    root_str = str(ctx.get("root") or "").strip()
-    if not root_str:
-        raise HTTPException(status_code=404, detail="No project attached to this session")
-    root = _Path(root_str)
-    if not root.exists():
-        raise HTTPException(status_code=404, detail="Project root not found on disk")
-    target = resolve_under_root(root, path)
-    if target is None:
-        raise HTTPException(status_code=403, detail="Path is outside the attached project")
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    if not target.is_file():
-        raise HTTPException(status_code=400, detail="Path is not a file")
-    try:
-        content, meta = read_text_file(target)
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    try:
-        rel = str(target.relative_to(root.resolve())).replace("\\", "/")
-    except Exception:
-        rel = path
-    return {
-        "ok": True,
-        "thread_id": tid,
-        "root": str(root.resolve()),
-        "path": rel,
-        "name": target.name,
-        "content": content,
-        "binary": bool(meta.get("binary")),
-        "truncated": bool(meta.get("truncated")),
-        "size": meta.get("size") or 0,
-        "mtime": meta.get("mtime") or 0,
-    }
-
-
-@app.get("/code/activity")
-async def code_activity(
-    thread_id: Optional[str] = Query(default=None),
-    limit: int = Query(default=60, ge=1, le=200),
-):
-    """Session-scoped terminal ToolRuns and file change ToolRuns (no cross-session bleed)."""
-    from agent.code_workspace import build_session_activity
-
-    tid = _normalize_thread_id(thread_id)
-    return build_session_activity(tid, limit=limit)
-
-
-@app.get("/code/preview")
-async def code_preview_status(thread_id: Optional[str] = Query(default=None)):
-    from agent.code_workspace import get_preview_manager
-
-    tid = _normalize_thread_id(thread_id)
-    return get_preview_manager().status(tid)
-
-
-@app.post("/code/preview/start")
-async def code_preview_start(thread_id: Optional[str] = Query(default=None)):
-    """Launch a project-local preview when detection says it is possible."""
-    from agent.code_workspace import detect_project, get_preview_manager, resolve_project_context
-    from pathlib import Path as _Path
-
-    tid = _normalize_thread_id(thread_id)
-    ctx = resolve_project_context(tid)
-    root_str = str(ctx.get("root") or "").strip()
-    if not root_str:
-        raise HTTPException(status_code=404, detail="No project attached to this session")
-    root = _Path(root_str)
-    if not root.exists() or not root.is_dir():
-        raise HTTPException(status_code=404, detail="Project root not found on disk")
-    detection = detect_project(root)
-    result = get_preview_manager().start(tid, root, detection)
-    result["detection"] = detection.as_dict()
-    result["thread_id"] = tid
-    result["root"] = str(root.resolve())
-    if not result.get("ok"):
-        # Honest non-2xx for unavailable, but keep body useful
-        return result
-    return result
-
-
-@app.post("/code/preview/stop")
-async def code_preview_stop(thread_id: Optional[str] = Query(default=None)):
-    from agent.code_workspace import get_preview_manager
-
-    tid = _normalize_thread_id(thread_id)
-    result = get_preview_manager().stop(tid)
-    result["thread_id"] = tid
-    result["preview"] = get_preview_manager().status(tid)
-    return result
-
-
-@app.get("/code/diff")
-async def code_diff(
-    path: str = Query(..., description="Absolute or project-relative file path"),
-    thread_id: Optional[str] = Query(default=None),
-):
-    """Diff current file against the latest checkpoint for this session/project when available."""
-    from agent.code_workspace import resolve_project_context, resolve_under_root, read_text_file
-    from agent.checkpoints import _load_index
-    from pathlib import Path as _Path
-    import difflib
-
-    tid = _normalize_thread_id(thread_id)
-    ctx = resolve_project_context(tid)
-    root_str = str(ctx.get("root") or "").strip()
-    if not root_str:
-        raise HTTPException(status_code=404, detail="No project attached")
-    root = _Path(root_str)
-    raw = str(path or "").strip()
-    target: Optional[_Path] = None
-    try:
-        p = _Path(raw)
-        if p.is_absolute() and p.exists():
-            # must stay under root
-            if os.path.commonpath([os.path.normcase(str(root.resolve())), os.path.normcase(str(p.resolve()))]) == os.path.normcase(str(root.resolve())):
-                target = p.resolve()
-    except Exception:
-        target = None
-    if target is None:
-        target = resolve_under_root(root, raw)
-    if target is None or not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail="File not found in project")
-
-    current, meta = read_text_file(target)
-    if meta.get("binary"):
-        return {
-            "ok": True,
-            "path": str(target),
-            "has_checkpoint": False,
-            "binary": True,
-            "original": "",
-            "current": "",
-            "unified_diff": "",
-            "message": "Binary file — no text diff.",
-        }
-
-    original = ""
-    checkpoint_meta = None
-    try:
-        for entry in reversed(_load_index()):
-            if str(entry.get("thread_id") or "legacy") not in {tid, "legacy"}:
-                continue
-            orig = str(entry.get("original_path") or "")
-            try:
-                if os.path.normcase(str(_Path(orig).resolve())) != os.path.normcase(str(target)):
-                    continue
-            except Exception:
-                if orig.replace("\\", "/").lower() != str(target).replace("\\", "/").lower():
-                    continue
-            bak = _Path(str(entry.get("backup_path") or ""))
-            if bak.is_file():
-                original = bak.read_text(encoding="utf-8", errors="replace")
-                checkpoint_meta = entry
-                break
-    except Exception:
-        pass
-
-    if not original:
-        return {
-            "ok": True,
-            "path": str(target),
-            "has_checkpoint": False,
-            "binary": False,
-            "original": current,
-            "current": current,
-            "unified_diff": "",
-            "message": "No checkpoint for this file in this session — showing current contents only.",
-            "size": meta.get("size") or 0,
-        }
-
-    diff_lines = list(
-        difflib.unified_diff(
-            original.splitlines(),
-            current.splitlines(),
-            fromfile=f"a/{target.name}",
-            tofile=f"b/{target.name}",
-            lineterm="",
-        )
-    )
-    return {
-        "ok": True,
-        "path": str(target),
-        "has_checkpoint": True,
-        "binary": False,
-        "original": original,
-        "current": current,
-        "unified_diff": "\n".join(diff_lines),
-        "checkpoint": checkpoint_meta,
-        "size": meta.get("size") or 0,
-        "message": "",
-    }
-
-
 # === Routine Management Endpoints ===
 
 class RoutineResponse(BaseModel):
@@ -4687,59 +5983,46 @@ async def heartbeat_history(limit: int = 20):
 
 
 # ---------------------------------------------------------------------------
-# Proactive Engine API (v6.1.0)
+# Retired ProactiveEngine compatibility API
 # ---------------------------------------------------------------------------
 
 @app.get("/proactive")
 async def proactive_status():
-    """Get proactive engine status and tasks."""
-    from agent.proactive import get_proactive_engine
-    pe = get_proactive_engine()
-    if pe is None:
-        return {"running": False, "tasks": [], "channels": []}
+    """Project the retired scheduler contract without reviving its authority."""
     return {
-        "running": pe.is_running,
-        "tasks": pe.list_tasks(),
-        "channels": pe._channels,
+        "running": False,
+        "retired": True,
+        "tasks": [],
+        "channels": [],
+        "replacement": "/routines",
+        "message": (
+            "ProactiveEngine was retired. Routines, AutomationRuns, and TaskRuns "
+            "own scheduled and background work."
+        ),
     }
 
 
 @app.post("/proactive/task")
 async def proactive_add_task(request: Request):
-    """Add or remove a proactive task."""
-    data = await request.json()
-    from agent.proactive import get_proactive_engine
-    pe = get_proactive_engine()
-    if pe is None:
-        return {"ok": False, "error": "ProactiveEngine not running"}
-
-    action = data.get("action", "add")
-
-    if action == "remove":
-        task_id = data.get("task_id", "")
-        removed = pe.remove_task(task_id)
-        return {"ok": removed, "message": f"Task '{task_id}' {'removed' if removed else 'not found'}"}
-
-    # Default: add
-    task = pe.add_task(
-        prompt=data.get("prompt", ""),
-        priority=int(data.get("priority", 5)),
-        cooldown_minutes=int(data.get("cooldown_minutes", 60)),
-        label=data.get("label", "Custom Task"),
-        source="user",
-        max_runs=int(data.get("max_runs", 0)),
+    """Fail closed instead of creating work in a second scheduler."""
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "ProactiveEngine is retired. Create Project/Session-scoped work with "
+            "POST /routines so AutomationRun, Execution, and TaskRun lineage remain canonical."
+        ),
     )
-    return {"ok": True, "task": task.to_dict()}
 
 
 @app.get("/proactive/history")
 async def proactive_history(limit: int = 20):
-    """Get recent proactive engine actions."""
-    from agent.proactive import get_proactive_engine
-    pe = get_proactive_engine()
-    if pe is None:
-        return {"history": []}
-    return {"history": pe.get_history(limit=limit)}
+    """Return an inert compatibility projection; canonical history is TaskRun-owned."""
+    return {
+        "retired": True,
+        "history": [],
+        "replacement": "/routines",
+        "message": "Use routine and TaskRun projections for background-work history.",
+    }
 
 # ---------------------------------------------------------------------------
 # Discord API
@@ -4963,18 +6246,7 @@ async def twitter_autonomous_history():
 
 @app.get("/sessions", response_model=SessionsResponse)
 async def list_sessions():
-    multi_agent_enabled = bool(getattr(config, "multi_agent_enabled", True))
     runtime_provider = _runtime_provider.value if _runtime_provider is not None else None
-
-    if not multi_agent_enabled:
-        return SessionsResponse(
-            multi_agent_enabled=False,
-            pool_max=_agent_pool_max,
-            pool_size=1 if _agent is not None else 0,
-            thread_ids=["default"],
-            lm_studio_only=_is_lmstudio_only_enabled(),
-            runtime_provider=runtime_provider,
-        )
 
     with _agent_pool_lock:
         thread_ids = list(_agent_pool.keys())
@@ -5001,6 +6273,9 @@ class ThreadCreateRequest(BaseModel):
     source: str = Field(default="web", description="Source: web, discord, telegram, whatsapp, api")
     workspace_id: str = Field(default="", description="Optional workspace ID")
     project_id: str = Field(default="", description="Optional containing Project")
+    idempotency_key: str = Field(
+        default="", max_length=128, description="Opaque key that makes creation retries idempotent"
+    )
 
 class ThreadUpdateRequest(BaseModel):
     title: Optional[str] = Field(default=None, description="New title")
@@ -5059,11 +6334,16 @@ async def create_thread(request: ThreadCreateRequest):
     """Create a new conversation thread."""
     from agent.threads import get_thread_manager
     tm = get_thread_manager()
-    thread = tm.create_thread(
-        title=request.title,
-        source=request.source,
-        workspace_id=request.workspace_id,
-    )
+    try:
+        thread = tm.create_thread(
+            title=request.title,
+            source=request.source,
+            workspace_id=request.workspace_id,
+            idempotency_key=request.idempotency_key,
+            idempotency_context=request.project_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if request.project_id:
         agent = get_agent(thread.thread_id)
         with agent._request_lock:
@@ -5254,49 +6534,6 @@ async def a2a_list_tasks(request: Request, limit: int = 50):
 
 # ── Multi-Agent Orchestration Endpoints (v6.0.0) ────────────────
 
-@app.post("/orchestrate")
-async def orchestrate_query(request: Request):
-    """Submit a complex query for multi-agent orchestration.
-
-    Decomposes the query into sub-tasks, dispatches them in parallel
-    across the agent pool, and returns a merged response.
-    """
-    if not getattr(config, "orchestration_enabled", False):
-        raise HTTPException(status_code=404, detail="Orchestration is disabled")
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-
-    query = body.get("query", "").strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="Missing 'query' field")
-
-    from agent.orchestrator import get_orchestrator
-    orch = get_orchestrator()
-
-    # Run synchronously in a thread to avoid blocking the event loop
-    import asyncio
-    plan = await asyncio.to_thread(orch.run, query)
-
-    return plan.to_dict()
-
-
-@app.get("/orchestrate/{plan_id}")
-async def get_orchestration_plan(plan_id: str):
-    """Get the status and results of an orchestration plan."""
-    if not getattr(config, "orchestration_enabled", False):
-        raise HTTPException(status_code=404, detail="Orchestration is disabled")
-
-    from agent.orchestrator import get_orchestrator
-    orch = get_orchestrator()
-    plan = orch.get_plan(plan_id)
-    if not plan:
-        raise HTTPException(status_code=404, detail="Plan not found")
-    return plan.to_dict()
-
-
 @app.post("/documents/upload", response_model=DocumentItem)
 async def upload_document(
     file: UploadFile = File(...),
@@ -5374,7 +6611,9 @@ async def clear_documents(session_id: str = Query(...), project_id: str = Query(
 @app.post("/query/stream")
 async def query_stream(request: QueryRequest):
     q: queue.Queue = queue.Queue()
-    request_id = str(uuid.uuid4())
+    request_id = str(request.client_request_id or "").strip() or str(uuid.uuid4())
+    cancel_event = threading.Event()
+    _register_query_cancellation(request_id, request.thread_id or "default", cancel_event)
     _metric_inc("requests", 1)
 
     logger.debug(
@@ -5384,68 +6623,82 @@ async def query_stream(request: QueryRequest):
         bool(request.include_memory),
         len((request.message or "")),
     )
-    # Session metadata is authoritative even when an optional provider cannot
-    # run the Turn. Unknown ids still fail closed in _record_session_message.
-    _record_session_message(request.thread_id, request.message)
+    # Unknown Session ids still fail closed in _record_session_message. Provider
+    # and coding readiness are diagnosed only after the Turn owns an Execution.
+    try:
+        source = _prepare_query_transport(request, request_id)
+        _record_session_message(request.thread_id, request.message)
+        agent = get_agent(request.thread_id)
+        _start_agent_thread(
+            agent=agent,
+            message=request.message,
+            include_memory=request.include_memory,
+            thread_id=request.thread_id,
+            workspace=request.workspace,
+            request_id=request_id,
+            q=q,
+            cancel_event=cancel_event,
+            thinking_enabled=request.thinking_enabled,
+            reasoning_effort=request.reasoning_effort,
+            source=source,
+            voice_turn_id=str(request.voice_turn_id or ""),
+        )
+    except Exception as exc:
+        cancel_event.set()
+        _release_query_cancellation(request_id, cancel_event)
+        if request.voice_turn_id:
+            try:
+                from agent.voice_transport import fail_voice_turn
 
-    if _should_preflight_provider(request.message):
-        readiness = _check_provider_readiness()
-        if not bool(readiness.get("ok")):
-            logger.warning(
-                "Provider preflight failed for /query/stream request_id={} provider={} detail={}",
-                request_id,
-                readiness.get("provider"),
-                readiness.get("detail"),
-            )
-
-            async def unavailable_gen():
-                yield (json.dumps(
-                    {
-                        "type": "status",
-                        "agent_mode": "idle",
-                        "at": time.time(),
-                        "request_id": request_id,
-                    },
-                    ensure_ascii=False,
-                ) + "\n").encode("utf-8")
-                yield (json.dumps(_provider_unavailable_payload(request_id, readiness), ensure_ascii=False) + "\n").encode("utf-8")
-
-            return StreamingResponse(unavailable_gen(), media_type="application/x-ndjson")
-
-    agent = get_agent(request.thread_id)
-    _coding_report, coding_blocker = _coding_preflight_payload(agent, request.thread_id, request.message)
-    if coding_blocker:
-        async def coding_unavailable_gen():
-            yield (json.dumps(
-                {
-                    "type": "final",
-                    "response": coding_blocker,
-                    "success": False,
-                    "request_id": request_id,
-                    "error_code": str(((_coding_report.get("blockers") or [{}])[0] or {}).get("code") or "coding_not_ready"),
-                    "coding_readiness": _coding_report,
-                    "at": time.time(),
-                },
-                ensure_ascii=False,
-            ) + "\n").encode("utf-8")
-
-        return StreamingResponse(coding_unavailable_gen(), media_type="application/x-ndjson")
-    _start_agent_thread(
-        agent=agent,
-        message=request.message,
-        include_memory=request.include_memory,
-        thread_id=request.thread_id,
-        workspace=request.workspace,
-        request_id=request_id,
-        q=q,
-    )
+                fail_voice_turn(
+                    str(request.voice_turn_id),
+                    session_id=str(request.thread_id or "default"),
+                    error_code="voice_query_start_failed",
+                )
+            except Exception as voice_exc:
+                logger.warning(
+                    "Voice transport startup failure could not be persisted voice_turn_id={} request_id={} error_type={}",
+                    request.voice_turn_id,
+                    request_id,
+                    type(voice_exc).__name__,
+                )
+        raise
 
     async def gen():
-        while True:
-            item = await anyio.to_thread.run_sync(q.get)
-            if item is None:
-                break
-            yield (json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8")
+        first = True
+        startup_timeout = max(
+            1.0,
+            float(getattr(config, "stream_startup_timeout_seconds", 15.0) or 15.0),
+        )
+        try:
+            while True:
+                try:
+                    item = await anyio.to_thread.run_sync(
+                        (lambda: q.get(timeout=startup_timeout)) if first else q.get,
+                        abandon_on_cancel=True,
+                    )
+                except queue.Empty:
+                    cancel_event.set()
+                    yield (
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "message": "The selected model did not start responding in time. This run was cancelled.",
+                                "request_id": request_id,
+                                "at": time.time(),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                    break
+                first = False
+                if item is None:
+                    break
+                yield (json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8")
+        finally:
+            cancel_event.set()
+            _release_query_cancellation(request_id, cancel_event)
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
@@ -5656,6 +6909,12 @@ async def gateway_ws(websocket: WebSocket):
 
         request_id = payload.get("request_id") or str(uuid.uuid4())
         request_id = str(request_id)
+        thinking_enabled = bool(payload.get("thinking_enabled", True))
+        reasoning_effort = str(payload.get("reasoning_effort") or "medium")
+        if reasoning_effort not in {
+            "minimal", "low", "medium", "high", "extra_high", "max", "ultra"
+        }:
+            reasoning_effort = "medium"
 
         agent = get_agent(thread_id)
         try:
@@ -5669,6 +6928,8 @@ async def gateway_ws(websocket: WebSocket):
             pass
 
         q: queue.Queue = queue.Queue()
+        cancel_event = threading.Event()
+        _register_query_cancellation(request_id, thread_id or "default", cancel_event)
         _metric_inc("requests", 1)
         _start_agent_thread(
             agent=agent,
@@ -5678,19 +6939,47 @@ async def gateway_ws(websocket: WebSocket):
             workspace=payload.get("workspace"),
             request_id=request_id,
             q=q,
+            cancel_event=cancel_event,
+            thinking_enabled=thinking_enabled,
+            reasoning_effort=reasoning_effort,
         )
 
-        while True:
-            item = await anyio.to_thread.run_sync(q.get)
-            if item is None:
-                break
-            try:
-                await websocket.send_json(item)
-            except WebSocketDisconnect:
-                return
-            except Exception as exc:
-                logger.warning(f"Gateway WS send failed: {exc}")
-                break
+        try:
+            first = True
+            startup_timeout = max(
+                1.0,
+                float(getattr(config, "stream_startup_timeout_seconds", 15.0) or 15.0),
+            )
+            while True:
+                try:
+                    item = await anyio.to_thread.run_sync(
+                        (lambda: q.get(timeout=startup_timeout)) if first else q.get,
+                        abandon_on_cancel=True,
+                    )
+                except queue.Empty:
+                    cancel_event.set()
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": "The selected model did not start responding in time. This run was cancelled.",
+                            "request_id": request_id,
+                            "at": time.time(),
+                        }
+                    )
+                    break
+                first = False
+                if item is None:
+                    break
+                try:
+                    await websocket.send_json(item)
+                except WebSocketDisconnect:
+                    return
+                except Exception as exc:
+                    logger.warning(f"Gateway WS send failed: {exc}")
+                    break
+        finally:
+            cancel_event.set()
+            _release_query_cancellation(request_id, cancel_event)
 
 
 @app.get("/doctor", response_model=DoctorResponse)
@@ -6102,6 +7391,7 @@ async def consume_research_artifact_api(artifact_id: str, payload: Dict[str, Any
 async def skills_status_api():
     """Truthful skill executable classification (prompt-only never marked executable)."""
     from agent.skill_status_audit import audit_all_skills
+    from agent.specialist_runtime import get_specialist_runtime_manager
 
     rows = audit_all_skills(
         available_capabilities={"approvals", "research"},
@@ -6130,6 +7420,7 @@ async def studio_overview_api(session_id: Optional[str] = Query(default=None)):
     from agent.routines import get_routine_manager
     from agent.skill_execution import list_skill_executions_for_session, list_skill_proposals
     from agent.skill_status_audit import audit_all_skills
+    from agent.specialist_runtime import get_specialist_runtime_manager
     from agent.task_store import get_task_store
     from agent.tool_registry import ToolRegistry
 
@@ -6211,6 +7502,10 @@ async def studio_overview_api(session_id: Optional[str] = Query(default=None)):
         },
         "tools": tools,
         "skills": skills,
+        "specialist_runtimes": [
+            item.model_dump(mode="json")
+            for item in get_specialist_runtime_manager().catalog()
+        ],
         "skill_proposals": [item.model_dump(mode="json") for item in list_skill_proposals()],
         "skill_executions": [
             item.model_dump(mode="json")
@@ -6228,6 +7523,7 @@ async def studio_overview_api(session_id: Optional[str] = Query(default=None)):
             "heartbeat": "HeartbeatManager",
             "tools": "ToolRegistry",
             "skills": "SkillsRegistry",
+            "specialist_runtimes": "SpecialistRuntimeManager",
             "executions": "StateStore",
         },
     }
@@ -6249,20 +7545,351 @@ async def list_automation_runs_api(
     return {"items": [row.model_dump(mode="json") for row in rows], "count": len(rows)}
 
 
+@app.get("/work/occurrences")
+async def list_work_occurrences_api(
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
+    """Canonical background occurrence view without a second status owner."""
+
+    from agent.automation_runtime import get_automation_run_store
+    from agent.task_runs import get_task_run_store
+
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    rows = get_automation_run_store().list_runs(
+        project_id=scoped_project_id, session_id=session_id
+    )
+    items: list[dict[str, Any]] = []
+    for run in rows:
+        task = None
+        if run.task_run_id:
+            task = get_task_run_store().get(
+                run.task_run_id,
+                session_id=session_id,
+                project_id=scoped_project_id,
+            )
+        items.append({
+            "occurrence": run.model_dump(mode="json"),
+            "task_run": _task_run_summary(task).model_dump(mode="json") if task else None,
+        })
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/media/jobs")
+async def list_media_jobs_api(
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+    limit: int = Query(default=100, ge=1, le=200),
+):
+    """Unified projection; GenerationJob and VoiceJob remain the owners."""
+
+    from agent.generation_runtime import get_generation_job_store
+    from agent.media_jobs import project_generation_job, project_voice_job
+    from agent.voice_runtime import get_voice_job_store
+
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    rows = [
+        *(project_generation_job(row) for row in get_generation_job_store().list(session_id=session_id, limit=limit)),
+        *(project_voice_job(row) for row in get_voice_job_store().list(session_id=session_id, limit=limit)),
+    ]
+    rows = [row for row in rows if row.project_id == scoped_project_id]
+    rows.sort(key=lambda row: (row.updated_at, row.job_id), reverse=True)
+    return {
+        "items": [row.model_dump(mode="json") for row in rows[:limit]],
+        "count": min(len(rows), limit),
+    }
+
+
 @app.get("/connections")
 async def list_connections_api(
     session_id: str = Query(...),
     project_id: str = Query(default=""),
 ):
     """Secret-free Connection capabilities in the active exact scope."""
+    from agent.connection_lifecycle import get_connection_lifecycle_service
     from agent.connections import get_connection_registry
 
     scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    get_connection_lifecycle_service().migrate_legacy_settings(config)
     rows = get_connection_registry().list(
         project_id=scoped_project_id,
         session_id=session_id,
     )
     return {"items": [row.model_dump(mode="json") for row in rows], "count": len(rows)}
+
+
+class ConnectionAuthorizationRequest(BaseModel):
+    provider_id: str
+    session_id: str
+    project_id: str = ""
+    display_name: str = ""
+    configuration: dict[str, Any] = Field(default_factory=dict)
+    credentials: dict[str, Any] = Field(default_factory=dict)
+    allow_global: bool = False
+
+
+class ConnectionRevisionRequest(BaseModel):
+    session_id: str
+    project_id: str = ""
+    expected_revision: int = Field(ge=1)
+
+
+class ConnectionCapabilityUpdateRequest(ConnectionRevisionRequest):
+    enabled: bool
+
+
+class ConnectionAuthorizationCallbackRequest(BaseModel):
+    provider_id: str
+    transaction_id: str
+    code: str = ""
+    state: str = ""
+    error: str = ""
+
+
+def _connection_api_error(exc: Exception) -> HTTPException:
+    from agent.connections import (
+        ConnectionConflictError,
+        ConnectionScopeError,
+    )
+
+    if isinstance(exc, ConnectionConflictError):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, ConnectionScopeError):
+        return HTTPException(status_code=403, detail=str(exc))
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+def _require_connection_scope(
+    connection_id: str,
+    *,
+    session_id: str,
+    project_id: str,
+):
+    from agent.connections import ConnectionScopeError, get_connection_registry
+
+    scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    record = get_connection_registry().get(
+        connection_id,
+        project_id=scoped_project_id,
+        session_id=session_id,
+    )
+    if record is None:
+        raise ConnectionScopeError("Connection not found in the active Project and Session")
+    return scoped_project_id, record
+
+
+@app.get("/connections/catalog")
+async def connection_catalog_api(
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
+    """Consumer catalog joined to secret-free canonical Connection state."""
+    from agent.connection_lifecycle import get_connection_lifecycle_service
+
+    service = get_connection_lifecycle_service()
+    service.migrate_legacy_settings(config)
+    scoped_project_id = ""
+    if str(project_id or "").strip():
+        scoped_project_id = _require_automation_project_scope(session_id, project_id)
+    else:
+        from agent.threads import get_thread_manager
+
+        if get_thread_manager().get_thread(str(session_id or "").strip()) is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+    items = service.catalog(project_id=scoped_project_id, session_id=session_id)
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/settings/catalog")
+async def settings_catalog_api(
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+):
+    """Read-only, secret-free Settings cards projected from canonical owners."""
+    from agent.connection_lifecycle import get_connection_lifecycle_service
+    from agent.settings_catalog import build_settings_catalog
+    from agent.threads import get_thread_manager
+
+    session_key = str(session_id or "").strip()
+    if get_thread_manager().get_thread(session_key) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    service = get_connection_lifecycle_service()
+    scoped_project_id = (
+        _require_automation_project_scope(session_key, project_id)
+        if str(project_id or "").strip()
+        else ""
+    )
+    connection_items = service.catalog(
+        project_id=scoped_project_id,
+        session_id=session_key,
+    )
+    provider_projection = await get_provider_info(session_key)
+    projection = build_settings_catalog(
+        runtime_config=config,
+        provider_info=provider_projection.model_dump(mode="json"),
+        connection_catalog=connection_items,
+    )
+    return projection.model_dump(mode="json")
+
+
+@app.post("/connections/authorize")
+async def begin_connection_authorization_api(request: ConnectionAuthorizationRequest):
+    """Begin one explicit setup transaction; credentials never enter a projection."""
+    from agent.connection_lifecycle import get_connection_lifecycle_service
+
+    try:
+        scoped_project_id = _require_automation_project_scope(
+            request.session_id,
+            request.project_id,
+        )
+        result = get_connection_lifecycle_service().begin(
+            provider_id=request.provider_id,
+            project_id=scoped_project_id,
+            session_id=request.session_id,
+            display_name=request.display_name,
+            configuration=request.configuration,
+            credentials=request.credentials,
+            allow_global=request.allow_global,
+        )
+        return result.model_dump(mode="json")
+    except Exception as exc:
+        raise _connection_api_error(exc) from exc
+
+
+@app.post("/connections/authorization/callback")
+async def complete_connection_authorization_api(
+    _request: ConnectionAuthorizationCallbackRequest,
+):
+    """Reserved provider callback boundary.
+
+    No generic callback is accepted because OAuth code exchange, redirect and
+    state validation belong to a concrete provider adapter. This endpoint is
+    deliberately fail-closed until that adapter owns the transaction.
+    """
+    raise HTTPException(
+        status_code=501,
+        detail="This provider OAuth callback adapter is not installed; no Connection state changed",
+    )
+
+
+@app.post("/connections/{connection_id}/probe")
+async def probe_connection_api(
+    connection_id: str,
+    request: ConnectionRevisionRequest,
+):
+    from agent.connection_lifecycle import get_connection_lifecycle_service
+    from agent.connections import get_connection_registry
+
+    try:
+        _require_connection_scope(
+            connection_id,
+            session_id=request.session_id,
+            project_id=request.project_id,
+        )
+        record = get_connection_lifecycle_service().probe(
+            connection_id,
+            expected_revision=request.expected_revision,
+        )
+        return {"connection": get_connection_registry()._project(record).model_dump(mode="json")}
+    except Exception as exc:
+        raise _connection_api_error(exc) from exc
+
+
+@app.put("/connections/{connection_id}/capabilities/{capability_id}")
+async def update_connection_capability_api(
+    connection_id: str,
+    capability_id: str,
+    request: ConnectionCapabilityUpdateRequest,
+):
+    from agent.connection_lifecycle import get_connection_lifecycle_service
+    from agent.connections import get_connection_registry
+
+    try:
+        _require_connection_scope(
+            connection_id,
+            session_id=request.session_id,
+            project_id=request.project_id,
+        )
+        record = get_connection_lifecycle_service().set_capability(
+            connection_id,
+            capability_id,
+            expected_revision=request.expected_revision,
+            enabled=request.enabled,
+        )
+        return {"connection": get_connection_registry()._project(record).model_dump(mode="json")}
+    except Exception as exc:
+        raise _connection_api_error(exc) from exc
+
+
+@app.post("/connections/{connection_id}/reconnect")
+async def reconnect_connection_api(
+    connection_id: str,
+    request: ConnectionRevisionRequest,
+):
+    from agent.connection_lifecycle import get_connection_lifecycle_service
+    from agent.connections import get_connection_registry
+
+    try:
+        _require_connection_scope(
+            connection_id,
+            session_id=request.session_id,
+            project_id=request.project_id,
+        )
+        record = get_connection_lifecycle_service().reconnect(
+            connection_id,
+            expected_revision=request.expected_revision,
+        )
+        return {"connection": get_connection_registry()._project(record).model_dump(mode="json")}
+    except Exception as exc:
+        raise _connection_api_error(exc) from exc
+
+
+@app.post("/connections/{connection_id}/disable")
+async def disable_connection_api(
+    connection_id: str,
+    request: ConnectionRevisionRequest,
+):
+    from agent.connection_lifecycle import get_connection_lifecycle_service
+    from agent.connections import get_connection_registry
+
+    try:
+        _require_connection_scope(
+            connection_id,
+            session_id=request.session_id,
+            project_id=request.project_id,
+        )
+        record = get_connection_lifecycle_service().disable(
+            connection_id,
+            expected_revision=request.expected_revision,
+        )
+        return {"connection": get_connection_registry()._project(record).model_dump(mode="json")}
+    except Exception as exc:
+        raise _connection_api_error(exc) from exc
+
+
+@app.delete("/connections/{connection_id}")
+async def disconnect_connection_api(
+    connection_id: str,
+    session_id: str = Query(...),
+    project_id: str = Query(default=""),
+    expected_revision: int = Query(..., ge=1),
+):
+    from agent.connection_lifecycle import get_connection_lifecycle_service
+
+    try:
+        _require_connection_scope(
+            connection_id,
+            session_id=session_id,
+            project_id=project_id,
+        )
+        removed = get_connection_lifecycle_service().disconnect(
+            connection_id,
+            expected_revision=expected_revision,
+        )
+        return {"disconnected": True, "connection_id": removed.id}
+    except Exception as exc:
+        raise _connection_api_error(exc) from exc
 
 
 @app.get("/skills/executions")
@@ -6300,22 +7927,23 @@ async def tool_calling_diagnostics_api(thread_id: Optional[str] = Query(default=
     agent = get_existing_agent(thread_id) or get_agent(thread_id)
     diag = agent._tool_calling_diagnostics() if hasattr(agent, "_tool_calling_diagnostics") else {}
     provider = str(diag.get("provider") or getattr(agent, "llm_provider", ""))
-    langgraph_available = bool(diag.get("langgraph_available"))
-    agent_executor_available = bool(diag.get("agent_executor_available"))
     disabled = bool(diag.get("disable_native_tool_calling"))
-    native_attempted = bool(diag.get("native_tool_calling_enabled")) and not disabled
+    native_supported = bool(diag.get("native_tool_calling_supported"))
+    native_enabled = bool(diag.get("native_tool_calling_enabled")) and not disabled
     matrix = {
         "provider": provider,
-        "native_tool_calls": bool(native_attempted and (langgraph_available or agent_executor_available)),
-        "native_tool_calls_attempted": native_attempted,
-        "langgraph_available": langgraph_available,
-        "agent_executor_available": agent_executor_available,
-        "validated_json_plan_output": True,
+        "execution_loop": "canonical_model_control_plane",
+        "native_tool_calls": native_enabled,
+        "native_tool_calls_supported": native_supported,
+        "strict_agent_decision_validation": True,
         "deterministic_direct_tool_fallback": False,
-        "prose_only_risk": not bool(langgraph_available or agent_executor_available),
+        "printed_tool_syntax_executable": False,
         "lmstudio_tool_calling_flag": bool(diag.get("lmstudio_tool_calling")),
         "disable_native_tool_calling": disabled,
-        "notes": "Mutating tools remain governed by current ToolRun and approval authority.",
+        "notes": (
+            "Native calls and bounded structured decisions enter the same "
+            "ToolRun, approval, authority, and completion boundaries."
+        ),
     }
     return {"diagnostics": diag, "capability_matrix": matrix, "mode_label": agent._tool_calling_mode_label()}
 
@@ -6392,6 +8020,89 @@ async def obsidian_sync_apply_api(payload: Dict[str, Any] = Body(default_factory
     return {"ok": True, "manifest": manifest.model_dump(mode="json")}
 
 
+def _resolve_memory_read_scope(
+    thread_id: Optional[str],
+    project_id: str = "",
+) -> tuple[str, str, str]:
+    """Read-only Studio/list scope — never requires a bound Project.
+
+    Returns (session_id, project_id, project_path). Empty project_id lists
+    account/global memories plus any Project memories only when a Project is
+    active on the Session. Does not mutate memory stores.
+    """
+    session_id = _normalize_thread_id(thread_id)
+    state = get_state_store().get_thread_state(session_id)
+    active_project_id = str(getattr(state, "active_project_id", "") or "").strip()
+    requested = str(project_id or "").strip()
+    if requested and active_project_id and requested != active_project_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Session is not bound to the requested Project",
+        )
+    scoped_project_id = requested or active_project_id
+    if scoped_project_id:
+        from agent.projects import get_project_manager
+
+        if get_project_manager().get_project(scoped_project_id) is None:
+            # Detached / missing Project: still allow account memory, drop project filter.
+            scoped_project_id = ""
+    project_path = str(getattr(state, "project_path", "") or "").strip()
+    return session_id, scoped_project_id, project_path
+
+
+def _memory_item_from_payload(payload: dict) -> Optional[MemoryItem]:
+    """Project one canonical record to API MemoryItem; skip corrupt rows without erasing."""
+    try:
+        meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        mt = str(meta.get("type") or "").strip() if isinstance(meta, dict) else ""
+        pinned = meta.get("pinned") if isinstance(meta, dict) else None
+        raw_id = str(payload.get("id") or "").strip()
+        raw_text = str(payload.get("text") or "")
+        if not raw_id:
+            return None
+        base = {k: v for k, v in payload.items() if k in MemoryItem.model_fields}
+        base["id"] = raw_id
+        base["text"] = raw_text
+        if not isinstance(base.get("metadata"), dict):
+            base["metadata"] = dict(meta) if isinstance(meta, dict) else {}
+        mi = MemoryItem.model_validate(base)
+        mi.memory_type = mt or str(meta.get("curator_type") or "") or None
+        mi.pinned = bool(pinned) if pinned is not None else None
+        mi.owner_id = str(meta.get("owner_id") or "")
+        mi.scope = str(meta.get("scope") or "account")
+        mi.project_id = str(meta.get("project_id") or payload.get("project_id") or "")
+        mi.source_session_id = str(meta.get("source_session_id") or "")
+        mi.source_execution_id = str(meta.get("source_execution_id") or "")
+        mi.source_item_id = str(meta.get("source_item_id") or "")
+        mi.index_state = str(meta.get("index_state") or "pending")
+        mi.supersedes = str(meta.get("supersedes") or "")
+        mi.superseded_by = str(meta.get("superseded_by") or "")
+        mi.status = str(meta.get("status") or "active")
+        mi.checksum = str(meta.get("checksum") or "")
+        try:
+            mi.version = int(meta.get("version") or 1)
+        except Exception:
+            mi.version = 1
+        mi.subject = str(meta.get("subject") or "") or None
+        conf = meta.get("confidence")
+        try:
+            mi.confidence = float(conf) if conf is not None and conf != "" else None
+        except Exception:
+            mi.confidence = None
+        mi.explicit = bool(meta.get("explicit")) if meta.get("explicit") is not None else None
+        attrs = meta.get("structured_attributes")
+        mi.structured_attributes = dict(attrs) if isinstance(attrs, dict) else None
+        mi.source_text = str(meta.get("source_text") or "") or None
+        mi.active = True
+        semantic = str(meta.get("semantic_text") or "").strip()
+        if semantic:
+            mi.text = semantic
+        return mi
+    except Exception as exc:
+        logger.warning("Skipping corrupt memory projection (preserved on disk): {}", exc)
+        return None
+
+
 @app.get("/memory", response_model=MemoryListResponse)
 async def list_memory(
     offset: int = Query(default=0, ge=0),
@@ -6399,65 +8110,57 @@ async def list_memory(
     thread_id: Optional[str] = Query(default=None),
     project_id: str = Query(default=""),
 ):
+    """List memories for Studio. Read-only — never mutates canonical records or indexes."""
     try:
-        session_id = _normalize_thread_id(thread_id)
-        scoped_project_id = _require_automation_project_scope(session_id, project_id)
-        session_state = get_state_store().get_thread_state(session_id)
+        session_id, scoped_project_id, project_path = _resolve_memory_read_scope(thread_id, project_id)
         agent = get_agent(thread_id)
-        items = agent.memory.list_items(
+        memory = getattr(agent, "memory", None)
+        if memory is None:
+            return MemoryListResponse(items=[], count=0, use_faiss=False)
+        # Account/global always included; Project rows only when a Project is scoped.
+        items = memory.list_items(
             offset=offset,
             limit=limit,
             thread_id=session_id,
             project_id=scoped_project_id,
-            project_path=str(session_state.project_path or ""),
-            include_global=False,
+            project_path=project_path,
+            include_global=True,
         )
         out_items: List[MemoryItem] = []
         for i in items:
             payload = (i or {}) if isinstance(i, dict) else {}
-            meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-            mt = str(meta.get("type") or "").strip() if isinstance(meta, dict) else ""
-            pinned = meta.get("pinned") if isinstance(meta, dict) else None
-            mi = MemoryItem(**{k: v for k, v in payload.items() if k in MemoryItem.model_fields})
-            mi.memory_type = mt or str(meta.get("curator_type") or "") or None
-            mi.pinned = bool(pinned) if pinned is not None else None
-            mi.owner_id = str(meta.get("owner_id") or "")
-            mi.scope = str(meta.get("scope") or "account")
-            mi.project_id = str(meta.get("project_id") or "")
-            mi.source_session_id = str(meta.get("source_session_id") or "")
-            mi.source_execution_id = str(meta.get("source_execution_id") or "")
-            mi.source_item_id = str(meta.get("source_item_id") or "")
-            mi.index_state = str(meta.get("index_state") or "pending")
-            mi.supersedes = str(meta.get("supersedes") or "")
-            mi.superseded_by = str(meta.get("superseded_by") or "")
-            mi.status = str(meta.get("status") or "active")
-            mi.checksum = str(meta.get("checksum") or "")
-            mi.version = int(meta.get("version") or 1)
-            mi.subject = str(meta.get("subject") or "") or None
-            conf = meta.get("confidence")
-            mi.confidence = float(conf) if conf is not None else None
-            mi.explicit = bool(meta.get("explicit")) if meta.get("explicit") is not None else None
-            attrs = meta.get("structured_attributes")
-            mi.structured_attributes = dict(attrs) if isinstance(attrs, dict) else None
-            mi.source_text = str(meta.get("source_text") or "") or None
-            mi.active = True
-            # Prefer curated semantic text for Studio cards
-            semantic = str(meta.get("semantic_text") or "").strip()
-            if semantic:
-                mi.text = semantic
-            out_items.append(mi)
+            mi = _memory_item_from_payload(payload)
+            if mi is not None:
+                out_items.append(mi)
+        count_fn = getattr(memory, "count_items", None)
+        if callable(count_fn):
+            count = int(
+                count_fn(
+                    thread_id=session_id,
+                    project_id=scoped_project_id,
+                    include_global=True,
+                )
+                or 0
+            )
+        else:
+            count = len(out_items)
         return MemoryListResponse(
             items=out_items,
-            count=agent.memory.count_items(
-                thread_id=session_id,
-                project_id=scoped_project_id,
-                include_global=False,
-            ),
-            use_faiss=bool(getattr(agent.memory, "use_faiss", False)),
+            count=count,
+            use_faiss=bool(getattr(memory, "use_faiss", False)),
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"List memory error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "memory_list_failed",
+                "message": "Memory list failed. Canonical records were not modified.",
+                "error": str(e),
+            },
+        ) from e
 
 
 def _normalize_memory_audit_text(text: str) -> str:
@@ -6660,8 +8363,7 @@ async def memory_doctor(
 ):
     """Read-only memory health report for duplicate/stale/untyped memory diagnosis."""
     try:
-        session_id = _normalize_thread_id(thread_id)
-        scoped_project_id = _require_automation_project_scope(session_id, project_id)
+        session_id, scoped_project_id, _path = _resolve_memory_read_scope(thread_id, project_id)
         agent = get_agent(session_id)
         return _build_memory_doctor_report(
             agent,
@@ -6669,9 +8371,18 @@ async def memory_doctor(
             scoped_project_id,
             max_scan=max_scan,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Memory doctor error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "memory_doctor_failed",
+                "message": "Memory doctor failed. Canonical records were not modified.",
+                "error": str(e),
+            },
+        ) from e
 
 
 @app.post("/memory/delete")
@@ -6764,15 +8475,14 @@ async def clear_memory(
 
 
 @app.get("/provider", response_model=ProviderInfoResponse)
-async def get_provider_info():
+async def get_provider_info(session_id: Optional[str] = Query(default=None)):
     """
     Get current provider information.
 
     Returns:
         Current provider details and available providers.
     """
-    from agent.core import list_available_providers
-    from agent.model_runtime import resolve_model_profile
+    from agent.model_runtime import list_available_providers, resolve_model_profile
 
     providers = list_available_providers()
     def _profile_for(prov: ModelProvider, model_name: str) -> dict[str, Any]:
@@ -6788,15 +8498,16 @@ async def get_provider_info():
 
     if _is_lmstudio_only_enabled():
         _force_lmstudio_config()
+        binding = _ensure_session_model_binding(session_id or "default")
         providers = [p for p in providers if p.get("id") == ModelProvider.LM_STUDIO.value]
-        model_profile = _profile_for(ModelProvider.LM_STUDIO, config.local.model_name)
+        model_profile = _profile_for(ModelProvider.LM_STUDIO, binding.model_id)
         ctx_w, max_out = int(model_profile["context_limit"]), int(getattr(config.local, "max_tokens", 0) or 4096)
         readiness = _check_provider_readiness(ModelProvider.LM_STUDIO)
         return ProviderInfoResponse(
             provider=ModelProvider.LM_STUDIO.value,
-            model=config.local.model_name,
+            model=binding.model_id,
             local=True,
-            base_url=config.local.base_url or LM_STUDIO_DEFAULT_URL,
+            base_url=_provider_configured_base_url(ModelProvider.LM_STUDIO),
             available_providers=providers,
             context_window=ctx_w,
             max_output_tokens=max_out,
@@ -6804,19 +8515,26 @@ async def get_provider_info():
             readiness_message=str(readiness.get("message") or ""),
             readiness_detail=str(readiness.get("detail") or ""),
             model_profile=model_profile,
+            session_id=binding.session_id,
+            binding_revision=binding.binding_revision,
         )
 
     # Do not instantiate the agent here; provider can be misconfigured (e.g. missing deps)
     # and we still want /provider to respond.
-    provider = _runtime_provider or (config.local.provider if config.use_local_models else _default_cloud_provider())
+    binding = _ensure_session_model_binding(session_id or "default")
+    provider = ModelProvider(binding.provider_id)
     is_local = provider not in (ModelProvider.OPENAI, ModelProvider.GEMINI)
     if provider == ModelProvider.OPENAI:
-        model = config.openai.model
+        model = binding.model_id
     elif provider == ModelProvider.GEMINI:
-        model = config.gemini.model
+        model = binding.model_id
     else:
-        model = config.local.model_name
-    base_url = None if provider in (ModelProvider.OPENAI, ModelProvider.GEMINI, ModelProvider.LLAMA_CPP) else config.local.base_url
+        model = binding.model_id
+    base_url = (
+        None
+        if provider in (ModelProvider.OPENAI, ModelProvider.GEMINI, ModelProvider.LLAMA_CPP)
+        else _provider_configured_base_url(provider)
+    )
     model_profile = _profile_for(provider, model)
     ctx_w = int(model_profile["context_limit"])
     max_out = int(
@@ -6825,7 +8543,7 @@ async def get_provider_info():
         else getattr(config.local, "max_tokens", 0)
         or 4096
     )
-    readiness = _check_provider_readiness(provider)
+    readiness = _check_provider_readiness(provider, model_id=model)
 
     return ProviderInfoResponse(
         provider=provider.value,
@@ -6839,6 +8557,8 @@ async def get_provider_info():
         readiness_message=str(readiness.get("message") or ""),
         readiness_detail=str(readiness.get("detail") or ""),
         model_profile=model_profile,
+        session_id=binding.session_id,
+        binding_revision=binding.binding_revision,
     )
 
 
@@ -6854,72 +8574,106 @@ async def switch_provider(request: SwitchProviderRequest):
         Success message.
     """
     try:
-        if _is_lmstudio_only_enabled():
-            raise HTTPException(status_code=403, detail="Provider switching is disabled (LM Studio only)")
         provider = ModelProvider(request.provider)
+        if (
+            _is_lmstudio_only_enabled()
+            and provider != ModelProvider.LM_STUDIO
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Only LM Studio models may be selected in LM Studio-only mode",
+            )
         _assert_provider_available(provider)
-        global _agent, _runtime_provider
+        session_id = _normalize_thread_id(request.session_id)
+        current_binding = _ensure_session_model_binding(session_id)
+        if current_binding.binding_revision != request.expected_revision:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Session model binding changed from revision "
+                    f"{request.expected_revision} to {current_binding.binding_revision}"
+                ),
+            )
+        requested_model = (
+            request.openai_model if provider == ModelProvider.OPENAI
+            else request.gemini_model if provider == ModelProvider.GEMINI
+            else request.model
+        )
+        selected_model = str(
+            requested_model or _default_model_for_provider(provider)
+        ).strip()
+        if not selected_model:
+            raise HTTPException(status_code=422, detail="A model id is required")
+        if request.base_url:
+            configured = str(
+                _provider_configured_base_url(provider)
+                if provider not in {ModelProvider.OPENAI, ModelProvider.GEMINI}
+                else ""
+            ).rstrip("/")
+            if configured and request.base_url.rstrip("/") != configured:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Provider endpoints are global configuration; change the endpoint in Settings before binding this Session",
+                )
+        if (
+            current_binding.provider_id == provider.value
+            and current_binding.model_id == selected_model
+        ):
+            return {
+                "success": True,
+                "message": "Session already uses that provider and model",
+                "provider": provider.value,
+                "model": current_binding.model_id,
+                "session_id": session_id,
+                "binding_revision": current_binding.binding_revision,
+                "cancelled_turns": 0,
+                "cancelled_incompatible_work": {"approvals": 0, "task_runs": 0},
+            }
+        cancelled = _cancel_active_queries_for_session(session_id)
+        if cancelled:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                with _ACTIVE_QUERY_CANCEL_LOCK:
+                    if not any(
+                        row[0] == session_id
+                        for row in _ACTIVE_QUERY_CANCELLATIONS.values()
+                    ):
+                        break
+                await asyncio.sleep(0.05)
+        binding = get_state_store().update_session_model_binding(
+            session_id,
+            provider_id=provider.value,
+            model_id=selected_model,
+            expected_revision=request.expected_revision,
+            provider_configuration_id=current_binding.provider_configuration_id,
+        )
+        retired = _cancel_incompatible_session_work(
+            session_id,
+            reason=(
+                "Session model binding changed from revision "
+                f"{current_binding.binding_revision} to {binding.binding_revision}"
+            ),
+        )
 
-        if provider == ModelProvider.OPENAI:
-            if request.openai_model:
-                config.openai.model = request.openai_model
-            config.use_local_models = False
-            config.default_cloud_provider = ModelProvider.OPENAI.value
-        elif provider == ModelProvider.GEMINI:
-            if request.gemini_model:
-                config.gemini.model = request.gemini_model
-            config.use_local_models = False
-            config.default_cloud_provider = ModelProvider.GEMINI.value
-        else:
-            config.local.provider = provider
-            if request.model:
-                config.local.model_name = request.model
-            if request.base_url:
-                config.local.base_url = request.base_url
-            else:
-                if provider == ModelProvider.OLLAMA:
-                    config.local.base_url = "http://localhost:11434"
-                elif provider == ModelProvider.LM_STUDIO:
-                    config.local.base_url = "http://localhost:1234"
-                elif provider == ModelProvider.LOCALAI:
-                    config.local.base_url = "http://localhost:8080"
-                elif provider == ModelProvider.VLLM:
-                    config.local.base_url = "http://localhost:8000"
-            config.use_local_models = True
-
-        existing = _read_runtime_settings()
-        existing["use_local_models"] = bool(config.use_local_models)
-        if provider == ModelProvider.OPENAI:
-            existing["default_cloud_provider"] = ModelProvider.OPENAI.value
-            openai_patch = existing.get("openai") if isinstance(existing.get("openai"), dict) else {}
-            openai_patch["model"] = config.openai.model
-            existing["openai"] = openai_patch
-        elif provider == ModelProvider.GEMINI:
-            existing["default_cloud_provider"] = ModelProvider.GEMINI.value
-            gemini_patch = existing.get("gemini") if isinstance(existing.get("gemini"), dict) else {}
-            gemini_patch["model"] = config.gemini.model
-            existing["gemini"] = gemini_patch
-        else:
-            local_patch = existing.get("local") if isinstance(existing.get("local"), dict) else {}
-            local_patch["provider"] = provider.value
-            local_patch["model_name"] = config.local.model_name
-            local_patch["base_url"] = config.local.base_url
-            existing["local"] = local_patch
-        config.apply_overrides(existing)
-        config.write_runtime_overrides(existing)
-
-        # Only commit runtime provider after validation + config updates.
-        _runtime_provider = provider
-
-        _agent = None
         with _agent_pool_lock:
-            _agent_pool.clear()
+            _agent_pool.pop(session_id, None)
+        from agent.model_runtime import clear_structured_output_probe_cache
+        clear_structured_output_probe_cache()
 
         return {
             "success": True,
             "message": f"Switched to {provider.value}",
-            "provider": provider.value
+            "provider": provider.value,
+            "model": binding.model_id,
+            "session_id": session_id,
+            "binding_revision": binding.binding_revision,
+            "cancelled_turns": cancelled,
+            "cancelled_incompatible_work": retired,
         }
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid provider: {request.provider}")
     except Exception as e:
@@ -6944,11 +8698,7 @@ async def list_provider_models(provider: Optional[str] = Query(default=None)):
         try:
             import requests
 
-            base = (config.local.base_url or "").rstrip("/")
-            if config.local.provider != ModelProvider.OLLAMA:
-                base = "http://localhost:11434"
-            if not base:
-                base = "http://localhost:11434"
+            base = _provider_configured_base_url(ModelProvider.OLLAMA)
             resp = requests.get(f"{base}/api/tags", timeout=4)
             resp.raise_for_status()
             data = resp.json() or {}
@@ -6966,14 +8716,7 @@ async def list_provider_models(provider: Optional[str] = Query(default=None)):
         try:
             import requests
 
-            base = (config.local.base_url or "").rstrip("/")
-            if not base:
-                if p == ModelProvider.LM_STUDIO:
-                    base = "http://localhost:1234"
-                elif p == ModelProvider.LOCALAI:
-                    base = "http://localhost:8080"
-                elif p == ModelProvider.VLLM:
-                    base = "http://localhost:8000"
+            base = _provider_configured_base_url(p)
             if base.endswith("/v1"):
                 url = f"{base}/models"
             else:
@@ -7118,26 +8861,6 @@ async def metrics():
 
 # ── Todo List Endpoints ──────────────────────────────────────────────────────
 
-_TODO_FILE = DATA_DIR / "todos.json"
-_todo_lock = threading.Lock()
-
-
-def _load_todos() -> list:
-    with _todo_lock:
-        if _TODO_FILE.exists():
-            try:
-                return json.loads(_TODO_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                return []
-        return []
-
-
-def _save_todos(todos: list) -> None:
-    with _todo_lock:
-        _TODO_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _TODO_FILE.write_text(json.dumps(todos, indent=2, default=str), encoding="utf-8")
-
-
 class TodoItem(BaseModel):
     id: str = ""
     title: str = ""
@@ -7213,6 +8936,11 @@ async def update_todo(
     current = store.get(todo_id)
     if current is None or current.project_id != scoped_project_id or current.session_id != session_id:
         raise HTTPException(status_code=404, detail="Todo not found")
+    if current.source != "user" or current.automation_run_ids or current.task_run_ids:
+        raise HTTPException(
+            status_code=409,
+            detail="Automation-backed Task records are read-only projections; edit the owning schedule or TaskRun",
+        )
     task = store.update(todo_id, **item.model_dump())
     if task is None:
         raise HTTPException(status_code=404, detail="Todo not found")
@@ -7233,6 +8961,11 @@ async def delete_todo(
     current = store.get(todo_id)
     if current is None or current.project_id != scoped_project_id or current.session_id != session_id:
         raise HTTPException(status_code=404, detail="Todo not found")
+    if current.source != "user" or current.automation_run_ids or current.task_run_ids:
+        raise HTTPException(
+            status_code=409,
+            detail="Automation-backed Task records cannot be deleted from the Checklist",
+        )
     if not store.delete(todo_id):
         raise HTTPException(status_code=404, detail="Todo not found")
     return {"deleted": todo_id}
@@ -7256,7 +8989,11 @@ async def reorder_todos(
     requested = [str(item) for item in order]
     if any(item not in scoped_ids for item in requested):
         raise HTTPException(status_code=409, detail="Task reorder crosses Project/Session scope")
-    store.reorder(requested)
+    store.reorder_scope(
+        requested,
+        project_id=scoped_project_id,
+        session_id=session_id,
+    )
     return {
         "todos": [
             task.model_dump(mode="json")

@@ -1,17 +1,17 @@
 """
-Proactive Engine for EchoSpeak v6.1.0 — Autonomous Agent Mode.
+Retired ProactiveEngine compatibility module.
 
-Manages a task queue of things the agent should do when idle:
-  - Memory consolidation & review
-  - Follow-up tasks from conversations
-  - Ambient monitoring (Discord, email digests)
-  - Routine preparation (pre-gather data for upcoming routines)
-
-Architecture: runs alongside HeartbeatManager as a daemon thread.
-Uses the same route_message() infrastructure for output delivery.
+Retired compatibility definitions only. Canonical background work is owned by
+Routine, AutomationRun, Execution, and TaskRun. This module remains importable
+while historical references are migrated, but it cannot start a daemon or own
+an independent scheduler.
 """
 
 from __future__ import annotations
+
+# RETIRED COMPATIBILITY MODULE: canonical background work is owned by Routine,
+# AutomationRun, Execution, and TaskRun. ProactiveEngine.start() fails closed so
+# this historical daemon cannot become a second scheduler authority.
 
 import threading
 import time
@@ -220,20 +220,11 @@ class ProactiveEngine:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the proactive engine background thread."""
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._running = True
-        self._thread = threading.Thread(
-            target=self._loop,
-            name="echospeak-proactive",
-            daemon=True,
-        )
-        self._thread.start()
-        logger.info(
-            f"ProactiveEngine started — interval={self._check_interval}m, "
-            f"tasks={len(self._queue)}, channels={self._channels}"
+        """Refuse to start the retired competing scheduler."""
+        self._running = False
+        raise RuntimeError(
+            "ProactiveEngine is retired; use Project/Session-scoped Routines so "
+            "AutomationRun, Execution, and TaskRun retain canonical ownership"
         )
 
     def stop(self) -> None:

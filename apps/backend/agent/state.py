@@ -3,25 +3,30 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import random
 import shutil
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
 from threading import RLock
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from loguru import logger
+from pydantic import BaseModel, Field, model_validator
 
 try:
     from config import DATA_DIR
 except Exception:
     DATA_DIR = Path("data")
 
-
 PHASE3_DIR = DATA_DIR / "phase3"
 _PROCESS_LOCK_HANDLE = None
 _PROCESS_LOCK_PATH: Optional[Path] = None
+# Path-scoped write locks so concurrent file targets never share a fixed .tmp name race.
+_PATH_WRITE_LOCKS: dict[str, threading.RLock] = {}
+_PATH_WRITE_LOCKS_GUARD = threading.Lock()
 APPROVALS_PATH = PHASE3_DIR / "approvals.json"
 EXECUTIONS_PATH = PHASE3_DIR / "executions.json"
 THREAD_STATE_PATH = PHASE3_DIR / "thread_state.json"
@@ -72,11 +77,16 @@ class ToolRunRecord(BaseModel):
     action_id: str = ""
     approval_id: str = ""
     status: str = "started"
+    execution_status: str = ""
+    result_state: str = ""
     canonical_arguments: dict[str, Any] = Field(default_factory=dict)
     canonical_arguments_hash: str = ""
     outcome: dict[str, Any] = Field(default_factory=dict)
     verification: dict[str, Any] = Field(default_factory=dict)
     retry_of: str = ""
+    requirement_id: str = ""
+    attempt_id: str = ""
+    evidence_ids: list[str] = Field(default_factory=list)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
     completed_at: Optional[float] = None
@@ -104,6 +114,14 @@ class ApprovalRecord(BaseModel):
     original_turn_id: str = ""
     tool_run_id: str = ""
     execution_id: Optional[str] = None
+    # Immutable semantic lineage. Approval authority is still revalidated from
+    # current runtime state; these fields identify the one TaskRun ledger that
+    # must receive the eventual ToolOutcome.
+    task_run_id: str = ""
+    requirement_id: str = ""
+    attempt_id: str = ""
+    task_run_revision: int = 0
+    model_binding_revision: int = 0
     status: str = "pending"
     tool: str
     kwargs: dict[str, Any] = Field(default_factory=dict)
@@ -171,6 +189,71 @@ class ExecutionRecord(BaseModel):
     trace_id: Optional[str] = None
     evaluation: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Canonical semantic projection. Persist only typed structural output and
+    # hashes; never model chain-of-thought or raw hidden reasoning.
+    turn_interpretation: dict[str, Any] = Field(default_factory=dict)
+    task_run_id: str = ""
+    agent_decisions: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SessionModelBinding(BaseModel):
+    """Durable selected-model authority for one Session.
+
+    Global configuration supplies defaults and provider credentials only. Once
+    created, this binding controls the exact provider/model used by the Session.
+    """
+
+    session_id: str
+    provider_id: str
+    model_id: str
+    provider_configuration_id: str = "global-default"
+    binding_revision: int = 1
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> "SessionModelBinding":
+        self.session_id = str(self.session_id or "").strip()
+        self.provider_id = str(self.provider_id or "").strip()
+        self.model_id = str(self.model_id or "").strip()
+        self.provider_configuration_id = str(
+            self.provider_configuration_id or "global-default"
+        ).strip()[:160]
+        if not self.session_id or not self.provider_id or not self.model_id:
+            raise ValueError("Session model binding requires session, provider, and model")
+        if int(self.binding_revision or 0) < 1:
+            raise ValueError("Session model binding revision must be positive")
+        return self
+
+
+class ToolResult(BaseModel):
+    """Typed information returned by one governed tool execution.
+
+    ToolOutcome remains the durable execution owner. This nested envelope
+    separates machine-usable data/provenance from the legacy presentation
+    string without creating another lifecycle or completion authority.
+    """
+
+    schema_version: int = 1
+    data: dict[str, Any] = Field(default_factory=dict)
+    sources: list[dict[str, Any]] = Field(default_factory=list)
+    observed_at: Optional[float] = None
+    error_code: str = ""
+    retryable: bool = False
+    semantic_fingerprint: str = ""
+    requirement_id: str = ""
+    attempt_id: str = ""
+
+    @model_validator(mode="after")
+    def bound_result(self) -> "ToolResult":
+        self.sources = [
+            dict(item) for item in self.sources if isinstance(item, dict)
+        ][:32]
+        self.error_code = str(self.error_code or "")[:160]
+        self.semantic_fingerprint = str(self.semantic_fingerprint or "")[:256]
+        self.requirement_id = str(self.requirement_id or "")[:200]
+        self.attempt_id = str(self.attempt_id or "")[:200]
+        return self
 
 
 class ToolOutcome(BaseModel):
@@ -185,14 +268,93 @@ class ToolOutcome(BaseModel):
     turn_id: str = ""
     success: bool = False
     status: str = "failed"
+    execution_status: str = "error"
+    result_state: str = ""
     output: str = ""
     error_code: str = ""
     error_message: str = ""
     retryable: bool = False
     policy_block: bool = False
     verification: dict[str, Any] = Field(default_factory=dict)
+    provider: str = ""
+    observed_at: Optional[float] = None
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    requirement_id: str = ""
+    attempt_id: str = ""
+    result: Optional[ToolResult] = None
+    evidence_ids: list[str] = Field(default_factory=list)
     started_at: float = Field(default_factory=time.time)
     completed_at: float = Field(default_factory=time.time)
+
+    @model_validator(mode="after")
+    def normalize_status_axes(self) -> "ToolOutcome":
+        from agent.retrieval_contracts import ExecutionStatus, ResultState, infer_result_state
+
+        allowed_execution = {item.value for item in ExecutionStatus}
+        allowed_result = {item.value for item in ResultState}
+        legacy = str(self.status or "").casefold()
+        if self.execution_status not in allowed_execution or (
+            self.execution_status == ExecutionStatus.ERROR.value and self.success
+        ):
+            self.execution_status = (
+                ExecutionStatus.SUCCESS.value if self.success
+                else ExecutionStatus.CANCELLED.value if legacy in {"cancelled", "canceled", "interrupted"}
+                else ExecutionStatus.BLOCKED.value if self.policy_block or legacy in {"blocked", "policy_block", "approval_required"}
+                else ExecutionStatus.ERROR.value
+            )
+        if self.result_state not in allowed_result:
+            self.result_state = infer_result_state(
+                self.tool_name, self.output or self.error_message, success=self.success
+            ).value
+        if self.result is not None:
+            if (
+                self.requirement_id
+                and self.result.requirement_id
+                and self.requirement_id != self.result.requirement_id
+            ):
+                raise ValueError("ToolResult requirement identity conflicts with ToolOutcome")
+            if (
+                self.attempt_id
+                and self.result.attempt_id
+                and self.attempt_id != self.result.attempt_id
+            ):
+                raise ValueError("ToolResult attempt identity conflicts with ToolOutcome")
+            self.requirement_id = self.requirement_id or self.result.requirement_id
+            self.attempt_id = self.attempt_id or self.result.attempt_id
+            self.error_code = self.error_code or self.result.error_code
+            self.retryable = bool(self.retryable or self.result.retryable)
+            self.observed_at = self.observed_at or self.result.observed_at
+        else:
+            verification = dict(self.verification or {})
+            data = verification.get("structured_values")
+            if not isinstance(data, dict):
+                data = {}
+            raw_sources = verification.get("sources")
+            if not isinstance(raw_sources, list):
+                raw_sources = verification.get("provenance")
+            if isinstance(raw_sources, dict):
+                raw_sources = [raw_sources]
+            sources = [
+                dict(item) for item in list(raw_sources or [])
+                if isinstance(item, dict)
+            ]
+            query_plan = dict(verification.get("query_plan") or {})
+            semantic_fingerprint = str(
+                verification.get("semantic_fingerprint")
+                or query_plan.get("query_plan_id")
+                or ""
+            )
+            self.result = ToolResult(
+                data=data,
+                sources=sources,
+                observed_at=self.observed_at,
+                error_code=self.error_code,
+                retryable=self.retryable,
+                semantic_fingerprint=semantic_fingerprint,
+                requirement_id=self.requirement_id,
+                attempt_id=self.attempt_id,
+            )
+        return self
 
     def user_text(self) -> str:
         return self.output or self.error_message or self.status.replace("_", " ")
@@ -228,6 +390,16 @@ class ThreadSessionState(BaseModel):
     active_project_id: str = ""
     workspace_root: str = ""
     project_path: str = ""
+    # Canonical semantic ownership is reference-only at Session scope.
+    foreground_task_id: str = ""
+    suspended_task_ids: list[str] = Field(default_factory=list)
+    pending_approval_ids: list[str] = Field(default_factory=list)
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+    semantic_schema_version: int = 0
+    semantic_state_migrated_at: float = 0.0
+    legacy_semantic_state: dict[str, Any] = Field(default_factory=dict)
+    # Deprecated compatibility fields below are cleared during the TaskRun
+    # migration and must not control a canonical post-8.0 Turn.
     objective: str = ""
     current_subject: str = ""
     mode: str = "chat"
@@ -251,15 +423,22 @@ class ThreadSessionState(BaseModel):
     current_execution_id: str = ""
     active_turn_id: str = ""
     selected_model_id: str = ""
+    model_binding: Optional[SessionModelBinding] = None
     model_profile: dict[str, Any] = Field(default_factory=dict)
     context_budget: dict[str, Any] = Field(default_factory=dict)
     unfinished_workflow: dict[str, Any] = Field(default_factory=dict)
+    # Read-compatible v7 projection only. Canonical continuation now belongs to
+    # TaskRun arbitration and is never resumed from this dictionary.
+    active_continuation: dict[str, Any] = Field(default_factory=dict)
     # Assistant-offered next action awaiting user confirmation (not an approval gate).
     # Shape: origin_execution_id, kind, action, subject, status, assistant_text, created_at
     pending_offered_action: dict[str, Any] = Field(default_factory=dict)
     # Last assistant checkable claim for verify/double-check follow-ups (not offered actions).
     # Shape: text, subject, origin_execution_id, provisional, created_at
     last_assistant_claim: dict[str, Any] = Field(default_factory=dict)
+    # User-authored follow-ups waiting to enter the ordinary canonical Chat
+    # pipeline. Session owns this input queue; it is not a TaskRun scheduler.
+    queued_turns: list[dict[str, Any]] = Field(default_factory=list)
     pending_approval_id: str = ""
     last_execution_id: str = ""
     last_trace_id: str = ""
@@ -427,22 +606,95 @@ class StateStore:
         self._fail_corrupt_state(path, ValueError("authoritative JSON root must be an object"), kind="schema")
         raise AssertionError("unreachable")
 
+    @staticmethod
+    def _path_write_lock(path: Path) -> threading.RLock:
+        key = str(path.resolve()) if path.exists() or path.parent.exists() else str(path)
+        with _PATH_WRITE_LOCKS_GUARD:
+            lock = _PATH_WRITE_LOCKS.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                _PATH_WRITE_LOCKS[key] = lock
+            return lock
+
     def _write_json(self, path: Path, payload: Any) -> None:
+        """Windows-safe atomic JSON replace with unique temps and bounded retry.
+
+        Fixed ``.json.tmp`` names lose races under concurrent writers and Windows
+        scanners. Keep the previous valid destination if replacement fails.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp = path.with_suffix(path.suffix + ".tmp")
         serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-        try:
-            with temp.open("w", encoding="utf-8", newline="\n") as handle:
-                handle.write(serialized)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp, path)
-        finally:
-            if temp.exists():
+        store_id = id(self)
+        max_attempts = 8
+        last_error: Optional[Exception] = None
+        with self._path_write_lock(path):
+            for attempt in range(1, max_attempts + 1):
+                temp = path.with_name(
+                    f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.{uuid.uuid4().hex[:8]}.tmp"
+                )
                 try:
-                    temp.unlink()
-                except OSError:
-                    pass
+                    with temp.open("w", encoding="utf-8", newline="\n") as handle:
+                        handle.write(serialized)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temp, path)
+                    if attempt > 1:
+                        logger.info(
+                            "Durable JSON replace recovered path={} pid={} thread={} store={} attempt={}",
+                            path,
+                            os.getpid(),
+                            threading.get_ident(),
+                            store_id,
+                            attempt,
+                        )
+                    return
+                except PermissionError as exc:
+                    last_error = exc
+                    logger.warning(
+                        "Durable JSON replace sharing violation path={} pid={} thread={} store={} "
+                        "attempt={}/{} reason={}",
+                        path,
+                        os.getpid(),
+                        threading.get_ident(),
+                        store_id,
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
+                    time.sleep(min(0.05 * (2 ** (attempt - 1)), 0.8) + random.uniform(0.0, 0.05))
+                except OSError as exc:
+                    last_error = exc
+                    # WinError 5 / 32 / 33 (access denied / sharing / lock violation)
+                    winerr = getattr(exc, "winerror", None)
+                    if winerr in {5, 32, 33} or getattr(exc, "errno", None) in {13, 11}:
+                        logger.warning(
+                            "Durable JSON replace OS retry path={} pid={} thread={} store={} "
+                            "attempt={}/{} winerror={} errno={} reason={}",
+                            path,
+                            os.getpid(),
+                            threading.get_ident(),
+                            store_id,
+                            attempt,
+                            max_attempts,
+                            winerr,
+                            getattr(exc, "errno", None),
+                            exc,
+                        )
+                        time.sleep(min(0.05 * (2 ** (attempt - 1)), 0.8) + random.uniform(0.0, 0.05))
+                    else:
+                        raise
+                finally:
+                    if temp.exists():
+                        try:
+                            temp.unlink()
+                        except OSError:
+                            pass
+            # Leave previous valid file intact; surface failure so the turn cannot
+            # silently claim durable progress that never landed.
+            raise RuntimeError(
+                f"Failed to persist durable state to {path} after {max_attempts} attempts "
+                f"(pid={os.getpid()} thread={threading.get_ident()} store={store_id}): {last_error}"
+            ) from last_error
 
     def _load_all(self) -> None:
         approvals_raw = self._require_mapping(self.approvals_path, self._read_json(self.approvals_path))
@@ -588,7 +840,8 @@ class StateStore:
                         project_id: str = "", run_id: str = "", item_id: str = "",
                         canonical_arguments: Optional[dict[str, Any]] = None,
                         canonical_arguments_hash: str = "", action_id: str = "",
-                        approval_id: str = "", retry_of: str = "") -> ToolRunRecord:
+                        approval_id: str = "", retry_of: str = "",
+                        requirement_id: str = "", attempt_id: str = "") -> ToolRunRecord:
         rid = str(run_id or "").strip() or str(uuid.uuid4())
         with self._lock:
             existing = self._tool_runs.get(rid)
@@ -602,7 +855,8 @@ class StateStore:
                                    session_id=session_id or "default", project_id=project_id, item_id=item_id,
                                    canonical_arguments=canonical_arguments or {},
                                    canonical_arguments_hash=canonical_arguments_hash, action_id=action_id,
-                                   approval_id=approval_id, retry_of=retry_of)
+                                   approval_id=approval_id, retry_of=retry_of,
+                                   requirement_id=requirement_id, attempt_id=attempt_id)
             self._tool_runs[record.id] = record
             self._events.append(RuntimeEvent(project_id=project_id, session_id=record.session_id,
                                              turn_id=turn_id, item_id=item_id, tool_run_id=record.id,
@@ -628,6 +882,13 @@ class StateStore:
                 new_status = "complete"
             record.outcome = payload
             record.verification = dict(payload.get("verification") or {})
+            record.requirement_id = str(payload.get("requirement_id") or record.requirement_id or "")
+            record.attempt_id = str(payload.get("attempt_id") or record.attempt_id or "")
+            record.evidence_ids = list(dict.fromkeys(
+                str(item) for item in payload.get("evidence_ids", record.evidence_ids) if str(item).strip()
+            ))
+            record.execution_status = str(payload.get("execution_status") or "")
+            record.result_state = str(payload.get("result_state") or "")
             record.status = new_status
             record.updated_at = record.completed_at = time.time()
             self._events.append(RuntimeEvent(project_id=record.project_id, session_id=record.session_id,
@@ -674,6 +935,42 @@ class StateStore:
     def list_tool_runs(self, turn_id: str) -> list[ToolRunRecord]:
         with self._lock:
             return [ToolRunRecord(**run.model_dump()) for run in self._tool_runs.values() if run.turn_id == turn_id]
+
+    def cancel_open_tool_runs(self, turn_id: str, reason: str = "Turn cancelled") -> list[ToolRunRecord]:
+        """Terminalize only the exact Turn's open ToolRuns as cancelled."""
+        with self._lock:
+            run_ids = [
+                run.id
+                for run in self._tool_runs.values()
+                if run.turn_id == str(turn_id or "")
+                and str(run.status or "").lower() not in self.TOOL_RUN_TERMINAL
+            ]
+        cancelled: list[ToolRunRecord] = []
+        for run_id in run_ids:
+            record = self.get_tool_run(run_id)
+            if record is None:
+                continue
+            finished = self.finish_tool_run(
+                run_id,
+                ToolOutcome(
+                    tool_name=record.tool_name,
+                    run_id=run_id,
+                    execution_id=record.turn_id,
+                    project_id=record.project_id,
+                    session_id=record.session_id,
+                    turn_id=record.turn_id,
+                    success=False,
+                    status="cancelled",
+                    execution_status="cancelled",
+                    result_state="no_data",
+                    error_code="turn_cancelled",
+                    error_message=str(reason or "Turn cancelled")[:500],
+                    retryable=False,
+                ),
+            )
+            if finished is not None:
+                cancelled.append(finished)
+        return cancelled
 
     def list_tool_runs_for_session(self, session_id: str, limit: int = 120) -> list[ToolRunRecord]:
         """ToolRuns for one Session only (never bleed across sessions)."""
@@ -1104,10 +1401,142 @@ class StateStore:
             state.failed_actions = list(state.failed_actions or [])[-40:]
             state.plan_steps = list(state.plan_steps or [])[-80:]
             state.ledger = list(state.ledger or [])[-120:]
+            state.queued_turns = list(state.queued_turns or [])[-100:]
             state.updated_at = time.time()
             self._thread_state[key] = state
             self._persist_thread_state()
             return ThreadSessionState(**state.model_dump())
+
+    def enqueue_turn(
+        self,
+        thread_id: Optional[str],
+        *,
+        message: str,
+        client_request_id: str,
+    ) -> dict[str, Any]:
+        key = str(thread_id or "default").strip() or "default"
+        text = str(message or "").strip()
+        request_id = str(client_request_id or "").strip()
+        if not text or not request_id:
+            raise ValueError("Queued Turn requires message and client_request_id")
+        with self._lock:
+            state = self._thread_state.get(key) or ThreadSessionState(
+                thread_id=key, session_id=key
+            )
+            existing = next(
+                (
+                    dict(item) for item in state.queued_turns
+                    if str(item.get("client_request_id") or "") == request_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing
+            item = {
+                "message": text[:50000],
+                "client_request_id": request_id[:128],
+                "created_at": time.time(),
+            }
+            state.queued_turns = [*list(state.queued_turns or []), item][-100:]
+            state.updated_at = time.time()
+            self._thread_state[key] = state
+            self._persist_thread_state()
+            return dict(item)
+
+    def list_queued_turns(self, thread_id: Optional[str]) -> list[dict[str, Any]]:
+        key = str(thread_id or "default").strip() or "default"
+        with self._lock:
+            state = self._thread_state.get(key) or ThreadSessionState(
+                thread_id=key, session_id=key
+            )
+            return [dict(item) for item in list(state.queued_turns or [])]
+
+    def claim_queued_turn(self, thread_id: Optional[str]) -> Optional[dict[str, Any]]:
+        """Atomically remove and return the oldest queued follow-up."""
+        key = str(thread_id or "default").strip() or "default"
+        with self._lock:
+            state = self._thread_state.get(key) or ThreadSessionState(
+                thread_id=key, session_id=key
+            )
+            pending = list(state.queued_turns or [])
+            if not pending:
+                return None
+            item = dict(pending.pop(0))
+            state.queued_turns = pending
+            state.updated_at = time.time()
+            self._thread_state[key] = state
+            self._persist_thread_state()
+            return item
+
+    def ensure_session_model_binding(
+        self,
+        session_id: str,
+        *,
+        provider_id: str,
+        model_id: str,
+        provider_configuration_id: str = "global-default",
+    ) -> SessionModelBinding:
+        """Lazily bind an existing Session to its current configured default."""
+
+        key = str(session_id or "default").strip() or "default"
+        with self._lock:
+            state = self._thread_state.get(key) or ThreadSessionState(
+                thread_id=key, session_id=key
+            )
+            if state.model_binding is None:
+                state.model_binding = SessionModelBinding(
+                    session_id=key,
+                    provider_id=provider_id,
+                    model_id=model_id,
+                    provider_configuration_id=provider_configuration_id,
+                )
+                state.runtime_provider = state.model_binding.provider_id
+                state.selected_model_id = state.model_binding.model_id
+                state.updated_at = time.time()
+                self._thread_state[key] = state
+                self._persist_thread_state()
+            return state.model_binding.model_copy(deep=True)
+
+    def update_session_model_binding(
+        self,
+        session_id: str,
+        *,
+        provider_id: str,
+        model_id: str,
+        expected_revision: int,
+        provider_configuration_id: str = "global-default",
+    ) -> SessionModelBinding:
+        """CAS-update only one Session's selected model."""
+
+        key = str(session_id or "default").strip() or "default"
+        with self._lock:
+            state = self._thread_state.get(key) or ThreadSessionState(
+                thread_id=key, session_id=key
+            )
+            current = state.model_binding
+            if current is None:
+                raise ValueError("Session model binding has not been initialized")
+            if current.binding_revision != int(expected_revision):
+                raise RuntimeError(
+                    f"Session model binding changed from revision {expected_revision} "
+                    f"to {current.binding_revision}"
+                )
+            binding = SessionModelBinding(
+                session_id=key,
+                provider_id=provider_id,
+                model_id=model_id,
+                provider_configuration_id=provider_configuration_id,
+                binding_revision=current.binding_revision + 1,
+                created_at=current.created_at,
+                updated_at=time.time(),
+            )
+            state.model_binding = binding
+            state.runtime_provider = binding.provider_id
+            state.selected_model_id = binding.model_id
+            state.updated_at = time.time()
+            self._thread_state[key] = state
+            self._persist_thread_state()
+            return binding.model_copy(deep=True)
 
     def list_thread_states(self) -> list[ThreadSessionState]:
         """Return Session state snapshots for UI projections and maintenance."""
@@ -1158,9 +1587,14 @@ class StateStore:
             except Exception:
                 pass
             try:
-                from agent.code_workspace import get_preview_manager
+                from agent.project_preview import stop_preview_for_scope_change
 
-                get_preview_manager().stop(tid)
+                stop_preview_for_scope_change(
+                    tid,
+                    reason="Project was deleted",
+                    detached_project_id=target,
+                    state_store=self,
+                )
             except Exception:
                 pass
         return changed
@@ -1177,6 +1611,7 @@ class StateStore:
             return ProjectLedgerEntry(**entry.model_dump())
 
     def create_execution(self, **payload: Any) -> ExecutionRecord:
+        record_user_message = bool(payload.pop("record_user_message", True))
         payload.setdefault("session_id", payload.get("thread_id") or "default")
         payload.setdefault("project_id", payload.get("active_project_id") or "")
         record = ExecutionRecord(**payload)
@@ -1217,9 +1652,10 @@ class StateStore:
                 continuity_notice="",
                 safest_next_action="",
             )
-            self.add_item(turn_id=record.id, item_type="user_message", status="complete",
-                          payload={"text": record.query}, session_id=record.session_id,
-                          project_id=record.project_id, model_id=record.model_id)
+            if record_user_message and str(record.query or "").strip():
+                self.add_item(turn_id=record.id, item_type="user_message", status="complete",
+                              payload={"text": record.query}, session_id=record.session_id,
+                              project_id=record.project_id, model_id=record.model_id)
         return ExecutionRecord(**record.model_dump())
 
     def update_execution(self, execution_id: str, **updates: Any) -> Optional[ExecutionRecord]:
@@ -1278,13 +1714,22 @@ class StateStore:
                 self._persist_executions()
         return ApprovalRecord(**record.model_dump())
 
-    def update_approval(self, approval_id: str, *, status: str, outcome_summary: str = "") -> Optional[ApprovalRecord]:
+    def update_approval(
+        self,
+        approval_id: str,
+        *,
+        status: str,
+        outcome_summary: str = "",
+        tool_run_id: str = "",
+    ) -> Optional[ApprovalRecord]:
         with self._lock:
             record = self._approvals.get(approval_id)
             if record is None:
                 return None
             record.status = status
             record.outcome_summary = outcome_summary
+            if tool_run_id:
+                record.tool_run_id = str(tool_run_id)
             record.updated_at = time.time()
             record.decided_at = time.time()
             self._approvals[approval_id] = record
@@ -1328,6 +1773,35 @@ class StateStore:
                 execution.updated_at = time.time()
                 self._executions[execution.id] = execution
                 self._persist_executions()
+            return ApprovalRecord(**record.model_dump())
+
+    def bind_approval_task_checkpoint(
+        self,
+        approval_id: str,
+        *,
+        task_run_id: str,
+        requirement_id: str,
+        attempt_id: str,
+        task_run_revision: int,
+    ) -> ApprovalRecord:
+        """Advance only the CAS checkpoint for an already-bound pending approval."""
+
+        with self._lock:
+            record = self._approvals.get(str(approval_id or ""))
+            if record is None or record.status != "pending":
+                raise ValueError("Approval is no longer pending")
+            if (
+                record.task_run_id != str(task_run_id or "")
+                or record.requirement_id != str(requirement_id or "")
+                or record.attempt_id != str(attempt_id or "")
+            ):
+                raise ValueError("Approval TaskRun lineage cannot be changed")
+            if int(task_run_revision or 0) <= int(record.task_run_revision or 0):
+                raise ValueError("Approval TaskRun checkpoint must advance")
+            record.task_run_revision = int(task_run_revision)
+            record.updated_at = time.time()
+            self._approvals[record.id] = record
+            self._persist_approvals()
             return ApprovalRecord(**record.model_dump())
 
     def claim_pending_approval(self, approval_id: str, *, status: str = "consuming") -> Optional[ApprovalRecord]:

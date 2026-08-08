@@ -219,7 +219,13 @@ class DuckDuckGoProvider:
         self.max_results = max(3, min(int(max_results), 12))
         self.timeout_s = timeout_s
 
-    def search(self, query: str, *, news: bool = False) -> SearchProviderResult:
+    def search(
+        self,
+        query: str,
+        *,
+        news: bool = False,
+        allow_simplified_retry: bool = True,
+    ) -> SearchProviderResult:
         q = str(query or "").strip()
         if not q:
             return SearchProviderResult(provider=self.name, errors=["empty query"])
@@ -287,7 +293,7 @@ class DuckDuckGoProvider:
             return SearchProviderResult(provider=self.name, errors=errors, queries_used=queries_used)
 
         # Empty → simplified retry
-        if not hits:
+        if not hits and allow_simplified_retry:
             simple = simplify_query(q)
             if simple and simple.lower() != q.lower():
                 queries_used.append(simple)
@@ -493,7 +499,7 @@ def _dedupe_hits(hits: Sequence[SearchHit]) -> List[SearchHit]:
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator
+# Provider selection and legacy orchestration
 # ---------------------------------------------------------------------------
 
 
@@ -520,6 +526,81 @@ def resolve_provider_order(config: Any) -> List[str]:
         order.append("duckduckgo")
     return order
 
+
+def _provider_registry(config: Any) -> Dict[str, Any]:
+    """Build configured provider adapters without selecting a retry policy."""
+
+    timeout = float(getattr(config, "web_search_timeout", 10) or 10)
+    max_results = int(getattr(config, "web_search_max_results", 8) or 8)
+    return {
+        "duckduckgo": DuckDuckGoProvider(max_results=max_results, timeout_s=timeout),
+        "searxng": SearXNGProvider(
+            base_url=str(getattr(config, "searxng_base_url", "") or ""),
+            max_results=max_results,
+            timeout_s=timeout,
+        ),
+        "brave": BraveProvider(
+            api_key=str(getattr(config, "brave_search_api_key", "") or ""),
+            max_results=max_results,
+            timeout_s=timeout,
+        ),
+    }
+
+
+def run_web_search_attempt(
+    query: str,
+    *,
+    provider_name: str,
+    config: Any = None,
+    max_hits: int = 10,
+) -> SearchProviderResult:
+    """Run one query through one provider adapter.
+
+    This is the canonical TaskRun acquisition boundary. It deliberately owns no
+    cross-provider cascade, query-variant fan-out, page extraction, or completion
+    decision. Those recovery choices remain visible to the TaskRun scheduler as
+    separate governed attempts.
+    """
+
+    if config is None:
+        from config import config as config  # noqa: A001
+
+    normalized_query = normalize_provider_query(query)
+    if is_vague_search_query(normalized_query):
+        return SearchProviderResult(
+            provider="none",
+            errors=["Search query is too vague; provide a concrete subject, entity, or question."],
+            queries_used=[],
+        )
+    selected = str(provider_name or "").strip().casefold()
+    if selected == "ddg":
+        selected = "duckduckgo"
+    provider = _provider_registry(config).get(selected)
+    if provider is None:
+        return SearchProviderResult(
+            provider=selected or "none",
+            errors=[f"Search provider {selected or 'none'} is not registered"],
+            queries_used=[normalized_query],
+        )
+    if selected in {"brave", "searxng"} and not getattr(provider, "available", False):
+        return SearchProviderResult(
+            provider=selected,
+            errors=[f"Search provider {selected} is not configured"],
+            queries_used=[normalized_query],
+        )
+    result = provider.search(
+        normalized_query,
+        news=_is_newsish(normalized_query),
+        allow_simplified_retry=False,
+    )
+    return SearchProviderResult(
+        hits=_dedupe_hits(result.hits)[: max(1, int(max_hits))],
+        provider=str(result.provider or selected),
+        errors=list(result.errors or [])[:8],
+        queries_used=list(result.queries_used or [normalized_query])[:8],
+    )
+
+
 def run_web_search(
     query: str,
     *,
@@ -545,22 +626,7 @@ def run_web_search(
             queries_used=[],
         )
 
-    timeout = float(getattr(config, "web_search_timeout", 10) or 10)
-    max_results = int(getattr(config, "web_search_max_results", 8) or 8)
-
-    providers: Dict[str, Any] = {
-        "duckduckgo": DuckDuckGoProvider(max_results=max_results, timeout_s=timeout),
-        "searxng": SearXNGProvider(
-            base_url=str(getattr(config, "searxng_base_url", "") or ""),
-            max_results=max_results,
-            timeout_s=timeout,
-        ),
-        "brave": BraveProvider(
-            api_key=str(getattr(config, "brave_search_api_key", "") or ""),
-            max_results=max_results,
-            timeout_s=timeout,
-        ),
-    }
+    providers = _provider_registry(config)
 
     order = resolve_provider_order(config)
     variants = build_query_variants(normalized_query, max_variants=3)

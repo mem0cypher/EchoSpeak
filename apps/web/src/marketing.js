@@ -94,7 +94,7 @@ const workflow = [
     },
     {
         title: "Stage 4: Invoke LLM",
-        description: "Routes through a LangGraph ReAct agent. Executes tools gracefully. Sensitive destructive tools are paused and pushed to the 4-layer confirmation gate.",
+        description: "Routes through Echo's canonical bounded model loop. Sensitive actions stay behind durable ToolRuns and exact approval checks.",
     },
     {
         title: "Stage 5: Finalize",

@@ -26,10 +26,12 @@ Usage in core.py:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -47,6 +49,17 @@ class ToolEntry:
     policy_flags: tuple = ()  # env flags required to enable
     keyword_hints: tuple = ()  # keywords for heuristic routing
     owner: str = "builtin"
+    origin: str = "native"  # native | skill | connection | mcp
+    connection_id: str = ""
+    mcp_server: str = ""
+    health: str = "healthy"
+    input_schema: Dict[str, Any] = field(default_factory=dict)
+    output_schema: Dict[str, Any] = field(default_factory=dict)
+    approval_required: bool = False
+    available: bool = True
+    unavailable_reason: str = ""
+    project_ids: tuple = ()
+    session_ids: tuple = ()
 
 
 _registration_context: ContextVar[tuple[str, bool]] = ContextVar(
@@ -64,6 +77,17 @@ class ToolRegistry:
     """
 
     _entries: Dict[str, ToolEntry] = {}
+    _revision: int = 0
+    _lock = threading.RLock()
+
+    @classmethod
+    def _put(cls, entry: ToolEntry) -> None:
+        """Store one entry and advance the immutable inventory revision on change."""
+        with cls._lock:
+            if cls._entries.get(entry.name) == entry:
+                return
+            cls._entries[entry.name] = entry
+            cls._revision += 1
 
     @classmethod
     @contextmanager
@@ -87,6 +111,15 @@ class ToolRegistry:
         risk_level: str = "safe",
         policy_flags: Optional[List[str]] = None,
         keyword_hints: Optional[List[str]] = None,
+        origin: str = "native",
+        connection_id: str = "",
+        mcp_server: str = "",
+        health: str = "healthy",
+        input_schema: Optional[Dict[str, Any]] = None,
+        output_schema: Optional[Dict[str, Any]] = None,
+        approval_required: Optional[bool] = None,
+        available: bool = True,
+        unavailable_reason: str = "",
     ):
         """Decorator that registers a tool function in the global registry.
 
@@ -109,7 +142,7 @@ class ToolRegistry:
                     f"Tool registration collision for '{name}': "
                     f"owner '{owner}' cannot replace '{existing.owner}'"
                 )
-            cls._entries[name] = ToolEntry(
+            cls._put(ToolEntry(
                 name=name,
                 func=func,
                 description=description,
@@ -119,7 +152,16 @@ class ToolRegistry:
                 policy_flags=_flags,
                 keyword_hints=_hints,
                 owner=owner,
-            )
+                origin=str(origin or "native"),
+                connection_id=str(connection_id or ""),
+                mcp_server=str(mcp_server or ""),
+                health=str(health or "unknown"),
+                input_schema=dict(input_schema or {}),
+                output_schema=dict(output_schema or {}),
+                approval_required=bool(is_action if approval_required is None else approval_required),
+                available=bool(available),
+                unavailable_reason=str(unavailable_reason or ""),
+            ))
             return func
 
         return decorator
@@ -153,7 +195,7 @@ class ToolRegistry:
             risk = meta.get("risk_level", "safe")
             requires_confirm = meta.get("requires_confirmation", False)
             flags = tuple(meta.get("policy_flags", []))
-            cls._entries[name] = ToolEntry(
+            cls._put(ToolEntry(
                 name=name,
                 func=func,
                 description=desc,
@@ -162,7 +204,92 @@ class ToolRegistry:
                 risk_level=risk,
                 policy_flags=flags,
                 owner="legacy_metadata",
+                origin="native",
+                approval_required=bool(requires_confirm),
+            ))
+
+    @classmethod
+    def register_entry(cls, entry: ToolEntry, *, reject_conflicts: bool = True) -> ToolEntry:
+        """Register a fully typed dynamic entry without bypassing collision policy."""
+        existing = cls._entries.get(entry.name)
+        if existing is not None and reject_conflicts:
+            raise ValueError(
+                f"Tool registration collision for '{entry.name}': "
+                f"owner '{entry.owner}' cannot replace '{existing.owner}'"
             )
+        cls._put(entry)
+        return entry
+
+    @classmethod
+    def remove_owned(cls, name: str, owner: str) -> bool:
+        """Remove only the entry owned by the caller; never delete a collision winner."""
+        current = cls._entries.get(str(name or ""))
+        if current is None or current.owner != str(owner or ""):
+            return False
+        with cls._lock:
+            cls._entries.pop(current.name, None)
+            cls._revision += 1
+        return True
+
+    @classmethod
+    def set_owner_availability(
+        cls,
+        owner: str,
+        *,
+        available: bool,
+        health: str,
+        reason: str = "",
+    ) -> int:
+        """Atomically project transport health onto all tools owned by a provider."""
+        changed = 0
+        for name, entry in list(cls._entries.items()):
+            if entry.owner != str(owner or ""):
+                continue
+            updated = replace(
+                entry,
+                available=bool(available),
+                health=str(health or "unknown"),
+                unavailable_reason="" if available else str(reason or "unavailable"),
+            )
+            if updated != entry:
+                cls._put(updated)
+                changed += 1
+        return changed
+
+    @classmethod
+    def describe(cls, name: str) -> Optional[Dict[str, Any]]:
+        entry = cls.get(name)
+        if entry is None:
+            return None
+        return {
+            "name": entry.name,
+            "description": entry.description,
+            "category": entry.category,
+            "origin": entry.origin,
+            "owner": entry.owner,
+            "connection_id": entry.connection_id,
+            "mcp_server": entry.mcp_server,
+            "health": entry.health,
+            "schema": dict(entry.input_schema or {}),
+            "output_schema": dict(entry.output_schema or {}),
+            "approval_required": bool(entry.approval_required or entry.is_action),
+            "available": bool(entry.available),
+            "unavailable_reason": entry.unavailable_reason,
+            "risk_level": entry.risk_level,
+            "project_ids": list(entry.project_ids),
+            "session_ids": list(entry.session_ids),
+        }
+
+    @classmethod
+    def available_in_scope(cls, name: str, *, project_id: str = "", session_id: str = "") -> bool:
+        entry = cls.get(name)
+        if entry is None or not entry.available:
+            return False
+        if entry.project_ids and str(project_id or "") not in set(entry.project_ids):
+            return False
+        if entry.session_ids and str(session_id or "") not in set(entry.session_ids):
+            return False
+        return True
 
     # ── Queries ─────────────────────────────────────────────────────
 
@@ -177,14 +304,44 @@ class ToolRegistry:
         return dict(cls._entries)
 
     @classmethod
+    def inventory_snapshot(cls, config: Any = None) -> Dict[str, Any]:
+        """Return one deterministic inventory artifact used by prompt and execution."""
+        entries = list(cls._entries.values())
+        if config is not None:
+            enabled = {
+                str(getattr(func, "name", "") or getattr(func, "__name__", ""))
+                for func in cls.get_config_filtered_funcs(config)
+            }
+            entries = [entry for entry in entries if entry.name in enabled]
+        records = [
+            {
+                "name": entry.name,
+                "owner": entry.owner,
+                "origin": entry.origin,
+                "category": entry.category,
+                "available": bool(entry.available),
+                "approval_required": bool(entry.approval_required or entry.is_action),
+                "health": entry.health,
+            }
+            for entry in sorted(entries, key=lambda item: item.name)
+        ]
+        canonical = json.dumps(records, sort_keys=True, separators=(",", ":"))
+        return {
+            "revision": cls._revision,
+            "count": len(records),
+            "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "tools": records,
+        }
+
+    @classmethod
     def get_funcs(cls) -> List[Any]:
         """Return all tool functions (for LangChain agent init)."""
-        return [e.func for e in cls._entries.values()]
+        return [e.func for e in cls._entries.values() if e.available]
 
     @classmethod
     def get_safe_funcs(cls) -> List[Any]:
         """Return non-action tool functions only (safe for LLM tool-calling)."""
-        return [e.func for e in cls._entries.values() if not e.is_action]
+        return [e.func for e in cls._entries.values() if e.available and not e.is_action]
 
     @classmethod
     def get_config_filtered_funcs(cls, config: Any) -> List[Any]:
@@ -203,6 +360,8 @@ class ToolRegistry:
         """
         result: List[Any] = []
         for entry in cls._entries.values():
+            if not entry.available:
+                continue
             if not entry.is_action:
                 result.append(entry.func)
                 continue
@@ -251,15 +410,21 @@ class ToolRegistry:
     @classmethod
     def clear(cls) -> None:
         """Clear all registered tools (for testing)."""
-        cls._entries.clear()
+        with cls._lock:
+            if cls._entries:
+                cls._entries.clear()
+                cls._revision += 1
 
 
 # ── Pipeline Plugin System ──────────────────────────────────────────
 
 class PipelinePlugin:
-    """Base class for pipeline plugins that skills can subclass.
+    """Legacy compatibility hook for the disabled pre-v8 pipeline.
 
-    Each method corresponds to a pipeline stage in ``process_query()``.
+    Ordinary production Turns do not dispatch these hooks. Packages, Skills,
+    Connections, and governed Tools use separate canonical contracts. Existing
+    skill folders may keep these read-only transforms while migration proceeds.
+    Each method corresponds to a legacy pipeline stage in ``process_query()``.
     Return ``None`` to pass through; return a value to short-circuit.
 
     Example skill plugin (``skills/weather/plugin.py``)::
@@ -291,6 +456,7 @@ class PipelinePlugin:
     # registered as an action tool so it receives request-time authority.
     permission_sensitive: bool = False
     mutates_external_state: bool = False
+    compatibility_only: bool = True
 
     def on_shortcut(self, user_input: str, context: Any, **kwargs) -> Any:
         """Called during Stage 3 (shortcuts). Return a tuple to short-circuit."""
@@ -306,7 +472,7 @@ class PipelinePlugin:
 
 
 class PluginRegistry:
-    """Registry for pipeline plugins.
+    """Registry for legacy compatibility hooks.
 
     Plugins are registered in order and dispatched sequentially at each
     pipeline stage. The first plugin to return a non-None value wins
@@ -402,6 +568,7 @@ class PluginRegistry:
 
 _CATEGORY_MAP = {
     "web_search": "research",
+    "safe_web_fetch": "research",
     "youtube_transcript": "research",
     "browse_task": "research",
     "get_system_time": "utility",

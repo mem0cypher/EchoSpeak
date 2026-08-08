@@ -3,12 +3,13 @@ Thread persistence manager for multi-turn conversations.
 
 Saves thread metadata (title, created, last_active, message_count, source)
 to a JSON file. Threads are lightweight wrappers — the actual conversation
-history lives in LangGraph checkpoints and the memory system.
+history lives in the durable Session store and the memory system.
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -34,6 +35,9 @@ class ThreadInfo:
     workspace_id: str = ""
     pinned: bool = False
     archived: bool = False
+    # Opaque creation identity used only to collapse transport retries.
+    idempotency_key: str = ""
+    creation_fingerprint: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -51,7 +55,7 @@ class ThreadManager:
 
     Stores thread metadata in a JSON file at ``data/threads.json``.
     Thread IDs are passed to the agent via ``process_query(thread_id=...)``,
-    which routes to the correct LangGraph checkpoint and memory partition.
+    which routes to the correct durable Session and memory partition.
     """
 
     def __init__(self, persist_path: Optional[Path] = None):
@@ -130,9 +134,37 @@ class ThreadManager:
         source: str = "web",
         workspace_id: str = "",
         thread_id: Optional[str] = None,
+        idempotency_key: str = "",
+        idempotency_context: str = "",
     ) -> ThreadInfo:
         """Create a new conversation thread."""
         with self._lock:
+            creation_key = str(idempotency_key or "").strip()
+            creation_fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "title": (title or "New Session").strip() or "New Session",
+                        "source": source,
+                        "workspace_id": workspace_id,
+                        "context": str(idempotency_context or ""),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if creation_key:
+                existing = next(
+                    (
+                        item for item in self._threads.values()
+                        if item.idempotency_key == creation_key and item.source == source
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if existing.creation_fingerprint and existing.creation_fingerprint != creation_fingerprint:
+                        raise ValueError("idempotency key was reused with different Session creation parameters")
+                    logger.info("Thread creation replay collapsed: {}", existing.thread_id)
+                    return existing
             tid = thread_id or str(uuid.uuid4())
             now = time.time()
             thread = ThreadInfo(
@@ -143,6 +175,8 @@ class ThreadManager:
                 message_count=0,
                 source=source,
                 workspace_id=workspace_id,
+                idempotency_key=creation_key,
+                creation_fingerprint=creation_fingerprint if creation_key else "",
             )
             self._threads[tid] = thread
             self._save()

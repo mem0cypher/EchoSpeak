@@ -17,7 +17,7 @@ import uuid
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Literal
 from pathlib import Path
 from urllib.parse import urlparse
 from loguru import logger
@@ -650,6 +650,12 @@ class TerminalRunArgs(BaseModel):
     command: str = Field(..., validation_alias=AliasChoices("command", "cmd", "powershell", "ps"))
     cwd: Optional[str] = Field(default=".", validation_alias=AliasChoices("cwd", "dir", "path", "workdir"))
     timeout: Optional[int] = Field(default=None, ge=1, le=120)
+
+
+class CodePreviewArgs(BaseModel):
+    """Preview controls derive all identity and scope from the active Turn."""
+
+    pass
 
 
 class ArtifactWriteArgs(BaseModel):
@@ -1299,6 +1305,64 @@ def terminal_run(command: str, cwd: Optional[str] = ".", timeout: Optional[int] 
         )
     except Exception as e:
         return f"ExitCode=1\nStatus=fail\nMode=host\nReason=Failed to run command: {str(e)}"
+
+
+@tool(
+    args_schema=CodePreviewArgs,
+    description="Start the detected preview for the active Session's attached Project. Requires explicit approval.",
+)
+def code_preview_start() -> str:
+    if denied := _tool_scope_denial("code_preview_start"):
+        return denied
+    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_terminal_commands", False):
+        return "Code preview is disabled. Enable system actions and terminal commands first."
+    context = _tool_execution_context.get() or {}
+    thread_id = str(context.get("thread_id") or "").strip()
+    project_root = str(context.get("project_root") or context.get("project_path") or "").strip()
+    if not thread_id or not project_root:
+        return "Code preview blocked: the active Session has no attached Project root."
+    try:
+        from agent.project_preview import detect_project, get_preview_manager
+
+        root = Path(project_root).resolve()
+        if not root.exists() or not root.is_dir():
+            return "Code preview blocked: the attached Project root is unavailable."
+        detection = detect_project(root)
+        result = get_preview_manager().start(thread_id, root, detection)
+        return json.dumps({
+            **dict(result or {}),
+            "thread_id": thread_id,
+            "project_root": str(root),
+            "detection": detection.as_dict(),
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return f"Code preview failed to start: {exc}"
+
+
+@tool(
+    args_schema=CodePreviewArgs,
+    description="Stop the running preview owned by the active Session. Requires explicit approval.",
+)
+def code_preview_stop() -> str:
+    if denied := _tool_scope_denial("code_preview_stop"):
+        return denied
+    if not getattr(config, "enable_system_actions", False) or not getattr(config, "allow_terminal_commands", False):
+        return "Code preview is disabled. Enable system actions and terminal commands first."
+    context = _tool_execution_context.get() or {}
+    thread_id = str(context.get("thread_id") or "").strip()
+    if not thread_id:
+        return "Code preview blocked: no active Session is bound."
+    try:
+        from agent.project_preview import get_preview_manager
+
+        result = get_preview_manager().stop(thread_id)
+        return json.dumps({
+            **dict(result or {}),
+            "thread_id": thread_id,
+            "preview": get_preview_manager().status(thread_id),
+        }, ensure_ascii=False)
+    except Exception as exc:
+        return f"Code preview failed to stop: {exc}"
 
 
 def _artifacts_root() -> Path:
@@ -1977,27 +2041,121 @@ def _encode_image_b64(img: "np.ndarray") -> str:
 
 
 class SportsLiveArgs(BaseModel):
-    query: str = Field(description="Live score, odds, or standings request (e.g. 'team score right now', 'moneyline odds')")
+    query: str = Field(description="Sports subject, team, or competition request")
+    operation: Literal[
+        "schedule", "live_scores", "standings", "results",
+        "team_next_event", "competition_next_event", "odds",
+    ] = Field(default="live_scores", description="Exact structured sports operation")
+
+
+class WeatherLiveArgs(BaseModel):
+    location: str = Field(description="City or location whose current weather should be retrieved")
 
 
 @tool(
     args_schema=SportsLiveArgs,
     description=(
         "Live sports scores and betting odds from a structured sports-data API "
-        "(not web crawl). Prefer this over web_search for live scores, who won, "
-        "moneyline/spread odds. Falls back with an explicit error if not configured."
+        "(not web crawl). Supports schedule, live_scores, standings, results, "
+        "team_next_event, competition_next_event, and odds. Unsupported provider coverage "
+        "returns a typed no-data/unsupported state so grounded web fallback may run."
     ),
 )
-def sports_live(query: str) -> str:
+def sports_live(query: str, operation: str = "live_scores") -> str:
     """Structured live sports data (The Odds API). Not a web search crawl."""
     try:
         from agent.sports_data import get_sports_data_client
 
         client = get_sports_data_client()
-        result = client.query(query or "")
+        result = client.query(query or "", operation=operation)
         return result.as_tool_text()
     except Exception as exc:
-        return f"[SPORTS_LIVE] ok=false ERROR: {exc}"
+        logger.exception("sports_live provider request failed")
+        return (
+            "[SPORTS_LIVE] ok=false execution_status=error "
+            "result_state=provider_unavailable provider=sports_live retryable=false\n"
+            "DETAIL: the structured sports provider request failed safely\n"
+            "NEXT_ACTION: use an allowed grounded web_search fallback when available."
+        )
+
+
+@tool(
+    args_schema=WeatherLiveArgs,
+    description=(
+        "Current weather from the structured Open-Meteo geocoding and forecast APIs. "
+        "Prefer this over web_search when a location is known."
+    ),
+)
+def weather_live(location: str) -> str:
+    """Keyless structured current weather with bounded network responses."""
+    from urllib.parse import urlencode
+    from urllib.request import Request, urlopen
+
+    place = str(location or "").strip()
+    if not place:
+        return "[WEATHER_LIVE] ok=false error=missing_location"
+
+    def _read_json(url: str) -> dict[str, Any]:
+        request = Request(url, headers={"Accept": "application/json", "User-Agent": "EchoSpeak/8.0"})
+        with urlopen(request, timeout=8) as response:
+            body = response.read(512_001)
+        if len(body) > 512_000:
+            raise ValueError("weather response exceeded 512 KB")
+        payload = json.loads(body.decode("utf-8")) if body else {}
+        if not isinstance(payload, dict):
+            raise ValueError("weather response was not an object")
+        return payload
+
+    try:
+        geo = _read_json(
+            "https://geocoding-api.open-meteo.com/v1/search?"
+            + urlencode({"name": place, "count": 1, "language": "en", "format": "json"})
+        )
+        rows = geo.get("results") or []
+        if not rows or not isinstance(rows[0], dict):
+            return f"[WEATHER_LIVE] ok=false error=location_not_found location={place}"
+        match = rows[0]
+        latitude = float(match["latitude"])
+        longitude = float(match["longitude"])
+        forecast = _read_json(
+            "https://api.open-meteo.com/v1/forecast?"
+            + urlencode({
+                "latitude": latitude,
+                "longitude": longitude,
+                "current": (
+                    "temperature_2m,apparent_temperature,relative_humidity_2m,"
+                    "precipitation,weather_code,wind_speed_10m"
+                ),
+                "temperature_unit": "celsius",
+                "wind_speed_unit": "kmh",
+                "timezone": "auto",
+            })
+        )
+        current = forecast.get("current")
+        if not isinstance(current, dict):
+            raise ValueError("forecast did not include current conditions")
+        result = {
+            "ok": True,
+            "source": "open-meteo",
+            "location": {
+                "name": match.get("name") or place,
+                "admin1": match.get("admin1") or "",
+                "country": match.get("country") or "",
+                "latitude": latitude,
+                "longitude": longitude,
+            },
+            "observed_at": current.get("time"),
+            "timezone": forecast.get("timezone"),
+            "temperature_c": current.get("temperature_2m"),
+            "apparent_temperature_c": current.get("apparent_temperature"),
+            "relative_humidity_percent": current.get("relative_humidity_2m"),
+            "precipitation_mm": current.get("precipitation"),
+            "weather_code": current.get("weather_code"),
+            "wind_speed_kmh": current.get("wind_speed_10m"),
+        }
+        return "[WEATHER_LIVE] " + json.dumps(result, ensure_ascii=False, sort_keys=True)
+    except Exception as exc:
+        return f"[WEATHER_LIVE] ok=false error={type(exc).__name__}: {exc}"
 
 
 @tool(args_schema=WebSearchArgs, description="Search the web for current information.")
@@ -2074,8 +2232,26 @@ def web_search(
         merged_hits = []
         errors = []
         providers_used = []
-        for q in queries:
-            res = run_web_search(q, config=config, enrich_extract=True, max_hits=10)
+
+        # Search discovery is read-only and has no shared TaskRun/ToolRun
+        # authority.  Independent query variants may therefore run in
+        # parallel inside this one governed ToolRun, while their results are
+        # consumed in original query order for deterministic evidence.
+        search_results = []
+        if len(queries) == 1:
+            search_results = [run_web_search(queries[0], config=config, enrich_extract=True, max_hits=10)]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            configured_limit = max(1, int(getattr(config, "research_max_concurrency", 4) or 4))
+            with ThreadPoolExecutor(max_workers=min(configured_limit, len(queries))) as executor:
+                futures = [
+                    executor.submit(run_web_search, q, config=config, enrich_extract=True, max_hits=10)
+                    for q in queries
+                ]
+                search_results = [future.result() for future in futures]
+
+        for res in search_results:
             if res.provider:
                 providers_used.append(res.provider)
             errors.extend(res.errors or [])
@@ -2491,6 +2667,47 @@ class BrowseTaskArgs(BaseModel):
         validation_alias=AliasChoices("task", "goal", "instructions"),
         description="Optional task/instructions for the browsing operation.",
     )
+
+
+class SafeWebFetchArgs(BaseModel):
+    url: str = Field(
+        ...,
+        validation_alias=AliasChoices("url", "link", "source_url"),
+        description="A public HTTP or HTTPS source URL discovered during research.",
+    )
+    objective: str = Field(
+        default="",
+        validation_alias=AliasChoices("objective", "goal", "question"),
+        description="The unresolved information field this page should help answer.",
+    )
+    max_text_chars: int = Field(default=24000, ge=1000, le=40000)
+
+
+@tool(
+    args_schema=SafeWebFetchArgs,
+    description=(
+        "Safely fetch and extract a public webpage without browser cookies or interaction. "
+        "Use after search discovery when snippets do not contain the requested information. "
+        "Returns visible text plus bounded JSON-LD, microdata/RDFa attributes, metadata, and tables."
+    ),
+)
+def safe_web_fetch(url: str, objective: str = "", max_text_chars: int = 24000) -> str:
+    del objective  # Runtime requirement state owns the objective and evidence binding.
+    try:
+        from agent.safe_web_retrieval import SafeWebRetrievalError, fetch_public_page
+
+        result = fetch_public_page(url, max_text_chars=max_text_chars)
+        return result.tool_text()
+    except SafeWebRetrievalError as exc:
+        return (
+            "execution_status=error\nresult_state=insufficient_evidence\n"
+            f"safe_fetch_error={exc.code}: {exc}"
+        )
+    except Exception as exc:
+        return (
+            "execution_status=error\nresult_state=insufficient_evidence\n"
+            f"safe_fetch_error={type(exc).__name__}: {exc}"
+        )
 
 
 @tool(args_schema=BrowseTaskArgs, description="Browse a URL with Playwright and return extracted page text.")
@@ -4197,6 +4414,8 @@ def todo_manage(action: str, title: str = "", description: str = "", todo_id: st
 TOOL_METADATA: Dict[str, Dict[str, Any]] = {
     # Read-only / safe tools
     "web_search": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "safe_web_fetch": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
+    "weather_live": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
     "sports_live": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
     "get_system_time": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
     "calculate": {"risk_level": "safe", "requires_confirmation": False, "policy_flags": []},
@@ -4241,6 +4460,8 @@ TOOL_METADATA: Dict[str, Dict[str, Any]] = {
     # Destructive risk tools (delete/terminal)
     "file_delete": {"risk_level": "destructive", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_FILE_WRITE"]},
     "terminal_run": {"risk_level": "destructive", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_TERMINAL_COMMANDS"]},
+    "code_preview_start": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_TERMINAL_COMMANDS"]},
+    "code_preview_stop": {"risk_level": "moderate", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_TERMINAL_COMMANDS"]},
     "checkpoint_undo": {"risk_level": "destructive", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_FILE_WRITE"]},
     # Self-modification tools
     "self_edit": {"risk_level": "destructive", "requires_confirmation": True, "policy_flags": ["ENABLE_SYSTEM_ACTIONS", "ALLOW_SELF_MODIFICATION"]},
@@ -4882,6 +5103,8 @@ def get_available_tools() -> list:
     """
     tools = [
         web_search,
+        safe_web_fetch,
+        weather_live,
         sports_live,
         get_system_time,
         calculate,
@@ -4910,6 +5133,8 @@ def get_available_tools() -> list:
         artifact_write,
         notepad_write,
         terminal_run,
+        code_preview_start,
+        code_preview_stop,
         system_info,
         project_status,
         checkpoint_undo,

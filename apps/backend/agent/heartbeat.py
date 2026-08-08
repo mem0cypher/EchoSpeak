@@ -565,20 +565,36 @@ class HeartbeatManager:
             if not is_silent
             else []
         )
-        verified = bool(success and (is_silent or response_stripped) and not blocked_channels)
-        status = "complete" if verified else "needs_permission" if blocked_channels else "failed"
         state = state_store.get_thread_state(session_id)
         execution_id = str(state.last_execution_id or state.current_execution_id or "")
-        tool_run_ids = [item.id for item in state_store.list_tool_runs(execution_id)] if execution_id else []
+        from agent.automation_projection import project_execution
+        canonical = project_execution(
+            project_id=project_id,
+            session_id=session_id,
+            execution_id=execution_id,
+            occurrence_id=run.id,
+        )
+        tool_run_ids = list(canonical.tool_run_ids) if canonical else []
         approval_ids = [str(state.pending_approval_id)] if state.pending_approval_id else []
-        if verified:
-            run_status = AutomationRunStatus.COMPLETED
-        elif state.pending_approval_id:
-            run_status = AutomationRunStatus.WAITING_FOR_APPROVAL
-        elif blocked_channels:
-            run_status = AutomationRunStatus.BLOCKED
-        else:
-            run_status = AutomationRunStatus.FAILED
+        verified = bool(
+            canonical
+            and canonical.verified
+            and (is_silent or response_stripped)
+            and not blocked_channels
+        )
+        status = (
+            "complete" if verified
+            else "needs_permission" if canonical and canonical.automation_status == "waiting_for_approval"
+            else "blocked" if blocked_channels or (canonical and canonical.product_task_status == "blocked")
+            else "cancelled" if canonical and canonical.product_task_status == "cancelled"
+            else "failed"
+        )
+        run_status = AutomationRunStatus(
+            "completed" if verified
+            else "blocked" if blocked_channels
+            else canonical.automation_status if canonical
+            else "failed"
+        )
         run_store.transition(
             run.id,
             run_status,
@@ -589,8 +605,13 @@ class HeartbeatManager:
             execution_id=execution_id,
             tool_run_ids=tool_run_ids,
             approval_ids=approval_ids,
+            artifact_ids=list(canonical.artifact_ids) if canonical else [],
+            task_run_id=str(canonical.task_run_id) if canonical else "",
             outcome={
                 "verified": verified,
+                "completion_authority": "task_run",
+                "canonical_task_status": canonical.canonical_status.value if canonical else "missing",
+                "canonical_completion_disposition": canonical.completion_disposition if canonical else "pending",
                 "silent": is_silent,
                 "response_present": bool(response_stripped),
                 "blocked_delivery_channels": blocked_channels,
@@ -601,10 +622,13 @@ class HeartbeatManager:
             task.id,
             status=status,
             execution_ids=[execution_id] if execution_id else [],
+            task_run_ids=[canonical.task_run_id] if canonical else [],
             tool_run_ids=tool_run_ids,
             approval_ids=approval_ids,
             verification={
                 "verified": verified,
+                "completion_authority": "task_run",
+                "canonical_task_status": canonical.canonical_status.value if canonical else "missing",
                 "silent": is_silent,
                 "response_present": bool(response_stripped),
                 "blocked_delivery_channels": blocked_channels,

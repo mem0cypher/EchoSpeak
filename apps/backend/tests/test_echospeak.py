@@ -1,4 +1,4 @@
-"""
+﻿"""
 Tests for Echo Speak.
 Pytest test suite for validating the voice AI system.
 """
@@ -79,13 +79,13 @@ class TestModelProvider:
         assert ModelProvider.VLLM.value == "vllm"
 
 
-class TestLLMWrapper:
-    """Tests for the LLM wrapper."""
+class TestModelRuntimeClient:
+    """Tests for the canonical provider communication client."""
 
     @pytest.fixture
     def mock_openai(self):
         """Mock OpenAI dependencies."""
-        with patch('agent.core.ChatOpenAI') as mock:
+        with patch('agent.model_runtime.ReasoningChatOpenAI') as mock:
             mock_instance = MagicMock()
             mock.return_value = mock_instance
             yield mock_instance
@@ -93,37 +93,28 @@ class TestLLMWrapper:
     @pytest.fixture
     def mock_ollama(self):
         """Mock Ollama dependencies."""
-        with patch('agent.core.ChatOllama') as mock:
+        with patch('agent.model_runtime.ChatOllama') as mock:
             mock_instance = MagicMock()
             mock.return_value = mock_instance
             yield mock_instance
 
-    def test_openai_wrapper_creation(self, mock_openai):
-        """Test OpenAI LLM wrapper creation."""
-        with patch('agent.core.get_llm_config') as mock_config:
-            mock_config.return_value.model = "gpt-4o-mini"
-            mock_config.return_value.temperature = 0.7
-            mock_config.return_value.max_tokens = 4096
-            mock_config.return_value.api_key = "test-key"
+    def test_openai_runtime_creation(self, mock_openai):
+        """Test OpenAI provider client creation with an exact model."""
+        from agent.model_runtime import ModelRuntimeClient
+        from config import ModelProvider
 
-            from agent.core import LLMWrapper, ModelProvider
-            from config import config
+        runtime = ModelRuntimeClient(ModelProvider.OPENAI, "gpt-4o-mini")
+        assert runtime.provider == ModelProvider.OPENAI
+        assert runtime.model_id == "gpt-4o-mini"
 
-            wrapper = LLMWrapper(ModelProvider.OPENAI)
-            assert wrapper.llm_type == ModelProvider.OPENAI
+    def test_ollama_runtime_creation(self, mock_ollama):
+        """Test Ollama provider client creation with an exact model."""
+        from agent.model_runtime import ModelRuntimeClient
+        from config import ModelProvider
 
-    def test_ollama_wrapper_creation(self, mock_ollama):
-        """Test Ollama LLM wrapper creation."""
-        with patch('agent.core.get_llm_config') as mock_config:
-            mock_config.return_value.model_name = "llama3"
-            mock_config.return_value.temperature = 0.7
-            mock_config.return_value.max_tokens = 4096
-            mock_config.return_value.base_url = "http://localhost:11434"
-
-            from agent.core import LLMWrapper, ModelProvider
-
-            wrapper = LLMWrapper(ModelProvider.OLLAMA)
-            assert wrapper.llm_type == ModelProvider.OLLAMA
+        runtime = ModelRuntimeClient(ModelProvider.OLLAMA, "llama3")
+        assert runtime.provider == ModelProvider.OLLAMA
+        assert runtime.model_id == "llama3"
 
 
 class TestAgentMemory:
@@ -286,8 +277,8 @@ class TestActionParser:
             def invoke(self, text: str) -> str:
                 return '{"action":"file_write","confidence":0.9,"path":"hello.py","content":"print(\\"Hello, world!\\")","append":false}'
 
-        agent.llm_wrapper = StubLLM()
-        agent.research_llm_wrapper = None
+        agent.model_runtime = StubLLM()
+        agent.research_model_runtime = None
 
         resp, _ok = agent.process_query("create a python script that prints hello world", include_memory=False)
         assert "pending action" in resp.lower() or "reply 'confirm'" in resp.lower()
@@ -560,7 +551,7 @@ class TestDiscordHardening:
 
     def test_web_answer_abdication_detected_and_evidence_gate(self, tmp_path):
         """System-wide keep-trying: abdication drafts are weak even with evidence present."""
-        from agent.core import EchoSpeakAgent, WebTaskReflector
+        from agent.core import EchoSpeakAgent, WebEvidenceHeuristics
 
         agent = EchoSpeakAgent(memory_path=str(tmp_path))
         give_up = (
@@ -584,7 +575,7 @@ class TestDiscordHardening:
         assert agent._answer_is_abdication(fluff) is True
 
         # Grounded packet quality gate: fluff without times is not acceptable
-        ref = WebTaskReflector(agent)
+        ref = WebEvidenceHeuristics(agent)
         weak_packet = (
             "[GROUNDED_SEARCH] accepted=true\n"
             "The World Cup has 104 games. Full schedule available online."
@@ -878,7 +869,7 @@ class TestDiscordHardening:
             def _coerce_content_to_text(self, content):
                 return str(content or "")
 
-        agent.llm_wrapper = StubLLM()
+        agent.model_runtime = StubLLM()
         wrapped = (
             "Recent conversation context:\n"
             "User: I'm on CachyOS so I can't unfortunately\n"
@@ -1253,8 +1244,8 @@ class TestConversationAndResearchRouting:
             def invoke(self, text: str) -> str:
                 return "SUMMARY"
 
-        agent.llm_wrapper = StubLLM()
-        agent.research_llm_wrapper = None
+        agent.model_runtime = StubLLM()
+        agent.research_model_runtime = None
 
         captured: list[str] = []
 
@@ -1270,10 +1261,6 @@ class TestConversationAndResearchRouting:
         agent._raw_web_search_execute = fake_raw_web_search
         agent._fetch_search_result_page_text = lambda url, **kw: ""
         agent.tools = [Tool("web_search", lambda q: agent._grounded_web_search(q), "Search the web")]
-        agent.graph_agent = None
-        agent.agent_executor = None
-        agent.fallback_executor = None
-
         agent.process_query("latest news today", include_memory=True, thread_id="t1")
         assert captured, "Expected web_search to be invoked for news intent"
         assert "today" in captured[-1].lower()
@@ -1294,7 +1281,7 @@ class TestConversationAndResearchRouting:
             def invoke(self, text: str) -> str:
                 return "The Edmonton Oilers play today, Friday, March 6, 2026."
 
-        agent.llm_wrapper = StubLLM()
+        agent.model_runtime = StubLLM()
 
         captured_queries: list[str] = []
         time_calls: list[str] = []
@@ -1322,10 +1309,6 @@ class TestConversationAndResearchRouting:
             Tool("get_system_time", fake_time, "Get current time"),
         ]
         agent.lc_tools = list(agent.tools)
-        agent.graph_agent = None
-        agent.agent_executor = None
-        agent.fallback_executor = None
-
         response, _ok = agent.process_query("when does the edmonton oilers play next?", include_memory=True, thread_id="t1")
 
         assert "march 6, 2026" in response.lower()
@@ -1352,7 +1335,7 @@ class TestConversationAndResearchRouting:
                 return "The Edmonton Oilers play today, Friday, March 6, 2026, against Dallas."
 
         llm = StubLLM()
-        agent.llm_wrapper = llm
+        agent.model_runtime = llm
 
         captured_queries: list[str] = []
 
@@ -1378,10 +1361,6 @@ class TestConversationAndResearchRouting:
             Tool("get_system_time", fake_time, "Get current time"),
         ]
         agent.lc_tools = list(agent.tools)
-        agent.graph_agent = None
-        agent.agent_executor = None
-        agent.fallback_executor = None
-
         response, _ok = agent.process_query("when does the edmonton oilers play next?", include_memory=True, thread_id="t1")
 
         assert "march 6, 2026" in response.lower()
@@ -1398,7 +1377,7 @@ class TestConversationAndResearchRouting:
             def invoke(self, text: str) -> str:
                 return "SUMMARY"
 
-        agent.llm_wrapper = StubLLM()
+        agent.model_runtime = StubLLM()
 
         captured_queries: list[str] = []
 
@@ -1414,10 +1393,6 @@ class TestConversationAndResearchRouting:
         agent._fetch_search_result_page_text = lambda url, **kw: ""
         agent.tools = [Tool("web_search", lambda q: agent._grounded_web_search(q), "Search the web")]
         agent.lc_tools = list(agent.tools)
-        agent.graph_agent = None
-        agent.agent_executor = None
-        agent.fallback_executor = None
-
         response, _ok = agent.process_query(
             "Deep search the best microphones for streaming in 2026 under $300 and recommend the best value pick.",
             include_memory=True,
@@ -1428,36 +1403,6 @@ class TestConversationAndResearchRouting:
         assert captured_queries
         assert "best microphones for streaming" in captured_queries[-1].lower() or "microphones" in captured_queries[-1].lower()
         assert "deep search" not in captured_queries[-1].lower()
-
-    def test_proactive_prompt_does_not_enter_multi_task_planner(self, tmp_path, monkeypatch):
-        from agent.core import EchoSpeakAgent
-
-        agent = EchoSpeakAgent(memory_path=str(tmp_path))
-
-        class StubLLM:
-            def invoke(self, text: str) -> str:
-                return "NO_ACTION"
-
-        agent.llm_wrapper = StubLLM()
-        agent.graph_agent = None
-        agent.agent_executor = None
-        agent.fallback_executor = None
-
-        def fail_if_called(_user_input: str) -> bool:
-            raise AssertionError("proactive queries should not hit multi-task planning")
-
-        monkeypatch.setattr(agent._task_planner, "needs_planning", fail_if_called, raising=True)
-
-        response, ok = agent.process_query(
-            "Check your memory for any pending follow-ups, reminders, or tasks the user mentioned they'd get back to.",
-            include_memory=False,
-            source="proactive",
-            thread_id="proactive_test",
-        )
-
-        assert ok is True
-        assert response == "NO_ACTION"
-
 
 class TestNoSearchOnSocialIntro:
     def test_social_intro_does_not_trigger_web_search(self, tmp_path, monkeypatch):
@@ -1482,50 +1427,6 @@ class TestNoSearchOnSocialIntro:
 
         agent.process_query("i have friend named max! he's currently watching you! say hi! remember my friend max!", include_memory=False)
         assert calls == []
-
-    def test_langgraph_passes_thread_id_for_thread_scoped_graph_runs(self, tmp_path, monkeypatch):
-        from agent.core import EchoSpeakAgent
-
-        agent = EchoSpeakAgent(memory_path=str(tmp_path))
-
-        class StubLLM:
-            def invoke(self, text: str) -> str:
-                return "OK"
-
-        agent.llm_wrapper = StubLLM()
-
-        # Avoid tool routing for this test.
-        agent.tools = []
-        agent.agent_executor = None
-        agent.fallback_executor = None
-        agent._allowed_lc_tool_names = lambda _input: frozenset({"get_system_time"})
-        agent._get_langgraph_agent_for_toolset = lambda _tools: agent.graph_agent
-        agent._extract_graph_response = lambda _result: "OK"
-
-        captured_messages: list = []
-        captured_config: dict = {}
-
-        class FakeGraph:
-            def invoke(self, payload, config=None):
-                captured_messages[:] = list(payload.get("messages") or [])
-                if isinstance(config, dict):
-                    captured_config.clear()
-                    captured_config.update(config)
-                return {"messages": []}
-
-        agent.graph_agent = FakeGraph()
-
-        # First turn establishes chat history.
-        agent.process_query("hello", include_memory=True, thread_id="threadA")
-        # Second turn should reuse the thread_id rather than injecting chat history into the payload.
-        agent.process_query("how are you?", include_memory=True, thread_id="threadA")
-
-        assert len(captured_messages) >= 2
-        types = [getattr(m, "type", None) for m in captured_messages]
-        assert "human" in types
-        assert "system" in types
-        assert captured_config.get("configurable", {}).get("thread_id") == "threadA"
-
 
 class TestToolAllowlistMerge:
     def test_skills_cannot_expand_or_shrink_workspace_ceiling(self):
@@ -1635,9 +1536,7 @@ class TestDeterministicProfileMemory:
             def invoke(self, _text: str) -> str:
                 return "OK"
 
-        agent.llm_wrapper = StubLLM()
-        agent.graph_agent = None
-
+        agent.model_runtime = StubLLM()
         agent.process_query("my sister name is Emily remember that", include_memory=False)
         resp, _ = agent.process_query("what is my sister name?", include_memory=False)
         assert "emily" in (resp or "").lower()
@@ -1651,9 +1550,7 @@ class TestDeterministicProfileMemory:
             def invoke(self, _text: str) -> str:
                 return "OK"
 
-        agent.llm_wrapper = StubLLM()
-        agent.graph_agent = None
-
+        agent.model_runtime = StubLLM()
         agent.process_query("im memo not max", include_memory=False)
         resp_me, _ = agent.process_query("what is my name?", include_memory=False)
         assert "memo" in (resp_me or "").lower()
@@ -1677,9 +1574,7 @@ class TestCuratedMemoryRememberAndImportance:
             def invoke(self, _text: str) -> str:
                 return "OK"
 
-        agent.llm_wrapper = StubLLM()
-        agent.graph_agent = None
-
+        agent.model_runtime = StubLLM()
         resp, _ = agent.process_query("remember my sister name is Emily", include_memory=False)
         assert "remember" in (resp or "").lower()
 
@@ -1702,9 +1597,7 @@ class TestCuratedMemoryRememberAndImportance:
             def invoke(self, _text: str) -> str:
                 return "OK"
 
-        agent.llm_wrapper = StubLLM()
-        agent.graph_agent = None
-
+        agent.model_runtime = StubLLM()
         agent.process_query("my sister name is Emily", include_memory=False)
         mem_path = tmp_path / "MEMORY.md"
         assert mem_path.exists()
@@ -1848,13 +1741,13 @@ class TestCoreAgent:
 
     def test_create_agent_function_exists(self):
         """Test create_agent function exists."""
-        from agent.core import create_agent
+        from app import create_agent
 
         assert callable(create_agent)
 
     def test_list_available_providers(self):
         """Test listing available providers."""
-        from agent.core import list_available_providers
+        from agent.model_runtime import list_available_providers
 
         providers = list_available_providers()
         assert isinstance(providers, list)
@@ -1862,7 +1755,7 @@ class TestCoreAgent:
 
     def test_get_provider_requirements(self):
         """Test getting provider requirements."""
-        from agent.core import get_provider_requirements
+        from agent.model_runtime import get_provider_requirements
         from config import ModelProvider
 
         reqs = get_provider_requirements(ModelProvider.OLLAMA)
@@ -1900,9 +1793,9 @@ class TestIntegration:
 class TestLocalModels:
     """Tests for local model functionality."""
 
-    def test_llm_wrapper_supports_all_providers(self):
-        """Test that LLM wrapper can theoretically support all providers."""
-        from agent.core import LLMWrapper
+    def test_model_runtime_catalog_supports_all_providers(self):
+        """Test that the provider communication layer catalogs all providers."""
+        from agent.model_runtime import list_available_providers
         from config import ModelProvider
 
         providers = [
@@ -1912,8 +1805,9 @@ class TestLocalModels:
             ModelProvider.LOCALAI,
         ]
 
+        catalog = {entry["id"] for entry in list_available_providers()}
         for provider in providers:
-            assert provider.value in [p.value for p in ModelProvider]
+            assert provider.value in catalog
 
     def test_model_provider_enum(self):
         """Test model provider enum values."""

@@ -12,6 +12,7 @@ import hashlib
 import time
 import shutil
 import threading
+import importlib
 from functools import wraps
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Iterable, Tuple
@@ -40,6 +41,19 @@ _RECORD_LOCKS_GUARD = threading.Lock()
 _RECORD_LOCKS: Dict[str, threading.RLock] = {}
 _MEMORY_INSTANCES_GUARD = threading.Lock()
 _MEMORY_INSTANCES: Dict[str, "AgentMemory"] = {}
+
+
+def _require_complete_torch() -> None:
+    """Repair PyInstaller's known partial torch import before sentence-transformers loads."""
+    loaded = sys.modules.get("torch")
+    if loaded is not None and not hasattr(loaded, "autograd"):
+        for name in [key for key in sys.modules if key == "torch" or key.startswith("torch.")]:
+            sys.modules.pop(name, None)
+        importlib.invalidate_caches()
+    torch = importlib.import_module("torch")
+    autograd = importlib.import_module("torch.autograd")
+    if not hasattr(torch, "autograd") or autograd is None:
+        raise RuntimeError("PyTorch is incomplete: torch.autograd is unavailable")
 
 
 def _record_lock_for(path: Path) -> threading.RLock:
@@ -92,6 +106,12 @@ class AgentMemory:
                 embed_query("healthcheck")
         except Exception as e:
             logger.warning(f"Embeddings validation failed ({e}); disabling embeddings so we can fall back")
+            self.embedding_health = {
+                "available": False,
+                "provider": str(self.embedding_health.get("provider") or "unknown"),
+                "model": str(self.embedding_health.get("model") or ""),
+                "detail": str(e),
+            }
             self.embeddings = None
 
     def __init__(self, memory_path: Optional[str] = None):
@@ -105,6 +125,12 @@ class AgentMemory:
         self.file_memory_max_chars = int(getattr(config, "file_memory_max_chars", 2000) or 2000)
         self.partition_enabled = bool(getattr(config, "memory_partition_enabled", False))
         self._vector_stores: Dict[str, FAISS] = {}
+        self.embedding_health: Dict[str, Any] = {
+            "available": False,
+            "provider": "none",
+            "model": "",
+            "detail": "Embeddings have not initialized",
+        }
 
         api_key = config.openai.api_key if config.openai.api_key else os.getenv("OPENAI_API_KEY", "")
         embedding_provider = getattr(getattr(config, "embedding", None), "provider", None)
@@ -114,12 +140,21 @@ class AgentMemory:
         if embedding_provider in {ModelProvider.OPENAI, ModelProvider.LM_STUDIO}:
             if OpenAIEmbeddings is None:
                 logger.warning("langchain-openai not installed; falling back to local embeddings")
+            elif embedding_provider == ModelProvider.OPENAI and not api_key:
+                # A missing credential is a readiness state, not a failed
+                # provider attempt. Never construct or call the OpenAI client.
+                logger.info("OpenAI embeddings skipped: OPENAI_API_KEY is not configured")
+                self.embedding_health = {
+                    "available": False,
+                    "provider": "openai",
+                    "model": embedding_model,
+                    "detail": "Skipped: OPENAI_API_KEY is not configured",
+                }
             else:
                 try:
                     if embedding_provider == ModelProvider.OPENAI:
-                        if not api_key:
-                            raise RuntimeError("Missing OPENAI_API_KEY")
                         self.embeddings = OpenAIEmbeddings(model=embedding_model, api_key=api_key)
+                        self.embedding_health = {"available": True, "provider": "openai", "model": embedding_model, "detail": "Ready"}
                     else:
                         base_url = getattr(getattr(config, "local", None), "base_url", "http://localhost:1234")
                         base_url = str(base_url or "").rstrip("/")
@@ -135,6 +170,7 @@ class AgentMemory:
                             tiktoken_enabled=False,
                         )
                         logger.info(f"Using LM Studio embeddings at {base_url}")
+                        self.embedding_health = {"available": True, "provider": "lm_studio", "model": embedding_model, "detail": "Ready"}
                 except Exception as e:
                     logger.warning(
                         f"Embeddings init failed for provider={embedding_provider} ({e}); falling back to local embeddings"
@@ -148,14 +184,24 @@ class AgentMemory:
 
         if self.embeddings is None:
             try:
-                try:
-                    from langchain_huggingface import HuggingFaceEmbeddings
-                except ImportError:
-                    from langchain_community.embeddings import HuggingFaceEmbeddings
+                _require_complete_torch()
+                from langchain_huggingface import HuggingFaceEmbeddings
                 self.embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+                self.embedding_health = {
+                    "available": True,
+                    "provider": "huggingface_local",
+                    "model": "sentence-transformers/all-MiniLM-L6-v2",
+                    "detail": "Ready",
+                }
                 logger.info("Using local HuggingFace embeddings for memory (no OpenAI key)")
             except Exception as e:
                 logger.warning(f"No OpenAI key and local embeddings unavailable ({e}). Using simple memory storage (FAISS disabled).")
+                self.embedding_health = {
+                    "available": False,
+                    "provider": "huggingface_local",
+                    "model": "sentence-transformers/all-MiniLM-L6-v2",
+                    "detail": str(e),
+                }
                 self.use_faiss = False
                 self.simple_memory = []
 
@@ -183,6 +229,17 @@ class AgentMemory:
         with self._records_lock:
             self._load_records()
             self._migrate_legacy_memory_records()
+
+    def capability_status(self) -> Dict[str, Any]:
+        """Safe structural readiness; canonical typed records remain available without FAISS."""
+        return {
+            "typed_memory_ready": True,
+            "semantic_retrieval_ready": bool(self.use_faiss and self.embeddings is not None),
+            "embedding": dict(self.embedding_health),
+            "canonical_record_count": len(self._records),
+            "index_rebuildable": True,
+            "root": str(self.memory_root.resolve(strict=False)),
+        }
 
     def _owner_id(self, owner_id: Optional[str] = None) -> str:
         return str(owner_id or getattr(config, "memory_owner_id", "local-owner") or "local-owner").strip()
@@ -1620,6 +1677,95 @@ class AgentMemory:
             })
         canonical.sort(key=lambda item: str(item.get("updated_at") or item.get("timestamp") or ""), reverse=True)
         return canonical[offset: offset + limit]
+
+    @_synchronized_records()
+    def runtime_memory_projection(
+        self,
+        query: str,
+        *,
+        session_id: str,
+        project_id: str = "",
+        project_path: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        limit: int = 8,
+        max_chars: int = 3200,
+    ) -> List[Dict[str, Any]]:
+        """Compile one authorized deterministic projection for both model stages."""
+        owner = self._owner_id(owner_id)
+        query_tokens = set(re.findall(r"[a-z0-9]{2,}", str(query or "").casefold()))
+        active_project_id = str(project_id or "").strip()
+        active_project_path = str(project_path or "").strip()
+        rows: list[tuple[int, float, str, Dict[str, Any]]] = []
+        for record in self._records.values():
+            if not bool(record.get("active", True)) or str(record.get("owner_id") or "") != owner:
+                continue
+            scope = str(record.get("scope") or "account").strip().lower()
+            if scope == "temporary":
+                continue
+            metadata = dict(record.get("metadata") or {})
+            record_project_id = str(record.get("project_id") or metadata.get("project_id") or "").strip()
+            record_project_path = str(metadata.get("project_path") or "").strip()
+            if scope == "project":
+                if active_project_id:
+                    if record_project_id and record_project_id != active_project_id:
+                        continue
+                    if not record_project_id and (
+                        not active_project_path or record_project_path != active_project_path
+                    ):
+                        continue
+                elif not active_project_path or record_project_path != active_project_path:
+                    continue
+            elif scope == "session":
+                if not self._thread_matches(record.get("source_session_id"), session_id):
+                    continue
+            elif scope != "account":
+                continue
+            content = str(record.get("text") or "").strip()
+            if not content:
+                continue
+            memory_type = str(record.get("memory_type") or metadata.get("type") or "note").strip().lower()
+            pinned = metadata.get("pinned") is True
+            content_tokens = set(re.findall(r"[a-z0-9]{2,}", content.casefold()))
+            overlap = len(query_tokens & content_tokens) / max(1, len(query_tokens)) if query_tokens else 0.0
+            if scope == "account" and pinned and memory_type == "profile":
+                priority, relevance = 0, max(1.0, overlap)
+            elif scope == "project" and pinned:
+                priority, relevance = 1, max(0.75, overlap)
+            elif scope in {"account", "project"} and (overlap > 0 or pinned):
+                priority, relevance = 2, overlap + (0.25 if pinned else 0.0)
+            elif scope == "session" and overlap > 0:
+                priority, relevance = 3, overlap
+            else:
+                continue
+            memory_id = str(record.get("id") or "")
+            rows.append((
+                priority,
+                relevance,
+                memory_id,
+                {
+                    "memory_id": memory_id,
+                    "type": memory_type,
+                    "scope": scope,
+                    "project_id": record_project_id,
+                    "pinned": pinned,
+                    "content": content,
+                    "source_session_id": str(record.get("source_session_id") or ""),
+                    "semantic_key": str(record.get("semantic_key") or ""),
+                    "provenance": "MemoryManager.records.json",
+                },
+            ))
+        rows.sort(key=lambda item: (item[0], -item[1], item[2]))
+        projection: List[Dict[str, Any]] = []
+        used = 0
+        for _priority, _relevance, _memory_id, item in rows:
+            size = len(str(item.get("content") or ""))
+            if projection and used + size > max(256, int(max_chars)):
+                continue
+            projection.append(item)
+            used += size
+            if len(projection) >= max(1, min(int(limit), 24)):
+                break
+        return projection
 
     @_synchronized_records()
     def delete_items(

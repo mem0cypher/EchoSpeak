@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import agent.state as state_module
 import agent.checkpoints as checkpoint_module
-from agent.core import ConversationMemory, EchoSpeakAgent, TaskPlanner
+from agent.core import ConversationMemory, EchoSpeakAgent
 from agent.mode_controller import ModeDecision, TurnMode
 from agent.memory import AgentMemory
 from agent.state import StateStore, ThreadSessionState
@@ -202,7 +202,6 @@ def test_ledger_records_provenance_without_persisting_write_body_or_secret(tmp_p
     agent._current_execution_id = "exec-1"
     agent._execution_context = context
     agent._current_mode_profile = SimpleNamespace(executor_name="coding_implement_executor")
-    agent._task_planner = TaskPlanner(agent)
 
     agent._record_tool_execution_outcome(
         tool_name="file_write",
@@ -246,67 +245,6 @@ def test_single_agent_runtime_buffers_are_selected_per_thread():
     assert "from-b" not in history
     assert agent._summary == "summary-a"
     assert agent._current_subject_text == "subject-a"
-
-
-def test_planner_reclassifies_semantic_calculator_work_as_reasoning():
-    agent = SimpleNamespace(_tool_allowed=lambda _name: True)
-    planner = TaskPlanner(agent)
-
-    tasks = planner._validate_and_order_tasks([
-        {
-            "description": "Analyze the architecture and propose a fix",
-            "kind": "tool",
-            "tool": "calculate",
-            "params": {"expression": "Analyze the architecture and propose a fix"},
-            "depends_on": -1,
-        }
-    ])
-
-    assert len(tasks) == 1
-    assert tasks[0]["kind"] == "reasoning"
-    assert tasks[0]["tool"] == ""
-
-
-def test_calculator_error_string_marks_planner_step_failed():
-    agent = EchoSpeakAgent.__new__(EchoSpeakAgent)
-    agent._execution_context = ThreadSessionState(thread_id="t", allowed_tool_names=["calculate"])
-    agent._current_execution_id = "exec"
-    agent._tool_allowed = lambda _name: True
-    agent._is_action_tool = lambda _name: False
-    agent._emit_thinking_step = lambda *_args, **_kwargs: None
-    planner = TaskPlanner(agent)
-    planner._reflection_engine = SimpleNamespace(should_reflect=lambda *_args: False)
-    planner.pending_tasks = [{
-        "index": 0,
-        "description": "Calculate",
-        "kind": "tool",
-        "tool": "calculate",
-        "params": {"expression": "not math"},
-        "depends_on": -1,
-        "status": "pending",
-    }]
-    tool = SimpleNamespace(name="calculate", invoke=lambda **_kwargs: "Calculation error: invalid syntax")
-
-    result = planner.execute_next_task([tool])
-
-    assert result is not None
-    assert result["status"] == "failed"
-    assert "Calculation error" in result["result"]
-
-
-def test_chat_mode_cannot_enter_legacy_planner_or_tool_boundary():
-    agent = EchoSpeakAgent.__new__(EchoSpeakAgent)
-    agent._current_mode_decision = ModeDecision(
-        mode=TurnMode.CHAT,
-        confidence=1.0,
-        reason="chat",
-        user_text="tell me a story and explain it",
-        allowed_tool_names=frozenset(),
-    )
-    agent._workspace_id = "chat"
-    planner = TaskPlanner(agent)
-
-    assert planner.needs_planning("tell me a story and explain it") is False
 
 
 def test_local_first_constraint_blocks_web_until_local_inspection():

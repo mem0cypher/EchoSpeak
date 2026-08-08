@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
@@ -42,7 +43,8 @@ _ODDS_RE = re.compile(
 _STANDINGS_RE = re.compile(
     r"(?i)\b(standings|league\s*table|points\s*table|playoff\s*picture|conference\s*rankings)\b"
 )
-# Schedule / "who's playing tomorrow" stays on web_search
+# Schedule requests are first-class structured operations. The provider may
+# still return a typed unsupported/no-data state before governed web fallback.
 _SCHEDULE_ONLY_RE = re.compile(
     r"(?i)\b("
     r"who(?:'s| is)?\s+playing|what\s+matches|fixtures?|kickoff|start\s*time|"
@@ -57,11 +59,8 @@ def is_live_sports_data_intent(text: str) -> bool:
     if not t:
         return False
     low = t.lower()
-    # Pure schedule / slate → web search (tournament pages, local listings)
-    if _SCHEDULE_ONLY_RE.search(low) and not (_LIVE_SCORE_RE.search(low) or _ODDS_RE.search(low)):
-        # "who's playing tomorrow" is schedule; "what's the score" is live
-        if not re.search(r"(?i)\b(score|won|winning|odds|standings)\b", low):
-            return False
+    if _SCHEDULE_ONLY_RE.search(low):
+        return True
     if _ODDS_RE.search(low):
         return True
     if _STANDINGS_RE.search(low):
@@ -79,7 +78,7 @@ def is_live_sports_data_intent(text: str) -> bool:
 
 
 def live_sports_mode(text: str) -> str:
-    """odds | scores | standings | none"""
+    """schedule | odds | scores | standings | none."""
     if not is_live_sports_data_intent(text):
         return "none"
     low = (text or "").lower()
@@ -87,6 +86,8 @@ def live_sports_mode(text: str) -> str:
         return "odds"
     if _STANDINGS_RE.search(low):
         return "standings"
+    if _SCHEDULE_ONLY_RE.search(low):
+        return "schedule"
     return "scores"
 
 
@@ -153,16 +154,38 @@ class SportsLiveResult:
     events: List[Dict[str, Any]] = field(default_factory=list)
     error: str = ""
     fallback_to_web: bool = False
+    result_state: str = "data_found"
+    observed_at: float = field(default_factory=time.time)
+
+    def __post_init__(self) -> None:
+        if self.ok:
+            self.result_state = "data_found"
+            return
+        if self.result_state != "data_found":
+            return
+        detail = str(self.error or "").lower()
+        if "not configured" in detail or "rejected" in detail or "rate limit" in detail:
+            self.result_state = "provider_unavailable"
+        elif "could not map" in detail:
+            self.result_state = "ambiguous_entity"
+        elif "not available" in detail or "not a live" in detail or "not supported" in detail:
+            self.result_state = "unsupported_intent"
+        else:
+            self.result_state = "no_data"
 
     def as_tool_text(self) -> str:
         if not self.ok:
             return (
-                f"[SPORTS_LIVE] ok=false provider={self.provider} mode={self.mode}\n"
-                f"ERROR: {self.error}\n"
-                "FALLBACK: web_search may be used if configured."
+                f"[SPORTS_LIVE] ok=false execution_status=success "
+                f"result_state={self.result_state} provider={self.provider} "
+                f"observed_at={self.observed_at:.3f} mode={self.mode}\n"
+                f"DETAIL: {self.error}\n"
+                "NEXT_ACTION: use an allowed grounded web_search fallback when available."
             )
         lines = [
-            f"[SPORTS_LIVE] ok=true provider={self.provider} mode={self.mode} sport={self.sport_key}",
+            f"[SPORTS_LIVE] ok=true execution_status=success result_state={self.result_state} "
+            f"provider={self.provider} observed_at={self.observed_at:.3f} "
+            f"mode={self.mode} sport={self.sport_key}",
             "Use ONLY this structured live data for scores/odds. Do not invent lines.",
             "",
             self.summary.strip(),
@@ -318,9 +341,64 @@ class SportsDataClient:
             summary=summary, events=events,
         )
 
-    def query(self, user_text: str) -> SportsLiveResult:
-        """High-level entry: classify + fetch; filter by team tokens when possible."""
-        mode = live_sports_mode(user_text)
+    def fetch_schedule(self, sport_key: str) -> SportsLiveResult:
+        """Fetch the provider's explicit event/schedule operation."""
+        data, err = self._get(
+            f"/sports/{sport_key}/events/",
+            {"dateFormat": "iso"},
+        )
+        if err:
+            return SportsLiveResult(
+                ok=False,
+                mode="schedule",
+                provider=self.provider,
+                sport_key=sport_key,
+                error=err,
+                fallback_to_web=True,
+                result_state="provider_unavailable",
+            )
+        if not isinstance(data, list) or not data:
+            return SportsLiveResult(
+                ok=False,
+                mode="schedule",
+                provider=self.provider,
+                sport_key=sport_key,
+                error="No scheduled events returned for this sport",
+                fallback_to_web=True,
+                result_state="no_data",
+            )
+        events = [item for item in data[:20] if isinstance(item, dict)]
+        lines: List[str] = []
+        for event in events:
+            away = str(event.get("away_team") or "")
+            home = str(event.get("home_team") or "")
+            commence = str(event.get("commence_time") or "")
+            lines.append(f"- {away} @ {home}" + (f" [{commence}]" if commence else ""))
+        return SportsLiveResult(
+            ok=True,
+            mode="schedule",
+            provider=self.provider,
+            sport_key=sport_key,
+            summary="Scheduled events:\n" + "\n".join(lines),
+            events=events,
+        )
+
+    def query(self, user_text: str, operation: str = "") -> SportsLiveResult:
+        """Execute one explicit sports operation, with bounded legacy inference."""
+        requested = str(operation or "").strip().lower()
+        operation_modes = {
+            "schedule": "schedule",
+            "team_next_event": "schedule",
+            "competition_next_event": "schedule",
+            "live_scores": "scores",
+            "results": "scores",
+            "standings": "standings",
+            "odds": "odds",
+        }
+        mode = operation_modes.get(requested) or live_sports_mode(user_text)
+        # Older callers supplied the live_scores default even for odds text.
+        if requested == "live_scores" and _ODDS_RE.search(user_text or ""):
+            mode = "odds"
         if mode == "none":
             return SportsLiveResult(
                 ok=False, mode="none", provider=self.provider,
@@ -342,6 +420,8 @@ class SportsDataClient:
             )
         if mode == "odds":
             result = self.fetch_odds(sport)
+        elif mode == "schedule":
+            result = self.fetch_schedule(sport)
         elif mode == "standings":
             # The Odds API has limited standings; fall back honestly
             return SportsLiveResult(

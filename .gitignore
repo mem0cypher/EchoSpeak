@@ -76,6 +76,20 @@ apps/backend/projects/
 # Disposable live acceptance roots (local only)
 .live-acceptance/
 
+# Disposable validation state may contain credentials, secrets, and transcripts.
+.tmp/
+
+# Local surgical-edit safety copies are recovery artifacts, not product source.
+*.safetycopy
+*.safety-copy-*
+
+# One-off frontend recovery probes and alternate local package-manager state.
+apps/web/check-syntax.cjs
+apps/web/check-ts.cjs
+apps/web/scan-tags.cjs
+apps/web/pnpm-lock.yaml
+apps/web/pnpm-workspace.yaml
+
 
 # Desktop/Tauri build artifacts (do not commit)
 apps/desktop/node_modules/

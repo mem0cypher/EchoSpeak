@@ -50,18 +50,39 @@ class CodingPhaseName(str, Enum):
     SUMMARIZE = "summarize"
 
 
+def is_search_retry_utterance(text: str) -> bool:
+    """True when the user is asking to re-run a prior search/lookup.
+
+    Must match natural phrasing such as \"try again with that search\" without
+    requiring a bare \"try again\" full match.
+    """
+    low = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not low:
+        return False
+    return bool(
+        re.search(
+            r"(?i)\b("
+            r"(?:try|retry)(?:\s+\w+){0,6}\s+(?:that\s+|the\s+|this\s+)?search|"
+            r"(?:try|retry)\s+again(?:\s+with)?(?:\s+(?:that|the|this))?\s+search|"
+            r"retry\s+(?:the\s+|that\s+|this\s+)?search|"
+            r"search\s+(?:it|that|this)\s+again|"
+            r"(?:do|run)\s+(?:that|the|this)\s+search\s+again|"
+            r"look\s+(?:it|that)\s+up\s+again|"
+            r"search\s+again"
+            r")\b",
+            low,
+        )
+    )
+
+
 # Mode classification chooses capabilities and evidence policy, never a model.
-# The canonical Session-selected model is bound once by EchoSpeakAgent at Turn
-# creation. Keep these aliases temporarily for import compatibility; blank
-# values explicitly mean "bind the active Session model".
-SESSION_MODEL = ("", "")
-CHAT_MODEL = SESSION_MODEL
-CODING_MODEL = SESSION_MODEL
-RESEARCH_MODEL = SESSION_MODEL
+# Blank ModeDecision model fields mean "use the exact Session model binding".
 
 RESEARCH_TOOLS: FrozenSet[str] = frozenset(
     {
         "web_search",
+        "safe_web_fetch",
+        "weather_live",
         "sports_live",
         "get_system_time",
         "calculate",
@@ -91,6 +112,8 @@ CODING_WRITE_TOOLS: FrozenSet[str] = frozenset(
         "artifact_write",
         "notepad_write",
         "checkpoint_undo",
+        "code_preview_start",
+        "code_preview_stop",
     }
 )
 
@@ -101,6 +124,8 @@ CODING_VERIFY_TOOLS: FrozenSet[str] = frozenset(
         "file_read",
         "project_status",
         "system_info",
+        "code_preview_start",
+        "code_preview_stop",
     }
 )
 
@@ -248,7 +273,12 @@ def _is_utility_tool_request(text: str) -> bool:
     low = re.sub(r"\s+", " ", str(text or "").strip().lower())
     if not low:
         return False
-    if re.search(r"\b(search|look up|research|online|web|weather|score|news|price|fifa|match)\b", low):
+    # Live research keywords win over pure arithmetic phrasing.
+    if re.search(
+        r"\b(search|look up|research|online|web|weather|score|news|price|fifa|match|"
+        r"bitcoin|stock|headline|forecast)\b",
+        low,
+    ):
         return False
     if re.fullmatch(
         r"(?:please\s+)?(?:"
@@ -265,7 +295,23 @@ def _is_utility_tool_request(text: str) -> bool:
         return True
     if re.search(r"\b(calculate|compute|solve|evaluate)\b", low) and re.search(r"\d", low):
         return True
-    if re.fullmatch(r"[\d\s+\-*/^().%]+", low) and re.search(r"\d", low):
+    # Unit conversion is local calculator work, not web research.
+    if re.search(
+        r"\bconvert\b.{0,40}\b(?:celsius|fahrenheit|°?\s*c|°?\s*f|"
+        r"kilometers?|miles?|kg|pounds?|lbs?)\b",
+        low,
+    ) and re.search(r"\d", low):
+        return True
+    # Arithmetic questions: "what is 17 * 19", "17 x 19?", "17 times 19"
+    if re.search(
+        r"(?:"
+        r"what(?:'s|\s+is)\s+"
+        r")?"
+        r"[\d.]+\s*(?:[+\-*/^x×]|times|plus|minus|divided\s+by)\s*[\d.]+",
+        low,
+    ) and not re.search(r"\b(who|where|when|why|news|weather|score)\b", low):
+        return True
+    if re.fullmatch(r"[\d\s+\-*/^().%x×]+", low) and re.search(r"\d", low):
         return True
     return False
 
@@ -314,6 +360,8 @@ def _is_checkable_task(text: str) -> bool:
         return True
     if re.search(r"\b(?:where (?:can|should) i (?:buy|go|stay|eat)|is .{1,60} (?:in stock))\b", low):
         return True
+    # Pure arithmetic is utility (CHAT + calculate), never TASK_RESEARCH.
+    # Previously `\d + \d` forced research and caused false web_search for "17 * 19".
     return False
 
 
@@ -435,9 +483,12 @@ def _intent_relation(text: str, *, continues: bool, explicit_new: bool) -> str:
     ):
         return "cancel"
     # Retry/try-again is always a continuation signal (coding or multi-task research).
+    # Include "try again with that search", "retry the search", "search it again", etc.
     if re.fullmatch(r"(?:please )?(?:try|retry)(?: that| it| again)?", low) or re.fullmatch(
         r"(?:please )?try again[.!?]?", low
     ):
+        return "retry"
+    if is_search_retry_utterance(low):
         return "retry"
     if explicit_new:
         return "new_objective"
@@ -521,8 +572,8 @@ def classify_turn_mode(user_input: str, *, source: str = "", active_work: Any = 
             confidence=1.0,
             reason="empty input",
             user_text=text,
-            model_provider=CHAT_MODEL[0],
-            model_name=CHAT_MODEL[1],
+            model_provider="",
+            model_name="",
             required_capabilities=frozenset({"chat"}),
         )
 
@@ -558,8 +609,8 @@ def classify_turn_mode(user_input: str, *, source: str = "", active_work: Any = 
             confidence=0.95,
             reason="utility tool request (clock/date/calc)",
             user_text=text,
-            model_provider=CHAT_MODEL[0],
-            model_name=CHAT_MODEL[1],
+            model_provider="",
+            model_name="",
             verification_required=False,
             evidence_required=False,
             required_capabilities=frozenset({"chat"}),
@@ -598,13 +649,29 @@ def classify_turn_mode(user_input: str, *, source: str = "", active_work: Any = 
             ),
             user_text=text,
             coding_phase=phase,
-            model_provider=CODING_MODEL[0],
-            model_name=CODING_MODEL[1],
+            model_provider="",
+            model_name="",
             verification_required=True,
             evidence_required=compound_research,
             required_capabilities=frozenset({"coding", "research"} if compound_research else {"coding"}),
             constraints=constraints,
             intent_relation=relation,
+        )
+
+    # Referential search retry must be research, not tool-free chat.
+    if relation == "retry" and is_search_retry_utterance(text):
+        return ModeDecision(
+            mode=TurnMode.TASK_RESEARCH,
+            confidence=0.92,
+            reason="referential search retry",
+            user_text=text,
+            model_provider="",
+            model_name="",
+            verification_required=True,
+            evidence_required=True,
+            required_capabilities=frozenset({"research"}),
+            constraints=constraints,
+            intent_relation="retry",
         )
 
     if _is_checkable_task(text):
@@ -614,8 +681,8 @@ def classify_turn_mode(user_input: str, *, source: str = "", active_work: Any = 
             confidence=0.94 if deep else 0.82,
             reason="deep research intent" if deep else "checkable task or live information request",
             user_text=text,
-            model_provider=RESEARCH_MODEL[0],
-            model_name=RESEARCH_MODEL[1],
+            model_provider="",
+            model_name="",
             verification_required=True,
             evidence_required=True,
             required_capabilities=frozenset({"research"}),
@@ -631,8 +698,8 @@ def classify_turn_mode(user_input: str, *, source: str = "", active_work: Any = 
         confidence=0.72 if ambiguous else 0.9,
         reason="no operational or checkable intent",
         user_text=text,
-        model_provider=CHAT_MODEL[0],
-        model_name=CHAT_MODEL[1],
+        model_provider="",
+        model_name="",
         ambiguous=ambiguous,
         required_capabilities=frozenset({"chat"}),
         constraints=constraints,
@@ -683,7 +750,7 @@ def allowed_tools_for_mode(decision: ModeDecision, available_tool_names: Iterabl
     if "no_delete" in constraints:
         requested = requested - frozenset({"file_delete"})
     if "local_first" in constraints and decision.mode != TurnMode.TASK_RESEARCH:
-        requested = requested - frozenset({"web_search", "browse_task", "youtube_transcript"})
+        requested = requested - frozenset({"web_search", "safe_web_fetch", "browse_task", "youtube_transcript"})
     return frozenset(available & requested)
 
 

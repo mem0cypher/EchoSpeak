@@ -1,5 +1,11 @@
 # EchoSpeak Architecture Audit
 
+> **Historical audit, not current runtime documentation.** Its versioned
+> findings describe earlier worktree states. Use
+> [`docs/SYSTEM_ARCHITECTURE.md`](docs/SYSTEM_ARCHITECTURE.md) and
+> [`docs/RUNTIME_CONTRACTS.md`](docs/RUNTIME_CONTRACTS.md) for the current
+> EchoSpeak 8.0 implementation.
+
 **Generated:** 2025-01-20  
 **Updated:** 2026-07-12 (v7.6.10 runtime contracts — **implemented partial; pending live validation**)  
 **Version:** 7.6.10 (pre-acceptance)  

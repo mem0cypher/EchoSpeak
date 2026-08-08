@@ -4,19 +4,33 @@ import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { useLocation, useNavigate } from "react-router-dom";
 import { create } from "zustand";
-import { SquareAvatarVisual } from "./components/SquareAvatarVisual";
-import { getToolCategory, getToolDisplayDetails } from "./components/echoAnimationUtils";
-import type { CodeDiffSession } from "./components/InlineCodeDiff";
-import { CodeWorkspace } from "./components/CodeWorkspace";
-import type { LiveFileChange, LiveTerminalEntry } from "./components/CodeWorkspace";
-import { createEmptyTaskPlan, taskPlanReducer } from "./components/TaskChecklist";
-import type { TaskPlanState } from "./components/TaskChecklist";
+import { createEmptyTaskPlan, taskPlanReducer } from "./taskPlanProjection";
+import type { TaskPlanProjection } from "./taskPlanProjection";
 import type { EchoReaction, ToolCategory } from "./components/echoAnimationUtils";
-import { TodoPanel } from "./components/TodoPanel";
 import { AvatarEditor } from "./components/AvatarEditor";
 import { ProjectSidebar } from "./components/ProjectSidebar";
 import { MediaLibraryView } from "./features/media/MediaLibraryView.tsx";
+import { VisualizerWorkspace } from "./features/visualizer/VisualizerWorkspace";
+import {
+  SettingsCatalog,
+  type SettingsCatalogAction,
+  type SettingsCatalogCard,
+  type SettingsCatalogCategory,
+} from "./features/settings/SettingsCatalog";
+import { useWorkStore } from "./features/work/store";
 import { loadRuntimeLayout, runtimeGridColumns, saveRuntimeLayout } from "./runtimeLayout";
+import {
+  buildLiveOperationalStatus,
+  canApplyFinalToChat,
+  mergeFinalReply,
+  shouldIncludeChatActivity,
+} from "./chatPresentation";
+import { STUDIO_SECTION_ORDER } from "./studioNavigation";
+import {
+  coerceAllowlistValue,
+  commitAllowlistDraft,
+  removeAllowlistEntry,
+} from "./settingsAllowlist";
 import { buildResearchRunFromToolEvent, normalizeResearchRun } from "./features/research/buildResearchRun";
 import { useResearchStore } from "./features/research/store";
 import type { ResearchRun } from "./features/research/types";
@@ -30,25 +44,42 @@ import { CapabilityRegistryGroups, OperationalStateCard } from "./features/opera
 import type { OperationalApproval, OperationalThreadState } from "./features/operations/OperationalStateCard";
 import {
   createEchoSpeakWebSocket,
+  controlDesktopWindow,
   getEchoSpeakApiBase,
   isDesktopRuntime,
+  openDesktopCompanionWindow,
+  openDesktopSettingsWindow,
+  pickDesktopConnectionFolder,
   pickDesktopProjectFolder,
 } from "./desktop/bridge";
+import {
+  LocalVoiceInput,
+  localVoicePlayback,
+} from "./voiceTransport";
+import type {
+  SpeechScope,
+  VoiceTranscript,
+  VoiceTransportPhase,
+} from "./voiceTransport";
 import { canApplySessionHistory, ownsStreamCleanup } from "./desktop/sessionProjection";
 import {
-  desktopVisualizerMode,
+  desktopExecutionProfile,
   desktopWorkspaceForView,
   desktopWorkspaceLabel,
+  desktopVisualizerPanelLabel,
   isDesktopContextualSurface,
   type DesktopSidebarView,
+  type DesktopVisualizerPanel,
   type DesktopWorkspaceSurface,
 } from "./desktop/workspaceState";
 import {
+  activityActionsFromStreamEvent,
   agentActivityReducer,
   initialAgentActivity,
   isStreamThreadCurrent,
   toolCategoryFromPhase,
   type AgentActivityState,
+  type SemanticActivityEvent,
 } from "./agentActivity";
 
 // Types
@@ -59,13 +90,11 @@ type DocSource = {
   source?: string;
   chunk?: number;
 };
-
 type RuntimeSettingsEnvelope = {
   settings: Record<string, any>;
   overrides: Record<string, any>;
   issues?: { key: string; message: string; severity: "error" | "warning" }[];
 };
-
 type SettingsTestResult = {
   ok: boolean;
   target: string;
@@ -295,7 +324,7 @@ const buildMessageUsage = (
   };
 };
 
-type AgentStreamEvent =
+type AgentStreamEvent = (
   | { type: "tool_start"; id: string; name: string; input: string; at: number; request_id?: string }
   | { type: "tool_end"; id: string; name?: string; output: string; research?: ResearchRun; outcome?: { success: boolean; status: string; error_code?: string; error_message?: string; retryable?: boolean }; at: number; request_id?: string }
   | { type: "tool_error"; id: string; error: string; at: number; request_id?: string }
@@ -304,15 +333,24 @@ type AgentStreamEvent =
   | { type: "agent_token"; data: string; at: number; request_id?: string }
   | { type: "memory_saved"; memory_count: number; at: number; request_id?: string }
   | { type: "task_plan"; data: any[]; at?: number; request_id?: string }
-  | { type: "task_step"; data: { index: number; status: string; description?: string; tool?: string; result_preview?: string; total?: number }; at?: number; request_id?: string }
-  | { type: "task_reflection"; data: { index: number; accepted: boolean; reason?: string; cycle?: number }; at?: number; request_id?: string }
   | { type: "partial_reply"; response: string; speak?: boolean; segment?: number; reason?: string; request_id?: string; at: number }
-  | { type: "final"; response: string; spoken_text?: string; success: boolean; memory_count: number; doc_sources?: DocSource[]; research?: ResearchRun[]; response_render?: ResponseRenderIntent; execution_id?: string; trace_id?: string; thread_state?: ThreadSessionState | null; execution_projection?: Record<string, any>; partial_replies?: string[]; request_id?: string; at: number }
-  | { type: "turn_bound"; request_id?: string; execution_id?: string; turn_id?: string; thread_id?: string; active_project_id?: string; at: number }
-  | { type: "error"; message: string; at: number; request_id?: string };
+  | { type: "final"; response: string; spoken_text?: string; success: boolean; memory_count: number; doc_sources?: DocSource[]; research?: ResearchRun[]; response_render?: ResponseRenderIntent; execution_id?: string; trace_id?: string; thread_state?: ThreadSessionState | null; execution_projection?: Record<string, any>; partial_replies?: string[]; voice_turn_id?: string; request_id?: string; at: number }
+  | { type: "turn_bound"; request_id?: string; execution_id?: string; turn_id?: string; thread_id?: string; active_project_id?: string; model?: string; reasoning_control?: Record<string, unknown>; at: number }
+  | { type: "task_bound"; task_run_id: string; task_revision: number; objective?: string; active_requirement?: string; status?: string; request_id?: string; at: number }
+  | { type: "iteration_boundary"; iteration: number; phase?: string; model?: string; request_id?: string; at: number }
+  | { type: "token_usage"; prompt?: number; completion?: number; total?: number; request_id?: string; at: number }
+  | { type: "reasoning_summary"; content: string; iteration?: number; request_id?: string; at: number }
+  | { type: "recovery"; message: string; request_id?: string; at: number }
+  | { type: "lifecycle"; phase: string; execution_id?: string; error?: string; request_id?: string; at?: number }
+  | { type: "error"; message: string; at: number; request_id?: string }
+) & { activity?: SemanticActivityEvent; seq?: number };
 
-/** Square spinner — Echo's shape, no emoji */
-const SquareLoader: React.FC<{ size?: number; color?: string }> = ({ size = 12, color = "rgba(140,160,255,0.95)" }) => (
+/** Square spinner — Echo's shape (startup-style), no generic browser spinner / emoji */
+const SquareLoader: React.FC<{ size?: number; color?: string; active?: boolean }> = ({
+  size = 12,
+  color = "rgba(255,255,255,0.88)",
+  active = true,
+}) => (
   <span
     aria-hidden
     style={{
@@ -322,12 +360,185 @@ const SquareLoader: React.FC<{ size?: number; color?: string }> = ({ size = 12, 
       borderRadius: 2,
       border: `2px solid ${color}`,
       borderTopColor: "transparent",
-      animation: "echo-square-spin 0.75s linear infinite",
+      animation: active ? "echo-square-spin 0.75s linear infinite" : "none",
       verticalAlign: "middle",
       flexShrink: 0,
     }}
   />
 );
+
+/** Compact live strip for the active assistant turn — operational status and interrupt controls. */
+const LiveChatActivityBar: React.FC<{
+  status: ReturnType<typeof buildLiveOperationalStatus>;
+  activity: AgentActivityState;
+  showSpinner: boolean;
+  onStop?: () => void;
+  onSteer?: () => void;
+  onQueue?: () => void;
+}> = ({ status, activity, showSpinner, onStop, onSteer, onQueue }) => {
+  const [expanded, setExpanded] = useState(true);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!activity.streaming || !activity.startTime) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [activity.startTime, activity.streaming]);
+  const elapsedSeconds = activity.startTime
+    ? Math.max(0, Math.floor((now - activity.startTime) / 1000))
+    : 0;
+  const chips: { key: string; label: string; value: string }[] = [];
+  if (status.task) chips.push({ key: "task", label: "Task", value: status.task });
+  if (status.tool) chips.push({ key: "tool", label: "Tool", value: status.tool });
+  if (status.skill) chips.push({ key: "skill", label: "Skill", value: status.skill });
+  if (status.search) chips.push({ key: "search", label: "Search", value: status.search });
+  if (status.verifying) chips.push({ key: "verify", label: "Status", value: "Verifying" });
+  const requirementRows = activity.requirements.slice(0, 5);
+  const timelineRows = activity.timeline.slice(-4);
+  return (
+    <div className="live-run" data-testid="chat-live-activity" data-expanded={expanded ? "true" : "false"}>
+      <div className="live-run-header">
+        <div className="live-run-heading">
+          <SquareLoader size={12} color="rgba(255,255,255,0.9)" active={showSpinner} />
+          <strong>{status.headline}</strong>
+          <span className="live-run-meta">
+            {elapsedSeconds}s{activity.iteration ? ` · pass ${activity.iteration}` : ""}
+          </span>
+        </div>
+        {(onStop || onSteer || onQueue) && (
+          <div className="live-run-actions">
+            {onStop && (
+              <button
+                className="live-run-action is-stop"
+                type="button"
+                onClick={onStop}
+                title="Stop current agent turn"
+                aria-label="Stop current turn"
+              >
+                Stop
+              </button>
+            )}
+            {onSteer && (
+              <button
+                className="live-run-action"
+                type="button"
+                onClick={onSteer}
+                title="Steer active TaskRun with new instruction"
+                aria-label="Steer active TaskRun"
+              >
+                Steer
+              </button>
+            )}
+            {onQueue && (
+              <button
+                className="live-run-action"
+                type="button"
+                onClick={onQueue}
+                title="Queue follow-up instruction"
+                aria-label="Queue follow-up instruction"
+              >
+                Queue
+              </button>
+            )}
+            <button
+              className="live-run-action is-toggle"
+              type="button"
+              onClick={() => setExpanded((value) => !value)}
+              title={expanded ? "Collapse run details" : "Expand run details"}
+              aria-label={expanded ? "Collapse run details" : "Expand run details"}
+            >
+              {expanded ? "Less" : "More"}
+            </button>
+          </div>
+        )}
+      </div>
+      {expanded && (activity.objective || activity.activeRequirement || activity.activeModel || activity.tokenUsage || activity.recoveryReason || activity.nextAction || activity.requirements.length) ? (
+        <div className="live-run-details">
+          {activity.objective ? <div className="live-run-detail"><span>Objective</span>{activity.objective}</div> : null}
+          {activity.activeRequirement ? <div className="live-run-detail"><span>Current step</span>{activity.activeRequirement}</div> : null}
+          {activity.activeModel ? <div className="live-run-detail"><span>Model</span>{activity.activeModel}</div> : null}
+          {activity.tokenUsage?.total ? <div className="live-run-detail"><span>Tokens</span>{formatTokenCount(activity.tokenUsage.total)}</div> : null}
+          {activity.recoveryReason ? <div className="live-run-detail"><span>Recovery</span>{activity.recoveryReason}</div> : null}
+          {activity.nextAction ? <div className="live-run-detail"><span>Next</span>{activity.nextAction}</div> : null}
+        </div>
+      ) : null}
+      {expanded && (activity.attemptCount || activity.retryCount || activity.sourceCount || activity.missingFields.length) ? (
+        <div className="live-run-measures" aria-label="Current run coverage">
+          <span><b>{activity.attemptCount}</b> attempts</span>
+          <span><b>{activity.retryCount}</b> retries</span>
+          <span><b>{activity.sourceCount}</b> sources</span>
+          <span><b>{activity.missingFields.length}</b> gaps</span>
+        </div>
+      ) : null}
+      {expanded && requirementRows.length ? (
+        <div className="live-run-requirements" aria-label="Task requirements">
+          {requirementRows.map((requirement, index) => (
+            <div key={`${requirement.label}:${index}`} data-status={requirement.status}>
+              <i aria-hidden />
+              <span>{requirement.label}</span>
+              <small>{requirement.status.replace(/_/g, " ")}</small>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {expanded && activity.sources.length ? (
+        <div className="live-run-sources" aria-label="Sources used in this run">
+          <span>Sources</span>
+          <div>
+            {activity.sources.slice(-4).map((source, index) => source.url ? (
+              <a key={`${source.url}:${index}`} href={source.url} target="_blank" rel="noreferrer">
+                {source.label}
+              </a>
+            ) : (
+              <small key={`${source.label}:${index}`}>{source.label}</small>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      {expanded && chips.length ? (
+        <div className="live-run-trace">
+          {chips.map((chip) => (
+            <div key={chip.key}>
+              <span>{chip.label}</span>
+              <strong>{chip.value}</strong>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {expanded && timelineRows.length ? (
+        <div className="live-run-timeline" aria-label="Recent run activity">
+          {timelineRows.map((entry) => (
+            <div key={entry.key}>
+              <i data-status={entry.status} aria-hidden />
+              <span>{entry.label}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+};
+const SettingsGroupIcon: React.FC<{ name: string }> = ({ name }) => {
+  const common = {
+    width: 17,
+    height: 17,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.7,
+    strokeLinecap: "round" as const,
+    strokeLinejoin: "round" as const,
+  };
+  if (name === "Models") return <svg {...common}><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9zM9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M20 9h3M1 15h3M20 15h3"/></svg>;
+  if (name === "Search & Research") return <svg {...common}><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5M7.5 10.5h6M10.5 7.5v6"/></svg>;
+  if (name === "Connections") return <svg {...common}><path d="M9.5 14.5 14.5 9M7 17l-1.5 1.5a3.5 3.5 0 0 1-5-5L5 9a3.5 3.5 0 0 1 5 0M17 7l1.5-1.5a3.5 3.5 0 0 1 5 5L19 15a3.5 3.5 0 0 1-5 0"/></svg>;
+  if (name === "Voice & Speech") return <svg {...common}><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"/><path d="M5 11v1a7 7 0 0 0 14 0v-1M12 19v3M8 22h8"/></svg>;
+  if (name === "Local Tools") return <svg {...common}><path d="M14.5 6.5 17.5 3.5a4 4 0 0 1-5 5L5 16l3 3 7.5-7.5a4 4 0 0 1 5-5l-3 3z"/></svg>;
+  if (name === "Skills") return <svg {...common}><path d="M12 3 4 7v10l8 4 8-4V7zM8 9h8M8 13h5"/></svg>;
+  if (name === "MCP") return <svg {...common}><rect x="3" y="5" width="7" height="6" rx="1"/><rect x="14" y="13" width="7" height="6" rx="1"/><path d="M10 8h4a3 3 0 0 1 3 3v2M14 16h-4a3 3 0 0 1-3-3v-2"/></svg>;
+  if (name === "Privacy & Permissions") return <svg {...common}><path d="M12 3 4.5 6v5.5c0 4.5 3 7.8 7.5 9.5 4.5-1.7 7.5-5 7.5-9.5V6L12 3Z"/><path d="m9 12 2 2 4-4"/></svg>;
+  if (name === "Advanced") return <svg {...common}><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg>;
+  return <svg {...common}><path d="M4 5h16v14H4zM8 9h8M8 13h5"/></svg>;
+};
 
 type GatewayEvent =
   | { type: "gateway_ready"; session_id?: string; at?: number }
@@ -361,7 +572,7 @@ type ThinkingStep = {
 type TaskPlanEntry = {
   id: string;
   at: number;
-  plan: TaskPlanState;
+  plan: TaskPlanProjection;
   request_id?: string;
 };
 
@@ -387,6 +598,8 @@ type ProviderInfo = {
   ready?: boolean;
   readiness_message?: string;
   readiness_detail?: string;
+  session_id?: string;
+  binding_revision?: number;
 };
 
 type ProviderModelsResponse = {
@@ -409,6 +622,13 @@ type MemoryItem = {
   updated_at?: string;
   index_state?: string;
   supersedes?: string;
+  /** Optional projection fields from MemoryCurator / list API. */
+  project_id?: string;
+  project_path?: string;
+  confidence?: number | string;
+  source?: string;
+  status?: string;
+  provenance?: string;
 };
 
 type MemoryListResponse = {
@@ -432,30 +652,6 @@ type MemoryDoctorReport = {
   recommendations: string[];
 };
 
-type CodingReadiness = {
-  schema_version: number;
-  session_id: string;
-  ok: boolean;
-  ready_for_reading: boolean;
-  ready_for_editing: boolean;
-  project: { attached: boolean; project_id: string; name: string; root: string; root_exists: boolean; root_authorized: boolean; interaction_mode: string };
-  model: { provider: string; model: string; ready: boolean; message: string; detail?: string; tool_call_path: string; context_limit: number };
-  provider: { provider?: string; name?: string; ready: boolean; message: string; detail?: string };
-  workspace: Record<string, any>;
-  file_roots: { root?: string; extra_roots?: string[]; terminal_execution_mode?: string; terminal_denylist?: string[] };
-  tools: Record<string, "available" | "disabled" | "unregistered" | "filtered">;
-  tool_rows: { name: string; status: string; loaded: boolean; allowed: boolean; reason?: string }[];
-  permissions: { read: boolean; write: boolean; terminal: boolean };
-  approval: { writes_require_confirmation: boolean; pending_approval_id?: string | null; pending_tool?: string | null };
-  terminal: { mode: string; enabled: boolean; available: boolean; required_for_file_editing: boolean };
-  blockers: { code: string; message: string }[];
-  warnings: { code: string; message: string }[];
-  blocked_tools: string[];
-  missing_tools: string[];
-  recommended_loop: string[];
-  recommendations: string[];
-};
-
 type DocumentItem = {
   id: string;
   filename: string;
@@ -475,6 +671,11 @@ type ThreadSessionState = OperationalThreadState & {
   thread_id: string;
   workspace_id?: string;
   active_project_id?: string;
+  foreground_task_id?: string;
+  suspended_task_ids?: string[];
+  pending_approval_ids?: string[];
+  source_metadata?: Record<string, any>;
+  semantic_schema_version?: number;
   pending_approval_id?: string;
   last_execution_id?: string;
   last_trace_id?: string;
@@ -621,100 +822,6 @@ const isEmptySessionDraft = (session: { name?: string; messageCount?: number }):
   Number(session.messageCount || 0) === 0 &&
   /^(?:new|default)?\s*(?:session|thread)(?:\s+\d+)?$/i.test(String(session.name || "").trim());
 
-const replaceCodeSession = (sessions: CodeDiffSession[], nextSession: CodeDiffSession): [CodeDiffSession[], number] => {
-  const existingIndex = sessions.findIndex((session) => session.filename === nextSession.filename);
-  if (existingIndex >= 0) {
-    const next = [...sessions];
-    next[existingIndex] = nextSession;
-    return [next, existingIndex];
-  }
-  const next = [...sessions, nextSession].slice(-10);
-  const nextIndex = next.findIndex((session) => session.filename === nextSession.filename);
-  return [next, nextIndex >= 0 ? nextIndex : Math.max(0, next.length - 1)];
-};
-
-const isFileWriteSummary = (value: string): boolean => /^(Wrote|Appended) \d+ chars to /.test(value);
-
-/** Parse <<<ECHO_FILE ...>>> ... <<<END_ECHO_FILE>>> blocks from tool output. */
-const parseEchoFileBlock = (
-  raw: string
-): { path: string; content: string; action: string; chars: number } | null => {
-  const text = String(raw || "");
-  const m = text.match(
-    /<<<ECHO_FILE\s+([^>]*?)>>>\r?\n?([\s\S]*?)\r?\n?<<<END_ECHO_FILE>>>/i
-  );
-  if (!m) return null;
-  const meta = m[1] || "";
-  const content = m[2] ?? "";
-  const pathM = meta.match(/\bpath=([^\s]+)/i);
-  const actionM = meta.match(/\baction=([^\s]+)/i);
-  const charsM = meta.match(/\bchars=(\d+)/i);
-  return {
-    path: (pathM?.[1] || "").replace(/^["']|["']$/g, ""),
-    content,
-    action: actionM?.[1] || "read",
-    chars: charsM ? Number(charsM[1]) : content.length,
-  };
-};
-
-/** Extract path + content from tool input (JSON / kwargs / free form). */
-const parseFileToolInput = (rawInput: string): { path: string; content: string } => {
-  const raw = String(rawInput || "");
-  let path = "";
-  let content = "";
-  try {
-    const j = JSON.parse(raw);
-    if (j && typeof j === "object") {
-      path = String(j.path || j.file_path || j.filepath || j.filename || "").trim();
-      content = typeof j.content === "string" ? j.content : typeof j.text === "string" ? j.text : "";
-      if (path || content) return { path, content };
-    }
-  } catch {
-    /* not JSON */
-  }
-  const pathM =
-    raw.match(/['"]path['"]\s*:\s*['"]([^'"]+)['"]/i) ||
-    raw.match(/\bpath\s*=\s*['"]([^'"]+)['"]/i) ||
-    raw.match(/\bpath\s*[:=]\s*([^\s,}\]]+)/i);
-  if (pathM) path = pathM[1].replace(/^['"]|['"]$/g, "");
-  // content after content= / "content": "
-  const contentKey = raw.search(/['"]content['"]\s*:/i);
-  if (contentKey >= 0) {
-    const after = raw.slice(contentKey);
-    const quoted = after.match(/['"]content['"]\s*:\s*(")([\s\S]*)$/i);
-    if (quoted) {
-      // naive unescape of JSON string remainder
-      let body = quoted[2];
-      // trim trailing ", append flags
-      const end = body.lastIndexOf('"');
-      if (end >= 0) body = body.slice(0, end);
-      content = body.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
-    }
-  }
-  if (!path) {
-    // first path-like token
-    const bare = raw.match(/(?:Desktop[/\\][^\s,'"]+\.\w{1,8}|[A-Za-z]:\\[^\s,'"]+|\/[^\s,'"]+\.\w{1,8}|[\w./\\-]+\.\w{1,8})/);
-    if (bare) path = bare[0];
-  }
-  return { path, content };
-};
-
-const basenamePath = (p: string): string => {
-  const s = String(p || "").replace(/\\/g, "/");
-  const parts = s.split("/").filter(Boolean);
-  return parts[parts.length - 1] || s || "file";
-};
-
-const langFromFilename = (filename: string, toolName: string): string => {
-  if (toolName === "terminal_run") return "bash";
-  const ext = (filename.split(".").pop() || "text").toLowerCase();
-  if (ext === "js" || ext === "mjs" || ext === "cjs") return "javascript";
-  if (ext === "ts" || ext === "tsx") return "typescript";
-  if (ext === "py") return "python";
-  if (ext === "htm") return "html";
-  return ext || "text";
-};
-
 const fallbackProviders: ProviderListItem[] = [
   { id: "openai", name: "OpenAI", local: false, description: "OpenAI GPT models" },
   { id: "gemini", name: "Google Gemini", local: false, description: "Google Gemini models" },
@@ -731,14 +838,12 @@ type AppState = {
   listening: boolean;
   speaking: boolean;
   speechEnabled: boolean;
-  selectedVoice: string | null;
   speechBeat: number;
   addMessage: (msg: Message) => void;
   setStreaming: (v: boolean) => void;
   setListening: (v: boolean) => void;
   setSpeaking: (v: boolean) => void;
   setSpeechEnabled: (v: boolean) => void;
-  setSelectedVoice: (v: string | null) => void;
   bumpSpeechBeat: () => void;
 };
 
@@ -749,8 +854,6 @@ const useAppStore = create<AppState>((set) => ({
   speaking: false,
   speechEnabled: true,
   setSpeechEnabled: (v) => set({ speechEnabled: v }),
-  selectedVoice: null,
-  setSelectedVoice: (v) => set({ selectedVoice: v }),
   speechBeat: 0,
   addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
   setStreaming: (v) => set({ streaming: v }),
@@ -1134,7 +1237,7 @@ const globalCss = `
            background: rgba(255,255,255,0.045);
            box-shadow: none;
          }
-         /* ── EchoSpeak Studio shell (portaled to body — full workspace, no chrome bleed) ── */
+         /* ── EchoSpeak Settings modal (portaled to body, no chrome bleed) ── */
          .studio-shell {
            position: fixed;
            inset: 0;
@@ -1154,8 +1257,8 @@ const globalCss = `
            overflow: hidden;
          }
          .app-shell.is-studio-covered {
-           visibility: hidden;
            pointer-events: none;
+           filter: blur(2px);
          }
          .studio-shell::before {
            content: "";
@@ -1236,12 +1339,15 @@ const globalCss = `
          }
          .studio-nav {
            position: relative;
-           z-index: 2;
+           z-index: 5;
            display: flex;
-           justify-content: center;
+           align-items: stretch;
+           justify-content: stretch;
            border-bottom: 1px solid rgba(255,255,255,0.06);
-           background: rgba(255,255,255,0.015);
+           background: rgba(8,8,8,0.98);
            min-width: 0;
+           width: 100%;
+           flex: 0 0 auto;
          }
          .studio-nav-arrow {
            width: 36px;
@@ -1249,35 +1355,42 @@ const globalCss = `
            border: 0;
            border-left: 1px solid rgba(255,255,255,0.06);
            border-right: 1px solid rgba(255,255,255,0.06);
-           background: rgba(8,8,8,0.96);
+           background: rgba(8,8,8,0.98);
            color: rgba(255,255,255,0.72);
            cursor: pointer;
            font-size: 18px;
+           z-index: 2;
          }
          .studio-nav-arrow:hover { color: #fff; background: rgba(255,255,255,0.06); }
          .studio-nav-inner {
            display: flex;
            gap: 0;
            overflow-x: auto;
-           max-width: 960px;
+           overflow-y: hidden;
            min-width: 0;
-           width: 100%;
-           padding: 0 8px;
-           scrollbar-width: none;
+           flex: 1 1 auto;
+           width: auto;
+           max-width: none;
+           padding: 0 4px;
+           scrollbar-width: thin;
+           scrollbar-color: rgba(255,255,255,0.25) transparent;
+           -webkit-overflow-scrolling: touch;
          }
-         .studio-nav-inner::-webkit-scrollbar { display: none; }
+         .studio-nav-inner::-webkit-scrollbar { height: 4px; }
+         .studio-nav-inner::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.22); border-radius: 999px; }
          .studio-tab {
            height: 44px;
-           padding: 0 16px;
+           padding: 0 14px;
            border: none;
            border-bottom: 2px solid transparent;
            background: transparent;
            color: rgba(255,255,255,0.4);
            font-size: 12px;
            font-weight: 600;
-           letter-spacing: 0.06em;
+           letter-spacing: 0.04em;
            cursor: pointer;
            white-space: nowrap;
+           flex: 0 0 auto;
            transition: color 0.15s ease;
            font-family: Inter, system-ui, sans-serif;
          }
@@ -1346,10 +1459,349 @@ const globalCss = `
            align-items: stretch;
            width: 100%;
          }
-         .studio-shell .research-card {
-           width: 100%;
-           box-sizing: border-box;
-         }
+          .studio-shell .research-card {
+            width: 100%;
+            box-sizing: border-box;
+          }
+          /* Reference-faithful Settings composition: title, vertical section rail, content. */
+          .studio-backdrop {
+            position: fixed;
+            inset: 0;
+            z-index: 100000;
+            display: grid;
+            place-items: center;
+            padding: 42px;
+            box-sizing: border-box;
+            overflow: hidden;
+            background: rgba(0,0,0,.72);
+            backdrop-filter: blur(5px);
+            -webkit-backdrop-filter: blur(5px);
+          }
+          .studio-shell {
+            position: relative;
+            inset: auto;
+            z-index: 1;
+            width: min(1060px, calc(100vw - 84px));
+            height: min(760px, calc(100dvh - 84px));
+            max-width: 1060px;
+            max-height: 760px;
+            display: grid;
+            grid-template-columns: 220px minmax(0, 1fr);
+            grid-template-rows: 58px 44px minmax(0, 1fr);
+            background: #0a0a0a;
+            border: 1px solid rgba(255,255,255,.13);
+            border-radius: 12px;
+            box-shadow: 0 28px 90px rgba(0,0,0,.68);
+            overflow: hidden;
+          }
+          .studio-top {
+            grid-column: 1 / -1;
+            grid-row: 1;
+            padding: 0 20px 0 22px;
+            background: #0b0b0b;
+          }
+          .studio-title {
+            font-family: 'Inter', 'Segoe UI Variable', sans-serif;
+            font-size: 17px;
+            font-weight: 520;
+            letter-spacing: -.015em;
+            text-transform: none;
+          }
+          .studio-x {
+            width: 32px;
+            height: 32px;
+            border: 0;
+          }
+          .studio-nav {
+            grid-column: 1;
+            grid-row: 2 / 4;
+            min-width: 0;
+            width: auto;
+            padding: 14px 12px;
+            align-items: stretch;
+            border-right: 1px solid rgba(255,255,255,.09);
+            border-bottom: 0;
+            background: #0a0a0a;
+          }
+          .studio-nav-inner {
+            width: 100%;
+            padding: 0;
+            min-height: 0;
+            overflow-x: hidden;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255,255,255,.18) transparent;
+          }
+          .studio-nav .studio-tab {
+            width: 100%;
+            height: 42px;
+            display: flex;
+            align-items: center;
+            gap: 11px;
+            padding: 0 12px;
+            border: 0;
+            border-radius: 5px;
+            color: rgba(255,255,255,.67);
+            font-size: 12px;
+            font-weight: 500;
+            letter-spacing: 0;
+            text-align: left;
+          }
+          .studio-nav .studio-tab.active {
+            color: #fff;
+            background: rgba(255,255,255,.08);
+          }
+          .studio-tab-icon {
+            width: 18px;
+            display: inline-grid;
+            place-items: center;
+            color: rgba(255,255,255,.7);
+            font-size: 15px;
+          }
+          .studio-subnav {
+            grid-column: 2;
+            grid-row: 2;
+            min-width: 0;
+            display: flex;
+            align-items: end;
+            gap: 4px;
+            padding: 6px 22px 0;
+            overflow-x: auto;
+            border-bottom: 1px solid rgba(255,255,255,.07);
+            background: #0b0b0b;
+          }
+          .studio-subnav .studio-tab {
+            height: 37px;
+            padding: 0 10px;
+            font-size: 10px;
+            letter-spacing: .02em;
+          }
+          .studio-body {
+            grid-column: 2;
+            grid-row: 3;
+            display: block;
+            overflow: hidden;
+          }
+          .studio-column {
+            max-width: none;
+            padding: 20px 22px 28px;
+          }
+          .studio-hero {
+            margin-bottom: 14px;
+            padding-bottom: 12px;
+          }
+          .studio-hero h2 {
+            font-family: 'Inter', 'Segoe UI Variable', sans-serif;
+            font-size: 19px;
+            font-weight: 550;
+          }
+          .studio-hero span {
+            font-family: 'Inter', 'Segoe UI Variable', sans-serif;
+            font-size: 10px;
+            letter-spacing: .08em;
+          }
+          .settings-general-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+          }
+          .settings-general-card {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            padding: 16px;
+            border: 1px solid rgba(255,255,255,.09);
+            border-radius: 8px;
+            background: rgba(255,255,255,.025);
+          }
+          .settings-general-card-wide {
+            grid-column: 1 / -1;
+          }
+          .settings-general-row {
+            min-height: 46px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 18px;
+            padding-top: 12px;
+            border-top: 1px solid rgba(255,255,255,.07);
+            color: #fff;
+          }
+          .settings-general-row > span {
+            display: grid;
+            gap: 4px;
+          }
+          .settings-general-row strong {
+            font-size: 12px;
+            font-weight: 550;
+          }
+          .settings-general-row small {
+            color: rgba(255,255,255,.44);
+            font-size: 10px;
+            line-height: 1.4;
+          }
+          .settings-general-row input[type="checkbox"] {
+            width: 17px;
+            height: 17px;
+            accent-color: #fff;
+            flex: 0 0 auto;
+          }
+          /* One visual language across every Settings group. Existing controls
+             retain their backend ownership; this layer only normalizes layout. */
+          .studio-shell .research-scroll {
+            gap: 12px;
+            padding: 0 2px 2px 0;
+            scrollbar-gutter: stable;
+          }
+          .studio-shell .research-card {
+            margin: 0;
+            padding: 15px 16px;
+            border-color: rgba(255,255,255,.09);
+            border-radius: 8px;
+            background: rgba(255,255,255,.024);
+          }
+          .studio-shell .research-card:hover {
+            border-color: rgba(255,255,255,.14);
+            background: rgba(255,255,255,.032);
+          }
+          .studio-shell .research-title {
+            margin-bottom: 5px;
+            font-size: 13px;
+            font-weight: 560;
+            letter-spacing: -.005em;
+          }
+          .studio-shell .research-snippet {
+            font-size: 11px;
+            line-height: 1.55;
+            color: rgba(255,255,255,.48);
+          }
+          .studio-shell input:not([type="checkbox"]):not([type="radio"]),
+          .studio-shell select,
+          .studio-shell textarea {
+            min-height: 36px;
+            max-width: 100%;
+            box-sizing: border-box;
+            border: 1px solid rgba(255,255,255,.11);
+            border-radius: 5px;
+            color: rgba(255,255,255,.9);
+            background: #111113;
+            font: 500 11px/1.4 'Inter', 'Segoe UI Variable', sans-serif;
+          }
+          .studio-shell input:not([type="checkbox"]):not([type="radio"]):focus,
+          .studio-shell select:focus,
+          .studio-shell textarea:focus {
+            outline: 1px solid rgba(255,255,255,.62);
+            outline-offset: 1px;
+            border-color: rgba(255,255,255,.32);
+          }
+          .studio-shell .icon-button {
+            min-height: 32px;
+            border-radius: 5px;
+            border-color: rgba(255,255,255,.12);
+            background: rgba(255,255,255,.035);
+            font: 550 11px/1 'Inter', 'Segoe UI Variable', sans-serif;
+          }
+          @media (max-width: 900px), (max-height: 720px) {
+            .studio-backdrop {
+              padding: 16px;
+            }
+            .studio-shell {
+              width: calc(100vw - 32px);
+              height: calc(100dvh - 32px);
+              max-width: none;
+              max-height: none;
+              grid-template-columns: 184px minmax(0, 1fr);
+            }
+            .studio-nav {
+              padding: 10px 8px;
+            }
+            .studio-nav .studio-tab {
+              height: 38px;
+              padding: 0 9px;
+              font-size: 11px;
+            }
+            .studio-column {
+              padding: 16px 18px 22px;
+            }
+            .studio-hero {
+              margin-bottom: 11px;
+              padding-bottom: 10px;
+            }
+          }
+          @media (max-width: 720px) {
+            .studio-shell {
+              grid-template-columns: minmax(0, 1fr);
+              grid-template-rows: 56px 51px 42px minmax(0, 1fr);
+            }
+            .studio-top {
+              grid-column: 1;
+              grid-row: 1;
+              padding: 0 14px 0 16px;
+            }
+            .studio-nav {
+              grid-column: 1;
+              grid-row: 2;
+              width: 100%;
+              padding: 6px 8px;
+              overflow-x: auto;
+              border-right: 0;
+              border-bottom: 1px solid rgba(255,255,255,.08);
+            }
+            .studio-nav-inner {
+              flex-direction: row;
+              gap: 4px;
+              overflow-x: auto;
+              overflow-y: hidden;
+            }
+            .studio-nav .studio-tab {
+              width: auto;
+              flex: 0 0 auto;
+              padding: 0 10px;
+            }
+            .studio-subnav {
+              grid-column: 1;
+              grid-row: 3;
+              padding: 5px 12px 0;
+            }
+            .studio-body {
+              grid-column: 1;
+              grid-row: 4;
+            }
+            .studio-column {
+              padding: 14px 14px 20px;
+            }
+          }
+          @media (max-width: 520px) {
+            .studio-backdrop {
+              padding: 0;
+            }
+            .studio-shell {
+              width: 100vw;
+              height: 100dvh;
+              border: 0;
+              border-radius: 0;
+            }
+            .settings-general-grid {
+              grid-template-columns: minmax(0, 1fr);
+            }
+            .settings-general-card-wide {
+              grid-column: auto;
+            }
+            .settings-general-card,
+            .studio-shell .research-card {
+              padding: 13px;
+            }
+            .settings-general-row {
+              align-items: flex-start;
+              gap: 12px;
+            }
+            .studio-hero span {
+              display: none;
+            }
+          }
          .research-title {
            font-size: 16px;
            font-weight: 600;
@@ -1413,6 +1865,325 @@ const globalCss = `
            background: rgba(255,255,255,0.28);
            background-clip: padding-box;
            border: 2px solid transparent;
+         }
+
+         .live-run {
+           width: 100%;
+           min-width: 0;
+           box-sizing: border-box;
+           margin: 8px 0 12px;
+           padding: 10px 12px;
+           border: 1px solid rgba(255,255,255,0.09);
+           border-radius: 6px;
+           background: rgba(255,255,255,0.022);
+         }
+         .live-run-header {
+           display: flex;
+           align-items: center;
+           justify-content: space-between;
+           gap: 14px;
+           min-width: 0;
+         }
+         .live-run-heading {
+           display: flex;
+           align-items: center;
+           gap: 9px;
+           min-width: 0;
+           color: rgba(255,255,255,0.82);
+           font-size: 12px;
+           line-height: 1.35;
+         }
+         .live-run-heading > strong {
+           min-width: 0;
+           overflow: hidden;
+           text-overflow: ellipsis;
+           white-space: nowrap;
+           font-weight: 560;
+         }
+         .live-run-meta {
+           flex: 0 0 auto;
+           color: rgba(255,255,255,0.36);
+           font-family: 'JetBrains Mono', ui-monospace, monospace;
+           font-size: 9px;
+           letter-spacing: 0.04em;
+         }
+         .live-run-actions {
+           display: flex;
+           align-items: center;
+           gap: 5px;
+           flex: 0 0 auto;
+         }
+         .live-run-action {
+           min-height: 28px;
+           padding: 0 9px;
+           border: 1px solid rgba(255,255,255,0.12);
+           border-radius: 4px;
+           color: rgba(255,255,255,0.68);
+           background: rgba(255,255,255,0.025);
+           font: 550 10px/1 Inter, 'Segoe UI Variable', sans-serif;
+           cursor: pointer;
+           transition: color .15s ease, border-color .15s ease, background .15s ease;
+         }
+         .live-run-action:hover {
+           color: #fff;
+           border-color: rgba(255,255,255,0.25);
+           background: rgba(255,255,255,0.07);
+         }
+         .live-run-action.is-stop {
+           color: rgba(255,255,255,0.88);
+           border-color: rgba(255,255,255,0.2);
+         }
+         .live-run-action.is-toggle {
+           color: rgba(255,255,255,0.46);
+           background: transparent;
+         }
+         .live-run-details {
+           display: grid;
+           grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+           gap: 10px 16px;
+           margin-top: 10px;
+           padding: 10px 0 0 21px;
+           border-top: 1px solid rgba(255,255,255,0.065);
+         }
+         .live-run-detail {
+           min-width: 0;
+           color: rgba(255,255,255,0.65);
+           font-size: 11px;
+           line-height: 1.45;
+           overflow-wrap: anywhere;
+         }
+         .live-run-detail > span {
+           display: block;
+           margin-bottom: 3px;
+           color: rgba(255,255,255,0.32);
+           font-family: 'JetBrains Mono', ui-monospace, monospace;
+           font-size: 8px;
+           letter-spacing: 0.09em;
+           text-transform: uppercase;
+         }
+         .live-run-measures {
+           display: flex;
+           flex-wrap: wrap;
+           gap: 6px;
+           margin: 9px 0 0 21px;
+         }
+         .live-run-measures > span {
+           padding: 4px 7px;
+           border: 1px solid rgba(255,255,255,0.075);
+           border-radius: 4px;
+           color: rgba(255,255,255,0.38);
+           background: rgba(255,255,255,0.018);
+           font: 500 8px/1.2 'JetBrains Mono', ui-monospace, monospace;
+           letter-spacing: .04em;
+           text-transform: uppercase;
+         }
+         .live-run-measures b {
+           color: rgba(255,255,255,0.72);
+           font-weight: 650;
+         }
+         .live-run-requirements,
+         .live-run-timeline {
+           display: grid;
+           gap: 5px;
+           margin: 9px 0 0 21px;
+           padding-top: 8px;
+           border-top: 1px solid rgba(255,255,255,0.05);
+         }
+         .live-run-requirements > div,
+         .live-run-timeline > div {
+           display: grid;
+           grid-template-columns: 8px minmax(0, 1fr) auto;
+           align-items: center;
+           gap: 7px;
+           min-width: 0;
+           color: rgba(255,255,255,0.58);
+           font-size: 10px;
+           line-height: 1.35;
+         }
+         .live-run-requirements i,
+         .live-run-timeline i {
+           width: 5px;
+           height: 5px;
+           border: 1px solid rgba(255,255,255,0.35);
+           border-radius: 50%;
+           box-sizing: border-box;
+         }
+         .live-run-requirements > div[data-status="satisfied"] i,
+         .live-run-timeline i[data-status="succeeded"] {
+           border-color: rgba(255,255,255,0.8);
+           background: rgba(255,255,255,0.8);
+         }
+         .live-run-requirements > div[data-status="weak"] i,
+         .live-run-requirements > div[data-status="blocked"] i,
+         .live-run-requirements > div[data-status="exhausted"] i,
+         .live-run-timeline i[data-status="failed"] {
+           border-style: dashed;
+           opacity: .7;
+         }
+         .live-run-requirements span,
+         .live-run-timeline span {
+           min-width: 0;
+           overflow: hidden;
+           text-overflow: ellipsis;
+           white-space: nowrap;
+         }
+         .live-run-requirements small {
+           color: rgba(255,255,255,0.3);
+           font: 500 8px/1 'JetBrains Mono', ui-monospace, monospace;
+           letter-spacing: .05em;
+           text-transform: uppercase;
+         }
+         .live-run-timeline > div {
+           grid-template-columns: 8px minmax(0, 1fr);
+           color: rgba(255,255,255,0.4);
+           font-size: 9px;
+         }
+         .live-run-sources {
+           display: grid;
+           grid-template-columns: 58px minmax(0,1fr);
+           gap: 8px;
+           margin: 9px 0 0 21px;
+           padding-top: 8px;
+           border-top: 1px solid rgba(255,255,255,0.05);
+         }
+         .live-run-sources > span {
+           color: rgba(255,255,255,0.3);
+           font: 600 8px/1.5 'JetBrains Mono', ui-monospace, monospace;
+           letter-spacing: .08em;
+           text-transform: uppercase;
+         }
+         .live-run-sources > div {
+           display: flex;
+           flex-wrap: wrap;
+           gap: 5px 10px;
+           min-width: 0;
+         }
+         .live-run-sources a,
+         .live-run-sources small {
+           max-width: 230px;
+           overflow: hidden;
+           color: rgba(255,255,255,0.48);
+           font-size: 9px;
+           line-height: 1.4;
+           text-decoration: none;
+           text-overflow: ellipsis;
+           white-space: nowrap;
+         }
+         .live-run-sources a:hover {
+           color: rgba(255,255,255,0.82);
+           text-decoration: underline;
+         }
+         .live-run-trace {
+           display: flex;
+           flex-wrap: wrap;
+           gap: 5px 12px;
+           margin-top: 8px;
+           padding-left: 21px;
+         }
+         .live-run-trace > div {
+           display: inline-flex;
+           gap: 5px;
+           min-width: 0;
+           color: rgba(255,255,255,0.34);
+           font-family: 'JetBrains Mono', ui-monospace, monospace;
+           font-size: 9px;
+           line-height: 1.45;
+         }
+         .live-run-trace strong {
+           max-width: 320px;
+           overflow: hidden;
+           color: rgba(255,255,255,0.56);
+           font-weight: 500;
+           text-overflow: ellipsis;
+           white-space: nowrap;
+         }
+         .steer-backdrop {
+           position: fixed;
+           inset: 0;
+           z-index: 100000;
+           display: grid;
+           place-items: center;
+           padding: 20px;
+           box-sizing: border-box;
+           background: rgba(0,0,0,0.72);
+           backdrop-filter: blur(5px);
+         }
+         .steer-dialog {
+           width: min(460px, 100%);
+           display: flex;
+           flex-direction: column;
+           gap: 14px;
+           padding: 20px;
+           box-sizing: border-box;
+           border: 1px solid rgba(255,255,255,0.13);
+           border-radius: 8px;
+           color: #fff;
+           background: #0b0b0c;
+           box-shadow: 0 28px 80px rgba(0,0,0,0.68);
+         }
+         .steer-dialog-copy {
+           display: grid;
+           gap: 4px;
+         }
+         .steer-dialog-copy span {
+           color: rgba(255,255,255,0.34);
+           font-family: 'JetBrains Mono', ui-monospace, monospace;
+           font-size: 8px;
+           letter-spacing: .11em;
+           text-transform: uppercase;
+         }
+         .steer-dialog h3 {
+           margin: 0;
+           font-size: 17px;
+           font-weight: 560;
+           letter-spacing: -.01em;
+         }
+         .steer-dialog > p {
+           margin: 0;
+           color: rgba(255,255,255,0.5);
+           font-size: 12px;
+           line-height: 1.55;
+         }
+         .steer-input {
+           width: 100%;
+           min-height: 88px;
+           box-sizing: border-box;
+           resize: vertical;
+           border: 1px solid rgba(255,255,255,0.13);
+           border-radius: 5px;
+           outline: 0;
+           padding: 11px 12px;
+           color: #fff;
+           background: #111113;
+           font: 400 13px/1.5 Inter, 'Segoe UI Variable', sans-serif;
+         }
+         .steer-input:focus {
+           border-color: rgba(255,255,255,0.34);
+           box-shadow: 0 0 0 1px rgba(255,255,255,0.08);
+         }
+         .steer-dialog-actions {
+           display: flex;
+           justify-content: flex-end;
+           gap: 7px;
+         }
+         .steer-button {
+           min-height: 34px;
+           padding: 0 13px;
+           border: 1px solid rgba(255,255,255,0.13);
+           border-radius: 4px;
+           color: rgba(255,255,255,0.7);
+           background: rgba(255,255,255,0.025);
+           font: 550 11px/1 Inter, 'Segoe UI Variable', sans-serif;
+           cursor: pointer;
+         }
+         .steer-button.is-primary {
+           color: #090909;
+           border-color: #f2f2f2;
+           background: #f2f2f2;
+         }
+         .steer-button:disabled {
+           opacity: .38;
+           cursor: default;
          }
 
          /* ── Composer dock ──
@@ -1550,10 +2321,10 @@ const globalCss = `
            background: rgba(255,255,255,0.1);
          }
          .mic-button.active {
-           background: rgba(239,68,68,0.12);
-           border-color: rgba(239,68,68,0.45);
-           color: #f87171;
-         }
+            background: rgba(255,255,255,0.12);
+            border-color: rgba(255,255,255,0.42);
+            color: #fff;
+          }
          .composer-square.active {
            background: rgba(255,255,255,0.1);
            border-color: rgba(255,255,255,0.28);
@@ -1573,14 +2344,37 @@ const globalCss = `
          .controls-row {
            display: flex;
            flex-direction: row;
-           flex-wrap: nowrap;
+           flex-wrap: wrap;
            align-items: stretch;
+           gap: 6px;
            width: 100%;
            min-width: 0;
-           background: rgba(255,255,255,0.08);
-           border: 1px solid rgba(255,255,255,0.1);
-           border-radius: 3px;
+           background: transparent;
+           border: 0;
+           border-radius: 0;
+           overflow: visible;
+         }
+         .composer-primary-controls {
+           display: grid;
+           grid-template-columns: auto minmax(112px, .75fr) minmax(156px, 1.25fr) minmax(98px, .6fr);
+           flex: 1 1 570px;
+           min-width: min(100%, 520px);
            overflow: hidden;
+           border: 1px solid rgba(255,255,255,0.1);
+           border-radius: 4px;
+           background: #0a0a0a;
+         }
+         .composer-mode-controls {
+           display: flex;
+           align-items: stretch;
+           gap: 4px;
+           flex: 0 0 auto;
+           min-height: 48px;
+           padding: 4px;
+           box-sizing: border-box;
+           border: 1px solid rgba(255,255,255,0.1);
+           border-radius: 4px;
+           background: #0a0a0a;
          }
          .control-slot {
            display: flex;
@@ -1611,6 +2405,7 @@ const globalCss = `
          .model-slot {
            flex: 1 1 auto;
            min-width: 120px;
+           border-right: 1px solid rgba(255,255,255,0.08);
          }
          .composer-tools-slot {
            display: flex;
@@ -1624,6 +2419,73 @@ const globalCss = `
            padding: 0 8px;
            align-self: stretch;
            border-right: 1px solid rgba(255,255,255,0.08);
+          }
+          .voice-transport-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            max-width: 108px;
+            min-width: 0;
+            padding: 0 4px;
+            color: rgba(255,255,255,.52);
+            font: 550 9px/1 Inter, 'Segoe UI Variable', sans-serif;
+            letter-spacing: .01em;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+          }
+          .voice-transport-status i {
+            width: 5px;
+            height: 5px;
+            flex: 0 0 5px;
+            border-radius: 50%;
+            background: rgba(255,255,255,.52);
+            box-shadow: 0 0 0 3px rgba(255,255,255,.045);
+            transition: transform 90ms linear, background .15s ease;
+          }
+          .voice-transport-status[data-state="listening"],
+          .voice-transport-status[data-state="speaking"] {
+            color: rgba(255,255,255,.86);
+          }
+          .voice-transport-status[data-state="listening"] i,
+          .voice-transport-status[data-state="speaking"] i {
+            background: #fff;
+          }
+          .voice-transport-status[data-state="error"] {
+            color: rgba(255,255,255,.58);
+          }
+         .composer-mode-button {
+           min-width: 54px;
+           height: 38px;
+           display: inline-flex;
+           align-items: center;
+           justify-content: center;
+           gap: 6px;
+           padding: 0 9px;
+           border: 1px solid transparent;
+           border-radius: 3px;
+           color: rgba(255,255,255,0.48);
+           background: transparent;
+           font: 550 10px/1 Inter, 'Segoe UI Variable', sans-serif;
+           cursor: pointer;
+           transition: color .15s ease, background .15s ease, border-color .15s ease;
+         }
+         .composer-mode-button svg {
+           width: 14px;
+           height: 14px;
+           flex: 0 0 auto;
+         }
+         .composer-mode-button:hover {
+           color: rgba(255,255,255,0.82);
+           background: rgba(255,255,255,0.045);
+         }
+         .composer-mode-button.active {
+           color: #fff;
+           border-color: rgba(255,255,255,0.15);
+           background: rgba(255,255,255,0.08);
+         }
+         .composer-mode-label {
+           white-space: nowrap;
          }
 
          .icon-button, .provider-picker, .model-picker, .mode-picker, .toolbar-button {
@@ -1696,6 +2558,60 @@ const globalCss = `
          select option {
            background: #111;
            color: ${colors.text};
+         }
+         @media (max-width: 1120px) {
+           .composer-mode-controls {
+             flex: 1 1 100%;
+             justify-content: flex-end;
+           }
+         }
+         @media (max-width: 760px) {
+           .live-run-header {
+             align-items: flex-start;
+             flex-direction: column;
+           }
+           .live-run-actions {
+             width: 100%;
+           }
+           .live-run-action.is-toggle {
+             margin-left: auto;
+           }
+           .live-run-details {
+             grid-template-columns: minmax(0, 1fr);
+             padding-left: 0;
+           }
+           .live-run-trace {
+             padding-left: 0;
+           }
+           .composer-primary-controls {
+             grid-template-columns: repeat(3, minmax(0, 1fr));
+           }
+           .composer-tools-slot {
+             grid-column: 1 / -1;
+             min-height: 46px;
+             border-right: 0;
+             border-bottom: 1px solid rgba(255,255,255,0.08);
+           }
+           .provider-slot,
+           .model-slot,
+           .effort-slot {
+             min-width: 0;
+           }
+           .composer-mode-controls {
+             justify-content: space-between;
+           }
+           .composer-mode-button {
+             flex: 1 1 0;
+           }
+         }
+         @media (max-width: 520px) {
+           .composer-mode-label {
+             display: none;
+           }
+           .composer-mode-button {
+             min-width: 38px;
+             padding: 0 8px;
+           }
          }
        `;
 
@@ -1802,6 +2718,19 @@ const PlatformHeader = ({
   </div>
 );
 
+const stopTts = () => {
+  localVoicePlayback.stop();
+  useAppStore.getState().setSpeaking(false);
+};
+
+/*
+ * Legacy browser-owned voice implementation retained temporarily as migration
+ * evidence only. Production Chat no longer executes this block: microphone
+ * capture and playback are owned by voiceTransport.ts and the backend's typed
+ * local Voice transport. Keeping the old implementation non-executable avoids
+ * a competing transcript/playback authority while the dirty worktree is being
+ * consolidated without a destructive whole-file rewrite.
+ *
 const chunkTextForTTS = (text: string, maxChars: number = 260) => {
   const cleaned = (text || "").replace(/\s+/g, " ").trim();
   if (!cleaned) return [] as string[];
@@ -1859,12 +2788,7 @@ try {
 
 const stopTts = () => {
   ttsSequence += 1;
-  try {
-    if (typeof window !== "undefined" && "speechSynthesis" in window) {
-      window.speechSynthesis.pause();
-      window.speechSynthesis.cancel();
-    }
-  } catch { }
+  localVoicePlayback.stop();
   useAppStore.getState().setSpeaking(false);
 };
 
@@ -2091,7 +3015,7 @@ const speakText = async (text: string) => {
 const useMicStreamer = (onFinalTranscript?: (text: string) => void) => {
   const recRef = useRef<any>(null);
   const transcriptRef = useRef<string>("");
-  const { setListening, setStreaming, addMessage } = useAppStore();
+  const { setListening, addMessage } = useAppStore();
 
   const stopAll = (submitTranscript: boolean) => {
     const t = transcriptRef.current.trim();
@@ -2118,7 +3042,6 @@ const useMicStreamer = (onFinalTranscript?: (text: string) => void) => {
     }
     recRef.current = null;
     setListening(false);
-    setStreaming(false);
   };
 
   const start = async () => {
@@ -2144,11 +3067,9 @@ const useMicStreamer = (onFinalTranscript?: (text: string) => void) => {
       rec.lang = navigator.language || "en-US";
 
       setListening(true);
-      setStreaming(true);
 
       rec.onstart = () => {
         setListening(true);
-        setStreaming(true);
       };
 
       rec.onresult = (evt: any) => {
@@ -2212,6 +3133,7 @@ const useMicStreamer = (onFinalTranscript?: (text: string) => void) => {
     },
   };
 };
+*/
 
 const ContextMeter: React.FC<{ messages: Message[]; contextWindow: number }> = ({ messages, contextWindow }) => {
   const [hover, setHover] = React.useState(false);
@@ -2401,7 +3323,7 @@ const ChatBubble: React.FC<{
       }}
     >
       <div
-        className="chat-flat"
+        className={`chat-flat${isUser ? " chat-user-bubble-wrap" : ""}`}
         style={{
           position: "relative",
           maxWidth: isUser ? "94%" : "100%",
@@ -2483,33 +3405,17 @@ const ChatBubble: React.FC<{
           </div>
         ) : null}
 
-        {/* Compact footer: debug/thread context sits tight against time/tok/ctx/sources */}
+        {/* Single compact meta row: Time · Tokens · CTX · Sources · Search (wrap only when narrow). */}
         <div
           style={{
             marginTop: 4,
             display: "flex",
             flexDirection: "column",
-            gap: 3,
+            gap: 0,
             minWidth: 0,
             width: "100%",
           }}
         >
-          {!isUser && msg.docSources?.length ? (
-            <details style={{ color: colors.textDim, fontSize: 11, minWidth: 0, maxWidth: "100%", margin: 0 }}>
-              <summary style={{ cursor: "pointer", color: colors.text }}>
-                Local sources ({msg.docSources.length})
-              </summary>
-              <div style={{ display: "grid", gap: 2, marginTop: 3, overflowWrap: "anywhere", wordBreak: "break-word" }}>
-                {msg.docSources.map((source, index) => (
-                  <div key={`${source.id || source.source || source.filename || "source"}:${index}`}>
-                    {source.filename || source.source || source.id}
-                    {typeof source.chunk === "number" ? ` · chunk ${source.chunk}` : ""}
-                  </div>
-                ))}
-              </div>
-            </details>
-          ) : null}
-
           {(() => {
             const msgTokens = msg.usage?.tokens ?? estimateTokens(msg.text);
             const ctxUsed = msg.usage?.contextUsed ?? msgTokens;
@@ -2519,6 +3425,7 @@ const ChatBubble: React.FC<{
             const model = msg.usage?.model || modelLabel || "";
             return (
               <div
+                data-testid="chat-bubble-meta"
                 style={{
                   marginTop: 0,
                   fontSize: 10,
@@ -2532,11 +3439,13 @@ const ChatBubble: React.FC<{
                   gap: 6,
                   position: "relative",
                   flexWrap: "wrap",
+                  rowGap: 4,
                 }}
               >
-                <span>{new Date(msg.at).toLocaleTimeString()}</span>
+                <span data-testid="chat-meta-time">{new Date(msg.at).toLocaleTimeString()}</span>
                 <span style={{ opacity: 0.45 }}>·</span>
                 <span
+                  data-testid="chat-meta-tokens"
                   onMouseEnter={() => setMetaHover(true)}
                   onMouseLeave={() => setMetaHover(false)}
                   style={{
@@ -2546,15 +3455,19 @@ const ChatBubble: React.FC<{
                   }}
                 >
                   ~{formatTokenCount(msgTokens)} tok
-                  {!isUser ? (
-                    <>
-                      <span style={{ opacity: 0.45 }}> · </span>
-                      {ctxPct}% ctx
-                    </>
-                  ) : null}
                 </span>
-                {!isUser && !stillTyping && msg.embeds?.length ? (
-                  <ChatEmbedFooter embeds={msg.embeds} colors={colors} />
+                {!isUser ? (
+                  <>
+                    <span style={{ opacity: 0.45 }}>·</span>
+                    <span data-testid="chat-meta-ctx">{ctxPct}% ctx</span>
+                  </>
+                ) : null}
+                {!isUser && !stillTyping ? (
+                  <ChatEmbedFooter
+                    embeds={msg.embeds}
+                    colors={colors}
+                    extraSources={Array.isArray(msg.docSources) ? msg.docSources.length : 0}
+                  />
                 ) : null}
                 {metaHover && (
                   <div
@@ -2616,22 +3529,23 @@ const ChatBubble: React.FC<{
   );
 };
 
-const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; content: string; at: number; steps?: ThinkingStep[]; request_id?: string } }> = ({ item }) => {
+const ThinkingActivityCard: React.FC<{
+  item: { kind: "thinking"; id: string; content: string; at: number; steps?: ThinkingStep[]; request_id?: string };
+  /** Only one card owns the Echo spinner — other rows use static marks. */
+  primarySpinner?: boolean;
+}> = ({ item, primarySpinner = true }) => {
   // One clean list: drop pure thought dumps; keep at most one soft "thinking…" if nothing else yet.
   const rawSteps = item.steps || [];
   const workSteps = rawSteps.filter((s) => s.type !== "thought");
-  const hasRealWork = workSteps.some(
-    (s) => !/^(thinking|thinking…|waiting|working)(\s|\.|…)*$/i.test(String(s.content || "").trim())
+  const softPlaceholder = /^(understanding|planning|responding|thinking|waiting(?: for model)?|working|checking)(\s|\.|…)*$/i;
+  // Soft placeholders are owned by LiveChatActivityBar — only real tool/search/task rows here.
+  const steps: ThinkingStep[] = workSteps.filter(
+    (s) => !softPlaceholder.test(String(s.content || "").trim())
   );
-  const steps: ThinkingStep[] = hasRealWork
-    ? workSteps.filter(
-        (s) => !/^(thinking|thinking…|waiting|working)(\s|\.|…)*$/i.test(String(s.content || "").trim())
-      )
-    : workSteps.length > 0
-      ? [workSteps[workSteps.length - 1]] // single placeholder spinner row
-      : [];
   const anyRunning = steps.some((s) => s.status === "running");
   const containerRef = useRef<HTMLDivElement>(null);
+  // Prefer a single animated Echo mark on the newest running step (when this card owns spin).
+  const primaryRunningId = [...steps].reverse().find((s) => s.status === "running")?.id;
 
   useEffect(() => {
     const el = containerRef.current?.closest(".chat-scroll") as HTMLElement | null;
@@ -2658,12 +3572,14 @@ const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; con
       transition={{ duration: 0.18, ease: "easeOut" }}
       style={{ display: "flex", justifyContent: "flex-start", width: "100%", padding: "2px 0 2px" }}
       ref={containerRef}
+      data-testid="chat-thinking-activity"
     >
       <div className="chat-flat" style={{ width: "100%", maxWidth: "100%", color: colors.textDim }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {steps.map((step) => {
             const failed = step.status === "failed";
             const running = step.status === "running";
+            const spinHere = primarySpinner && running && step.id === primaryRunningId;
             return (
               <div
                 key={step.id}
@@ -2683,8 +3599,8 @@ const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; con
                 }}
               >
                 <span style={{ marginTop: 3, flexShrink: 0 }}>
-                  {running ? (
-                    <SquareLoader size={9} color="rgba(255,255,255,0.85)" />
+                  {spinHere ? (
+                    <SquareLoader size={9} color="rgba(255,255,255,0.85)" active />
                   ) : failed ? (
                     <span
                       style={{
@@ -2703,7 +3619,7 @@ const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; con
                         width: 7,
                         height: 7,
                         borderRadius: 1,
-                        background: "rgba(255,255,255,0.28)",
+                        background: running ? "rgba(255,255,255,0.55)" : "rgba(255,255,255,0.28)",
                       }}
                     />
                   )}
@@ -2721,9 +3637,9 @@ const ThinkingActivityCard: React.FC<{ item: { kind: "thinking"; id: string; con
   );
 };
 
-const ActivityCard: React.FC<{ item: ActivityItem }> = ({ item }) => {
+const ActivityCard: React.FC<{ item: ActivityItem; primarySpinner?: boolean }> = ({ item, primarySpinner }) => {
   if (item.kind === "thinking") {
-    return <ThinkingActivityCard item={item} />;
+    return <ThinkingActivityCard item={item} primarySpinner={primarySpinner} />;
   }
 
   if (item.kind === "memory") {
@@ -3049,9 +3965,12 @@ const ConfirmationCard: React.FC<ConfirmationCardProps> = ({
   );
 };
 
-type DashboardTab = "chat" | "research" | "overview" | "skills" | "memory" | "docs" | "settings" | "capabilities" | "approvals" | "executions" | "projects" | "automations" | "connections" | "soul" | "services" | "avatar_editor";
+type DashboardTab = "chat" | "research" | "overview" | "skills" | "memory" | "docs" | "settings" | "search_settings" | "mcp_settings" | "advanced_settings" | "system_services" | "capabilities" | "approvals" | "executions" | "projects" | "automations" | "connections" | "soul" | "services" | "avatar_editor";
 
-export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialView = "chat" }) => {
+export const Dashboard: React.FC<{
+  initialView?: DashboardTab;
+  desktopSettingsWindow?: boolean;
+}> = ({ initialView = "chat", desktopSettingsWindow = false }) => {
   const location = useLocation();
   const navigate = useNavigate();
   const desktopMode = useMemo(() => isDesktopRuntime(), []);
@@ -3059,8 +3978,9 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const workspaceRoute = location.pathname.replace(/\/+$/, "");
   const mediaRouteActive = workspaceRoute === "/app/media";
   const [desktopSurface, setDesktopSurface] = useState<DesktopWorkspaceSurface>(() =>
-    mediaRouteActive ? "media" : "chat"
+    mediaRouteActive ? "visualizer" : "chat"
   );
+  const [desktopSettingsOpen, setDesktopSettingsOpen] = useState(desktopSettingsWindow);
   const [desktopStudioHost, setDesktopStudioHost] = useState<HTMLDivElement | null>(null);
   const {
     messages,
@@ -3073,98 +3993,12 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     speechBeat,
     speechEnabled,
     setSpeechEnabled,
-    selectedVoice,
-    setSelectedVoice,
   } = useAppStore();
-
-  const unlockSpeech = () => {
-    try {
-      stopTts();
-      if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
-      setSpeechEnabled(true);
-
-      const u = new SpeechSynthesisUtterance(" ");
-      u.volume = 0;
-      u.onend = () => {
-        try {
-          window.speechSynthesis.cancel();
-        } catch { }
-      };
-      try {
-        window.speechSynthesis.resume();
-      } catch { }
-      window.speechSynthesis.speak(u);
-      window.setTimeout(() => {
-        try {
-          window.speechSynthesis.cancel();
-        } catch { }
-      }, 120);
-    } catch {
-      // ignore
-    }
-  };
-
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
-
-  const silenceTimeoutRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    const updateVoices = () => {
-      setVoices(window.speechSynthesis.getVoices());
-    };
-    updateVoices();
-    window.speechSynthesis.onvoiceschanged = updateVoices;
-
-    // Hotkey and Transcript Auto-Send Logic
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.key.toLowerCase() === "m") {
-        e.preventDefault();
-        const listeningState = useAppStore.getState().listening;
-        if (listeningState) {
-          stop();
-          useAppStore.getState().setListening(false);
-          useAppStore.getState().setStreaming(false);
-        } else {
-          start();
-        }
-      }
-    };
-
-    const handleTranscript = (e: Event) => {
-      const customEvent = e as CustomEvent<string>;
-      const text = customEvent.detail;
-      setInput(text);
-
-      // Reset the silence timer
-      if (silenceTimeoutRef.current) {
-        window.clearTimeout(silenceTimeoutRef.current);
-      }
-
-      // Auto-send after 2 seconds of silence
-      silenceTimeoutRef.current = window.setTimeout(() => {
-        const state = useAppStore.getState();
-        stop();
-        state.setListening(false);
-        state.setStreaming(false);
-      }, 2000);
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("echospeak-transcript", handleTranscript);
-
-    return () => {
-      window.speechSynthesis.onvoiceschanged = null;
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("echospeak-transcript", handleTranscript);
-      if (silenceTimeoutRef.current) window.clearTimeout(silenceTimeoutRef.current);
-    };
-  }, []);
 
   const [input, setInput] = useState("");
   const workspaceMode = "auto";
   const [activities, setActivities] = useState<ActivityItem[]>([]);
   const [taskPlans, setTaskPlans] = useState<TaskPlanEntry[]>([]);
-  const activeTaskPlanIdRef = useRef<string | null>(null);
   const [echoReaction, setEchoReaction] = useState<EchoReaction | null>(null);
   const [userIsTyping, setUserIsTyping] = useState(false);
   const userTypingTimerRef = useRef<number>(0);
@@ -3180,16 +4014,10 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const prependResearchRun = useResearchStore((state) => state.prependRun);
   const replaceResearchRuns = useResearchStore((state) => state.replaceRuns);
   const clearResearchRuns = useResearchStore((state) => state.clearRuns);
-  const [leftTab, setLeftTab] = useState<DashboardTab>(initialView);
+  const [leftTab, setLeftTab] = useState<DashboardTab>(
+    desktopSettingsWindow ? "settings" : initialView
+  );
 
-  useEffect(() => {
-    if (mediaRouteActive) {
-      setLeftTab("chat");
-      if (desktopMode) setDesktopSurface("media");
-      return;
-    }
-    if (desktopMode) setDesktopSurface((current) => current === "media" ? "chat" : current);
-  }, [desktopMode, mediaRouteActive]);
   const [activeGroup, setActiveGroup] = useState<string | null>(null);
   const activeGroupButtonRef = useRef<HTMLButtonElement | null>(null);
   const activeGroupMenuRef = useRef<HTMLDivElement | null>(null);
@@ -3201,13 +4029,20 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const [narrowLayout, setNarrowLayout] = useState<boolean>(() => typeof window !== "undefined" && window.innerWidth < 900);
   const [agentMode, setAgentMode] = useState<"idle" | "research" | "coding" | "working" | "thinking">("idle");
   const [agentActivity, dispatchActivity] = useReducer(agentActivityReducer, undefined, initialAgentActivity);
-  const [visualizerPin, setVisualizerPin] = useState<null | "ring" | "research" | "coding" | "tasks">(null);
+  const [visualizerPin, setVisualizerPin] = useState<DesktopVisualizerPanel | null>(null);
+  useEffect(() => {
+    if (mediaRouteActive) {
+      setLeftTab("chat");
+      if (desktopMode) {
+        setDesktopSurface("visualizer");
+        setVisualizerPin("media");
+      }
+      return;
+    }
+    if (desktopMode) setVisualizerPin((current) => current === "media" ? "ring" : current);
+  }, [desktopMode, mediaRouteActive]);
   const [liveReplyDraft, setLiveReplyDraft] = useState("");
   const liveReplyDraftRef = useRef("");
-  const [codeSessions, setCodeSessions] = useState<CodeDiffSession[]>([]);
-  const [liveTerminal, setLiveTerminal] = useState<LiveTerminalEntry[]>([]);
-  const [liveFileChanges, setLiveFileChanges] = useState<LiveFileChange[]>([]);
-  const [codeRefreshToken, setCodeRefreshToken] = useState(0);
   const [avatarConfig, setAvatarConfig] = useState<AvatarConfig>(defaultAvatarConfig);
   const [memoryItems, setMemoryItems] = useState<MemoryItem[]>([]);
   const [memoryCount, setMemoryCount] = useState<number>(0);
@@ -3226,6 +4061,16 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const [servicesLoading, setServicesLoading] = useState<boolean>(false);
   const [studioOverview, setStudioOverview] = useState<any>(null);
   const [studioOverviewLoading, setStudioOverviewLoading] = useState<boolean>(false);
+  const [connectionCatalog, setConnectionCatalog] = useState<any[]>([]);
+  const [connectionError, setConnectionError] = useState<string>("");
+  const [connectionBusyId, setConnectionBusyId] = useState<string>("");
+  const [settingsCatalog, setSettingsCatalog] = useState<SettingsCatalogCard[]>([]);
+  const [settingsCatalogLoading, setSettingsCatalogLoading] = useState<boolean>(false);
+  const [settingsCatalogError, setSettingsCatalogError] = useState<string>("");
+  const [settingsCatalogLoadedAt, setSettingsCatalogLoadedAt] = useState<number>(0);
+  const [settingsCatalogScope, setSettingsCatalogScope] = useState<string>("");
+  const [catalogModelDrafts, setCatalogModelDrafts] = useState<Record<string, string>>({});
+  const settingsCatalogRequestRef = useRef(0);
   const [docCount, setDocCount] = useState<number>(0);
   const [docLoading, setDocLoading] = useState<boolean>(false);
   const [docEnabled, setDocEnabled] = useState<boolean>(false);
@@ -3238,13 +4083,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const [monitorAt, setMonitorAt] = useState<number>(0);
   const [monitorError, setMonitorError] = useState<string | null>(null);
   const toolInfoRef = useRef<Record<string, { name: string; input: string; requestId?: string }>>({});
-  const latestCodeFilenameRef = useRef<string | null>(null);
   const [capabilitiesData, setCapabilitiesData] = useState<any>(null);
   const [skillExecutions, setSkillExecutions] = useState<any[]>([]);
-  const [codingReadiness, setCodingReadiness] = useState<CodingReadiness | null>(null);
-  const [codingReadinessLoading, setCodingReadinessLoading] = useState<boolean>(false);
-  const codingReadinessRequestRef = useRef(0);
-  const codingReadinessOwnerRef = useRef("");
   const [memoryFilterType, setMemoryFilterType] = useState<string>("");
   const [selectedMemoryIds, setSelectedMemoryIds] = useState<string[]>([]);
   const [editingMemoryId, setEditingMemoryId] = useState<string | null>(null);
@@ -3255,6 +4095,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     workspace_root?: string; archived?: boolean; git_metadata?: Record<string, any>;
   }[]>(() => (desktopBootstrap?.projects || []) as any[]);
   const [activeProjectId, setActiveProjectId] = useState<string>(() => desktopBootstrap?.active_project_id || "");
+  const activeProjectIdRef = useRef<string>(desktopBootstrap?.active_project_id || "");
   const [folderDropActive, setFolderDropActive] = useState(false);
   const [projectsLoading, setProjectsLoading] = useState<boolean>(false);
   const [initialHydrationComplete, setInitialHydrationComplete] = useState(Boolean(desktopBootstrap));
@@ -3283,12 +4124,70 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     })),
   );
   const [activeThreadId, setActiveThreadId] = useState<string>(() => desktopBootstrap?.active_session_id || "");
+  const currentWorkRuns = useWorkStore((state) => state.runs);
+  const loadCurrentWorkRuns = useWorkStore((state) => state.loadRuns);
+  const workProjectionRevisionRef = useRef<string>("");
   const activeThreadIdRef = useRef<string>(desktopBootstrap?.active_session_id || "");
+  const threadCreationFlightRef = useRef<Promise<string> | null>(null);
   const streamControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const activeRequestIdsRef = useRef<Map<string, string>>(new Map());
+  const activeExecutionIdsRef = useRef<Map<string, string>>(new Map());
+  const activeTaskRunIdsRef = useRef<Map<string, string>>(new Map());
   const historyRequestSeqRef = useRef<Map<string, number>>(new Map());
   const projectionRevisionRef = useRef<Map<string, number>>(new Map());
   const sessionProjectionRef = useRef<Map<string, { messages: Message[]; activities: ActivityItem[] }>>(new Map());
   const [inFlightSessionIds, setInFlightSessionIds] = useState<Set<string>>(() => new Set());
+
+  useEffect(() => {
+    if (!initialHydrationComplete || !activeThreadId) return;
+    void loadCurrentWorkRuns(apiBase, activeThreadId, activeProjectId || "");
+  }, [activeProjectId, activeThreadId, apiBase, initialHydrationComplete, loadCurrentWorkRuns]);
+
+  useEffect(() => {
+    if (!initialHydrationComplete || !activeThreadId) return;
+    const activeStatuses = new Set([
+      "running",
+      "suspended_waiting_for_user",
+      "suspended_waiting_for_approval",
+    ]);
+    if (!currentWorkRuns.some((run) => activeStatuses.has(String(run.status || "").toLowerCase()))) {
+      workProjectionRevisionRef.current = currentWorkRuns
+        .map((run) => `${run.id}:${run.revision}:${run.status}`)
+        .join("|");
+      return;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      const before = useWorkStore.getState().runs
+        .map((run) => `${run.id}:${run.revision}:${run.status}`)
+        .join("|");
+      await loadCurrentWorkRuns(apiBase, activeThreadId, activeProjectId || "");
+      if (cancelled || activeThreadIdRef.current !== activeThreadId) return;
+      const after = useWorkStore.getState().runs
+        .map((run) => `${run.id}:${run.revision}:${run.status}`)
+        .join("|");
+      if (after && after !== before && after !== workProjectionRevisionRef.current) {
+        workProjectionRevisionRef.current = after;
+        await loadHistory(activeThreadId);
+        void refreshExecutions(activeThreadId);
+      }
+    };
+    workProjectionRevisionRef.current = currentWorkRuns
+      .map((run) => `${run.id}:${run.revision}:${run.status}`)
+      .join("|");
+    const interval = window.setInterval(() => void poll(), 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [
+    activeProjectId,
+    activeThreadId,
+    apiBase,
+    currentWorkRuns,
+    initialHydrationComplete,
+    loadCurrentWorkRuns,
+  ]);
 
   const setSessionInFlight = useCallback((threadId: string, active: boolean) => {
     setInFlightSessionIds((current) => {
@@ -3298,6 +4197,52 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       return next;
     });
   }, []);
+
+  const cancelSessionTurn = useCallback((
+    threadId: string,
+    preserveStream = false,
+    voiceTranscript?: VoiceTranscript,
+  ) => {
+    const sessionId = String(threadId || "").trim();
+    if (!sessionId) return;
+    const requestId = activeRequestIdsRef.current.get(sessionId);
+    const executionId = activeExecutionIdsRef.current.get(sessionId) || "";
+    // Navigation/supersession detaches local ownership immediately. The user
+    // Stop control keeps the exact stream open so the durable cancellation and
+    // final "Stopped by Ty." state can arrive from the backend.
+    if (!preserveStream) {
+      streamControllersRef.current.get(sessionId)?.abort();
+      streamControllersRef.current.delete(sessionId);
+      activeRequestIdsRef.current.delete(sessionId);
+      activeExecutionIdsRef.current.delete(sessionId);
+      activeTaskRunIdsRef.current.delete(sessionId);
+      setSessionInFlight(sessionId, false);
+    }
+    if (requestId) {
+      void fetch(`${apiBase}/query/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          request_id: requestId,
+          execution_id: executionId,
+          thread_id: sessionId,
+          voice_turn_id: voiceTranscript?.voiceTurnId,
+          voice_transcript: voiceTranscript?.text,
+        }),
+        keepalive: true,
+      }).catch(() => undefined);
+    }
+  }, [apiBase, setSessionInFlight]);
+
+  useEffect(() => {
+    const cancelAll = () => {
+      for (const sessionId of Array.from(activeRequestIdsRef.current.keys())) {
+        cancelSessionTurn(sessionId);
+      }
+    };
+    window.addEventListener("beforeunload", cancelAll);
+    return () => window.removeEventListener("beforeunload", cancelAll);
+  }, [cancelSessionTurn]);
 
   useEffect(() => {
     const applyBootstrap = (event: Event) => {
@@ -3337,6 +4282,10 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     activeThreadIdRef.current = activeThreadId;
     setStreaming(Boolean(activeThreadId && streamControllersRef.current.has(activeThreadId)));
   }, [activeThreadId, inFlightSessionIds, setStreaming]);
+
+  useEffect(() => {
+    activeProjectIdRef.current = activeProjectId;
+  }, [activeProjectId]);
 
   useEffect(() => {
     if (activeThreadId) {
@@ -3471,6 +4420,11 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                 summary: String(outcome.output || outcome.error_message || run.status || "").slice(0, 240),
                 status: String(run.status || (success ? "complete" : "failed")),
                 success,
+                execution_status: String(outcome.execution_status || ""),
+                result_state: String(outcome.result_state || ""),
+                provider: String(outcome.provider || ""),
+                observed_at: Number(outcome.observed_at || 0),
+                confidence: outcome.confidence == null ? null : Number(outcome.confidence),
               };
             };
             const completedActions = (Array.isArray(executionProjection.successful_mutations)
@@ -3652,7 +4606,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         useAppStore.setState({ messages: loadedMsgs });
         setActivities(loadedActs);
         sessionProjectionRef.current.set(threadId, { messages: loadedMsgs, activities: loadedActs });
-        // Historical research for Studio panel; chat embeds already on assistant messages.
+        // Historical research for the Visualizer panel; Chat embeds stay on assistant messages.
         if (hydratedResearch.length) {
           replaceResearchRuns(hydratedResearch);
         } else {
@@ -3774,44 +4728,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       const data = (await resp.json()) as PendingActionEnvelope;
       if (activeThreadIdRef.current !== threadId) return data;
       setPendingApproval(data);
-      const action = data.action;
-      if (data.has_pending && action?.tool === "file_write") {
-        const fullPath = String(action.kwargs?.path || "").replace(/\\/g, "/");
-        const projectRoot = String(action.execution_context?.project_path || action.execution_context?.workspace_root || "").replace(/\\/g, "/").replace(/\/$/, "");
-        const proposed = String(action.kwargs?.content || "");
-        const rootPrefix = `${projectRoot.toLowerCase()}/`;
-        const relativePath = projectRoot && fullPath.toLowerCase().startsWith(rootPrefix)
-          ? fullPath.slice(projectRoot.length + 1)
-          : "";
-        if (relativePath && proposed) {
-          try {
-            const fileResp = await fetchWithTimeout(
-              `${apiBase}/code/file?thread_id=${encodeURIComponent(threadId)}&path=${encodeURIComponent(relativePath)}`,
-              undefined,
-              5000,
-            );
-            if (fileResp.ok && activeThreadIdRef.current === threadId) {
-              const current = await fileResp.json();
-              if (!current.binary && !current.truncated) {
-                setCodeSessions((items) => [
-                  {
-                    filename: relativePath,
-                    language: langFromFilename(relativePath, "file_write"),
-                    originalContent: String(current.content || ""),
-                    currentContent: proposed,
-                    status: "draft",
-                    summary: "Durable approval pending — not saved",
-                    pendingConfirmation: true,
-                  },
-                  ...items.filter((item) => item.filename !== relativePath),
-                ]);
-              }
-            }
-          } catch (proposalError) {
-            console.error("Failed to hydrate pending code proposal:", proposalError);
-          }
-        }
-      }
       return data;
     } catch (e) {
       console.error("Failed to refresh pending approval:", e);
@@ -3974,47 +4890,51 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   }, [apiBase]);
 
   const createNewThread = async (projectId: string = "", requestedTitle: string = "New Session"): Promise<string> => {
+    if (threadCreationFlightRef.current) return threadCreationFlightRef.current;
+    const idempotencyKey = crypto.randomUUID();
+    const flight = (async (): Promise<string> => {
+      try {
+        const resp = await fetch(`${apiBase}/threads`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: requestedTitle, source: "web", project_id: projectId, idempotency_key: idempotencyKey }),
+        });
+        if (!resp.ok) throw new Error(`Create thread failed (${resp.status})`);
+        const data = await resp.json();
+        const nextThread = { id: String(data.thread_id), name: String(data.title || "New Session"), at: normalizeTimestampMs(data.last_active_at || data.created_at || Date.now()), projectId: String(data.project_id || projectId || "") };
+        projectionRevisionRef.current.set(nextThread.id, 0);
+        sessionProjectionRef.current.set(nextThread.id, { messages: [], activities: [] });
+        activeThreadIdRef.current = nextThread.id;
+        setThreads((prev) => [
+          nextThread,
+          ...prev.filter((item) => item.id !== nextThread.id && !isEmptySessionDraft(item)),
+        ]);
+        setActiveThreadId(nextThread.id);
+        useAppStore.setState({ messages: [] });
+        setActivities([]);
+        setTaskPlans([]);
+        clearResearchRuns();
+        setPendingApproval(null);
+        setApprovals([]);
+        setExecutions([]);
+        setSelectedTrace(null);
+        dispatchActivity({ type: "reset" });
+        setStreaming(false);
+        liveReplyDraftRef.current = "";
+        setLiveReplyDraft("");
+        setDocSources([]);
+        toolInfoRef.current = {};
+        return nextThread.id;
+      } catch (e) {
+        console.error("Failed to create thread:", e);
+        return "";
+      }
+    })();
+    threadCreationFlightRef.current = flight;
     try {
-      const resp = await fetch(`${apiBase}/threads`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: requestedTitle, source: "web", project_id: projectId }),
-      });
-      if (!resp.ok) throw new Error(`Create thread failed (${resp.status})`);
-      const data = await resp.json();
-      const nextThread = { id: String(data.thread_id), name: String(data.title || "New Session"), at: normalizeTimestampMs(data.last_active_at || data.created_at || Date.now()), projectId: String(data.project_id || projectId || "") };
-      projectionRevisionRef.current.set(nextThread.id, 0);
-      sessionProjectionRef.current.set(nextThread.id, { messages: [], activities: [] });
-      activeThreadIdRef.current = nextThread.id;
-      setThreads((prev) => [
-        nextThread,
-        ...prev.filter((item) => item.id !== nextThread.id && !isEmptySessionDraft(item)),
-      ]);
-      setActiveThreadId(nextThread.id);
-      useAppStore.setState({ messages: [] });
-      setActivities([]);
-      setTaskPlans([]);
-      activeTaskPlanIdRef.current = null;
-      clearResearchRuns();
-      latestCodeFilenameRef.current = null;
-      setCodeSessions([]);
-      setLiveTerminal([]);
-      setLiveFileChanges([]);
-      setCodeRefreshToken((n) => n + 1);
-      setPendingApproval(null);
-      setApprovals([]);
-      setExecutions([]);
-      setSelectedTrace(null);
-      dispatchActivity({ type: "reset" });
-      setStreaming(false);
-      liveReplyDraftRef.current = "";
-      setLiveReplyDraft("");
-      setDocSources([]);
-      toolInfoRef.current = {};
-      return nextThread.id;
-    } catch (e) {
-      console.error("Failed to create thread:", e);
-      return "";
+      return await flight;
+    } finally {
+      if (threadCreationFlightRef.current === flight) threadCreationFlightRef.current = null;
     }
   };
 
@@ -4044,13 +4964,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     useAppStore.setState({ messages: cachedProjection?.messages || [] });
     setActivities(cachedProjection?.activities || []);
     setTaskPlans([]);
-    activeTaskPlanIdRef.current = null;
     clearResearchRuns();
-    latestCodeFilenameRef.current = null;
-    setCodeSessions([]);
-    setLiveTerminal([]);
-    setLiveFileChanges([]);
-    setCodeRefreshToken((n) => n + 1);
     setPendingApproval(null);
     setApprovals([]);
     setExecutions([]);
@@ -4070,9 +4984,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     if (id === activeThreadId) {
       if (nextThreads[0]) switchThread(nextThreads[0].id);
       else {
-        streamControllersRef.current.get(id)?.abort();
-        streamControllersRef.current.delete(id);
-        setSessionInFlight(id, false);
+        cancelSessionTurn(id);
         activeThreadIdRef.current = "";
         setActiveThreadId("");
         useAppStore.setState({ messages: [] });
@@ -4153,6 +5065,40 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     model: "",
     base_url: "",
   });
+  const [thinkingEnabled, setThinkingEnabled] = useState<boolean>(
+    () => window.localStorage.getItem("echospeak.chat.thinking_enabled") !== "false",
+  );
+  const [reasoningEffort, setReasoningEffort] = useState<
+    "minimal" | "low" | "medium" | "high" | "extra_high" | "max" | "ultra"
+  >(() => {
+    const stored = window.localStorage.getItem("echospeak.chat.reasoning_effort");
+    return stored === "minimal" || stored === "low" || stored === "medium" || stored === "high" ||
+      stored === "extra_high" || stored === "max" || stored === "ultra"
+      ? stored
+      : "medium";
+  });
+  const [voiceReadAloud, setVoiceReadAloud] = useState<boolean>(
+    () => window.localStorage.getItem("echospeak.voice.read_aloud") === "true",
+  );
+  const [voiceConversationMode, setVoiceConversationMode] = useState<boolean>(false);
+  const wakeWordEnabled = false;
+  const [voicePhase, setVoicePhase] = useState<VoiceTransportPhase>("idle");
+  const [voiceNotice, setVoiceNotice] = useState("");
+  const [voiceInputLevel, setVoiceInputLevel] = useState(0);
+  const voiceInputRef = useRef<LocalVoiceInput | null>(null);
+  if (voiceInputRef.current == null) voiceInputRef.current = new LocalVoiceInput();
+  const [showSteerModal, setShowSteerModal] = useState<boolean>(false);
+  const [steerInput, setSteerInput] = useState<string>("");
+  const [steerSubmitting, setSteerSubmitting] = useState<boolean>(false);
+  useEffect(() => {
+    window.localStorage.setItem("echospeak.voice.read_aloud", String(voiceReadAloud));
+  }, [voiceReadAloud]);
+  useEffect(() => {
+    window.localStorage.setItem("echospeak.chat.thinking_enabled", String(thinkingEnabled));
+  }, [thinkingEnabled]);
+  useEffect(() => {
+    window.localStorage.setItem("echospeak.chat.reasoning_effort", reasoningEffort);
+  }, [reasoningEffort]);
   const lmStudioOnly = useMemo(() => isLmStudioOnlyLocked(providerInfo), [providerInfo]);
   const [providerError, setProviderError] = useState<string | null>(null);
   const [switchingProvider, setSwitchingProvider] = useState(false);
@@ -4170,6 +5116,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const [runtimeSettings, setRuntimeSettings] = useState<Record<string, any> | null>(null);
   const [runtimeOverrides, setRuntimeOverrides] = useState<Record<string, any> | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<Record<string, any>>({});
+  const [allowlistDraftText, setAllowlistDraftText] = useState("");
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
@@ -4183,6 +5130,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const [soulContent, setSoulContent] = useState<string>("");
   const [soulEnabled, setSoulEnabled] = useState<boolean>(true);
   const [soulPath, setSoulPath] = useState<string>("./SOUL.md");
+
   const [soulMaxChars, setSoulMaxChars] = useState<number>(8000);
   const [soulExists, setSoulExists] = useState<boolean>(false);
   const [soulLoading, setSoulLoading] = useState<boolean>(false);
@@ -4198,7 +5146,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const programmaticScrollRef = useRef(false);
   const pinBottomRafRef = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const sessionCreationForSendRef = useRef(false);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -4216,8 +5163,11 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const scheduleBackendRetry = () => {
     if (backendRetryRef.current.timer != null) return;
     const attempt = backendRetryRef.current.attempt;
-    const delay = Math.min(6000, Math.round(600 * Math.pow(1.6, attempt)));
-    backendRetryRef.current.attempt = Math.min(attempt + 1, 12);
+    // Backoff is deliberately slow after the initial recovery window. The old
+    // six-second ceiling could hammer a failing provider endpoint indefinitely
+    // and turn one backend exception into a noisy desktop-wide failure loop.
+    const delay = Math.min(30000, Math.round(900 * Math.pow(1.8, attempt)));
+    backendRetryRef.current.attempt = Math.min(attempt + 1, 8);
     backendRetryRef.current.timer = window.setTimeout(() => {
       backendRetryRef.current.timer = null;
       refreshProviderInfo({ allowRetry: true });
@@ -4227,7 +5177,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   const refreshProviderInfo = async (opts: { allowRetry?: boolean } = {}) => {
     try {
       setProviderError(null);
-      const resp = await fetchWithTimeout(`${apiBase}/provider`, undefined, 10000);
+      const scope = new URLSearchParams({ session_id: String(activeThreadIdRef.current || "default") });
+      const resp = await fetchWithTimeout(`${apiBase}/provider?${scope.toString()}`, undefined, 10000);
       if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
       const info = (await resp.json()) as ProviderInfo;
       setProviderInfo(info);
@@ -4251,9 +5202,11 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       const msg = err.message || String(e);
       const aborted = err.name === "AbortError" || msg.toLowerCase().includes("aborted");
       const offline = aborted || msg.includes("Failed to fetch");
+      const serverFailure = /\b5\d\d\b/.test(msg);
       const pretty = offline ? "Backend offline" : msg;
-      setProviderError(offline && opts.allowRetry ? "Backend offline — retrying" : pretty);
-      if (opts.allowRetry) scheduleBackendRetry();
+      const shouldRetry = Boolean(opts.allowRetry && (offline || serverFailure));
+      setProviderError(offline && shouldRetry ? "Backend offline — retrying" : pretty);
+      if (shouldRetry) scheduleBackendRetry();
     }
   };
 
@@ -4269,7 +5222,10 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       const issues = Array.isArray(data?.issues) ? data.issues : [];
       setRuntimeSettings(effective);
       setRuntimeOverrides(overrides);
-      setSettingsDraft({ ...(effective || {}), ...(overrides || {}) });
+      const merged = { ...(effective || {}), ...(overrides || {}) };
+      merged.open_application_allowlist = coerceAllowlistValue(merged.open_application_allowlist);
+      setSettingsDraft(merged);
+      setAllowlistDraftText("");
       setSettingsIssues(issues);
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e));
@@ -4338,10 +5294,22 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     setSettingsSaving(true);
     setSettingsError(null);
     try {
+      // Commit any unfinished allowlist draft so Enter/Add is not required before Save.
+      const allowCommitted = commitAllowlistDraft(
+        coerceAllowlistValue(settingsDraft.open_application_allowlist),
+        allowlistDraftText,
+        { force: true }
+      );
+      const payload = {
+        ...(settingsDraft || {}),
+        open_application_allowlist: allowCommitted.entries,
+      };
+      setAllowlistDraftText("");
+      setSettingsDraft((d) => ({ ...d, open_application_allowlist: allowCommitted.entries }));
       const resp = await fetchWithTimeout(`${apiBase}/settings`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(settingsDraft || {}),
+        body: JSON.stringify(payload),
       });
       if (!resp.ok) {
         let details: any = null;
@@ -4360,7 +5328,12 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       const data = (await resp.json()) as RuntimeSettingsEnvelope;
       setRuntimeSettings(data.settings || null);
       setRuntimeOverrides(data.overrides || null);
-      setSettingsDraft({ ...((data.settings as any) || {}), ...((data.overrides as any) || {}) });
+      {
+        const merged = { ...((data.settings as any) || {}), ...((data.overrides as any) || {}) };
+        merged.open_application_allowlist = coerceAllowlistValue(merged.open_application_allowlist);
+        setSettingsDraft(merged);
+        setAllowlistDraftText("");
+      }
       setSettingsIssues(Array.isArray(data?.issues) ? data.issues : []);
       setSettingsSavedAt(Date.now());
       await refreshProviderInfo();
@@ -4450,7 +5423,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   };
 
   useEffect(() => {
-    if (leftTab === "settings") {
+    if (leftTab === "advanced_settings") {
       refreshSettings();
     }
   }, [leftTab]);
@@ -4474,10 +5447,23 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       const threadQs = tid ? `&thread_id=${tid}` : "";
       const projectQs = `&project_id=${encodeURIComponent(activeProjectId)}`;
       const resp = await fetchWithTimeout(`${apiBase}/memory?offset=0&limit=200${threadQs}${projectQs}`);
-      if (!resp.ok) throw new Error(`Memory request failed (${resp.status})`);
+      if (!resp.ok) {
+        let detail = `Memory request failed (${resp.status})`;
+        try {
+          const body = await resp.json();
+          const d = body?.detail;
+          if (typeof d === "string") detail = d;
+          else if (d && typeof d === "object") detail = String(d.message || d.error || detail);
+        } catch {
+          /* keep status detail */
+        }
+        throw new Error(detail);
+      }
       const data = (await resp.json()) as MemoryListResponse;
+      // Empty list is a valid success state — never treat as failure.
       setMemoryItems(Array.isArray(data.items) ? data.items : []);
       setMemoryCount(typeof data.count === "number" ? data.count : 0);
+      setMemoryError(null);
     } catch (e) {
       setMemoryError(String(e));
     } finally {
@@ -4500,32 +5486,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       console.error("Memory doctor error:", e);
     } finally {
       setMemoryDoctorLoading(false);
-    }
-  };
-
-  const refreshCodingReadiness = async () => {
-    const ownerSessionId = String(activeThreadIdRef.current || "").trim();
-    if (codingReadinessOwnerRef.current !== ownerSessionId) {
-      codingReadinessOwnerRef.current = ownerSessionId;
-      setCodingReadiness(null);
-    }
-    const requestId = ++codingReadinessRequestRef.current;
-    if (!ownerSessionId) {
-      setCodingReadinessLoading(false);
-      return;
-    }
-    setCodingReadinessLoading(true);
-    try {
-      const tid = encodeURIComponent(ownerSessionId);
-      const resp = await fetchWithTimeout(`${apiBase}/coding/readiness?thread_id=${tid}`, undefined, 7000);
-      if (!resp.ok) throw new Error(`Coding readiness failed (${resp.status})`);
-      const data = (await resp.json()) as CodingReadiness;
-      if (activeThreadIdRef.current !== ownerSessionId || requestId !== codingReadinessRequestRef.current) return;
-      setCodingReadiness(data);
-    } catch (e) {
-      console.error("Coding readiness error:", e);
-    } finally {
-      if (requestId === codingReadinessRequestRef.current) setCodingReadinessLoading(false);
     }
   };
 
@@ -4664,8 +5624,13 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     if (!next.provider) return;
     setSwitchingProvider(true);
     setProviderError(null);
+    cancelSessionTurn(String(activeThreadIdRef.current || ""));
     try {
-      const body: any = { provider: next.provider };
+      const body: any = {
+        provider: next.provider,
+        session_id: String(activeThreadIdRef.current || "default"),
+        expected_revision: Number(providerInfo?.binding_revision || 1),
+      };
       if (next.provider === "openai") body.openai_model = next.model || undefined;
       else if (next.provider === "gemini") body.gemini_model = next.model || undefined;
       else body.model = next.model || undefined;
@@ -4694,7 +5659,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
 
   const timeline = useMemo<TimelineItem[]>(() => {
     // Chat is a conversation projection. Durable operational evidence stays in
-    // Studio/Viewer; only persistent errors remain alongside message bubbles.
+    // Studio/Viewer. While streaming, thinking steps are ephemeral live chrome.
+    // After the turn, only durable actionable errors remain with message bubbles.
     const merged: TimelineItem[] = [
       ...messages.map(
         (m): TimelineItem => ({
@@ -4704,16 +5670,18 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
           msg: m,
         })
       ),
-      ...activities.filter((item) => item.kind === "error").map(
-        (a): TimelineItem => ({
-          kind: "activity",
-          id: a.id,
-          at: a.at,
-          item: a,
-        })
-      ),
+      ...activities
+        .filter((item) => shouldIncludeChatActivity(String(item.kind || ""), streaming))
+        .map(
+          (a): TimelineItem => ({
+            kind: "activity",
+            id: a.id,
+            at: a.at,
+            item: a,
+          })
+        ),
     ];
-    // Chronological user/assistant history with persistent error rows.
+    // Chronological user/assistant history with live activity + persistent errors.
     const kindRank = (k: TimelineItem["kind"]) =>
       k === "message" ? 0 : k === "activity" ? 1 : 2;
     merged.sort((a, b) => {
@@ -4722,11 +5690,11 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       return kindRank(a.kind) - kindRank(b.kind);
     });
     return merged;
-  }, [messages, activities]);
+  }, [messages, activities, streaming]);
 
   const lastMsgLen = messages.length ? (messages[messages.length - 1]?.text || "").length : 0;
   const activityLen = activities.length;
-  const taskPlanLen = taskPlans.reduce((sum, entry) => sum + entry.plan.tasks.length + entry.plan.reflections.length, 0);
+  const taskPlanLen = taskPlans.reduce((sum, entry) => sum + entry.plan.tasks.length, 0);
 
   /**
    * Pin chat fully to the latest content. Instant scroll only — smooth scrolling
@@ -4898,27 +5866,58 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     };
   }, [scrollChatToBottom, leftTab]);
 
-  const sendText = async (overrideText?: string) => {
+  const speakLocalText = async (
+    text: string,
+    metadata: Pick<SpeechScope, "clientTurnId" | "requestId" | "executionId" | "taskRunId" | "completeTurn">,
+  ) => {
+    const sessionId = String(activeThreadIdRef.current || "").trim();
+    const cleaned = sanitizeForTTS(text);
+    if (!speechEnabled || !sessionId || !cleaned) return false;
+    setVoiceNotice("");
+    try {
+      await localVoicePlayback.speak(
+        cleaned,
+        {
+          apiBase,
+          sessionId,
+          projectId: String(activeProjectIdRef.current || ""),
+          ...metadata,
+        },
+        {
+          onPhase: (phase, detail) => {
+            setVoicePhase(phase);
+            setVoiceNotice(detail || "");
+            useAppStore.getState().setSpeaking(phase === "speaking");
+          },
+          onLevel: (level) => {
+            if (level > 0) useAppStore.getState().bumpSpeechBeat();
+          },
+        },
+      );
+      return true;
+    } catch (error) {
+      if ((error as any)?.name === "AbortError") return false;
+      setVoicePhase("error");
+      setVoiceNotice(error instanceof Error ? error.message : "Local speech playback is unavailable.");
+      useAppStore.getState().setSpeaking(false);
+      return false;
+    }
+  };
+
+  const sendText = async (overrideText?: string, voiceTranscript?: VoiceTranscript) => {
     const raw = overrideText ?? input;
     if (!raw.trim()) return;
-    // Sending is an explicit user action. If no Session exists yet, create one
-    // before the Turn and title it from the first message. Passive launch,
-    // navigation, view switching, and AI replies still never create Sessions.
-    let streamThreadId = String(activeThreadIdRef.current || activeThreadId || "").trim();
-    if (!streamThreadId) {
-      if (sessionCreationForSendRef.current) return;
-      sessionCreationForSendRef.current = true;
-      const title = raw.replace(/\s+/g, " ").trim().slice(0, 72) || "Quick Chat";
-      try {
-        streamThreadId = await createNewThread("", title);
-      } finally {
-        sessionCreationForSendRef.current = false;
-      }
-    }
+    // Session creation has one explicit owner: the + controls in the sidebar.
+    // Composer submission, navigation, hydration, and assistant replies never
+    // invent a Session.
+    const streamThreadId = String(activeThreadIdRef.current || activeThreadId || "").trim();
     if (!streamThreadId) return;
-    streamControllersRef.current.get(streamThreadId)?.abort();
+    const runRequestId = crypto.randomUUID();
+    const streamProjectId = String(activeProjectIdRef.current || activeProjectId || "").trim();
+    cancelSessionTurn(streamThreadId);
     const streamController = new AbortController();
     streamControllersRef.current.set(streamThreadId, streamController);
+    activeRequestIdsRef.current.set(streamThreadId, runRequestId);
     setSessionInFlight(streamThreadId, true);
 
     stickToBottomRef.current = true; // force sticky to bottom when sending a message
@@ -4939,7 +5938,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       return false;
     };
 
-    const desktopContext = shouldAttachMonitor(raw) ? clampContext(monitorText, 1200) : "";
+    const desktopContext = !voiceTranscript && shouldAttachMonitor(raw) ? clampContext(monitorText, 1200) : "";
     const requestText = desktopContext ? `${raw}\n\nLive desktop context:\n${desktopContext}` : raw;
 
     const ctxWindow = Number(providerInfo?.context_window || 0) || 32768;
@@ -4963,8 +5962,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     if (userTypingTimerRef.current) clearTimeout(userTypingTimerRef.current);
     setDocSources([]);
     // Turn-local research only — do not carry prior Session source cards into this answer.
-    // Global research panel history is still available in Studio; chat embeds use turnResearchRuns.
-    activeTaskPlanIdRef.current = null;
+    // Global research history remains available in Visualizer; Chat embeds use turnResearchRuns.
     // Fresh turn = fresh checklist only (no stacked plans from prior messages)
     setTaskPlans([]);
     liveReplyDraftRef.current = "";
@@ -4974,9 +5972,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     // Drop prior-turn tool metadata so done-labels never inherit stale queries
     // (e.g. Python search label leaking into a later GTA+FIFA turn).
     toolInfoRef.current = {};
-    // Seed a visible "working" step immediately so chat always shows progress
-    // (avatar can animate before the first tool/thinking event arrives).
-    const runRequestId = crypto.randomUUID();
     const bootstrapStepId = `${runRequestId}:working`;
     /** Backend Turn id once create_execution emits turn_bound / final. */
     let durableTurnId = "";
@@ -5019,25 +6014,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
             (!a.steps?.length || a.steps.every((s) => s.content === "thinking…" || s.status === "done"))
           )
       );
-      return [
-        ...pruned,
-        {
-          kind: "thinking" as const,
-          id: crypto.randomUUID(),
-          content: "thinking…",
-          at: Date.now(),
-          request_id: runRequestId,
-          steps: [
-            {
-              id: bootstrapStepId,
-              type: "tool" as const,
-              content: "thinking…",
-              status: "running" as const,
-              at: Date.now(),
-            },
-          ],
-        },
-      ];
+      return pruned;
     });
     try {
       const resp = await fetch(`${apiBase}/query/stream`, {
@@ -5048,6 +6025,11 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
           message: requestText,
           include_memory: true,
           thread_id: streamThreadId,
+          client_request_id: runRequestId,
+          thinking_enabled: thinkingEnabled,
+          reasoning_effort: reasoningEffort,
+          transport: voiceTranscript ? "voice" : "chat",
+          voice_turn_id: voiceTranscript?.voiceTurnId,
         }),
       });
       if (!resp.ok) {
@@ -5216,69 +6198,25 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         // (backend `at` can lag or collide with older messages and pin the plan high up).
         const eventAt = Date.now();
         setTaskPlans((prev) => {
-          if (evt.type === "task_plan") {
-            const id = crypto.randomUUID();
-            activeTaskPlanIdRef.current = id;
-            return [
-              ...prev,
-              {
-                id,
-                at: eventAt,
-                request_id: reqId || runRequestId,
-                plan: taskPlanReducer(createEmptyTaskPlan(), evt),
-              },
-            ];
-          }
-
-          const activeId =
-            activeTaskPlanIdRef.current ||
-            [...prev].reverse().find((entry) => entry.request_id === reqId || entry.request_id === runRequestId)?.id ||
-            [...prev].reverse().find((entry) => entry.plan.active)?.id;
-          if (!activeId) return prev;
-
-          return prev.map((entry) =>
-            entry.id === activeId
-              ? {
-                  ...entry,
-                  // Bump timestamp on every step so historical placement follows the turn
-                  at: eventAt,
-                  plan: taskPlanReducer(entry.plan, evt),
-                }
-              : entry
-          );
+          if (evt.type !== "task_plan") return prev;
+          const id = crypto.randomUUID();
+          return [
+            ...prev,
+            {
+              id,
+              at: eventAt,
+              request_id: reqId || runRequestId,
+              plan: taskPlanReducer(createEmptyTaskPlan(), evt),
+            },
+          ];
         });
       };
       const upsertTool = (evt: AgentStreamEvent) => {
         if (evt.type === "tool_start") {
           // Scope tool metadata to this stream turn (avoid stale labels from prior turns)
           toolInfoRef.current[evt.id] = { name: evt.name, input: evt.input, requestId: runRequestId };
-          dispatchActivity({ type: "tool_start", id: evt.id, name: evt.name });
           const toolNameStart = String(evt.name || "").toLowerCase();
-          // Live Code workspace: real terminal process start (this session stream only)
           if (toolNameStart === "terminal_run") {
-            const rawIn = String(evt.input || "");
-            let command = rawIn;
-            try {
-              const j = JSON.parse(rawIn);
-              if (j && typeof j === "object" && j.command) command = String(j.command);
-            } catch {
-              const m = rawIn.match(/['"]command['"]\s*:\s*['"]([^'"]+)['"]/i);
-              if (m) command = m[1];
-            }
-            setLiveTerminal((prev) => [
-              ...prev.filter((t) => t.id !== evt.id),
-              {
-                id: evt.id,
-                command: command.replace(/\s+/g, " ").trim().slice(0, 500) || "(terminal)",
-                output: "",
-                status: "running",
-                exitCode: null,
-                running: true,
-                at: normalizeTimestampMs(evt.at || Date.now()),
-                turnId: durableTurnId || runRequestId,
-                toolRunId: evt.id,
-              },
-            ]);
             setVisualizerPin("coding");
             setAgentMode("coding");
           }
@@ -5301,9 +6239,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         if (evt.type === "tool_end") {
           const info = toolInfoRef.current[evt.id];
           const toolFailed = evt.outcome?.success === false;
-          dispatchActivity(toolFailed
-            ? { type: "tool_error", id: evt.id, message: evt.outcome?.error_message || "Tool failed" }
-            : { type: "tool_end", id: evt.id });
           // Ignore tool_end that belongs to another turn's metadata
           if (info && (info as { requestId?: string }).requestId && (info as { requestId?: string }).requestId !== runRequestId) {
             return;
@@ -5356,7 +6291,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
               turnSearchQueries.push(String(info.input).replace(/\s+/g, " ").trim().slice(0, 120));
             }
           }
-          // Capture code for Code workspace (real file bodies + terminal ToolRuns)
+          // The durable ToolRun and specialist projections own code activity.
+          // The stream only nudges the Visualizer toward its Code panel.
           const codingTools = new Set([
             "file_write",
             "file_read",
@@ -5370,160 +6306,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
             "checkpoint_undo",
           ]);
           if (codingTools.has(toolName)) {
-            const rawInput = info?.input || "";
-            const rawOutput = String(evt.output || "");
-            const echo = parseEchoFileBlock(rawOutput);
-            const parsedIn = parseFileToolInput(rawInput);
-            const pathFromSummary = (rawOutput.match(/(?:Wrote|Appended|Read|Deleted|Moved|Copied).+?(?:to|from)\s+(.+?)(?:\n|$)/i) || [])[1]?.trim() || "";
-            const fullPath = echo?.path || parsedIn.path || pathFromSummary || "";
-            const filename = basenamePath(fullPath) || basenamePath(parsedIn.path) || toolName || "output";
-            const lang = langFromFilename(filename, toolName);
-            const eventAt = normalizeTimestampMs(evt.at || Date.now());
-
-            let fileBody = "";
-            if (echo?.content != null && echo.content.length > 0) {
-              fileBody = echo.content;
-            } else if (toolName === "file_write" && parsedIn.content) {
-              fileBody = parsedIn.content;
-            } else if (toolName === "file_read" && rawOutput && !/^File not found|^Path not allowed|^Failed to read|^Path is a directory|^Binary file/i.test(rawOutput.trim())) {
-              // legacy: raw file body without ECHO_FILE wrapper
-              const stripped = rawOutput.replace(/^Read \d+ chars from .+\n?/i, "");
-              fileBody = stripped || rawOutput;
-            } else if (toolName === "terminal_run" || toolName === "notepad_write" || toolName === "artifact_write") {
-              fileBody = rawOutput;
-            }
-
-            // Always open the coding pane on file ops (even errors — show the message)
-            const displayContent =
-              fileBody ||
-              (rawOutput.trim() ? rawOutput : `(no content returned for ${filename})`);
-            const isError =
-              /^(File not found|Path not found|Source path not found|Destination already exists|Mutation blocked|Path not allowed|Failed to |Path is a directory|Binary file|Unsupported text encoding|Rejected stub)/i.test(
-                rawOutput.trim()
-              );
-
-            if (toolName === "terminal_run") {
-              const exitM = rawOutput.match(/ExitCode\s*=\s*(-?\d+)/i);
-              const statusM = rawOutput.match(/Status\s*=\s*(\S+)/i);
-              const modeM = rawOutput.match(/Mode\s*=\s*(\S+)/i);
-              const reasonM = rawOutput.match(/Reason\s*=\s*(.+)/i);
-              const exitCode = exitM ? Number(exitM[1]) : null;
-              let command = rawInput;
-              try {
-                const j = JSON.parse(rawInput);
-                if (j && typeof j === "object" && j.command) command = String(j.command);
-              } catch {
-                const m = rawInput.match(/['"]command['"]\s*:\s*['"]([^'"]+)['"]/i);
-                if (m) command = m[1];
-              }
-              const bodyLines: string[] = [];
-              let pastHeader = false;
-              for (const line of rawOutput.split("\n")) {
-                if (!pastHeader && /^(ExitCode|Status|Mode|Reason|DurationMs)\s*=/i.test(line)) continue;
-                pastHeader = true;
-                bodyLines.push(line);
-              }
-              setLiveTerminal((prev) => {
-                const without = prev.filter((t) => t.id !== evt.id);
-                return [
-                  ...without,
-                  {
-                    id: evt.id,
-                    command: String(command || "").replace(/\s+/g, " ").trim().slice(0, 500) || "(terminal)",
-                    output: bodyLines.join("\n").trim() || rawOutput,
-                    status: statusM?.[1] || (toolFailed ? "fail" : "pass"),
-                    exitCode: Number.isFinite(exitCode as number) ? exitCode : null,
-                    running: false,
-                    at: eventAt,
-                    turnId: durableTurnId || runRequestId,
-                    toolRunId: evt.id,
-                    mode: modeM?.[1] || "",
-                    reason: reasonM?.[1]?.trim() || "",
-                  },
-                ];
-              });
-            } else {
-              const action =
-                toolName === "file_read"
-                  ? "inspect"
-                  : toolName === "file_delete"
-                    ? "delete"
-                    : toolName === "file_mkdir"
-                      ? "mkdir"
-                      : toolName.startsWith("file_")
-                        ? toolName.replace("file_", "")
-                        : "modify";
-              if (!toolFailed && !isError && toolName !== "file_read") {
-                setLiveFileChanges((prev) => [
-                  {
-                    id: evt.id,
-                    path: fullPath || filename,
-                    toolName,
-                    action,
-                    status: "complete",
-                    summary: (rawOutput.split("\n")[0] || toolName).slice(0, 200),
-                    at: eventAt,
-                    turnId: durableTurnId || runRequestId,
-                    toolRunId: evt.id,
-                    // A successful mutation is not verification. The durable
-                    // post-write file_read projection may promote this later.
-                    verified: false,
-                    currentContent: toolName === "file_write" ? fileBody || undefined : undefined,
-                  },
-                  ...prev.filter((c) => c.id !== evt.id),
-                ].slice(0, 80));
-              }
-            }
-
-            latestCodeFilenameRef.current = filename;
-            setCodeSessions((prev) => {
-              const existing =
-                prev.find((session) => session.filename === filename) ||
-                prev.find((session) => fullPath && session.filename === fullPath) ||
-                prev.find((session) => fullPath && session.filename === fullPath);
-              let nextSession: CodeDiffSession;
-
-              if (toolName === "file_read") {
-                nextSession = {
-                  filename: fullPath || filename,
-                  language: lang,
-                  originalContent: isError ? "" : displayContent,
-                  currentContent: displayContent,
-                  status: isError ? "output" : "read",
-                  summary: isError
-                    ? rawOutput.slice(0, 120)
-                    : `Loaded ${displayContent.length.toLocaleString()} chars`,
-                };
-              } else if (toolName === "file_write") {
-                const hasBody = Boolean(fileBody) && !toolFailed && !isError;
-                nextSession = {
-                  filename: fullPath || filename,
-                  language: lang,
-                  originalContent: existing?.originalContent || existing?.currentContent || "",
-                  currentContent: hasBody ? fileBody : existing?.currentContent || displayContent,
-                  status: toolFailed || isError ? "output" : isFileWriteSummary(rawOutput.split("\n")[0] || "") || hasBody ? "saved" : "draft",
-                  summary: hasBody
-                    ? `Saved ${fileBody.length.toLocaleString()} chars → ${basenamePath(fullPath || filename)}`
-                    : (rawOutput.split("\n")[0] || `Write ${filename}`).slice(0, 160),
-                };
-              } else if (toolName === "terminal_run") {
-                // Terminal lives in the Terminal pane — keep codeSessions for file diffs only
-                return prev;
-              } else {
-                nextSession = {
-                  filename: fullPath || filename,
-                  language: lang,
-                  originalContent: existing?.originalContent || "",
-                  currentContent: displayContent,
-                  status: "output",
-                  summary: undefined,
-                };
-              }
-
-              const [nextSessions] = replaceCodeSession(prev, nextSession);
-              return nextSessions;
-            });
-            setCodeRefreshToken((n) => n + 1);
             setVisualizerPin("coding");
             setAgentMode("coding");
           }
@@ -5545,24 +6327,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         }
 
         if (evt.type === "tool_error") {
-          dispatchActivity({ type: "tool_error", id: evt.id, message: evt.error });
           const info = toolInfoRef.current[evt.id];
           const toolName = info?.name || "tool";
-          if (String(toolName || "").toLowerCase() === "terminal_run") {
-            setLiveTerminal((prev) =>
-              prev.map((t) =>
-                t.id === evt.id
-                  ? {
-                      ...t,
-                      running: false,
-                      status: "fail",
-                      output: t.output || String(evt.error || "Terminal error"),
-                      at: normalizeTimestampMs(evt.at || Date.now()),
-                    }
-                  : t,
-              ),
-            );
-          }
           if (!SILENT_CHAT_TOOLS.has(String(toolName || "").toLowerCase())) {
             markThinkingStep(
               evt,
@@ -5613,25 +6379,46 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
             }
             maxStreamSeq = evtSeq;
           }
+          for (const action of activityActionsFromStreamEvent(evt as unknown as Record<string, unknown>)) {
+            dispatchActivity(action);
+          }
 
           if (evt.type === "turn_bound") {
             const execId = String(evt.execution_id || evt.turn_id || "").trim();
             if (execId) {
               durableTurnId = execId;
+              activeExecutionIdsRef.current.set(streamThreadId, execId);
               setLatestExecutionId(execId);
-              // Remap any live Code rows that still carry the client stream key.
-              setLiveTerminal((prev) =>
-                prev.map((t) => (t.turnId === runRequestId ? { ...t, turnId: execId } : t))
-              );
-              setLiveFileChanges((prev) =>
-                prev.map((c) => (c.turnId === runRequestId ? { ...c, turnId: execId } : c))
-              );
             }
-          } else if (evt.type === "task_plan" || evt.type === "task_step" || evt.type === "task_reflection") {
+            dispatchActivity({ type: "turn_bound", objective: raw });
+            const reasoningControl = evt.reasoning_control || {};
+            if (
+              thinkingEnabled &&
+              reasoningControl.native_support === false &&
+              reasoningEffort !== "medium"
+            ) {
+              dispatchActivity({
+                type: "step_update",
+                nextAction: "This provider does not expose native effort control on the active endpoint.",
+              });
+            }
+          } else if (evt.type === "task_bound") {
+            activeTaskRunIdsRef.current.set(streamThreadId, String(evt.task_run_id || ""));
+          } else if (evt.type === "reasoning_summary") {
+            const summary = String(evt.content || "").trim();
+            if (thinkingEnabled && summary) {
+              appendThinkingStep(evt, {
+                id: `${runRequestId}:reasoning-summary:${evt.iteration || 0}`,
+                type: "thought",
+                content: summary,
+                status: "done",
+                at: normalizeTimestampMs(evt.at || Date.now()),
+              });
+            }
+          } else if (evt.type === "recovery" || evt.type === "lifecycle" || evt.type === "iteration_boundary" || evt.type === "token_usage") {
+            // The shared activity decoder above owns these semantic projections.
+          } else if (evt.type === "task_plan") {
             upsertTaskPlan(evt);
-            if (evt.type === "task_step" && evt.data?.status) {
-              dispatchActivity({ type: "task_step", status: String(evt.data.status) });
-            }
           } else if (evt.type === "tool_start" || evt.type === "tool_end" || evt.type === "tool_error") {
             upsertTool(evt);
           } else if (evt.type === "thinking_step") {
@@ -5727,7 +6514,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
           } else if (evt.type === "agent_token") {
             const tok = String(evt.data || "");
             if (tok) {
-              dispatchActivity({ type: "agent_token", token: tok });
               const prev = liveReplyDraftRef.current;
               const next = prev + tok;
               liveReplyDraftRef.current = next;
@@ -5758,8 +6544,14 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
             liveReplyDraftRef.current = text;
             setLiveReplyDraft(text);
             // Speak this beat now — tools may follow, then a second reply.
-            if (evt.speak !== false) {
-              void speakText(text);
+            if (evt.speak !== false && (voiceReadAloud || voiceConversationMode)) {
+              void speakLocalText(text, {
+                clientTurnId: voiceTranscript?.clientTurnId || runRequestId,
+                requestId: runRequestId,
+                executionId: durableTurnId,
+                taskRunId: activeTaskRunIdsRef.current.get(streamThreadId) || "",
+                completeTurn: false,
+              });
             }
             const reqId = eventRequestId(evt);
             setActivities((prev) =>
@@ -5794,12 +6586,10 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                 };
               })
             );
-            dispatchActivity({ type: "thinking", content: "working" });
           } else if (evt.type === "thinking") {
             const content = (evt.content || "").trim();
             const reqId = eventRequestId(evt);
             if (content) {
-              dispatchActivity({ type: "thinking", content });
               // Only nudge the single bootstrap label — never stack extra rows.
               setActivities((prev) =>
                 prev.map((p) => {
@@ -5828,10 +6618,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
           } else if ((evt as any).type === "status" && (evt as any).agent_mode) {
             const mode = String((evt as any).agent_mode || "idle");
             setAgentMode(mode as any);
-            dispatchActivity({ type: "status_mode", mode, tool: (evt as any).tool });
           } else if (evt.type === "error") {
             setStreaming(false);
-            dispatchActivity({ type: "error", message: evt.message });
             setLiveReplyDraft("");
             completeAllRunningSteps("failed");
             setActivities((prev) => [
@@ -5845,25 +6633,35 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
             finalHandled = true;
 
             const liveDraft = liveReplyDraftRef.current.trim();
-            let reply = String(evt.response || liveDraft || "").trim();
-            const partials = [...partialReplies, ...(Array.isArray(evt.partial_replies) ? evt.partial_replies : [])]
-              .map((part) => String(part || "").trim())
-              .filter(Boolean)
-              .filter((part, index, rows) => rows.indexOf(part) === index);
-            if (partials.length && !partials.some((part) => reply.includes(part))) {
-              reply = [...partials, reply].filter(Boolean).join("\n\n");
+            const reply = mergeFinalReply(
+              evt.response,
+              liveDraft,
+              partialReplies,
+              Array.isArray(evt.partial_replies) ? evt.partial_replies : []
+            );
+
+            // Stale ownership: if the user switched Session/Project mid-stream,
+            // keep durable backend history but do not paint the final into the wrong chat.
+            // Own the Project captured at send time; compare against live refs (not stale closures).
+            if (
+              !canApplyFinalToChat({
+                activeThreadId: String(activeThreadIdRef.current || ""),
+                activeProjectId: String(activeProjectIdRef.current || ""),
+                ownedThreadId: streamThreadId,
+                ownedProjectId: streamProjectId,
+                streamOpen: streamControllersRef.current.get(streamThreadId) === streamController,
+              })
+            ) {
+              liveReplyDraftRef.current = "";
+              setLiveReplyDraft("");
+              setStreaming(false);
+              continue;
             }
 
             if (evt.execution_id) {
               durableTurnId = String(evt.execution_id);
             }
             const executionStatus = String(evt.thread_state?.execution_status || "");
-            dispatchActivity({
-              type: "final",
-              response: reply || partialReplies[partialReplies.length - 1] || "",
-              executionStatus,
-              success: evt.success,
-            });
             // Only mark tool rows done when backend authority says complete — not on soft success.
             if (executionStatus === "complete" && evt.success) {
               completeAllRunningSteps("done");
@@ -5979,9 +6777,41 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                   model: providerInfo?.model,
                 }),
               });
+              // The backend's spoken_text is the final remainder after any
+              // already-spoken partial reply. Never fall back to the merged
+              // display reply when a preamble has already been played.
               const spoken = (evt.spoken_text || "").trim();
-              const speakVal = spoken && spoken === reply ? spoken : reply;
-              void speakText(speakVal);
+              const speakVal = spoken || (partialReplies.length ? "" : reply);
+              if (voiceReadAloud || voiceConversationMode) {
+                const playbackScope = {
+                  apiBase,
+                  sessionId: String(activeThreadIdRef.current || ""),
+                  projectId: String(activeProjectIdRef.current || ""),
+                  clientTurnId: voiceTranscript?.clientTurnId || runRequestId,
+                  requestId: runRequestId,
+                  executionId: finalExecId,
+                  taskRunId: activeTaskRunIdsRef.current.get(streamThreadId) || "",
+                };
+                const playback = speakVal
+                  ? speakLocalText(speakVal, playbackScope)
+                  : localVoicePlayback.complete(playbackScope)
+                      .then(() => true)
+                      .catch((error) => {
+                        setVoicePhase("error");
+                        setVoiceNotice(error instanceof Error ? error.message : "Voice playback completion could not be saved.");
+                        return false;
+                      });
+                void playback.then((played) => {
+                  if (
+                    played &&
+                    voiceConversationMode &&
+                    activeThreadIdRef.current === streamThreadId &&
+                    !streamControllersRef.current.has(streamThreadId)
+                  ) {
+                    void start();
+                  }
+                });
+              }
             } else if (!partialReplies.length && !reply) {
               // True empty — still surface something so the turn doesn't ghost.
               addMessage({
@@ -6003,6 +6833,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
             refreshPendingApproval(streamThreadId);
             refreshApprovals(streamThreadId);
             refreshExecutions(streamThreadId);
+            void loadCurrentWorkRuns(apiBase, streamThreadId, activeProjectIdRef.current || "");
             void refreshThreads();
           }
         }
@@ -6030,6 +6861,11 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
 
       if (owned) {
         streamControllersRef.current.delete(streamThreadId);
+        if (activeRequestIdsRef.current.get(streamThreadId) === runRequestId) {
+          activeRequestIdsRef.current.delete(streamThreadId);
+          activeExecutionIdsRef.current.delete(streamThreadId);
+          activeTaskRunIdsRef.current.delete(streamThreadId);
+        }
         setSessionInFlight(streamThreadId, false);
       }
 
@@ -6071,7 +6907,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
             model: providerInfo?.model,
           }),
         });
-        void speakText(orphan);
+        // A stream without its canonical final event is incomplete. Keep the
+        // visible recovered text, but do not speak it as if Echo finalized it.
       }
       liveReplyDraftRef.current = "";
       setLiveReplyDraft("");
@@ -6096,12 +6933,220 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         void refreshPendingApproval(streamThreadId);
         void refreshExecutions(streamThreadId);
       }
+      if (finalHandled && !aborted && sameThread) {
+        window.setTimeout(async () => {
+          try {
+            const response = await fetch(
+              `${apiBase}/query/queue/claim?thread_id=${encodeURIComponent(streamThreadId)}`,
+              { method: "POST" },
+            );
+            if (!response.ok) return;
+            const payload = await response.json();
+            const message = String(payload?.item?.message || "").trim();
+            if (payload?.claimed && message && activeThreadIdRef.current === streamThreadId) {
+              void sendText(message);
+            }
+          } catch {
+            // The durable queue remains available for the next idle reconnect.
+          }
+        }, 200);
+      }
     }
   };
 
-  const { start, stop } = useMicStreamer((t: string) => {
-    sendText(t);
+  const queueFollowUp = async () => {
+    const sessionId = String(activeThreadIdRef.current || "").trim();
+    const message = String(input || "").trim();
+    if (!sessionId || !message) {
+      textareaRef.current?.focus();
+      return;
+    }
+    const response = await fetch(`${apiBase}/query/queue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        thread_id: sessionId,
+        message,
+        client_request_id: crypto.randomUUID(),
+      }),
+    });
+    if (!response.ok) return;
+    setInput("");
+    setUserIsTyping(false);
+    dispatchActivity({ type: "recovery", reason: "Follow-up queued." });
+  };
+
+  useEffect(() => {
+    const sessionId = String(activeThreadId || "").trim();
+    if (!sessionId || streaming || streamControllersRef.current.has(sessionId)) return;
+    let cancelled = false;
+    const resumeQueued = async () => {
+      try {
+        const response = await fetch(
+          `${apiBase}/query/queue/claim?thread_id=${encodeURIComponent(sessionId)}`,
+          { method: "POST" },
+        );
+        if (!response.ok || cancelled) return;
+        const payload = await response.json();
+        const message = String(payload?.item?.message || "").trim();
+        if (payload?.claimed && message && activeThreadIdRef.current === sessionId) {
+          void sendText(message);
+        }
+      } catch {
+        // Persisted input remains queued until the Session is idle again.
+      }
+    };
+    void resumeQueued();
+    return () => { cancelled = true; };
+    // sendText intentionally follows the current render's exact Session state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeThreadId, apiBase, streaming]);
+
+  const submitVoiceTranscript = async (transcript: VoiceTranscript) => {
+    if (
+      String(activeThreadIdRef.current || "") !== transcript.sessionId ||
+      String(activeProjectIdRef.current || "") !== transcript.projectId
+    ) {
+      setVoicePhase("error");
+      setVoiceNotice("Voice capture ended after the active Session changed, so it was not submitted.");
+      return;
+    }
+    setInput(transcript.text);
+    if (transcript.controlHint === "cancel_active") {
+      stopTts();
+      if (activeRequestIdsRef.current.get(transcript.sessionId)) {
+        cancelSessionTurn(transcript.sessionId, true, transcript);
+      } else {
+        void fetch(
+          `${apiBase}/media-runtime/voice/turns/${encodeURIComponent(transcript.voiceTurnId)}/cancel`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: transcript.sessionId }),
+          },
+        ).catch(() => undefined);
+      }
+      setVoicePhase("idle");
+      setVoiceNotice("Stopped by Ty.");
+      setInput("");
+      return;
+    }
+    if (["canonical_steer", "canonical_continue", "canonical_inspect"].includes(transcript.controlHint)) {
+      const taskRunId = activeTaskRunIdsRef.current.get(transcript.sessionId) || "";
+      const requestId = activeRequestIdsRef.current.get(transcript.sessionId) || "";
+      if (taskRunId && requestId) {
+        const response = await fetch(`${apiBase}/query/steer`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            thread_id: transcript.sessionId,
+            instruction: transcript.text,
+            task_run_id: taskRunId,
+            client_request_id: requestId,
+            voice_turn_id: transcript.voiceTurnId,
+          }),
+        });
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          throw new Error(String(payload?.detail || "The active run could not accept that direction."));
+        }
+        dispatchActivity({ type: "steer", instruction: transcript.text });
+        setInput("");
+        setVoicePhase("idle");
+        setVoiceNotice(
+          transcript.controlHint === "canonical_inspect"
+            ? "Status question attached to the active run."
+            : transcript.controlHint === "canonical_continue"
+            ? "The active run will continue."
+            : "Direction added to the active run.",
+        );
+        return;
+      }
+    }
+    await sendText(transcript.text, transcript);
+  };
+
+  const start = async () => {
+    const sessionId = String(activeThreadIdRef.current || "").trim();
+    if (!sessionId || !voiceInputRef.current) {
+      setVoicePhase("error");
+      setVoiceNotice("Create or select a Session before using Voice.");
+      return;
+    }
+    stopTts();
+    setVoiceNotice("");
+    try {
+      await voiceInputRef.current.start(
+        {
+          apiBase,
+          sessionId,
+          projectId: String(activeProjectIdRef.current || ""),
+        },
+        {
+          onPhase: (phase, detail) => {
+            setVoicePhase(phase);
+            setVoiceNotice(detail || "");
+            setListening(phase === "listening" || phase === "requesting_permission");
+          },
+          onLevel: setVoiceInputLevel,
+          onFinalTranscript: (transcript) => {
+            setListening(false);
+            setVoiceInputLevel(0);
+            void submitVoiceTranscript(transcript).catch((error) => {
+              setVoicePhase("error");
+              setVoiceNotice(error instanceof Error ? error.message : "The spoken instruction could not be applied.");
+            });
+          },
+          onFailure: (error) => {
+            setListening(false);
+            setVoiceInputLevel(0);
+            setVoicePhase("error");
+            setVoiceNotice(error.message || "Local transcription is unavailable.");
+          },
+        },
+      );
+    } catch (error) {
+      setListening(false);
+      setVoicePhase("error");
+      setVoiceNotice(error instanceof Error ? error.message : "Local microphone capture is unavailable.");
+    }
+  };
+
+  const stop = async () => {
+    if (!voiceInputRef.current) return;
+    setListening(false);
+    try {
+      const transcript = await voiceInputRef.current.stop(true);
+      if (!transcript) return;
+      await submitVoiceTranscript(transcript);
+    } catch (error) {
+      setVoicePhase("error");
+      setVoiceNotice(error instanceof Error ? error.message : "Local transcription is unavailable.");
+    } finally {
+      setListening(false);
+      setVoiceInputLevel(0);
+    }
+  };
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.key.toLowerCase() !== "m") return;
+      event.preventDefault();
+      if (voiceInputRef.current?.active) void stop();
+      else void start();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   });
+
+  useEffect(() => {
+    if (voiceInputRef.current?.active) void voiceInputRef.current.stop(false);
+    setListening(false);
+    setVoiceInputLevel(0);
+    setVoicePhase("idle");
+    setVoiceNotice("");
+    stopTts();
+  }, [activeThreadId, activeProjectId]);
 
   const refreshMonitor = async () => {
     try {
@@ -6133,7 +7178,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
 
   useEffect(() => {
     refreshProviderInfo({ allowRetry: true });
-  }, [apiBase]);
+  }, [apiBase, activeThreadId]);
 
   const refreshServices = async () => {
     setServicesLoading(true);
@@ -6166,7 +7211,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         undefined,
         4000,
       );
-      if (!response.ok) throw new Error(`Studio projection failed (${response.status})`);
+      if (!response.ok) throw new Error(`Settings projection failed (${response.status})`);
       const projection = await response.json();
       setStudioOverview(projection);
       setRoutines(projection.routines || []);
@@ -6174,6 +7219,239 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       console.error("Failed to refresh Studio projection", error);
     } finally {
       setStudioOverviewLoading(false);
+    }
+  };
+
+  const refreshConnections = async () => {
+    if (!activeThreadId) {
+      setConnectionCatalog([]);
+      setConnectionError("");
+      return;
+    }
+    try {
+      const query = new URLSearchParams({
+        session_id: activeThreadId,
+        project_id: activeProjectId,
+      });
+      const response = await fetchWithTimeout(
+        `${apiBase}/connections/catalog?${query}`,
+        undefined,
+        5000,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(String(payload?.detail || `Connections failed (${response.status})`));
+      setConnectionCatalog(Array.isArray(payload.items) ? payload.items : []);
+      setConnectionError("");
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const refreshSettingsCatalog = async () => {
+    if (!activeThreadId) {
+      settingsCatalogRequestRef.current += 1;
+      setSettingsCatalog([]);
+      setSettingsCatalogError("");
+      setSettingsCatalogLoadedAt(0);
+      setSettingsCatalogScope("");
+      return;
+    }
+    const requestNumber = ++settingsCatalogRequestRef.current;
+    const requestedScope = `${activeThreadId}:${activeProjectId}`;
+    setSettingsCatalogLoading(true);
+    try {
+      const query = new URLSearchParams({
+        session_id: activeThreadId,
+        project_id: activeProjectId,
+      });
+      const response = await fetchWithTimeout(
+        `${apiBase}/settings/catalog?${query}`,
+        undefined,
+        12000,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(String(payload?.detail || `Settings catalog failed (${response.status})`));
+      if (requestNumber !== settingsCatalogRequestRef.current) return;
+      setSettingsCatalog(Array.isArray(payload.cards) ? payload.cards : []);
+      setSettingsCatalogLoadedAt(Date.now());
+      setSettingsCatalogScope(requestedScope);
+      setSettingsCatalogError("");
+    } catch (error) {
+      if (requestNumber !== settingsCatalogRequestRef.current) return;
+      setSettingsCatalogError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (requestNumber === settingsCatalogRequestRef.current) setSettingsCatalogLoading(false);
+    }
+  };
+
+  const handleSettingsCatalogAction = (
+    card: SettingsCatalogCard,
+    action: SettingsCatalogAction,
+  ) => {
+    if (card.category === "connections" && action.kind === "connect") {
+      if (!activeProjectId) {
+        setConnectionError("Select a Project before connecting an external capability.");
+        return;
+      }
+      const providerId = card.id.replace(/^connection:/, "");
+      const provider = connectionCatalog.find((item: any) => String(item.id || "") === providerId);
+      if (provider) void runConnectionAction(provider, "connect");
+      else setConnectionError("This Connection is no longer present in the current catalog. Refresh and try again.");
+      return;
+    }
+    if (action.kind === "inspect") {
+      if (card.category === "skills") setLeftTab("skills");
+      else if (card.category === "local_tools") setLeftTab("capabilities");
+      return;
+    }
+    // Credential entry, provider endpoints, local paths, commands, and MCP
+    // transports deliberately remain behind the explicit Advanced surface.
+    // This navigation does not mutate provider or Connection authority.
+    if (["advanced", "configure", "manage"].includes(action.kind)) {
+      setLeftTab("advanced_settings");
+    }
+  }
+
+  const selectLocalVoiceProvider = async (
+    operation: "speech_to_text" | "text_to_speech",
+    providerId: string,
+  ) => {
+    setSettingsSaving(true);
+    setSettingsCatalogError("");
+    try {
+      const key = operation === "speech_to_text" ? "voice_local_stt_provider" : "voice_local_tts_provider";
+      const response = await fetchWithTimeout(`${apiBase}/settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ [key]: providerId }),
+      }, 10000);
+      if (!response.ok) throw new Error(`Voice preference could not be saved (${response.status})`);
+      await refreshSettingsCatalog();
+    } catch (error) {
+      setSettingsCatalogError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSettingsSaving(false);
+    }
+  };
+
+  const setCloudVoiceOptIn = async (providerId: string, enabled: boolean) => {
+    setSettingsSaving(true);
+    setSettingsCatalogError("");
+    try {
+      const response = await fetchWithTimeout(`${apiBase}/settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voice_cloud_provider: enabled ? providerId : "" }),
+      }, 10000);
+      if (!response.ok) throw new Error(`Cloud Voice preference could not be saved (${response.status})`);
+      await refreshSettingsCatalog();
+    } catch (error) {
+      setSettingsCatalogError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSettingsSaving(false);
+    }
+  };
+
+  async function runConnectionAction(
+    provider: any,
+    action: "connect" | "probe" | "reconnect" | "disable" | "disconnect",
+  ) {
+    if (!activeThreadId || !activeProjectId) return;
+    const connection = provider?.connection;
+    const busyKey = String(connection?.id || provider?.id || action);
+    setConnectionBusyId(busyKey);
+    setConnectionError("");
+    try {
+      let response: Response;
+      if (action === "connect") {
+        if (provider.id !== "obsidian") {
+          throw new Error(
+            provider.rollout_state === "advanced"
+              ? "Configure custom MCP transports in Advanced until the reviewed editor is available here."
+              : `${provider.name} OAuth is not installed yet; EchoSpeak did not create a fake connection.`,
+          );
+        }
+        if (!desktopMode) {
+          throw new Error("Connect local folders from the EchoSpeak desktop application. Browser development does not receive filesystem paths.");
+        }
+        const vaultPath = await pickDesktopConnectionFolder(provider.name);
+        if (!vaultPath) return;
+        response = await fetchWithTimeout(`${apiBase}/connections/authorize`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            provider_id: provider.id,
+            session_id: activeThreadId,
+            project_id: activeProjectId,
+            display_name: provider.name,
+            configuration: { vault_path: vaultPath },
+            credentials: {},
+            allow_global: false,
+          }),
+        }, 8000);
+      } else if (action === "disconnect") {
+        const query = new URLSearchParams({
+          session_id: activeThreadId,
+          project_id: activeProjectId,
+          expected_revision: String(connection.revision),
+        });
+        response = await fetchWithTimeout(
+          `${apiBase}/connections/${encodeURIComponent(connection.id)}?${query}`,
+          { method: "DELETE" },
+          5000,
+        );
+      } else {
+        response = await fetchWithTimeout(
+          `${apiBase}/connections/${encodeURIComponent(connection.id)}/${action}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: activeThreadId,
+              project_id: activeProjectId,
+              expected_revision: connection.revision,
+            }),
+          },
+          8000,
+        );
+      }
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(String(payload?.detail || `Connection action failed (${response.status})`));
+      await Promise.all([refreshConnections(), refreshSettingsCatalog(), refreshStudioOverview()]);
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setConnectionBusyId("");
+    }
+  }
+
+  const toggleConnectionCapability = async (
+    connection: any,
+    capability: any,
+  ) => {
+    setConnectionBusyId(String(connection.id));
+    try {
+      const response = await fetchWithTimeout(
+        `${apiBase}/connections/${encodeURIComponent(connection.id)}/capabilities/${encodeURIComponent(capability.id)}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: activeThreadId,
+            project_id: activeProjectId,
+            expected_revision: connection.revision,
+            enabled: !capability.enabled,
+          }),
+        },
+        5000,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(String(payload?.detail || `Capability update failed (${response.status})`));
+      await Promise.all([refreshConnections(), refreshSettingsCatalog()]);
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setConnectionBusyId("");
     }
   };
 
@@ -6195,8 +7473,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   };
 
   useEffect(() => {
-    if (leftTab === "research" || (desktopMode && desktopSurface === "research")) void refreshResearchArtifacts();
-  }, [activeProjectId, activeThreadId, desktopMode, desktopSurface, leftTab]);
+    if (leftTab === "research" || (desktopMode && desktopSurface === "visualizer" && visualizerPin === "research")) void refreshResearchArtifacts();
+  }, [activeProjectId, activeThreadId, desktopMode, desktopSurface, leftTab, visualizerPin]);
 
   useEffect(() => {
     const gatewayUrl = `${apiBase.replace(/^http/i, "ws")}/gateway/ws`;
@@ -6350,17 +7628,25 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     if (["overview", "skills", "capabilities", "executions", "automations", "connections"].includes(leftTab)) {
       refreshStudioOverview();
     }
+    if (leftTab === "connections") refreshConnections();
+    if (
+      ["settings", "search_settings", "services", "mcp_settings", "connections", "capabilities", "skills"].includes(leftTab)
+      && (
+        settingsCatalogScope !== `${activeThreadId}:${activeProjectId}`
+        || !settingsCatalog.length
+        || Date.now() - settingsCatalogLoadedAt > 15000
+      )
+    ) {
+      refreshSettingsCatalog();
+    }
     if (leftTab === "memory") {
       refreshMemory();
       refreshMemoryDoctor();
     }
     if (leftTab === "docs") refreshDocuments();
     if (leftTab === "soul") refreshSoul();
-    if (leftTab === "services") refreshServices();
+    if (leftTab === "system_services") refreshServices();
     if (leftTab === "projects") refreshProjects();
-    if (leftTab === "capabilities") {
-      refreshCodingReadiness();
-    }
     if (leftTab === "approvals") {
       refreshPendingApproval();
       refreshApprovals();
@@ -6369,7 +7655,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       refreshExecutions();
       if (latestTraceId) loadTrace(latestTraceId);
     }
-  }, [leftTab, activeThreadId]);
+  }, [leftTab, activeThreadId, activeProjectId]);
 
   useEffect(() => {
     if (backendOnline === false) return;
@@ -6414,10 +7700,13 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   }, [providerDraft.provider, providerDraft.model, providerDraft.base_url, switchingProvider]);
 
   useEffect(() => {
-    const listener = () => stop();
+    const listener = () => {
+      void voiceInputRef.current?.stop(false);
+      stopTts();
+    };
     window.addEventListener("beforeunload", listener);
     return () => window.removeEventListener("beforeunload", listener);
-  }, [stop]);
+  }, []);
 
   useEffect(() => {
     if (!activeGroup) {
@@ -6517,31 +7806,76 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
     ? (providerDraft.provider === "openai" ? openaiModelOptions : providerDraft.provider === "gemini" ? geminiModelOptions : providerModels)
     : [providerDraft.model || "Default model"];
   const modelPickerValue = showModelPicker ? providerDraft.model : modelPickerOptions[0];
-  const studioTabs: { id: typeof leftTab; label: string; group: string }[] = [
-    { id: "overview", label: "Overview", group: "Control Center" },
-    { id: "skills", label: "Skills", group: "Capabilities" },
-    { id: "memory", label: "Memory", group: "Knowledge" },
-    { id: "docs", label: "Docs", group: "Knowledge" },
-    { id: "settings", label: "Settings", group: "Config" },
-    { id: "capabilities", label: "Tools", group: "Config" },
-    { id: "soul", label: "Soul", group: "Config" },
-    { id: "avatar_editor", label: "Avatar", group: "Config" },
-    { id: "approvals", label: "Approvals", group: "Automation" },
-    { id: "executions", label: "Viewer", group: "Operations" },
-    { id: "projects", label: "Projects", group: "Automation" },
-    { id: "automations", label: "Automations", group: "Automation" },
-    { id: "connections", label: "Connections", group: "Automation" },
-    { id: "services", label: "Services", group: "Automation" },
-  ];
+  const studioTabMeta: Record<string, { label: string; group: string }> = {
+    settings: { label: "Providers", group: "Models" },
+    search_settings: { label: "Providers", group: "Search & Research" },
+    services: { label: "Providers", group: "Voice & Speech" },
+    avatar_editor: { label: "Echo companion", group: "Voice & Speech" },
+    connections: { label: "Accounts & apps", group: "Connections" },
+    capabilities: { label: "Inventory", group: "Local Tools" },
+    skills: { label: "Registry", group: "Skills" },
+    mcp_settings: { label: "Servers & tools", group: "MCP" },
+    approvals: { label: "Approvals", group: "Privacy & Permissions" },
+    memory: { label: "Memory", group: "Privacy & Permissions" },
+    docs: { label: "Documents", group: "Privacy & Permissions" },
+    soul: { label: "Soul", group: "Privacy & Permissions" },
+    overview: { label: "Appearance", group: "Advanced" },
+    projects: { label: "Projects & Sessions", group: "Advanced" },
+    executions: { label: "Runtime viewer", group: "Advanced" },
+    automations: { label: "Automations", group: "Advanced" },
+    system_services: { label: "Background services", group: "Advanced" },
+    advanced_settings: { label: "Runtime configuration", group: "Advanced" },
+  }
+  const studioTabs: { id: typeof leftTab; label: string; group: string }[] = STUDIO_SECTION_ORDER.map((id) => ({
+    id: id as typeof leftTab,
+    label: studioTabMeta[id]?.label || id,
+    group: studioTabMeta[id]?.group || "Advanced",
+  }));
+  const studioGroups = [
+    "Models",
+    "Search & Research",
+    "Voice & Speech",
+    "Connections",
+    "Local Tools",
+    "Skills",
+    "MCP",
+    "Privacy & Permissions",
+    "Advanced",
+  ].map((label) => ({
+    label,
+    tabs: studioTabs.filter((tab) => tab.group === label),
+  }));
   const studioOpen = desktopMode
-    ? desktopSurface === "studio"
+    ? desktopSettingsOpen
     : leftTab !== "chat" && leftTab !== "research";
-  /** Media occupies the shell as a first-class workspace. */
-  const mediaWorkspaceOpen = desktopMode ? desktopSurface === "media" : mediaRouteActive;
-  const desktopVisualizerOpen = desktopMode && ["visualizer", "research", "code", "tasks"].includes(desktopSurface);
+  const mediaWorkspaceOpen = !desktopMode && mediaRouteActive;
+  const desktopVisualizerOpen = desktopMode && desktopSurface === "visualizer";
   const desktopContextualWorkspace = desktopMode && isDesktopContextualSurface(desktopSurface);
-  const activeWorkspaceLabel = desktopMode ? desktopWorkspaceLabel(desktopSurface) : "EchoSpeak";
+  const activeWorkspaceLabel = desktopMode
+    ? desktopSurface === "visualizer"
+      ? desktopVisualizerPanelLabel(visualizerPin || "ring")
+      : desktopWorkspaceLabel(desktopSurface)
+    : "EchoSpeak";
   const studioActiveTab = studioTabs.find((t) => t.id === leftTab);
+  const activeStudioGroup = studioGroups.find((group) =>
+    group.tabs.some((tab) => tab.id === leftTab)
+  ) || studioGroups[0];
+  const activeSettingsCatalogCategory: SettingsCatalogCategory | null = ({
+    settings: "models",
+    search_settings: "search_research",
+    services: "voice_speech",
+    connections: "connections",
+    mcp_settings: "mcp",
+    capabilities: "local_tools",
+    skills: "skills",
+  } as Partial<Record<DashboardTab, SettingsCatalogCategory>>)[leftTab] || null;
+  const activeChatTask = currentWorkRuns.find((run) =>
+    !["completed", "cancelled", "superseded", "quarantined"].includes(String(run.status || "").toLowerCase())
+  ) || null;
+  const activeChatRequirementStates = activeChatTask
+    ? Object.values(activeChatTask.requirement_statuses || {})
+    : [];
+  const activeChatSatisfied = activeChatRequirementStates.filter((status) => status === "satisfied").length;
   const studioNavRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     studioNavRef.current?.querySelector<HTMLElement>(`[data-studio-tab="${leftTab}"]`)?.scrollIntoView({
@@ -6550,27 +7884,27 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
       inline: "center",
     });
   }, [leftTab]);
-  const moveStudioTabFocus = (currentIndex: number, key: string) => {
-    let nextIndex = currentIndex;
-    if (key === "ArrowRight") nextIndex = (currentIndex + 1) % studioTabs.length;
-    else if (key === "ArrowLeft") nextIndex = (currentIndex - 1 + studioTabs.length) % studioTabs.length;
-    else if (key === "Home") nextIndex = 0;
-    else if (key === "End") nextIndex = studioTabs.length - 1;
-    else return false;
-    const next = studioTabs[nextIndex];
-    setLeftTab(next.id);
-    window.requestAnimationFrame(() => studioNavRef.current?.querySelector<HTMLElement>(`[data-studio-tab="${next.id}"]`)?.focus());
-    return true;
-  };
   const closeStudio = () => {
+    if (desktopSettingsWindow) {
+      void controlDesktopWindow("close");
+      return;
+    }
     setLeftTab("chat");
-    if (desktopMode) setDesktopSurface("chat");
+    if (desktopMode) setDesktopSettingsOpen(false);
     if (mediaRouteActive) navigate("/app");
     setShowVisualizer(true);
   };
+  useEffect(() => {
+    if (!desktopMode || !studioOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeStudio();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [desktopMode, studioOpen]);
 
   const shellColumns = desktopMode
-    ? [showSidebar ? (sidebarCollapsed || narrowLayout ? "56px" : "252px") : null, "minmax(0, 1fr)"].filter(Boolean).join(" ")
+    ? [showSidebar ? (sidebarCollapsed || narrowLayout ? "56px" : "288px") : null, "minmax(0, 1fr)"].filter(Boolean).join(" ")
     : runtimeGridColumns({
       sidebarVisible: showSidebar,
       sidebarCollapsed: sidebarCollapsed || narrowLayout,
@@ -6581,6 +7915,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
   return (
     <div
       className="echo-root"
+      data-execution-profile={desktopMode ? desktopExecutionProfile(desktopSurface, visualizerPin || "ring") : undefined}
       style={{
         width: "100%",
         height: "100%",
@@ -6623,7 +7958,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
           activeSessionId={activeThreadId}
           activeView={desktopMode
             ? (desktopSurface === "visualizer" ? "avatar" : desktopSurface)
-            : mediaRouteActive ? "media" : leftTab === "research" ? "research" : leftTab !== "chat" ? "studio" : visualizerPin === "coding" ? "code" : visualizerPin === "tasks" ? "tasks" : "avatar"}
+            : (showVisualizer && !narrowLayout ? "avatar" : "chat")}
           onToggleCollapsed={() => setSidebarCollapsed(v => !v)}
           onNewSession={createNewThread}
           onAddFolder={() => void attachFolder()}
@@ -6637,37 +7972,28 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
             if (activeProjectId === id) { setActiveProjectId(""); await refreshThreadState(activeThreadId); }
             await refreshProjects();
           }}
+          onSettings={() => {
+            setLeftTab("settings");
+            if (desktopMode && !desktopSettingsWindow) {
+              void openDesktopSettingsWindow().catch(() => setDesktopSettingsOpen(true));
+            } else {
+              setDesktopSettingsOpen(true);
+            }
+          }}
+          settingsOpen={studioOpen}
           onView={(view) => {
             if (desktopMode) {
               const surface = desktopWorkspaceForView(view as DesktopSidebarView);
               setDesktopSurface(surface);
-              if (surface === "media") {
-                navigate("/app/media");
-                return;
-              }
               if (mediaRouteActive) navigate("/app");
-              if (surface === "studio") {
-                setLeftTab("overview");
-                return;
-              }
-              setLeftTab(surface === "research" ? "research" : "chat");
-              const visualizerMode = desktopVisualizerMode(surface);
-              if (visualizerMode) setVisualizerPin(visualizerMode);
+              setLeftTab("chat");
+              if (surface === "visualizer" && !visualizerPin) setVisualizerPin("ring");
               return;
             }
-            if (view === "studio") {
-              if (mediaRouteActive) navigate("/app");
-              setLeftTab("overview");
-              return;
-            }
-            if (view === "media") {
-              navigate("/app/media");
-              return;
-            }
-            setLeftTab(view === "research" ? "research" : "chat");
             if (mediaRouteActive) navigate("/app");
-            setShowVisualizer(true);
-            setVisualizerPin(view === "code" ? "coding" : view === "tasks" ? "tasks" : view === "research" ? "research" : "ring");
+            setLeftTab("chat");
+            setShowVisualizer(view === "avatar");
+            if (view === "avatar") setVisualizerPin((current) => current || "ring");
           }}
         /> : null}
         {mediaWorkspaceOpen ? (
@@ -6681,289 +8007,23 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
         ) : null}
         {!mediaWorkspaceOpen && (desktopMode ? desktopVisualizerOpen : showVisualizer && !narrowLayout) ? (
           <div className="visualizer-pane">
-            {/* Mode Indicator Tabs */}
-            <div style={{
-              display: "none",
-              gap: 0,
-              padding: 0,
-              justifyContent: "center",
-              alignItems: "center",
-              background: "rgba(10, 12, 16, 0.85)",
-              borderRadius: "4px",
-              border: "1px solid rgba(255,255,255,0.12)",
-              boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
-              backdropFilter: "blur(20px)",
-              WebkitBackdropFilter: "blur(20px)",
-              margin: "12px auto 8px auto",
-              width: "fit-content",
-              zIndex: 10,
-              overflow: "hidden",
-            }}>
-              {(["ring", "research", "coding", "tasks"] as const).map((m) => {
-                const effectiveMode = visualizerPin || (agentMode === "research" ? "research" : agentMode === "coding" ? "coding" : "ring");
-                const isActive = effectiveMode === m;
-                const isPinned = visualizerPin === m;
-                const icons: Record<string, React.ReactNode> = {
-                  ring: (
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="3" y="3" width="18" height="18" rx="3" />
-                      <circle cx="9" cy="10" r="1.5" fill="currentColor" stroke="none" />
-                      <circle cx="15" cy="10" r="1.5" fill="currentColor" stroke="none" />
-                      <path d="M9 15c0 0 1 1.5 3 1.5s3-1.5 3-1.5" />
-                    </svg>
-                  ),
-                  research: (
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                      <circle cx="11" cy="11" r="7" />
-                      <path d="M21 21l-4.35-4.35" />
-                    </svg>
-                  ),
-                  coding: (
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                      <polyline points="16 18 22 12 16 6" />
-                      <polyline points="8 6 2 12 8 18" />
-                    </svg>
-                  ),
-                  tasks: (
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                      <polyline points="9 11 12 14 22 4" />
-                      <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
-                    </svg>
-                  ),
-                };
-                const labels: Record<string, string> = {
-                  ring: "Avatar",
-                  research: "Research",
-                  coding: "Code",
-                  tasks: "Tasks",
-                };
-                return (
-                  <button
-                    key={m}
-                    onClick={() => setVisualizerPin(isPinned ? null : m)}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "7px",
-                      padding: "13px 20px",
-                      borderRadius: "0px",
-                      fontSize: 13,
-                      fontWeight: 600,
-                      cursor: "pointer",
-                      border: "none",
-                      borderRight: m === "tasks" ? "none" : "1px solid rgba(255,255,255,0.08)",
-                      background: isActive
-                        ? "linear-gradient(180deg, rgba(255,255,255,0.13) 0%, rgba(255,255,255,0.03) 100%)"
-                        : "transparent",
-                      color: isActive ? "#ffffff" : "rgba(255,255,255,0.4)",
-                      transition: "all 0.2s ease-in-out",
-                      boxShadow: isActive ? "inset 0 -2px 0 rgba(140,180,255,0.85)" : "none",
-                      textDecoration: "none",
-                      letterSpacing: "0.01em",
-                    }}
-                  >
-                    <span style={{ opacity: isActive ? 1 : 0.65, display: "flex" }}>
-                      {icons[m]}
-                    </span>
-                    <span style={{ textShadow: isActive ? "0 0 10px rgba(255,255,255,0.35)" : "none" }}>
-                      {labels[m]}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-            {/* Visualizer Content — workspace modes fill the cell; avatar stays centered */}
-            {(() => {
-              const effectiveMode = visualizerPin || (agentMode === "research" ? "research" : agentMode === "coding" ? "coding" : "ring");
-              const isAvatar = effectiveMode === "ring";
-              return (
-                <div className={`visualizer-pane-body ${isAvatar ? "is-avatar" : "is-workspace"}`}>
-                  {(() => {
-                    if (effectiveMode === "research") {
-                      return (
-                        <div style={{ width: "100%", height: "100%", minHeight: 0, minWidth: 0, padding: "12px 16px 16px", overflowY: "auto", overflowX: "hidden", display: "flex", flexDirection: "column", gap: 12, boxSizing: "border-box" }}>
-                          <div style={{ fontSize: 13, fontWeight: 700, color: "rgba(255,255,255,0.5)", textTransform: "uppercase", letterSpacing: 1.5, padding: "8px 0" }}>
-                            Research Feed
-                          </div>
-                          {researchArtifactsError ? (
-                            <div style={{ border: "1px solid rgba(248,113,113,.35)", padding: 12, color: "#fca5a5", fontSize: 11 }}>{researchArtifactsError}</div>
-                          ) : null}
-                          {researchArtifacts.slice(0, 6).map((artifact) => (
-                            <details key={artifact.id} style={{ background: "rgba(255,255,255,.03)", border: "1px solid rgba(255,255,255,.09)", padding: 14 }}>
-                              <summary style={{ cursor: "pointer", fontSize: 12, fontWeight: 650 }}>
-                                {artifact.objective || artifact.query || "Research artifact"} · {artifact.status}
-                              </summary>
-                              {artifact.summary ? <div style={{ fontSize: 11, color: "rgba(255,255,255,.62)", lineHeight: 1.5, marginTop: 10 }}>{artifact.summary}</div> : null}
-                              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(110px,1fr))", gap: 6, marginTop: 10 }}>
-                                {[['Claims', artifact.claims?.length || 0], ['Sources', artifact.sources?.length || 0], ['Evidence', artifact.evidence?.length || 0], ['Gaps', artifact.coverage_gaps?.length || 0]].map(([label, value]) => (
-                                  <div key={String(label)} style={{ background: "rgba(255,255,255,.035)", padding: 7, fontSize: 10 }}>{label}: <strong>{value}</strong></div>
-                                ))}
-                              </div>
-                              {(artifact.claims || []).slice(0, 6).map((claim: any) => (
-                                <div key={claim.id} style={{ borderLeft: "2px solid rgba(255,255,255,.22)", paddingLeft: 9, marginTop: 9, fontSize: 11 }}>
-                                  {claim.text} <span style={{ color: "rgba(255,255,255,.4)" }}>· {claim.status} · {Math.round(Number(claim.confidence || 0) * 100)}%</span>
-                                </div>
-                              ))}
-                              {(artifact.contradictions || []).length ? <div style={{ color: "#fbbf24", fontSize: 10, marginTop: 9 }}>{artifact.contradictions.length} contradiction(s) retained for review.</div> : null}
-                            </details>
-                          ))}
-                          {researchArtifacts.length === 0 && research.length === 0 ? (
-                            <div style={{ textAlign: "center", color: "rgba(255,255,255,0.25)", fontSize: 13, padding: 40, fontStyle: "italic" }}>
-                              Research results will appear here when the agent searches the web...
-                            </div>
-                          ) : research.length ? (
-                            research.slice(0, 8).map((group, gi) => (
-                              <motion.div
-                                key={group.id}
-                                initial={{ opacity: 0, y: 20 }}
-                                animate={{ opacity: 1, y: 0 }}
-                                transition={{ duration: 0.35, delay: gi * 0.05 }}
-                                style={{
-                                  background: "rgba(255,255,255,0.03)",
-                                  border: "1px solid rgba(255,255,255,0.08)",
-                                  borderRadius: 14,
-                                  padding: 16,
-                                }}
-                              >
-                                <div style={{ fontSize: 12, fontWeight: 600, color: "rgba(139,92,246,0.9)", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
-                                  <span style={{ fontSize: 14 }}>🔎</span>
-                                  <span style={{ fontStyle: "italic" }}>
-                                    "{group.query}"
-                                  </span>
-                                </div>
-                                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                                  {group.evidence.slice(0, 5).map((r, ri) => (
-                                    <motion.div
-                                      key={r.id || ri}
-                                      initial={{ opacity: 0, x: -10 }}
-                                      animate={{ opacity: 1, x: 0 }}
-                                      transition={{ duration: 0.25, delay: ri * 0.08 }}
-                                      style={{
-                                        display: "flex",
-                                        flexDirection: "column",
-                                        gap: 3,
-                                        padding: "8px 12px",
-                                        borderRadius: 10,
-                                        background: "rgba(255,255,255,0.02)",
-                                        borderLeft: "3px solid rgba(139,92,246,0.4)",
-                                      }}
-                                    >
-                                      <div style={{ fontSize: 12, fontWeight: 600, color: "rgba(96,165,250,0.9)" }}>
-                                        {r.title || r.url}
-                                      </div>
-                                      <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                                        {r.url}
-                                      </div>
-                                      {(r.summary || r.snippet) && (
-                                        <div style={{ fontSize: 11, color: "rgba(255,255,255,0.5)", lineHeight: 1.4 }}>
-                                          {(r.summary || r.snippet).slice(0, 150)}{(r.summary || r.snippet).length > 150 ? "…" : ""}
-                                        </div>
-                                      )}
-                                    </motion.div>
-                                  ))}
-                                </div>
-                              </motion.div>
-                            ))
-                          ) : null}
-                        </div>
-                      );
-                    }
-                    if (effectiveMode === "coding") {
-                      return (
-                        <div style={{ flex: 1, width: "100%", height: "100%", minHeight: 0, minWidth: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-                          <CodeWorkspace
-                            apiBase={apiBase}
-                            threadId={activeThreadId || "default"}
-                            liveTerminal={liveTerminal}
-                            liveChanges={liveFileChanges}
-                            codeSessions={codeSessions}
-                            pendingConfirmPath={
-                              pendingApproval?.has_pending && pendingApproval?.action?.tool === "file_write"
-                                ? String(pendingApproval?.action?.kwargs?.path || "")
-                                : undefined
-                            }
-                            onConfirmSave={() => {
-                              const approvalId = String(pendingApproval?.approval_id || "");
-                              if (approvalId) void decideApproval(approvalId, "confirm");
-                            }}
-                            onCancelSave={() => {
-                              const approvalId = String(pendingApproval?.approval_id || "");
-                              if (approvalId) void decideApproval(approvalId, "cancel");
-                            }}
-                            refreshToken={codeRefreshToken}
-                          />
-                        </div>
-                      );
-                    }
-                    if (effectiveMode === "tasks") {
-                      return (
-                        <div style={{ flex: 1, width: "100%", height: "100%", minHeight: 0, minWidth: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-                          <TodoPanel
-                            apiBase={apiBase}
-                            projectId={activeProjectId}
-                            sessionId={activeThreadId}
-                            colors={colors}
-                            variant="visualizer"
-                          />
-                        </div>
-                      );
-                    }
-                    // Avatar phase is driven by the same agentActivity reducer as chat.
-                    const phase = agentActivity.phase;
-                    const isThinking =
-                      !listening &&
-                      !speaking &&
-                      (phase === "thinking" ||
-                        phase === "streaming_reply" ||
-                        phase === "task_running" ||
-                        phase.startsWith("tool_"));
-                    const currentToolCategory = (
-                      agentActivity.activeToolName
-                        ? getToolCategory(agentActivity.activeToolName)
-                        : toolCategoryFromPhase(phase)
-                    ) as ToolCategory;
-                    const activeToolName = agentActivity.activeToolName || undefined;
-                    const thinkingText =
-                      phase === "awaiting_confirm"
-                        ? "Awaiting confirmation"
-                        : phase === "error"
-                          ? agentActivity.lastError || "Error"
-                          : phase === "tool_search"
-                            ? "Searching"
-                            : phase === "streaming_reply"
-                              ? "Writing"
-                              : agentActivity.activeToolName
-                                ? getToolDisplayDetails(agentActivity.activeToolName, "")
-                                : agentActivity.label;
-                    const pendingConfirm =
-                      agentActivity.pendingConfirmation || Boolean(pendingApproval?.has_pending);
-                    return (
-                      <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", transformOrigin: "center center" }}>
-                        <SquareAvatarVisual
-                          speaking={speaking}
-                          backendOnline={backendOnline}
-                          isThinking={isThinking}
-                          thinkingText={thinkingText}
-                          activeToolName={activeToolName}
-                          heartbeatEnabled={settingsDraft?.heartbeat_enabled}
-                          toolCategory={currentToolCategory}
-                          userIsTyping={userIsTyping}
-                          pendingConfirmation={pendingConfirm}
-                          reaction={echoReaction}
-                          onReactionDone={() => setEchoReaction(null)}
-                          spotifyPlaying={spotifyPlaying?.is_playing ? spotifyPlaying : null}
-                          avatarConfig={avatarConfig}
-                        />
-                      </div>
-                    );
-                  })()}
-                </div>
-              );
-            })()}
+            <VisualizerWorkspace
+              apiBase={apiBase}
+              sessionId={activeThreadId || ""}
+              projectId={activeProjectId || ""}
+              activity={agentActivity}
+            />
           </div>
         ) : null}
         {desktopMode && studioOpen ? (
-          <div className="desktop-studio-host" ref={setDesktopStudioHost} data-testid="desktop-studio-host" />
+          <div
+            className="desktop-studio-host"
+            ref={setDesktopStudioHost}
+            data-testid="desktop-studio-host"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) closeStudio();
+            }}
+          />
         ) : null}
         <div className={`glow-panel${desktopContextualWorkspace ? " desktop-contextual-workspace" : desktopMode ? " desktop-chat-workspace" : ""}`}>
           <div className="panel-header">
@@ -6987,8 +8047,13 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                   }
                   setShowVisualizer(true);
                   setLeftTab("overview");
+                  if (desktopMode && !desktopSettingsWindow) {
+                    void openDesktopSettingsWindow().catch(() => setDesktopSettingsOpen(true));
+                  } else if (desktopMode) {
+                    setDesktopSettingsOpen(true);
+                  }
                 }}
-                title={studioOpen ? "Close Studio" : "Open Studio"}
+                title={studioOpen ? "Close Settings" : "Open Settings"}
                 style={{
                   display: "none",
                   height: 32,
@@ -7000,7 +8065,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                   border: `1px solid ${studioOpen ? "rgba(140,180,255,0.38)" : colors.line}`,
                 }}
               >
-                Studio
+                Settings
               </button>
               <div
                 className={`switcher-dot ${backendOnline ? "online" : "offline"}`}
@@ -7200,6 +8265,25 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
               {true && (
                 <>
                   <div key={activeThreadId || "quick-chat"} className="chat-scroll" style={{ flex: 1 }} ref={chatScrollRef} onScroll={onChatScroll}>
+                    {activeChatTask ? (
+                      <section style={{ margin: "4px 4px 12px", padding: "11px 13px", border: "1px solid rgba(255,255,255,.1)", background: "linear-gradient(115deg,rgba(255,255,255,.045),rgba(255,255,255,.012))", borderRadius: 5, display: "flex", alignItems: "center", gap: 12 }} aria-label="Current work">
+                        <div style={{ minWidth: 0, flex: 1 }}>
+                          <div style={{ color: "rgba(255,255,255,.38)", font: "600 8px ui-monospace,monospace", letterSpacing: ".12em", textTransform: "uppercase" }}>Current work · {String(activeChatTask.status || "running").replace(/_/g, " ")}</div>
+                          <div style={{ marginTop: 5, color: "rgba(255,255,255,.86)", fontSize: 11.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{activeChatTask.objective}</div>
+                          <div style={{ marginTop: 4, color: "rgba(255,255,255,.36)", fontSize: 9.5 }}>{activeChatSatisfied}/{activeChatRequirementStates.length || 1} requirements satisfied</div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDesktopSurface("visualizer");
+                            setShowVisualizer(true);
+                          }}
+                          style={{ flex: "0 0 auto", border: "1px solid rgba(255,255,255,.15)", background: "#111", color: "#fff", borderRadius: 3, minHeight: 30, padding: "0 10px", cursor: "pointer", fontSize: 9.5 }}
+                        >
+                          Open in Visualizer
+                        </button>
+                      </section>
+                    ) : null}
                     <AnimatePresence initial={false}>
                       {timeline.map((t) =>
                         t.kind === "message" ? (
@@ -7221,7 +8305,12 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                             }}
                           />
                         ) : (
-                          <ActivityCard key={`act-${t.id}`} item={t.item} />
+                          <ActivityCard
+                            key={`act-${t.id}`}
+                            item={t.item}
+                            // Step list uses static marks when the hero strip owns the Echo spinner.
+                            primarySpinner={!streaming}
+                          />
                         )
                       )}
                     </AnimatePresence>
@@ -7277,29 +8366,47 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                         </div>
                       </div>
                     ) : null}
-                    {/* Footer spinner only if timeline has no running step yet (avoids double spinners). */}
-                    {streaming &&
-                    !liveReplyDraft &&
-                    !activities.some(
-                      (a) => a.kind === "thinking" && (a.steps || []).some((s) => s.status === "running")
-                    ) ? (
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 8,
-                          padding: "6px 4px 10px",
-                          fontSize: 12,
-                          color: "rgba(255,255,255,0.45)",
-                          fontFamily: "'JetBrains Mono', ui-monospace, monospace",
-                          letterSpacing: "0.04em",
+                    {/* Single Echo activity strip for the active Session stream only. */}
+                    {streaming ? (
+                      <LiveChatActivityBar
+                        activity={agentActivity}
+                        showSpinner
+                        onStop={() => {
+                          stopTts();
+                          setVoicePhase("idle");
+                          setVoiceNotice("Stopped by Ty.");
+                          cancelSessionTurn(activeThreadId, true);
                         }}
-                      >
-                        <SquareLoader size={11} color="rgba(255,255,255,0.85)" />
-                        <span>{(agentActivity.label || "Working").toLowerCase()}</span>
-                      </div>
+                        onSteer={activeTaskRunIdsRef.current.get(activeThreadId) ? () => setShowSteerModal(true) : undefined}
+                        onQueue={() => void queueFollowUp()}
+                        status={buildLiveOperationalStatus({
+                          phase: agentActivity.phase,
+                          streaming: true,
+                          label: agentActivity.label,
+                          activeToolName: agentActivity.activeToolName,
+                          thinkingText: agentActivity.thinkingText,
+                          taskDescription: (() => {
+                            const plan =
+                              taskPlans.find((entry) => entry.plan.active) ||
+                              [...taskPlans].reverse().find((entry) => entry.plan.tasks.length);
+                            const step =
+                              plan?.plan.tasks.find((t) =>
+                                ["running", "retrying", "awaiting_confirmation"].includes(t.status)
+                              ) || plan?.plan.tasks.find((t) => t.status === "pending");
+                            return step?.description || "";
+                          })(),
+                          searchHint: (() => {
+                            const thinking = [...activities]
+                              .reverse()
+                              .find((a) => a.kind === "thinking") as Extract<ActivityItem, { kind: "thinking" }> | undefined;
+                            const searchStep = [...(thinking?.steps || [])]
+                              .reverse()
+                              .find((s) => s.type === "search" && s.status === "running");
+                            return searchStep?.content || "";
+                          })(),
+                        })}
+                      />
                     ) : null}
-                    <div ref={chatBottomRef} style={{ height: 1 }} />
                   </div>
                   <div className="input-bar">
                     {/* Row 1: session strip stacked on input (same column width) + context + send */}
@@ -7376,6 +8483,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           className="input-field"
                           value={input}
                           rows={1}
+                          disabled={!activeThreadId}
                           onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => {
                             updateComposerInput(e.target.value);
                           }}
@@ -7385,7 +8493,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                               void sendText();
                             }
                           }}
-                          placeholder="Ask Echo anything..."
+                          placeholder={activeThreadId ? "Ask Echo anything..." : "Create a Session with + to chat"}
                           aria-label="Ask Echo anything"
                         />
                       </div>
@@ -7395,7 +8503,7 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           className="send-button"
                           onClick={() => void sendText()}
                           type="button"
-                          disabled={!input.trim()}
+                          disabled={!activeThreadId || !input.trim()}
                           title="Send"
                           aria-label="Send message"
                         >
@@ -7407,23 +8515,42 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                     </div>
                     {/* Row 2: mic mon viz | Provider | Model */}
                     <div className="controls-row">
-                      <div className="composer-tools-slot" role="group" aria-label="Input tools">
+                      <div className="composer-primary-controls">
+                        <div className="composer-tools-slot" role="group" aria-label="Input tools">
                         <button
                           className={`mic-button ${listening ? "active" : ""}`}
                           type="button"
                           title={listening ? "Stop microphone" : "Start microphone"}
                           aria-label={listening ? "Stop microphone" : "Start microphone"}
-                          onClick={() =>
-                            listening
-                              ? (stop(), setListening(false), setStreaming(false))
-                              : start()
-                          }
+                          disabled={voicePhase === "transcribing" || voicePhase === "requesting_permission"}
+                          onClick={() => listening ? void stop() : void start()}
                         >
                           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden>
                             <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" fill="currentColor" />
                             <path d="M19 10v2a7 7 0 0 1-14 0v-2" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
                           </svg>
                         </button>
+                        {(voicePhase !== "idle" || voiceNotice) ? (
+                          <span
+                            className="voice-transport-status"
+                            data-state={voicePhase}
+                            title={voiceNotice || voicePhase}
+                            aria-live="polite"
+                          >
+                            <i style={{ transform: `scale(${1 + voiceInputLevel * 0.55})` }} />
+                            {voicePhase === "requesting_permission"
+                              ? "Mic access"
+                              : voicePhase === "listening"
+                              ? "Listening"
+                              : voicePhase === "transcribing"
+                              ? "Local transcript"
+                              : voicePhase === "speaking"
+                              ? "Speaking"
+                              : voicePhase === "error"
+                              ? "Voice setup"
+                              : voiceNotice || "Voice ready"}
+                          </span>
+                        ) : null}
                         <button
                           className={`composer-square ${monitoring ? "active" : ""}`}
                           type="button"
@@ -7483,8 +8610,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                             </svg>
                           )}
                         </button>
-                      </div>
-                      <div className="control-slot provider-slot" data-label="Provider">
+                        </div>
+                        <div className="control-slot provider-slot" data-label="Provider">
                         <div className="inline-switcher">
                           <select
                             className="provider-picker"
@@ -7515,8 +8642,8 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                               ))}
                           </select>
                         </div>
-                      </div>
-                      <div className="control-slot model-slot" data-label="Model">
+                        </div>
+                        <div className="control-slot model-slot" data-label="Model">
                         <select
                           className="model-picker"
                           value={modelPickerValue}
@@ -7534,14 +8661,150 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                             </option>
                           ))}
                         </select>
+                        </div>
+                        <div className="control-slot effort-slot" data-label="Effort">
+                        <select
+                          className="model-picker"
+                          value={reasoningEffort}
+                          onChange={(e: any) => setReasoningEffort(e.target.value)}
+                          title="Reasoning effort"
+                          aria-label="Reasoning effort"
+                        >
+                          <option value="minimal">Minimal</option>
+                          <option value="low">Low</option>
+                          <option value="medium">Medium</option>
+                          <option value="high">High</option>
+                          <option value="extra_high">Extra High</option>
+                          <option value="max">Max</option>
+                          <option value="ultra">Ultra</option>
+                        </select>
+                      </div>
+                      </div>
+                      <div className="composer-mode-controls" role="group" aria-label="Thinking and voice controls">
+                      <button
+                        className={`composer-mode-button ${thinkingEnabled ? "active" : ""}`}
+                        type="button"
+                        title={thinkingEnabled ? "Thinking enabled" : "Thinking disabled"}
+                        aria-label={thinkingEnabled ? "Disable thinking" : "Enable thinking"}
+                        onClick={() => setThinkingEnabled(!thinkingEnabled)}
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/><circle cx="12" cy="12" r="3"/></svg>
+                        <span className="composer-mode-label">Think</span>
+                      </button>
+                      <button
+                        className={`composer-mode-button ${voiceReadAloud ? "active" : ""}`}
+                        type="button"
+                        title={voiceReadAloud ? "Read replies aloud ON" : "Read replies aloud OFF"}
+                        aria-label="Read replies aloud"
+                        onClick={() => {
+                          const enabled = !voiceReadAloud;
+                          setVoiceReadAloud(enabled);
+                          if (!enabled) stopTts();
+                        }}
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M4 10h3l4-3v10l-4-3H4zM15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12"/></svg>
+                        <span className="composer-mode-label">Read</span>
+                      </button>
+                      <button
+                        className={`composer-mode-button ${voiceConversationMode ? "active" : ""}`}
+                        type="button"
+                        title={voiceConversationMode ? "Voice conversation mode ON" : "Voice mode OFF"}
+                        aria-label="Voice conversation mode"
+                        onClick={() => {
+                          const enabled = !voiceConversationMode;
+                          setVoiceConversationMode(enabled);
+                          if (enabled && !streaming && !listening && voicePhase !== "transcribing") void start();
+                          if (!enabled) {
+                            void voiceInputRef.current?.stop(false);
+                            setListening(false);
+                            stopTts();
+                            setVoicePhase("idle");
+                            setVoiceNotice("");
+                          }
+                        }}
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M5 10v4M9 7v10M13 4v16M17 7v10M21 10v4"/></svg>
+                        <span className="composer-mode-label">Voice</span>
+                      </button>
+                      <button
+                        className={`composer-mode-button ${wakeWordEnabled ? "active" : ""}`}
+                        type="button"
+                        title="Wake word is not active yet. It follows the local Voice foundation in Phase 6."
+                        aria-label="Wake word unavailable"
+                        disabled
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden><circle cx="12" cy="12" r="3"/><path d="M12 2a10 10 0 0 1 10 10M12 22A10 10 0 0 1 2 12M5 5a10 10 0 0 1 14 14"/></svg>
+                        <span className="composer-mode-label">Wake</span>
+                      </button>
                       </div>
                     </div>
                   </div>
                 </>
               )}
 
+              {showSteerModal && (
+                <div className="steer-backdrop" role="presentation">
+                  <div className="steer-dialog" role="dialog" aria-modal="true" aria-labelledby="steer-dialog-title">
+                    <div className="steer-dialog-copy">
+                      <span>Active run</span>
+                      <h3 id="steer-dialog-title">Guide Echo</h3>
+                    </div>
+                    <p>
+                      Add a direction for Echo to use at the next safe boundary. Completed work stays intact.
+                    </p>
+                    <textarea
+                      className="steer-input"
+                      value={steerInput}
+                      onChange={(e) => setSteerInput(e.target.value)}
+                      placeholder="For example: focus on the Python files first"
+                      rows={3}
+                    />
+                    <div className="steer-dialog-actions">
+                      <button
+                        className="steer-button"
+                        type="button"
+                        onClick={() => { setShowSteerModal(false); setSteerInput(""); }}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        className="steer-button is-primary"
+                        type="button"
+                        disabled={!steerInput.trim() || steerSubmitting}
+                        onClick={async () => {
+                          if (!steerInput.trim() || !activeThreadId) return;
+                          setSteerSubmitting(true);
+                          try {
+                            const res = await fetch(`${apiBase}/query/steer`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({
+                                thread_id: activeThreadId,
+                                instruction: steerInput.trim(),
+                                task_run_id: activeTaskRunIdsRef.current.get(activeThreadId) || "",
+                                client_request_id: activeRequestIdsRef.current.get(activeThreadId) || "",
+                              }),
+                            });
+                            if (res.ok) {
+                              dispatchActivity({ type: "steer", instruction: steerInput.trim() });
+                              setShowSteerModal(false);
+                              setSteerInput("");
+                            }
+                          } finally {
+                            setSteerSubmitting(false);
+                          }
+                        }}
+                      >
+                        {steerSubmitting ? "Applying…" : "Apply direction"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {studioOpen && (!desktopMode || desktopStudioHost) && createPortal(
-                <motion.div
+                <div className="studio-backdrop">
+                  <motion.div
                   className="studio-shell"
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
@@ -7549,24 +8812,16 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                   transition={{ duration: 0.2 }}
                   role="dialog"
                   aria-modal="true"
-                  aria-label="EchoSpeak Studio"
+                  aria-label="EchoSpeak Settings"
                 >
                   <div className="studio-top">
-                    <div className="studio-brand">
-                      <div className="studio-brand-mark">
-                        <img src="/logo.png" alt="" />
-                      </div>
-                      <div>
-                        <div className="studio-title">EchoSpeak Studio</div>
-                        <div className="studio-sub">your machine · your rules</div>
-                      </div>
-                    </div>
+                    <div className="studio-title">Settings</div>
                     <button
                       type="button"
                       className="studio-x"
                       onClick={closeStudio}
-                      title="Close Studio"
-                      aria-label="Close Studio"
+                      title="Close Settings"
+                      aria-label="Close Settings"
                     >
                       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
                         <path d="M18 6L6 18M6 6l12 12" />
@@ -7574,100 +8829,294 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                     </button>
                   </div>
 
-                  <div className="studio-nav">
-                    <button type="button" className="studio-nav-arrow" aria-label="Scroll Studio tabs left" onClick={() => studioNavRef.current?.scrollBy({ left: -280, behavior: "smooth" })}>‹</button>
-                    <div className="studio-nav-inner" ref={studioNavRef} role="tablist" aria-label="Studio sections">
-                      {studioTabs.map((tab, tabIndex) => (
+                  <div className="studio-nav" data-testid="studio-nav">
+                    <div className="studio-nav-inner" ref={studioNavRef} role="tablist" aria-label="Settings sections">
+                      {studioGroups.map((group) => {
+                        const active = group.label === activeStudioGroup.label;
+                        return (
+                        <button
+                          key={group.label}
+                          type="button"
+                          className={"studio-tab" + (active ? " active" : "")}
+                          onClick={() => group.tabs[0] && setLeftTab(group.tabs[0].id)}
+                          role="tab"
+                          aria-selected={active}
+                          tabIndex={active ? 0 : -1}
+                          title={group.label}
+                        >
+                          <span className="studio-tab-icon" aria-hidden><SettingsGroupIcon name={group.label} /></span>
+                          {group.label}
+                        </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="studio-subnav" role="tablist" aria-label={`${activeStudioGroup.label} settings`}>
+                      {activeStudioGroup.tabs.map((tab) => (
                         <button
                           key={tab.id}
                           type="button"
                           className={"studio-tab" + (leftTab === tab.id ? " active" : "")}
                           onClick={() => setLeftTab(tab.id)}
-                          onKeyDown={(event) => {
-                            if (moveStudioTabFocus(tabIndex, event.key)) event.preventDefault();
-                          }}
                           role="tab"
                           aria-selected={leftTab === tab.id}
-                          tabIndex={leftTab === tab.id ? 0 : -1}
                           data-studio-tab={tab.id}
-                          title={tab.group}
                         >
                           {tab.label}
                         </button>
                       ))}
-                    </div>
                   </div>
-
-
 
                   <div className="studio-body">
                     <div className="studio-column">
                       <div className="studio-hero">
-                        <h2>{studioActiveTab?.label || "Studio"}</h2>
-                        <span>{studioActiveTab?.group || "workspace"}</span>
+                        <h2>{studioActiveTab?.label || "Settings"}</h2>
+                        <span>{studioActiveTab?.group || "Settings"}</span>
                       </div>
                       <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column", width: "100%" }}>
 
-              {/* Studio Overview */}
+              {/* Settings Overview */}
+              {activeSettingsCatalogCategory ? (
+                <SettingsCatalog
+                  category={activeSettingsCatalogCategory}
+                  cards={settingsCatalog}
+                  loading={settingsCatalogLoading}
+                  error={settingsCatalogError || (activeSettingsCatalogCategory === "connections" ? connectionError : "")}
+                  onRefresh={() => void (
+                    activeSettingsCatalogCategory === "connections"
+                      ? Promise.all([refreshConnections(), refreshSettingsCatalog()])
+                      : refreshSettingsCatalog()
+                  )}
+                  onAction={handleSettingsCatalogAction}
+                  onCapabilityAction={activeSettingsCatalogCategory === "connections" ? (card, capability) => {
+                    const providerId = card.id.replace(/^connection:/, "");
+                    const provider = connectionCatalog.find((item: any) => String(item.id || "") === providerId);
+                    const connection = provider?.connection;
+                    const source = (connection?.capabilities || []).find((item: any) => String(item.id || "") === capability.id);
+                    if (connection && source) void toggleConnectionCapability(connection, source);
+                  } : undefined}
+                  capabilityActionDisabled={activeSettingsCatalogCategory === "connections" ? (card, capability) => {
+                    const providerId = card.id.replace(/^connection:/, "");
+                    const provider = connectionCatalog.find((item: any) => String(item.id || "") === providerId);
+                    const connection = provider?.connection;
+                    const source = (connection?.capabilities || []).find((item: any) => String(item.id || "") === capability.id);
+                    return !activeProjectId || !connection || !source || connectionBusyId === String(connection.id || providerId);
+                  } : undefined}
+                  detailAddon={activeSettingsCatalogCategory === "models" ? (card) => {
+                    const providerId = card.id.replace(/^model:/, "");
+                    const defaultModel = card.selected ? String(providerInfo?.model || "") : "";
+                    const modelValue = catalogModelDrafts[providerId] ?? defaultModel;
+                    const unchanged = card.selected && modelValue === String(providerInfo?.model || "");
+                    return (
+                      <div className="settings-model-control">
+                        <label htmlFor={`settings-model-${providerId}`}>Exact model for this Session</label>
+                        <div>
+                          <input
+                            id={`settings-model-${providerId}`}
+                            type="text"
+                            value={modelValue}
+                            placeholder="Enter the exact model name"
+                            onChange={(event) => setCatalogModelDrafts((current) => ({
+                              ...current,
+                              [providerId]: event.target.value,
+                            }))}
+                          />
+                          <button
+                            type="button"
+                            className="settings-catalog-button"
+                            disabled={!modelValue.trim() || unchanged || switchingProvider || lmStudioOnly}
+                            onClick={() => void applyProviderSwitch({
+                              provider: providerId,
+                              model: modelValue.trim(),
+                              base_url: String(providerDraft.base_url || ""),
+                            }).then(() => void refreshSettingsCatalog())}
+                          >
+                            {switchingProvider ? "Applying..." : card.selected ? "Update Session" : "Use for this Session"}
+                          </button>
+                        </div>
+                        {providerError ? <small>{providerError}</small> : null}
+                      </div>
+                    );
+                  } : activeSettingsCatalogCategory === "voice_speech" ? (card) => {
+                    const providerId = card.id.replace(/^voice:/, "");
+                    const inputCapability = card.capabilities.find((capability) => capability.id === "voice.speech_to_text");
+                    const outputCapability = card.capabilities.find((capability) => capability.id === "voice.text_to_speech");
+                    const supportsInput = Boolean(inputCapability);
+                    const supportsOutput = Boolean(outputCapability);
+                    const isCloud = card.locality === "cloud";
+                    return (
+                      <div className="settings-model-control settings-voice-control">
+                        <label>{isCloud ? "Cloud audio permission" : "Use this local provider"}</label>
+                        <div>
+                          {isCloud ? (
+                            <button
+                              type="button"
+                              className={`settings-catalog-button${card.selected ? " is-quiet" : ""}`}
+                              disabled={!card.connected || settingsSaving}
+                              onClick={() => void setCloudVoiceOptIn(providerId, !card.selected)}
+                            >
+                              {card.selected ? "Keep audio on device" : "Opt in to cloud audio"}
+                            </button>
+                          ) : supportsInput ? (
+                            <button
+                              type="button"
+                              className="settings-catalog-button"
+                              disabled={!inputCapability?.available || card.locality !== "local" || settingsSaving}
+                              onClick={() => void selectLocalVoiceProvider("speech_to_text", providerId)}
+                            >
+                              Use for dictation
+                            </button>
+                          ) : null}
+                          {!isCloud && supportsOutput ? (
+                            <button
+                              type="button"
+                              className="settings-catalog-button is-quiet"
+                              disabled={!outputCapability?.available || card.locality !== "local" || settingsSaving}
+                              onClick={() => void selectLocalVoiceProvider("text_to_speech", providerId)}
+                            >
+                              Use for playback
+                            </button>
+                          ) : null}
+                        </div>
+                        <small>
+                          {isCloud
+                            ? card.connected
+                              ? "Opt-in records your data-path choice. Upload and usage-based execution remain disabled until this provider's governed adapter and approval boundary are ready."
+                              : "Connect this provider in Advanced first. Echo will never upload microphone audio because credentials merely exist."
+                            : "Microphone permission is requested only when you press the mic button. Local recordings are transcribed in memory and raw audio is not retained."}
+                        </small>
+                      </div>
+                    );
+                  } : activeSettingsCatalogCategory === "connections" ? (card) => {
+                    const providerId = card.id.replace(/^connection:/, "");
+                    const provider = connectionCatalog.find((item: any) => String(item.id || "") === providerId);
+                    const connection = provider?.connection;
+                    const busy = connectionBusyId === String(connection?.id || providerId);
+                    const reconnectRequired = card.status === "reconnect_required" || connection?.authentication === "expired";
+                    return (
+                      <div className="settings-connection-control">
+                        {!activeProjectId ? (
+                          <small>Select a Project to connect or manage this capability. Opening Settings never creates a Project or Session.</small>
+                        ) : connection ? (
+                          <>
+                            <div className="settings-connection-actions">
+                              <button
+                                type="button"
+                                className="settings-catalog-button"
+                                disabled={busy}
+                                onClick={() => void runConnectionAction(provider, reconnectRequired ? "reconnect" : "probe")}
+                              >
+                                {reconnectRequired ? "Reconnect" : "Check connection"}
+                              </button>
+                              <button
+                                type="button"
+                                className="settings-catalog-button is-quiet"
+                                disabled={busy}
+                                onClick={() => void runConnectionAction(provider, connection.enabled ? "disable" : "reconnect")}
+                              >
+                                {connection.enabled ? "Disable" : "Enable"}
+                              </button>
+                              <button
+                                type="button"
+                                className="settings-catalog-button is-quiet"
+                                disabled={busy}
+                                onClick={() => {
+                                  if (window.confirm(`Disconnect ${card.name}? Echo will lose these capabilities.`)) {
+                                    void runConnectionAction(provider, "disconnect");
+                                  }
+                                }}
+                              >
+                                Disconnect
+                              </button>
+                            </div>
+                          </>
+                        ) : (
+                          <small>Connect this provider to choose its Project-scoped capabilities. Unsupported OAuth adapters remain unavailable rather than creating a placeholder connection.</small>
+                        )}
+                      </div>
+                    );
+                  } : undefined}
+                />
+              ) : null}
+
               {leftTab === "overview" && (
                 <div className="research-scroll">
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 12 }}>
-                    <div style={{ color: colors.textDim, fontSize: 12 }}>
-                      Canonical operational state for this Session and its attached Project.
-                    </div>
-                    <button className="icon-button" type="button" onClick={refreshStudioOverview} disabled={studioOverviewLoading}>
-                      {studioOverviewLoading ? "Refreshing…" : "Refresh"}
-                    </button>
-                  </div>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 14 }}>
-                    {[
-                      ["Active tasks", (studioOverview?.tasks || []).filter((item: any) => !["complete", "done", "cancelled"].includes(item.status)).length],
-                      ["Enabled routines", (studioOverview?.routines || []).filter((item: any) => item.enabled).length],
-                      ["Tools available", (studioOverview?.tools || []).filter((item: any) => item.available).length],
-                      ["Skills executable", (studioOverview?.skills || []).filter((item: any) => item.executable).length],
-                      ["Heartbeat", studioOverview?.heartbeat?.running ? "Running" : studioOverview?.heartbeat?.enabled ? "Stopped" : "Disabled"],
-                    ].map(([label, value]) => (
-                      <div key={String(label)} className="research-card" style={{ margin: 0, minHeight: 86 }}>
-                        <div style={{ fontSize: 10, color: colors.textDim, letterSpacing: "0.08em", textTransform: "uppercase" }}>{label}</div>
-                        <div style={{ fontSize: 22, fontWeight: 720, marginTop: 10 }}>{String(value)}</div>
+                  <div className="settings-general-grid">
+                    <section className="settings-general-card">
+                      <div>
+                        <div className="research-title">Desktop workspace</div>
+                        <div className="research-snippet">Choose how the main EchoSpeak window is arranged.</div>
                       </div>
-                    ))}
-                  </div>
-                  <div className="research-card">
-                    <div className="research-title">Current scope</div>
-                    <div className="research-snippet" style={{ marginTop: 8 }}>
-                      Session <code>{activeThreadId || "none"}</code> · Project <code>{studioOverview?.active_project_id || "detached"}</code>
-                    </div>
-                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 8, marginTop: 12 }}>
-                      {Object.entries(studioOverview?.owners || {}).map(([domain, owner]) => (
-                        <div key={domain} style={{ borderTop: `1px solid ${colors.line}`, paddingTop: 8 }}>
-                          <div style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase" }}>{domain}</div>
-                          <div style={{ fontSize: 12, marginTop: 3 }}>{String(owner)}</div>
-                        </div>
-                      ))}
-                    </div>
-                    <button type="button" className="studio-nav-arrow" aria-label="Scroll Studio tabs right" onClick={() => studioNavRef.current?.scrollBy({ left: 280, behavior: "smooth" })}>›</button>
-                  </div>
-                  <div className="research-card">
-                    <div className="research-title">Recent Tasks</div>
-                    {(studioOverview?.tasks || []).slice(0, 8).map((task: any) => (
-                      <div key={task.id} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 12, borderTop: `1px solid ${colors.line}`, padding: "10px 0" }}>
-                        <div>
-                          <div style={{ fontSize: 12, fontWeight: 650 }}>{task.title}</div>
-                          <div style={{ fontSize: 10, color: colors.textDim, marginTop: 3 }}>{task.source} · {task.project_id || "no Project"} · {task.session_id || "no Session"}</div>
-                        </div>
-                        <span style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase" }}>{task.status}</span>
+                      <label className="settings-general-row">
+                        <span>
+                          <strong>Show sidebar</strong>
+                          <small>Keep Chats, Projects, and Settings visible.</small>
+                        </span>
+                        <input type="checkbox" checked={showSidebar} onChange={(event) => setShowSidebar(event.target.checked)} />
+                      </label>
+                      <label className="settings-general-row">
+                        <span>
+                          <strong>Compact sidebar</strong>
+                          <small>Use a narrower navigation rail.</small>
+                        </span>
+                        <input type="checkbox" checked={sidebarCollapsed} onChange={(event) => setSidebarCollapsed(event.target.checked)} />
+                      </label>
+                    </section>
+
+                    <section className="settings-general-card">
+                      <div>
+                        <div className="research-title">Conversation</div>
+                        <div className="research-snippet">Chat stays conversational; durable work is projected in Visualizer.</div>
                       </div>
-                    ))}
-                    {!(studioOverview?.tasks || []).length ? <div className="research-snippet" style={{ marginTop: 8 }}>No durable Product Tasks yet.</div> : null}
+                      <div className="settings-general-row">
+                        <span>
+                          <strong>New conversation</strong>
+                          <small>Create a chat only when you explicitly ask for one.</small>
+                        </span>
+                        <button className="icon-button" type="button" onClick={() => void createNewThread()}>New Chat</button>
+                      </div>
+                      <div className="settings-general-row">
+                        <span>
+                          <strong>Visualizer</strong>
+                          <small>Open the live projection of Echo&apos;s current work.</small>
+                        </span>
+                        <button
+                          className="icon-button"
+                          type="button"
+                          onClick={() => {
+                            closeStudio();
+                            if (desktopMode) setDesktopSurface("visualizer");
+                          }}
+                        >
+                          Open
+                        </button>
+                      </div>
+                    </section>
+
+                    <section className="settings-general-card settings-general-card-wide">
+                      <div>
+                        <div className="research-title">Local service</div>
+                        <div className="research-snippet">Provider, capability, voice, and privacy controls live in the dedicated sections at left.</div>
+                      </div>
+                      <div className="settings-general-row">
+                        <span>
+                          <strong>Status</strong>
+                          <small>{studioOverviewLoading ? "Refreshing local service state." : "Local service state is available on demand."}</small>
+                        </span>
+                        <button className="icon-button" type="button" onClick={refreshStudioOverview} disabled={studioOverviewLoading}>
+                          {studioOverviewLoading ? "Refreshing..." : "Refresh"}
+                        </button>
+                      </div>
+                    </section>
                   </div>
                 </div>
               )}
 
               {/* Skills */}
-              {leftTab === "skills" && (
+              {false && leftTab === "skills" && (
                 <div className="research-scroll">
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 12 }}>
+                  <div style={{ display: "none", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 12 }}>
                     <div style={{ color: colors.textDim, fontSize: 12 }}>Visibility is descriptive; only reviewed, enabled registry entries can execute.</div>
                     <button className="icon-button" type="button" onClick={refreshStudioOverview} disabled={studioOverviewLoading}>Refresh</button>
                   </div>
@@ -7914,10 +9363,14 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           const isEditing = editingMemoryId === m.id;
                           const isSelected = selectedMemoryIds.includes(m.id);
                           const indexState = String(m.index_state || m.metadata?.index_state || "pending");
+                          const scope = String(m.scope || m.metadata?.scope || "account");
+                          const projectLabel = String(m.project_id || m.project_path || m.metadata?.project_id || m.metadata?.project_path || "").trim();
+                          const confidence = m.confidence ?? m.metadata?.confidence;
+                          const sourceLabel = String(m.source || m.metadata?.source || "curated");
                           return (
                             <div key={m.id} className="research-card" style={{ border: isSelected ? `1px solid ${colors.accent}` : undefined }}>
                               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 10 }}>
-                                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, flex: 1 }}>
                                   <input
                                     type="checkbox"
                                     checked={isSelected}
@@ -7930,8 +9383,28 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                     }}
                                     style={{ width: 16, height: 16 }}
                                   />
-                                  <div style={{ fontSize: 14, color: colors.textDim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                                    {ts ? ts : "(no timestamp)"}
+                                  <div style={{ minWidth: 0 }}>
+                                    <div style={{ fontSize: 12, color: colors.textDim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                      {ts ? ts : "(no timestamp)"} · {sourceLabel}
+                                    </div>
+                                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 4 }}>
+                                      <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 999, border: `1px solid ${colors.line}`, color: colors.textDim }}>
+                                        scope:{scope}
+                                      </span>
+                                      {projectLabel ? (
+                                        <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 999, border: `1px solid ${colors.line}`, color: colors.textDim }}>
+                                          project:{projectLabel.length > 24 ? `${projectLabel.slice(0, 24)}…` : projectLabel}
+                                        </span>
+                                      ) : null}
+                                      {confidence != null && confidence !== "" ? (
+                                        <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 999, border: `1px solid ${colors.line}`, color: colors.textDim }}>
+                                          conf:{String(confidence)}
+                                        </span>
+                                      ) : null}
+                                      <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 999, border: `1px solid ${colors.line}`, color: colors.textDim }}>
+                                        index:{indexState}
+                                      </span>
+                                    </div>
                                   </div>
                                 </div>
                                 <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
@@ -8102,13 +9575,13 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
               )}
 
               {/* Settings Tab */}
-              {leftTab === "settings" && (
+              {leftTab === "advanced_settings" && (
                 <>
                   <div className="research-scroll">
                     <div className="research-card">
-                      <div className="research-title">Runtime Settings</div>
+                      <div className="research-title">Advanced Runtime Configuration</div>
                       <div className="research-snippet" style={{ marginBottom: 12 }}>
-                        These settings are saved to <code>apps/backend/data/settings.json</code> and override <code>.env</code> defaults.
+                        Technical compatibility controls live here while their remaining runtime consumers are audited. Credentials, paths, endpoints, commands, and raw configuration are intentionally kept off the main Settings catalog.
                       </div>
                       {settingsError ? <div className="research-snippet">Error: {settingsError}</div> : null}
                       {settingsLoading ? <div className="research-snippet">Loading settings…</div> : null}
@@ -8454,24 +9927,113 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                             </div>
                           </div>
 
-                          <div>
-                            <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>Open application allowlist</label>
-                            <input
-                              type="text"
-                              className="input-field"
-                              value={Array.isArray(settingsDraft.open_application_allowlist) ? settingsDraft.open_application_allowlist.join(",") : ""}
-                              placeholder="notepad,calc,chrome"
-                              onChange={(e) =>
-                                updateDraft(
-                                  "open_application_allowlist",
-                                  e.target.value
-                                    .split(",")
-                                    .map((x) => x.trim().toLowerCase())
-                                    .filter(Boolean)
-                                )
-                              }
-                              style={{ width: "100%", padding: "10px 14px", fontSize: 14 }}
-                            />
+                          <div data-testid="open-app-allowlist">
+                            <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>
+                              Open application allowlist
+                            </label>
+                            <div style={{ fontSize: 11, color: colors.textDim, marginBottom: 8, lineHeight: 1.45 }}>
+                              Full names with spaces or hyphens are allowed. Press Enter, comma, or Add to commit an entry. Paste comma- or newline-separated lists. Non-allowlisted apps stay blocked.
+                            </div>
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8, minHeight: 28 }}>
+                              {coerceAllowlistValue(settingsDraft.open_application_allowlist).map((entry) => (
+                                <span
+                                  key={entry}
+                                  data-testid={`allowlist-chip-${entry.replace(/\s+/g, "-")}`}
+                                  style={{
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: 6,
+                                    padding: "4px 8px",
+                                    borderRadius: 999,
+                                    border: `1px solid ${colors.line}`,
+                                    background: "rgba(255,255,255,0.04)",
+                                    fontSize: 12,
+                                    color: colors.text,
+                                    fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+                                  }}
+                                >
+                                  {entry}
+                                  <button
+                                    type="button"
+                                    className="icon-button"
+                                    aria-label={`Remove ${entry}`}
+                                    onClick={() =>
+                                      updateDraft(
+                                        "open_application_allowlist",
+                                        removeAllowlistEntry(coerceAllowlistValue(settingsDraft.open_application_allowlist), entry)
+                                      )
+                                    }
+                                    style={{ padding: "0 4px", height: 20, fontSize: 11, lineHeight: 1 }}
+                                  >
+                                    ×
+                                  </button>
+                                </span>
+                              ))}
+                              {!coerceAllowlistValue(settingsDraft.open_application_allowlist).length ? (
+                                <span style={{ fontSize: 11, color: colors.textDim }}>No applications allowlisted yet.</span>
+                              ) : null}
+                            </div>
+                            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                              <input
+                                type="text"
+                                className="input-field"
+                                data-testid="allowlist-draft-input"
+                                value={allowlistDraftText}
+                                placeholder="e.g. visual studio code"
+                                onChange={(e) => {
+                                  const next = e.target.value;
+                                  const committed = commitAllowlistDraft(
+                                    coerceAllowlistValue(settingsDraft.open_application_allowlist),
+                                    next
+                                  );
+                                  updateDraft("open_application_allowlist", committed.entries);
+                                  setAllowlistDraftText(committed.draft);
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    e.preventDefault();
+                                    const committed = commitAllowlistDraft(
+                                      coerceAllowlistValue(settingsDraft.open_application_allowlist),
+                                      allowlistDraftText,
+                                      { force: true }
+                                    );
+                                    updateDraft("open_application_allowlist", committed.entries);
+                                    setAllowlistDraftText("");
+                                  }
+                                }}
+                                onPaste={(e) => {
+                                  const text = e.clipboardData?.getData("text") || "";
+                                  if (/[\n,]/.test(text)) {
+                                    e.preventDefault();
+                                    const committed = commitAllowlistDraft(
+                                      coerceAllowlistValue(settingsDraft.open_application_allowlist),
+                                      `${allowlistDraftText}${text}`,
+                                      { force: true }
+                                    );
+                                    updateDraft("open_application_allowlist", committed.entries);
+                                    setAllowlistDraftText("");
+                                  }
+                                }}
+                                style={{ flex: 1, padding: "10px 14px", fontSize: 14 }}
+                              />
+                              <button
+                                type="button"
+                                className="icon-button"
+                                data-testid="allowlist-add-btn"
+                                style={{ padding: "0 12px", height: 38, fontSize: 12 }}
+                                onClick={() => {
+                                  const committed = commitAllowlistDraft(
+                                    coerceAllowlistValue(settingsDraft.open_application_allowlist),
+                                    allowlistDraftText,
+                                    { force: true }
+                                  );
+                                  updateDraft("open_application_allowlist", committed.entries);
+                                  setAllowlistDraftText("");
+                                }}
+                              >
+                                Add
+                              </button>
+                            </div>
                           </div>
 
                           {/* ----------------- BOTS & CONNECTORS ----------------- */}
@@ -8909,6 +10471,13 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           </div>
 
                           <div className="settings-section" style={settingsSectionStyle}>
+                            <div style={{ fontSize: 13, fontWeight: 700, color: colors.text, marginBottom: 4 }}>Connections are managed in Studio</div>
+                            <div style={{ fontSize: 12, color: colors.textDim }}>
+                              Provider identity, authorization, health, and capabilities now live in the Connections catalog. Legacy values are migrated into protected manual records and are no longer edited as ordinary Settings fields.
+                            </div>
+                          </div>
+
+                          <div className="settings-section" style={{ ...settingsSectionStyle, display: "none" }} aria-hidden="true">
                             <div style={{ fontSize: 13, fontWeight: 700, color: colors.text, marginBottom: 4 }}>Productivity & Service Integrations</div>
                             <div style={{ fontSize: 12, color: colors.textDim, marginBottom: 14 }}>Keep non-messaging integrations grouped here for workspaces, content, calendars, and home services.</div>
                             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: "8px 24px", marginBottom: 12 }}>
@@ -9278,18 +10847,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                   style={{ width: "100%", padding: "10px 14px", fontSize: 14 }}
                                 />
                               </div>
-                              <div style={{ flex: "1 1 180px" }}>
-                                <label style={{ display: "block", fontSize: 13, color: colors.textDim, marginBottom: 4 }}>Web max retries</label>
-                                <input
-                                  type="number"
-                                  className="input-field"
-                                  value={Number(settingsDraft.web_task_max_retries ?? 2)}
-                                  min={0}
-                                  max={5}
-                                  onChange={(e) => updateDraft("web_task_max_retries", Number(e.target.value || 0))}
-                                  style={{ width: "100%", padding: "10px 14px", fontSize: 14 }}
-                                />
-                              </div>
                             </div>
                           </div>
 
@@ -9502,7 +11059,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                               <Toggle label="Enable Trace" checked={Boolean(settingsDraft.trace_enabled)} onChange={(v) => updateDraft("trace_enabled", v)} />
                               <Toggle label="Multi-agent pool" checked={Boolean(settingsDraft.multi_agent_enabled)} onChange={(v) => updateDraft("multi_agent_enabled", v)} />
                               <Toggle label="A2A Protocol" checked={Boolean(settingsDraft.a2a_enabled)} onChange={(v) => updateDraft("a2a_enabled", v)} />
-                              <Toggle label="Orchestration" checked={Boolean(settingsDraft.orchestration_enabled)} onChange={(v) => updateDraft("orchestration_enabled", v)} />
                             </div>
                             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 }}>
                               <div style={{ flex: "2 1 280px" }}>
@@ -9715,13 +11271,13 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
               )}
 
               {/* Capabilities Tab */}
-              {leftTab === "capabilities" && (
+              {false && leftTab === "capabilities" && (
                 <>
                   <div className="research-scroll">
                     <div className="research-card">
                       <div className="research-title">Capabilities & Permissions</div>
                       <div className="research-snippet" style={{ marginBottom: 12 }}>
-                        View available tools, loaded skills, pipeline plugins, and what permissions they require.
+                        View available tools, materialized skills, Connections, and the permissions they require.
                       </div>
                       <button
                         className="icon-button"
@@ -9737,7 +11293,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                             setCapabilitiesData(data);
                             const skillData = skillRes.ok ? await skillRes.json() : { items: [] };
                             setSkillExecutions(Array.isArray(skillData.items) ? skillData.items : []);
-                            await refreshCodingReadiness();
                           } catch (e) {
                             console.error("Failed to fetch capabilities:", e);
                           }
@@ -9770,44 +11325,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
 
                           <CapabilityRegistryGroups registry={capabilitiesData.capability_registry} />
 
-                          {/* Coding Readiness */}
-                          <div style={{ background: "linear-gradient(135deg, rgba(34,197,94,0.08), rgba(255,255,255,0.01))", padding: 12, borderRadius: 12, border: "1px solid rgba(34,197,94,0.18)", marginBottom: 16 }}>
-                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 8 }}>
-                              <div style={{ fontSize: 12, fontWeight: 700 }}>Coding Agent Loop</div>
-                              <span style={{ fontSize: 11, fontWeight: 700, color: codingReadiness?.ok ? "#22c55e" : "#f59e0b" }}>
-                                {codingReadinessLoading ? "checking" : codingReadiness?.ok ? "ready" : "needs review"}
-                              </span>
-                            </div>
-                            {codingReadiness ? (
-                              <>
-                                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 8, marginBottom: 8 }}>
-                                  <div className="research-snippet">Model: {codingReadiness.model?.provider || "unknown"} / {codingReadiness.model?.model || "unknown"}</div>
-                                  <div className="research-snippet">Tool path: {codingReadiness.model?.tool_call_path || "unavailable"}</div>
-                                  <div className="research-snippet">Read: {codingReadiness.ready_for_reading ? "ready" : "blocked"} · Edit: {codingReadiness.ready_for_editing ? "ready" : "blocked"}</div>
-                                  <div className="research-snippet">Tools: {(codingReadiness.tool_rows || []).filter(t => t.allowed).length}/{(codingReadiness.tool_rows || []).length} ready</div>
-                                  <div className="research-snippet">Loop: {(codingReadiness.recommended_loop || []).join(" -> ")}</div>
-                                </div>
-                                {(codingReadiness.blockers || []).slice(0, 3).map((item) => (
-                                  <div key={item.code} className="research-snippet" style={{ color: colors.danger }}>{item.message}</div>
-                                ))}
-                                {(codingReadiness.warnings || []).slice(0, 2).map((item) => (
-                                  <div key={item.code} className="research-snippet" style={{ color: "#f59e0b" }}>{item.message}</div>
-                                ))}
-                                {(codingReadiness.blocked_tools || []).length ? (
-                                  <div className="research-snippet" style={{ color: "#f59e0b" }}>Blocked: {codingReadiness.blocked_tools.join(", ")}</div>
-                                ) : null}
-                                {(codingReadiness.missing_tools || []).length ? (
-                                  <div className="research-snippet" style={{ color: colors.danger }}>Missing: {codingReadiness.missing_tools.join(", ")}</div>
-                                ) : null}
-                                {(codingReadiness.recommendations || []).slice(0, 2).map((r, i) => (
-                                  <div key={`cr-${i}`} className="research-snippet">{r}</div>
-                                ))}
-                              </>
-                            ) : (
-                              <div className="research-snippet">Refresh tools to check whether coding can inspect, write, and verify projects.</div>
-                            )}
-                          </div>
-
                           {/* Features */}
                           <div style={{ background: "linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01))", padding: 12, borderRadius: 12, border: "1px solid rgba(255,255,255,0.1)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", boxShadow: "0 4px 16px -4px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.05)", marginBottom: 16 }}>
                             <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>Feature Flags</div>
@@ -9838,20 +11355,20 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                             ))}
                           </div>
 
-                          {/* Skills & Plugins */}
+                          {/* Skills */}
                           <div style={{ background: "linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01))", padding: 12, borderRadius: 12, border: "1px solid rgba(255,255,255,0.1)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", boxShadow: "0 4px 16px -4px rgba(0,0,0,0.2), inset 0 1px 0 rgba(255,255,255,0.05)", marginBottom: 16 }}>
-                            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>Loaded Skills & Plugins</div>
+                            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>Available Skills</div>
                             <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                               {(capabilitiesData.skills || []).length > 0 ? (
                                 (capabilitiesData.skills || []).map((skill: any) => (
                                   <div key={skill.id || skill.name} style={{ fontSize: 11, padding: "4px 10px", borderRadius: 6, background: colors.panel2, border: `1px solid ${colors.line}`, display: "flex", alignItems: "center", gap: 6 }}>
                                     <span>{skill.name || skill.id}</span>
                                     {skill.has_tools && <span style={{ fontSize: 9, padding: "1px 4px", borderRadius: 3, background: "rgba(59,130,246,0.15)", color: "#3b82f6", fontWeight: 600 }}>TOOL</span>}
-                                    {skill.has_plugin && <span style={{ fontSize: 9, padding: "1px 4px", borderRadius: 3, background: "rgba(168,85,247,0.15)", color: "#a855f7", fontWeight: 600 }}>PLUGIN</span>}
+                                    {skill.has_plugin && <span style={{ fontSize: 9, padding: "1px 4px", borderRadius: 3, background: "rgba(255,255,255,0.05)", color: colors.textDim, fontWeight: 600 }}>LEGACY HOOK DISABLED</span>}
                                   </div>
                                 ))
                               ) : (
-                                <div style={{ fontSize: 11, color: colors.textDim }}>No external skills or plugins are currently loaded.</div>
+                                <div style={{ fontSize: 11, color: colors.textDim }}>No external skills are currently available.</div>
                               )}
                             </div>
                             <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${colors.line}` }}>
@@ -9882,27 +11399,63 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                             </div>
                           </div>
 
-                          {/* Tools List */}
+                          {/* Tools List — ToolRegistry projection authority */}
                           <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>
                             Tools ({(capabilitiesData.tools?.items || []).length}
                             {typeof capabilitiesData.tools?.count === "number" ? ` of ${capabilitiesData.tools.count}` : ""})
                           </div>
                           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                            {(capabilitiesData.tools?.items || []).map((tool: any) => (
+                            {(capabilitiesData.tools?.items || []).map((tool: any) => {
+                              const trust = String(tool.trust_state || tool.health || "").toLowerCase();
+                              const missingConfig = Boolean(tool.missing_configuration || tool.config_missing || trust === "missing_configuration");
+                              const unhealthy = ["unhealthy", "error", "failed", "degraded"].includes(trust) || Boolean(tool.unhealthy);
+                              const promptOnly = Boolean(tool.prompt_only || tool.mode === "prompt_only");
+                              const disabled = Boolean(tool.disabled || tool.enabled === false);
+                              const providerBacked = Boolean(tool.provider_backed || tool.origin === "provider" || tool.mcp_server || tool.origin === "mcp");
+                              const permissionRestricted = !tool.allowed && (Boolean(tool.blocked_reason) || (tool.policy_flags && tool.policy_flags.length));
+                              let lifecycle = "registered";
+                              if (disabled) lifecycle = "disabled";
+                              else if (missingConfig) lifecycle = "missing configuration";
+                              else if (unhealthy) lifecycle = "unhealthy";
+                              else if (promptOnly) lifecycle = "prompt-only";
+                              else if (permissionRestricted) lifecycle = "permission restricted";
+                              else if (tool.allowed === false) lifecycle = "blocked";
+                              else if (tool.allowed === true && tool.executable === false) lifecycle = "available";
+                              else if (tool.allowed === true || tool.executable === true) lifecycle = "executable";
+                              else lifecycle = "registered";
+                              const lifecycleColor =
+                                lifecycle === "executable" ? "#22c55e"
+                                  : lifecycle === "available" || lifecycle === "registered" ? "rgba(255,255,255,0.65)"
+                                    : lifecycle === "prompt-only" || lifecycle === "missing configuration" ? "#f59e0b"
+                                      : "#ef4444";
+                              return (
                               <div
                                 key={tool.name}
                                 style={{
                                   background: colors.panel2,
                                   padding: 10,
                                   borderRadius: 6,
-                                  border: `1px solid ${tool.allowed ? colors.line : colors.danger}`,
-                                  opacity: tool.allowed ? 1 : 0.6,
+                                  border: `1px solid ${tool.allowed ? colors.line : "rgba(239,68,68,0.45)"}`,
+                                  opacity: disabled ? 0.55 : 1,
                                 }}
                               >
-                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, gap: 8, flexWrap: "wrap" }}>
                                   <span style={{ fontSize: 13, fontWeight: 600, fontFamily: "monospace" }}>{tool.name}</span>
-                                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                                    {/* Risk Level Badge */}
+                                  <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                                    <span
+                                      style={{
+                                        fontSize: 10,
+                                        padding: "2px 6px",
+                                        borderRadius: 4,
+                                        background: `${lifecycleColor}22`,
+                                        color: lifecycleColor,
+                                        fontWeight: 700,
+                                        textTransform: "uppercase",
+                                        letterSpacing: "0.04em",
+                                      }}
+                                    >
+                                      {lifecycle}
+                                    </span>
                                     <span
                                       style={{
                                         fontSize: 10,
@@ -9916,7 +11469,6 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                     >
                                       {tool.risk_level || "safe"}
                                     </span>
-                                    {/* Confirmation Badge */}
                                     {tool.requires_confirmation && (
                                       <span
                                         style={{
@@ -9929,6 +11481,21 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                         }}
                                       >
                                         CONFIRM
+                                      </span>
+                                    )}
+                                    {providerBacked && (
+                                      <span
+                                        style={{
+                                          fontSize: 10,
+                                          padding: "2px 6px",
+                                          borderRadius: 4,
+                                          background: "rgba(168,85,247,0.14)",
+                                          color: "#c084fc",
+                                          fontWeight: 600,
+                                          textTransform: "uppercase",
+                                        }}
+                                      >
+                                        provider-backed
                                       </span>
                                     )}
                                     <span
@@ -9944,35 +11511,26 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                                     >
                                       {tool.origin || "local"}
                                     </span>
-                                    {/* Allowed/Blocked Status */}
-                                    <span
-                                      style={{
-                                        fontSize: 11,
-                                        fontWeight: 600,
-                                        color: tool.allowed ? "#22c55e" : colors.danger,
-                                      }}
-                                    >
-                                      {tool.allowed ? "✓" : "✗"}
-                                    </span>
                                   </div>
                                 </div>
-                                {/* Blocked Reason */}
                                 {!tool.allowed && tool.blocked_reason && (
                                   <div style={{ fontSize: 11, color: colors.danger, marginBottom: 4 }}>
                                     {tool.blocked_reason}
                                   </div>
                                 )}
-                                {/* Policy Flags */}
                                 {tool.policy_flags && tool.policy_flags.length > 0 && (
                                   <div style={{ fontSize: 10, color: colors.textDim }}>
                                     Requires: {tool.policy_flags.join(", ")}
                                   </div>
                                 )}
                                 <div style={{ fontSize: 10, color: colors.textDim }}>
-                                  Trust: {tool.trust_state || "built_in"}{tool.mcp_server ? ` · MCP server: ${tool.mcp_server}` : ""}
+                                  Trust: {tool.trust_state || "built_in"}
+                                  {tool.mcp_server ? ` · MCP server: ${tool.mcp_server}` : ""}
+                                  {tool.description ? ` · ${String(tool.description).slice(0, 120)}` : ""}
                                 </div>
                               </div>
-                            ))}
+                              );
+                            })}
                           </div>
                         </>
                       )}
@@ -10342,14 +11900,47 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                       </div>
                     ))}
                   </div>
-                  {/* Pipeline Status */}
-                  <div style={{ padding: "10px 14px", marginBottom: 4, borderRadius: 10, background: "linear-gradient(135deg, rgba(34,197,94,0.08), rgba(34,197,94,0.02))", border: "1px solid rgba(34,197,94,0.2)" }}>
+                  {/* Pipeline Status — reflect backend heartbeat when known */}
+                  <div style={{ padding: "10px 14px", marginBottom: 4, borderRadius: 10, background: "linear-gradient(135deg, rgba(255,255,255,0.05), rgba(255,255,255,0.01))", border: `1px solid ${colors.line}` }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#22c55e", boxShadow: "0 0 6px rgba(34,197,94,0.5)", animation: "pulse 2s infinite" }} />
-                      <span style={{ fontSize: 11, color: "#22c55e", fontWeight: 600, letterSpacing: "0.03em" }}>SCHEDULER ACTIVE · CONNECTED TO PIPELINE</span>
+                      <span
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: "50%",
+                          background: studioOverview?.heartbeat?.running ? "#22c55e" : studioOverview?.heartbeat?.enabled ? "#f59e0b" : "rgba(255,255,255,0.35)",
+                          boxShadow: studioOverview?.heartbeat?.running ? "0 0 6px rgba(34,197,94,0.5)" : "none",
+                        }}
+                      />
+                      <span style={{ fontSize: 11, color: colors.text, fontWeight: 600, letterSpacing: "0.03em" }}>
+                        {studioOverview?.heartbeat?.running
+                          ? "HEARTBEAT RUNNING"
+                          : studioOverview?.heartbeat?.enabled
+                            ? "SCHEDULER ENABLED · NOT RUNNING"
+                            : "SCHEDULER DISABLED OR UNKNOWN"}
+                      </span>
                     </div>
-                    <div style={{ fontSize: 10, color: colors.textDim, marginTop: 4 }}>Each trigger creates one durable Task and one governed Turn. External delivery remains approval-bound.</div>
+                    <div style={{ fontSize: 10, color: colors.textDim, marginTop: 4 }}>
+                      Scope: Session <code>{activeThreadId || "none"}</code> · Project <code>{activeProjectId || "detached"}</code>. Each trigger must create one durable Task/Run through the backend; external delivery remains approval-bound.
+                    </div>
                   </div>
+                  {(studioOverview?.automation_runs || []).length ? (
+                    <div className="research-card" style={{ marginBottom: 10 }}>
+                      <div className="research-title">Recent Runs</div>
+                      {(studioOverview.automation_runs || []).slice(0, 8).map((run: any) => (
+                        <div key={run.id || `${run.task_id}-${run.started_at}`} style={{ borderTop: `1px solid ${colors.line}`, padding: "8px 0", display: "grid", gridTemplateColumns: "minmax(0,1fr) auto", gap: 10 }}>
+                          <div>
+                            <div style={{ fontSize: 12, fontWeight: 650 }}>{run.objective || run.title || run.task_id || "Run"}</div>
+                            <div style={{ fontSize: 10, color: colors.textDim, marginTop: 3 }}>
+                              {run.source || "automation"} · {run.project_id || "no Project"} · {run.session_id || "no Session"}
+                              {run.error ? ` · ${String(run.error).slice(0, 80)}` : ""}
+                            </div>
+                          </div>
+                          <span style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase" }}>{run.status || "unknown"}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                   <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
                     <button
                       className="icon-button"
@@ -10448,9 +12039,23 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                           {routine.description && (
                             <div style={{ fontSize: 12, color: colors.textDim, marginBottom: 6 }}>{routine.description}</div>
                           )}
+                          {(routine as any).objective || (routine as any).action_config?.query ? (
+                            <div style={{ fontSize: 12, color: colors.text, marginBottom: 6, lineHeight: 1.45 }}>
+                              <strong style={{ color: colors.textDim, fontWeight: 600 }}>Objective:</strong>{" "}
+                              {String((routine as any).objective || (routine as any).action_config?.query || "").slice(0, 240)}
+                            </div>
+                          ) : null}
                           <div style={{ fontSize: 11, color: colors.textDim, marginBottom: 4 }}>
                             <strong>Type:</strong> {routine.action_type} | <strong>Runs:</strong> {routine.run_count}
+                            {(routine as any).project_id ? ` | Project: ${String((routine as any).project_id).slice(0, 12)}…` : " | Project: scope-bound"}
                           </div>
+                          {((routine as any).allowed_tools || (routine as any).allowed_skills || (routine as any).allowed_connections) ? (
+                            <div style={{ fontSize: 10, color: colors.textDim, marginBottom: 4 }}>
+                              {((routine as any).allowed_tools || []).length ? `Tools: ${((routine as any).allowed_tools || []).slice(0, 6).join(", ")} ` : ""}
+                              {((routine as any).allowed_skills || []).length ? `Skills: ${((routine as any).allowed_skills || []).slice(0, 4).join(", ")} ` : ""}
+                              {((routine as any).allowed_connections || []).length ? `Connections: ${((routine as any).allowed_connections || []).slice(0, 4).join(", ")}` : ""}
+                            </div>
+                          ) : null}
                           {routine.schedule && (
                             <div style={{ fontSize: 11, color: colors.textDim, marginBottom: 4 }}>
                               <strong>Schedule:</strong> {routine.schedule}
@@ -10525,63 +12130,23 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                 </>
               )}
 
-              {/* Connections Tab */}
-              {leftTab === "connections" && (
-                <div className="research-scroll">
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 12 }}>
-                    <div style={{ color: colors.textDim, fontSize: 12 }}>
-                      Secret-free capabilities available to this exact Project and Session.
-                    </div>
-                    <button className="icon-button" type="button" onClick={refreshStudioOverview} disabled={studioOverviewLoading}>
-                      {studioOverviewLoading ? "Refreshing…" : "Refresh"}
-                    </button>
-                  </div>
-                  {(studioOverview?.connections || []).map((connection: any) => (
-                    <div key={connection.id} className="research-card" style={{ marginBottom: 10 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-                        <div>
-                          <div style={{ fontSize: 15, fontWeight: 650 }}>{connection.display_name}</div>
-                          <div style={{ fontSize: 11, color: colors.textDim, marginTop: 3 }}>
-                            {connection.kind}{connection.provider ? ` · ${connection.provider}` : ""}
-                          </div>
-                        </div>
-                        <span style={{ fontSize: 10, padding: "3px 7px", border: "1px solid rgba(255,255,255,.12)", borderRadius: 999 }}>
-                          {connection.health}
-                        </span>
-                      </div>
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
-                        {(connection.capabilities || []).map((capability: any) => (
-                          <span key={capability.id} style={{ fontSize: 10, padding: "4px 7px", background: "rgba(255,255,255,.05)", borderRadius: 4 }}>
-                            {capability.name}{capability.requires_approval ? " · approval" : ""}
-                          </span>
-                        ))}
-                      </div>
-                      {connection.authentication !== "none" ? (
-                        <div style={{ fontSize: 11, color: colors.textDim, marginTop: 10 }}>Authentication: {connection.authentication}</div>
-                      ) : null}
-                      {(connection.errors || []).length ? (
-                        <div style={{ fontSize: 11, color: "#fca5a5", marginTop: 8 }}>{connection.errors[0]}</div>
-                      ) : null}
-                    </div>
-                  ))}
-                  {!(studioOverview?.connections || []).length ? (
-                    <div className="research-card"><div className="research-snippet">No Connections are registered for this scope.</div></div>
-                  ) : null}
-                </div>
-              )}
-
               {/* Soul Tab */}
               {leftTab === "soul" && (
                 <>
                   <div className="research-scroll">
                     <div className="research-card">
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                        <h3 style={{ margin: 0, fontSize: 16, color: colors.text }}>Agent Soul</h3>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, gap: 12, flexWrap: "wrap" }}>
+                        <div>
+                          <h3 style={{ margin: 0, fontSize: 16, color: colors.text }}>Soul · Identity</h3>
+                          <div style={{ fontSize: 11, color: colors.textDim, marginTop: 4 }}>
+                            Persona, tone, response style, and creator attribution for Echo. Secrets and hidden prompts are not exposed here.
+                          </div>
+                        </div>
                         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                           {soulEnabled ? (
-                            <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "rgba(34,197,94,0.12)", color: "#22c55e" }}>ENABLED</span>
+                            <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "rgba(34,197,94,0.12)", color: "#22c55e", fontWeight: 700 }}>ENABLED</span>
                           ) : (
-                            <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "rgba(107,114,128,0.12)", color: colors.textDim }}>DISABLED</span>
+                            <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "rgba(107,114,128,0.12)", color: colors.textDim, fontWeight: 700 }}>DISABLED</span>
                           )}
                           {soulSavedAt && (
                             <span style={{ fontSize: 10, color: colors.textDim }}>Saved {new Date(soulSavedAt).toLocaleTimeString()}</span>
@@ -10589,8 +12154,23 @@ export const Dashboard: React.FC<{ initialView?: DashboardTab }> = ({ initialVie
                         </div>
                       </div>
 
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 8, marginBottom: 14 }}>
+                        <div style={{ padding: 10, borderRadius: 8, border: `1px solid ${colors.line}`, background: "rgba(255,255,255,0.02)" }}>
+                          <div style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase", letterSpacing: "0.06em" }}>Persistence</div>
+                          <div style={{ fontSize: 12, marginTop: 4, wordBreak: "break-all" }}>{soulPath || "runtime soul file"}</div>
+                        </div>
+                        <div style={{ padding: 10, borderRadius: 8, border: `1px solid ${colors.line}`, background: "rgba(255,255,255,0.02)" }}>
+                          <div style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase", letterSpacing: "0.06em" }}>Budget</div>
+                          <div style={{ fontSize: 12, marginTop: 4 }}>{soulContent.length} / {soulMaxChars} chars</div>
+                        </div>
+                        <div style={{ padding: 10, borderRadius: 8, border: `1px solid ${colors.line}`, background: "rgba(255,255,255,0.02)" }}>
+                          <div style={{ fontSize: 10, color: colors.textDim, textTransform: "uppercase", letterSpacing: "0.06em" }}>Applies to</div>
+                          <div style={{ fontSize: 12, marginTop: 4 }}>New turns in this runtime</div>
+                        </div>
+                      </div>
+
                       <div style={{ fontSize: 12, color: colors.textDim, marginBottom: 12 }}>
-                        The soul defines the agent's core identity, values, communication style, and boundaries. Changes apply to new conversations.
+                        Edit the durable identity document below. Changes persist through the Soul API and apply on subsequent conversations — not mid-stream rewrites of private model reasoning.
                       </div>
 
                       {soulLoading ? (
@@ -10676,10 +12256,29 @@ I am EchoSpeak, a personal AI assistant...
               )}
 
               {leftTab === "avatar_editor" && (
-                <AvatarEditor apiBase={apiBase} colors={colors} onConfigChange={setAvatarConfig} />
+                <div className="research-scroll">
+                  {desktopMode ? (
+                    <section className="settings-general-card">
+                      <div>
+                        <div className="research-title">Desktop companion</div>
+                        <div className="research-snippet">Keep the same animated Echo available outside the main window.</div>
+                      </div>
+                      <div className="settings-general-row">
+                        <span>
+                          <strong>Show Echo on desktop</strong>
+                          <small>Uses the selected Chat Session and the same canonical runtime.</small>
+                        </span>
+                        <button type="button" className="icon-button" onClick={() => void openDesktopCompanionWindow()}>
+                          Open
+                        </button>
+                      </div>
+                    </section>
+                  ) : null}
+                  <AvatarEditor apiBase={apiBase} colors={colors} onConfigChange={setAvatarConfig} />
+                </div>
               )}
 
-              {leftTab === "services" && (
+              {leftTab === "system_services" && (
                 <div className="research-scroll">
                   <div className="research-card">
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
@@ -10723,7 +12322,7 @@ I am EchoSpeak, a personal AI assistant...
                           disabled={servicesHeartbeatStatus?.running || servicesLoading}
                         >
                           Start Heartbeat
-                        </button>
+                      </button>
                         <button
                           className="icon-button"
                           style={{ fontSize: 12, padding: "6px 12px", height: "auto", background: !servicesHeartbeatStatus?.running ? "rgba(255,255,255,0.05)" : "rgba(239,68,68,0.2)", color: !servicesHeartbeatStatus?.running ? colors.textDim : "#ef4444", border: `1px solid ${!servicesHeartbeatStatus?.running ? colors.line : "rgba(239,68,68,0.5)"}` }}
@@ -10735,8 +12334,9 @@ I am EchoSpeak, a personal AI assistant...
                           disabled={!servicesHeartbeatStatus?.running || servicesLoading}
                         >
                           Stop Heartbeat
-                        </button>
+                      </button>
                       </div>
+                    </div>
 
                       <div style={{ fontSize: 12, color: colors.text, marginBottom: 8, fontWeight: 600 }}>Recent Proactive Thoughts</div>
                       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -10865,15 +12465,15 @@ I am EchoSpeak, a personal AI assistant...
                         </div>
                       )}
                     </div>
-
                   </div>
-                </div>
               )}
                       </div>
                     </div>
                   </div>
-                </motion.div>
-              , desktopMode ? desktopStudioHost! : document.body)}
+                  </motion.div>
+                </div>,
+                desktopMode ? desktopStudioHost! : document.body
+              )}
             </div>
           </div>
         </div>

@@ -3,9 +3,7 @@ Home Assistant tools — control smart home devices via the HA REST API.
 
 Requires:
   pip install requests  (already a dep)
-  ALLOW_HOME_ASSISTANT=true
-  HOME_ASSISTANT_URL=http://homeassistant.local:8123
-  HOME_ASSISTANT_TOKEN=eyJ...
+  Active scoped Home Assistant Connection
 """
 
 from __future__ import annotations
@@ -28,9 +26,6 @@ def _ha_config():
         from config import config
     except ImportError:
         raise RuntimeError("Config not available")
-
-    if not getattr(config, "allow_home_assistant", False):
-        raise RuntimeError("Home Assistant is disabled. Set ALLOW_HOME_ASSISTANT=true in .env")
 
     url = getattr(config, "home_assistant_url", "").rstrip("/")
     token = getattr(config, "home_assistant_token", "")

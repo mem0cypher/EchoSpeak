@@ -51,7 +51,7 @@ describe("buildResponseRenderPlan", () => {
     expect(plan.blocks.some((block) => block.kind === "chart")).toEqual(false);
   });
 
-  it("builds evidence blocks only from actual research runs", () => {
+  it("never attaches Evidence cards to Chat render plans", () => {
     const run: ResearchRun = {
       id: "r1",
       at: Date.now(),
@@ -78,6 +78,14 @@ describe("buildResponseRenderPlan", () => {
       ],
     };
     const plan = buildResponseRenderPlan({ answerText: "Answer with evidence.", researchRuns: [run] });
-    expect(plan.blocks.some((block) => block.kind === "evidence")).toEqual(true);
+    expect(plan.blocks.some((block) => block.kind === "evidence")).toEqual(false);
+    // Explicit evidence intent is also stripped from Chat.
+    const forced = buildResponseRenderPlan({
+      answerText: "Answer",
+      intent: {
+        blocks: [{ id: "ev", kind: "evidence", title: "Evidence", items: [{ title: "X", url: "https://x.test" }] }],
+      },
+    });
+    expect(forced.blocks.some((block) => block.kind === "evidence")).toEqual(false);
   });
 });

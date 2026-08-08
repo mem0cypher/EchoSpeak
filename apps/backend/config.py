@@ -52,18 +52,26 @@ WEBHOOK_SECRET_PATH = DATA_DIR / "webhook_secret.txt"
 
 SETTINGS_PATH = DATA_DIR / "settings.json"
 SETTINGS_SECRETS_PATH = DATA_DIR / "settings.secrets.json"
+_CREDENTIAL_REFS_KEY = "_credential_refs"
+_SETTINGS_CREDENTIAL_REF_KEY = "runtime_settings"
 
 SECRET_TOP_LEVEL_SETTINGS = {
     "api_auth_key",
     "discord_webhook_url",
     "discord_bot_token",
     "webhook_secret",
+    "webhook_secret_path",
+    "brave_search_api_key",
+    "odds_api_key",
     "email_password",
     "telegram_bot_token",
     "spotify_client_secret",
+    "spotify_token_path",
     "notion_token",
     "github_token",
     "home_assistant_token",
+    "google_calendar_credentials_path",
+    "google_calendar_token_path",
     "a2a_auth_key",
     "twitch_client_secret",
     "twitch_eventsub_secret",
@@ -79,6 +87,79 @@ SECRET_NESTED_SETTINGS = {
     "openai": {"api_key"},
     "gemini": {"api_key"},
 }
+
+_MCP_SECRET_KEYS = {
+    "headers",
+    "env",
+    "auth",
+    "oauth",
+    "cookies",
+    "authorization",
+    "password",
+    "token",
+    "api_key",
+    "client_secret",
+    "private_key",
+    "private_key_path",
+    "certificate",
+    "certificate_path",
+    "cert",
+    "cert_path",
+}
+
+
+def _url_contains_userinfo(value: Any) -> bool:
+    if not isinstance(value, str) or "://" not in value:
+        return False
+    try:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(value)
+        return parsed.username is not None or parsed.password is not None
+    except Exception:
+        return False
+
+
+def _extract_mcp_secret_overrides(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for server_name, raw in value.items():
+        if not isinstance(raw, dict):
+            continue
+        secret_row: dict[str, Any] = {}
+        for key, child in raw.items():
+            low = str(key or "").strip().lower()
+            if low in _MCP_SECRET_KEYS or any(
+                marker in low
+                for marker in ("secret", "password", "token", "private_key", "api_key")
+            ):
+                if child not in (None, "", {}, []):
+                    secret_row[str(key)] = _copy_jsonish(child)
+            elif low in {"url", "endpoint"} and _url_contains_userinfo(child):
+                secret_row[str(key)] = child
+        if secret_row:
+            out[str(server_name)] = secret_row
+    return out
+
+
+def _strip_mcp_secret_overrides(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return {}
+    out = _copy_jsonish(value)
+    for _server_name, raw in out.items():
+        if not isinstance(raw, dict):
+            continue
+        for key in list(raw):
+            low = str(key or "").strip().lower()
+            child = raw.get(key)
+            if (
+                low in _MCP_SECRET_KEYS
+                or any(marker in low for marker in ("secret", "password", "token", "private_key", "api_key"))
+                or (low in {"url", "endpoint"} and _url_contains_userinfo(child))
+            ):
+                raw.pop(key, None)
+    return out
 
 
 def _read_json_dict(path: Path) -> dict[str, Any]:
@@ -133,6 +214,31 @@ def _deep_merge(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _normalize_open_application_allowlist(value: Any) -> list[str]:
+    """Canonical string[] for OPEN_APPLICATION_ALLOWLIST.
+
+    Accepts list, tuple, or legacy comma/newline/semicolon-separated string.
+    Entries may contain spaces and hyphens; only separators split tokens.
+    """
+    parts: list[str] = []
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            parts.extend(str(item or "").replace("\n", ",").replace(";", ",").split(","))
+    elif value is None:
+        parts = []
+    else:
+        parts = str(value).replace("\n", ",").replace(";", ",").split(",")
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        token = " ".join(str(part or "").strip().lower().split())
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
 def _extract_secret_overrides(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
@@ -166,6 +272,9 @@ def _extract_secret_overrides(payload: dict[str, Any]) -> dict[str, Any]:
             section_out[secret_key] = value
         if section_out:
             out[section] = section_out
+    mcp_secrets = _extract_mcp_secret_overrides(payload.get("mcp_servers"))
+    if mcp_secrets:
+        out["mcp_servers"] = mcp_secrets
     return out
 
 
@@ -183,22 +292,56 @@ def _strip_secret_overrides(payload: dict[str, Any]) -> dict[str, Any]:
             patch.pop(secret_key, None)
         if not patch:
             out.pop(section, None)
+    if isinstance(out.get("mcp_servers"), dict):
+        out["mcp_servers"] = _strip_mcp_secret_overrides(out.get("mcp_servers"))
     return out
 
 
 def read_runtime_override_payload(include_secrets: bool = True, migrate_legacy: bool = True) -> dict[str, Any]:
     public_payload = _read_json_dict(SETTINGS_PATH)
-    secret_payload = _read_json_dict(SETTINGS_SECRETS_PATH) if include_secrets or migrate_legacy else {}
+    refs = public_payload.get(_CREDENTIAL_REFS_KEY)
+    refs = dict(refs) if isinstance(refs, dict) else {}
+    secret_payload: dict[str, Any] = {}
+    credential_ref = str(refs.get(_SETTINGS_CREDENTIAL_REF_KEY) or "").strip()
+    if credential_ref and (include_secrets or migrate_legacy):
+        try:
+            from agent.credential_broker import get_credential_broker
+
+            resolved = get_credential_broker().resolve(credential_ref)
+            if not isinstance(resolved, dict):
+                raise ValueError("runtime Settings credential is not an object")
+            secret_payload = resolved
+        except Exception:
+            if include_secrets:
+                raise
+    legacy_secret_file = (
+        _read_json_dict(SETTINGS_SECRETS_PATH)
+        if (include_secrets or migrate_legacy)
+        else {}
+    )
+    if legacy_secret_file:
+        secret_payload = _deep_merge(secret_payload, legacy_secret_file)
     legacy_secret_payload = _extract_secret_overrides(public_payload)
     if legacy_secret_payload:
         secret_payload = _deep_merge(secret_payload, legacy_secret_payload)
-        if migrate_legacy:
-            public_payload = _strip_secret_overrides(public_payload)
-            try:
-                _write_json_dict(SETTINGS_PATH, public_payload)
-                _write_json_dict(SETTINGS_SECRETS_PATH, secret_payload, chmod_owner_only=True)
-            except Exception:
-                pass
+    if migrate_legacy and (legacy_secret_payload or legacy_secret_file):
+        from agent.credential_broker import get_credential_broker
+
+        public_payload = _strip_secret_overrides(public_payload)
+        credential_ref = get_credential_broker().put(
+            secret_payload,
+            label="EchoSpeak runtime Settings",
+            reference=credential_ref,
+        )
+        public_payload[_CREDENTIAL_REFS_KEY] = {
+            **refs,
+            _SETTINGS_CREDENTIAL_REF_KEY: credential_ref,
+        }
+        _write_json_dict(SETTINGS_PATH, public_payload)
+        # Successful DPAPI migration removes the plaintext authority. The
+        # durable values are preserved by the opaque credential reference.
+        _write_json_dict(SETTINGS_SECRETS_PATH, {}, chmod_owner_only=True)
+    public_payload.pop(_CREDENTIAL_REFS_KEY, None)
     if include_secrets:
         return _deep_merge(public_payload, secret_payload)
     return public_payload
@@ -206,15 +349,39 @@ def read_runtime_override_payload(include_secrets: bool = True, migrate_legacy: 
 
 def write_runtime_override_payload(overrides: dict[str, Any]) -> None:
     payload = overrides if isinstance(overrides, dict) else {}
+    existing_public = _read_json_dict(SETTINGS_PATH)
+    refs = existing_public.get(_CREDENTIAL_REFS_KEY)
+    refs = dict(refs) if isinstance(refs, dict) else {}
+    current_ref = str(refs.get(_SETTINGS_CREDENTIAL_REF_KEY) or "").strip()
     public_payload = _strip_secret_overrides(payload)
     secret_payload = _extract_secret_overrides(payload)
-    _write_json_dict(SETTINGS_PATH, public_payload)
+    public_payload.pop(_CREDENTIAL_REFS_KEY, None)
     if secret_payload:
-        _write_json_dict(SETTINGS_SECRETS_PATH, secret_payload, chmod_owner_only=True)
+        from agent.credential_broker import get_credential_broker
+
+        new_ref = get_credential_broker().put(
+            secret_payload,
+            label="EchoSpeak runtime Settings",
+            reference=current_ref,
+        )
+        public_payload[_CREDENTIAL_REFS_KEY] = {
+            **refs,
+            _SETTINGS_CREDENTIAL_REF_KEY: new_ref,
+        }
+        _write_json_dict(SETTINGS_PATH, public_payload)
+        _write_json_dict(SETTINGS_SECRETS_PATH, {}, chmod_owner_only=True)
     else:
+        _write_json_dict(SETTINGS_PATH, public_payload)
+        if current_ref:
+            try:
+                from agent.credential_broker import get_credential_broker
+
+                get_credential_broker().delete(current_ref)
+            except Exception:
+                pass
         try:
             if SETTINGS_SECRETS_PATH.exists():
-                SETTINGS_SECRETS_PATH.unlink()
+                _write_json_dict(SETTINGS_SECRETS_PATH, {}, chmod_owner_only=True)
         except Exception:
             pass
 
@@ -249,19 +416,6 @@ class LocalModelConfig(BaseModel):
     use_mmap: bool = True
     use_mlock: bool = False
     threads: Optional[int] = None
-
-
-class ResearchModelConfig(BaseModel):
-    """Configuration for local research model (v8.0 dual-model feature)."""
-    provider: ModelProvider = ModelProvider.LM_STUDIO
-    base_url: str = "http://localhost:1234/v1"
-    model_name: str = "mradermacher/Marco-DeepResearch-8B-i1-GGUF"
-    temperature: float = 0.2
-    max_tokens: int = 4096
-    context_length: int = 32768
-    enabled: bool = False
-    # An 8 GB card should swap rather than keep both models resident.
-    load_strategy: str = "swap"  # swap | resident
 
 
 class OpenAIConfig(BaseModel):
@@ -410,22 +564,6 @@ class Config:
             threads=int(os.getenv("LOCAL_MODEL_THREADS", "0")) if os.getenv("LOCAL_MODEL_THREADS") else None
         )
 
-        research_provider_raw = os.getenv("RESEARCH_MODEL_PROVIDER", "lmstudio")
-        try:
-            research_provider = ModelProvider(research_provider_raw)
-        except Exception:
-            research_provider = ModelProvider.OLLAMA
-
-        self.research_model = ResearchModelConfig(
-            provider=research_provider,
-            base_url=os.getenv("RESEARCH_MODEL_URL", "http://localhost:1234/v1"),
-            model_name=os.getenv("RESEARCH_MODEL_NAME", "mradermacher/Marco-DeepResearch-8B-i1-GGUF"),
-            temperature=float(os.getenv("RESEARCH_MODEL_TEMPERATURE", "0.2")),
-            max_tokens=int(os.getenv("RESEARCH_MODEL_MAX_TOKENS", "4096")),
-            context_length=int(os.getenv("RESEARCH_MODEL_CONTEXT", "32768")),
-            enabled=os.getenv("RESEARCH_MODEL_ENABLED", "true").lower() == "true",
-            load_strategy=os.getenv("RESEARCH_MODEL_LOAD_STRATEGY", "swap").strip().lower() or "swap"
-        )
         try:
             configured_profiles = json.loads(os.getenv("MODEL_CAPABILITY_PROFILES", "{}") or "{}")
             self.model_capability_profiles = configured_profiles if isinstance(configured_profiles, dict) else {}
@@ -522,11 +660,88 @@ class Config:
         self.lmstudio_tool_calling = os.getenv("LM_STUDIO_TOOL_CALLING", "false").lower() == "true"
         # Explicit opt-out for native tool-calling path (equal-access default is allow).
         self.disable_native_tool_calling = os.getenv("DISABLE_NATIVE_TOOL_CALLING", "false").lower() == "true"
-        # Legacy gemini_use_langgraph kept for settings surface; LangGraph is now attempted by default.
-        self.gemini_use_langgraph = os.getenv("GEMINI_USE_LANGGRAPH", "true").lower() == "true"
-        self.gemini_disable_langgraph = os.getenv("GEMINI_DISABLE_LANGGRAPH", "false").lower() == "true"
         self.llm_trim_max_tokens = int(os.getenv("LLM_TRIM_MAX_TOKENS", "0") or 0)
         self.llm_trim_reserve_tokens = int(os.getenv("LLM_TRIM_RESERVE_TOKENS", "512") or 512)
+        # Hard provider boundaries for the canonical semantic/runtime loop. A
+        # model that stops producing bytes must release its Session slot rather
+        # than leaving the desktop in an unbounded "thinking" state.
+        self.turn_understanding_timeout_seconds = float(
+            os.getenv("TURN_UNDERSTANDING_TIMEOUT_SECONDS", "45") or 45
+        )
+        self.turn_understanding_cold_start_timeout_seconds = float(
+            os.getenv("TURN_UNDERSTANDING_COLD_START_TIMEOUT_SECONDS", "120") or 120
+        )
+        self.turn_understanding_max_output_tokens = int(
+            os.getenv("TURN_UNDERSTANDING_MAX_OUTPUT_TOKENS", "2048") or 2048
+        )
+        self.turn_understanding_retry_max_output_tokens = int(
+            os.getenv("TURN_UNDERSTANDING_RETRY_MAX_OUTPUT_TOKENS", "4096") or 4096
+        )
+        self.turn_understanding_timeout_max_seconds = float(
+            os.getenv("TURN_UNDERSTANDING_TIMEOUT_MAX_SECONDS", "120") or 120
+        )
+        self.turn_understanding_probe_timeout_seconds = float(
+            os.getenv("TURN_UNDERSTANDING_PROBE_TIMEOUT_SECONDS", "8") or 8
+        )
+        self.turn_understanding_diagnostic_preview = os.getenv(
+            "TURN_UNDERSTANDING_DIAGNOSTIC_PREVIEW", "false"
+        ).lower() == "true"
+        self.stream_startup_timeout_seconds = float(
+            os.getenv("STREAM_STARTUP_TIMEOUT_SECONDS", "15") or 15
+        )
+        self.model_request_timeout_seconds = float(
+            os.getenv("MODEL_REQUEST_TIMEOUT_SECONDS", "180") or 180
+        )
+        self.model_stream_idle_timeout_seconds = max(
+            5.0,
+            float(os.getenv("MODEL_STREAM_IDLE_TIMEOUT_SECONDS", "45") or 45),
+        )
+        self.model_control_max_loops = max(
+            1, int(os.getenv("MODEL_CONTROL_MAX_LOOPS", "12") or 12)
+        )
+        self.model_control_max_tool_calls = max(
+            0, int(os.getenv("MODEL_CONTROL_MAX_TOOL_CALLS", "16") or 16)
+        )
+        self.model_control_malformed_repairs = max(
+            0, int(os.getenv("MODEL_CONTROL_MALFORMED_REPAIRS", "2") or 2)
+        )
+        self.model_control_provider_retries = max(
+            0, int(os.getenv("MODEL_CONTROL_PROVIDER_RETRIES", "1") or 1)
+        )
+        self.model_control_provider_backoff_seconds = max(
+            0.0,
+            float(
+                os.getenv("MODEL_CONTROL_PROVIDER_BACKOFF_SECONDS", "0.35")
+                or 0.35
+            ),
+        )
+        self.model_control_no_progress_limit = max(
+            1, int(os.getenv("MODEL_CONTROL_NO_PROGRESS_LIMIT", "2") or 2)
+        )
+        self.model_control_max_elapsed_seconds = max(
+            1.0,
+            float(os.getenv("MODEL_CONTROL_MAX_ELAPSED_SECONDS", "600") or 600),
+        )
+        # Global upper bounds for requirement-driven research. Per-depth
+        # defaults may be lower; operator limits always win.
+        self.research_max_time_seconds = max(
+            1.0, float(os.getenv("RESEARCH_MAX_TIME_SECONDS", "120") or 120)
+        )
+        self.research_max_attempts_per_requirement = max(
+            1, int(os.getenv("RESEARCH_MAX_ATTEMPTS_PER_REQUIREMENT", "5") or 5)
+        )
+        self.research_max_external_calls = max(
+            1, int(os.getenv("RESEARCH_MAX_EXTERNAL_CALLS", "24") or 24)
+        )
+        self.research_max_sources_per_requirement = max(
+            1, int(os.getenv("RESEARCH_MAX_SOURCES_PER_REQUIREMENT", "8") or 8)
+        )
+        self.research_max_concurrency = max(
+            1, min(4, int(os.getenv("RESEARCH_MAX_CONCURRENCY", "4") or 4))
+        )
+        self.research_max_context_tokens = max(
+            256, int(os.getenv("RESEARCH_MAX_CONTEXT_TOKENS", "12000") or 12000)
+        )
         self.context_budget_enabled = os.getenv("CONTEXT_BUDGET_ENABLED", "true").lower() == "true"
         self.echo_resolution_enabled = os.getenv("ECHO_RESOLUTION_ENABLED", "true").lower() == "true"
 
@@ -563,12 +778,6 @@ class Config:
         self.action_parser_max_tokens = int(os.getenv("ACTION_PARSER_MAX_TOKENS", "256"))
         self.action_parser_heuristic_bypass = os.getenv("ACTION_PARSER_HEURISTIC_BYPASS", "true").lower() == "true"
         self.memory_extraction_async = os.getenv("MEMORY_EXTRACTION_ASYNC", "true").lower() == "true"
-
-
-        # Multi-step planning + reflection
-        self.multi_task_planner_enabled = os.getenv("MULTI_TASK_PLANNER_ENABLED", "true").lower() == "true"
-        self.web_task_reflection_enabled = os.getenv("WEB_TASK_REFLECTION_ENABLED", "true").lower() == "true"
-        self.web_task_max_retries = int(os.getenv("WEB_TASK_MAX_RETRIES", "2") or 2)
         self.search_grounding_enabled = os.getenv("SEARCH_GROUNDING_ENABLED", "true").lower() == "true"
         self.search_grounding_max_candidates = int(os.getenv("SEARCH_GROUNDING_MAX_CANDIDATES", "3") or 3)
 
@@ -647,11 +856,7 @@ class Config:
         self.allow_open_application = os.getenv("ALLOW_OPEN_APPLICATION", "false").lower() == "true"
         self.allow_self_modification = os.getenv("ALLOW_SELF_MODIFICATION", "false").lower() == "true"
         raw_apps = os.getenv("OPEN_APPLICATION_ALLOWLIST", "")
-        self.open_application_allowlist = [
-            a.strip().lower()
-            for a in raw_apps.replace("\n", ",").split(",")
-            if a.strip()
-        ]
+        self.open_application_allowlist = _normalize_open_application_allowlist(raw_apps)
         self.file_tool_root = _resolve_repo_path(os.getenv("FILE_TOOL_ROOT", str(REPO_ROOT)), REPO_ROOT)
         raw_file_extra_roots = os.getenv("FILE_TOOL_EXTRA_ROOTS", str(Path.home() / "Desktop"))
         self.file_tool_extra_roots = [
@@ -694,7 +899,14 @@ class Config:
         self.allow_voice_actions = os.getenv("ALLOW_VOICE_ACTIONS", "false").lower() == "true"
         self.allow_generation_actions = os.getenv("ALLOW_GENERATION_ACTIONS", "false").lower() == "true"
         self.voice_local_provider = os.getenv("VOICE_LOCAL_PROVIDER", "windows-sapi").strip() or "windows-sapi"
+        self.voice_local_stt_provider = os.getenv("VOICE_LOCAL_STT_PROVIDER", "windows-sapi").strip() or "windows-sapi"
+        self.voice_local_tts_provider = os.getenv("VOICE_LOCAL_TTS_PROVIDER", self.voice_local_provider).strip() or "windows-sapi"
         self.voice_cloud_provider = os.getenv("VOICE_CLOUD_PROVIDER", "").strip()
+        self.voice_faster_whisper_model_path = os.getenv("VOICE_FASTER_WHISPER_MODEL_PATH", "").strip()
+        self.voice_whisper_cpp_model_path = os.getenv("VOICE_WHISPER_CPP_MODEL_PATH", "").strip()
+        self.voice_piper_model_path = os.getenv("VOICE_PIPER_MODEL_PATH", "").strip()
+        self.voice_stt_language = os.getenv("VOICE_STT_LANGUAGE", "").strip()
+        self.voice_max_audio_bytes = max(262_144, int(os.getenv("VOICE_MAX_AUDIO_BYTES", "16777216") or 16_777_216))
         self.generation_local_provider = os.getenv("GENERATION_LOCAL_PROVIDER", "comfyui-local").strip() or "comfyui-local"
         self.generation_cloud_provider = os.getenv("GENERATION_CLOUD_PROVIDER", "").strip()
         self.comfyui_base_url = os.getenv("COMFYUI_BASE_URL", "http://127.0.0.1:8188").strip().rstrip("/")
@@ -813,7 +1025,6 @@ class Config:
         self.a2a_known_agents = [u.strip() for u in os.getenv("A2A_KNOWN_AGENTS", "").split(",") if u.strip()]
 
         # --- Multi-Agent Orchestration (v6.0.0) ---
-        self.orchestration_enabled = os.getenv("ORCHESTRATION_ENABLED", "false").lower() == "true"
         self.orchestration_max_subtasks = int(os.getenv("ORCHESTRATION_MAX_SUBTASKS", "5"))
         self.orchestration_timeout = int(os.getenv("ORCHESTRATION_TIMEOUT", "120"))
 
@@ -896,8 +1107,6 @@ class Config:
                         val = _coerce_model_provider(val)
                     if key == "provider" and obj is self.embedding:
                         val = _coerce_model_provider(val)
-                    if key == "provider" and obj is self.research_model:
-                        val = _coerce_model_provider(val)
                     if isinstance(current, bool):
                         if isinstance(val, str):
                             low = val.strip().lower()
@@ -944,13 +1153,16 @@ class Config:
                 ):
                     if isinstance(v, str):
                         v = [u.strip() for u in v.replace("\n", ",").split(",") if u.strip()]
+                if k == "open_application_allowlist":
+                    v = _normalize_open_application_allowlist(v)
+                if k == "terminal_command_denylist" and isinstance(v, str):
+                    v = [u.strip().lower() for u in v.replace("\n", ",").split(",") if u.strip()]
                 _set_attr(self, k, v)
 
         nested = {
             "openai": self.openai,
             "gemini": self.gemini,
             "local": self.local,
-            "research_model": self.research_model,
             "patches": self.patches,
             "embedding": self.embedding,
             "voice": self.voice,
@@ -971,7 +1183,6 @@ class Config:
             "openai": self.openai,
             "gemini": self.gemini,
             "local": self.local,
-            "research_model": self.research_model,
             "patches": self.patches,
             "embedding": self.embedding,
             "voice": self.voice,
@@ -986,6 +1197,11 @@ class Config:
         # Collect all top-level scalar attributes (same set accepted by apply_overrides)
         for k in self._public_top_level_keys():
             data[k] = getattr(self, k, None)
+
+        # MCP transport credentials are brokered even though server names and
+        # non-secret transport configuration remain visible in Advanced.
+        if isinstance(data.get("mcp_servers"), dict):
+            data["mcp_servers"] = _strip_mcp_secret_overrides(data["mcp_servers"])
 
         # Mask top-level secrets: present -> "***", absent/empty -> ""
         for k in SECRET_TOP_LEVEL_SETTINGS:
@@ -1014,10 +1230,25 @@ class Config:
             "use_tool_calling_llm",
             "lmstudio_tool_calling",
             "disable_native_tool_calling",
-            "gemini_use_langgraph",
-            "gemini_disable_langgraph",
             "llm_trim_max_tokens",
             "llm_trim_reserve_tokens",
+            "turn_understanding_timeout_seconds",
+            "turn_understanding_cold_start_timeout_seconds",
+            "turn_understanding_timeout_max_seconds",
+            "turn_understanding_probe_timeout_seconds",
+            "turn_understanding_diagnostic_preview",
+            "turn_understanding_max_output_tokens",
+            "turn_understanding_retry_max_output_tokens",
+            "stream_startup_timeout_seconds",
+            "model_request_timeout_seconds",
+            "model_stream_idle_timeout_seconds",
+            "model_control_max_loops",
+            "research_max_time_seconds",
+            "research_max_attempts_per_requirement",
+            "research_max_external_calls",
+            "research_max_sources_per_requirement",
+            "research_max_concurrency",
+            "research_max_context_tokens",
             "context_budget_enabled",
             "echo_resolution_enabled",
             "document_rag_enabled",
@@ -1043,9 +1274,6 @@ class Config:
             "action_plan_enabled",
             "action_parser_enabled",
             "action_parser_heuristic_bypass",
-            "multi_task_planner_enabled",
-            "web_task_reflection_enabled",
-            "web_task_max_retries",
             "search_grounding_enabled",
             "search_grounding_max_candidates",
             "session_memory_enabled",
@@ -1161,7 +1389,6 @@ class Config:
             "a2a_auth_key",
             "a2a_known_agents",
             # Orchestration
-            "orchestration_enabled",
             "orchestration_max_subtasks",
             "orchestration_timeout",
             # Twitch
@@ -1202,7 +1429,14 @@ class Config:
             "allow_voice_actions",
             "allow_generation_actions",
             "voice_local_provider",
+            "voice_local_stt_provider",
+            "voice_local_tts_provider",
             "voice_cloud_provider",
+            "voice_faster_whisper_model_path",
+            "voice_whisper_cpp_model_path",
+            "voice_piper_model_path",
+            "voice_stt_language",
+            "voice_max_audio_bytes",
             "generation_local_provider",
             "generation_cloud_provider",
             "comfyui_base_url",

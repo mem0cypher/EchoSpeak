@@ -311,7 +311,7 @@ class EchoSpeakDiscordBot:
             self._source = str(source or "discord_bot")
             self._tool_started = False
             self._tools_used: set[str] = set()
-            # LangChain/LangGraph callback managers may introspect these.
+            # Callback-compatible transports may introspect these fields.
             self.ignore_chain = False
             self.raise_error = False
             self.ignore_llm = False
@@ -370,8 +370,7 @@ class EchoSpeakDiscordBot:
         def on_chain_error(self, error: BaseException, run_id: str, parent_run_id: Optional[str] = None, **_: Any) -> None:
             return
 
-        # Some LangChain/LangGraph runners expect chat-model / llm callbacks to exist.
-        # Provide no-ops so missing hooks don't crash or spam logs.
+        # Keep no-op model hooks for callback-compatible provider transports.
         def on_chat_model_start(self, serialized: dict, messages: Any, run_id: str, parent_run_id: Optional[str] = None, **_: Any) -> None:
             return
 

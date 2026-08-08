@@ -68,7 +68,7 @@ When evidence is incomplete, the response states what completed, what did not,
 why, and the safest next action. It does not collapse partial work into “done.”
 
 Normal Chat intentionally hides persistent internal-operation cards after
-completion, but this does not delete evidence. Studio and Viewer continue to
+completion, but this does not delete evidence. Settings and Visualizer continue to
 project Executions, ToolRuns, approvals, research sources, tasks/runs,
 checkpoints, failures, and verification.
 

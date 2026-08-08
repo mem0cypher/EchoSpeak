@@ -44,6 +44,8 @@ class _Projects:
 
 
 def _patch_authority(monkeypatch: pytest.MonkeyPatch, module, tmp_path: Path, *, project_id: str, tool: str, permission: str):
+    import agent.tools as runtime_tools
+
     root = tmp_path / "project"
     root.mkdir(exist_ok=True)
     monkeypatch.setattr(module, "get_thread_manager", lambda: _Threads())
@@ -51,6 +53,14 @@ def _patch_authority(monkeypatch: pytest.MonkeyPatch, module, tmp_path: Path, *,
     monkeypatch.setattr(module, "get_project_manager", lambda: _Projects(project_id, root))
     monkeypatch.setattr(module.config, "enable_system_actions", True)
     monkeypatch.setattr(module.config, f"allow_{permission}", True)
+    monkeypatch.setattr(runtime_tools, "get_tool_execution_context", lambda: {
+        "execution_id": "execution-1",
+        "task_run_id": "task-run-1",
+        "tool_run_id": "tool-run-1",
+        "thread_id": "session-1",
+        "project_root": str(root),
+        "allowed_tool_names": [tool],
+    })
     return root
 
 

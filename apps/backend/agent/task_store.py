@@ -43,6 +43,7 @@ class ProductTask(BaseModel):
     job_ids: list[str] = Field(default_factory=list)
     artifact_ids: list[str] = Field(default_factory=list)
     automation_run_ids: list[str] = Field(default_factory=list)
+    task_run_ids: list[str] = Field(default_factory=list)
     approval_ids: list[str] = Field(default_factory=list)
     connection_references: list[dict[str, Any]] = Field(default_factory=list)
     retry_policy: dict[str, Any] = Field(default_factory=dict)
@@ -196,6 +197,30 @@ class TaskStore:
             self._order = requested + [item for item in self._order if item not in requested]
             self._save()
             return self.list()
+
+    def reorder_scope(
+        self,
+        order: list[str],
+        *,
+        project_id: str,
+        session_id: str,
+    ) -> list[ProductTask]:
+        """Reorder only positions already owned by one Project/Session scope."""
+
+        with self._lock:
+            scoped_positions = [
+                index for index, task_id in enumerate(self._order)
+                if task_id in self._tasks
+                and self._tasks[task_id].project_id == str(project_id or "")
+                and self._tasks[task_id].session_id == str(session_id or "")
+            ]
+            existing = [self._order[index] for index in scoped_positions]
+            requested = [item for item in order if item in existing]
+            replacement = requested + [item for item in existing if item not in requested]
+            for index, task_id in zip(scoped_positions, replacement):
+                self._order[index] = task_id
+            self._save()
+            return [self._tasks[item].model_copy(deep=True) for item in replacement]
 
 
 _task_store: Optional[TaskStore] = None

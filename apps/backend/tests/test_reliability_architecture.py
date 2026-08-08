@@ -342,7 +342,7 @@ def test_format_grounded_tool_output_marks_accepted_evidence():
 
 
 def test_grounded_web_search_single_path_persists_and_formats(monkeypatch):
-    """Stage 3 / TaskPlanner / native tools all call the same helper."""
+    """Every canonical web ToolRun uses the same grounded-search helper."""
     from agent.core import EchoSpeakAgent
 
     agent = EchoSpeakAgent.__new__(EchoSpeakAgent)
@@ -387,49 +387,15 @@ def test_grounded_web_search_single_path_persists_and_formats(monkeypatch):
     assert calls  # raw search was used as execute backend
 
 
-def test_web_task_reflector_skips_double_grounding():
-    from agent.core import WebTaskReflector
+def test_web_evidence_heuristics_accepts_grounded_packet():
+    from agent.core import WebEvidenceHeuristics
 
     agent = SimpleNamespace(_grounded_web_search=MagicMock(return_value="should-not-call"))
-    reflector = WebTaskReflector(agent)
+    heuristics = WebEvidenceHeuristics(agent)
     already = "[GROUNDED_SEARCH] accepted=true query=test\n\n1. Evidence here"
-    task = {"index": 0, "params": {"q": "test query"}}
 
-    out = reflector.reflect_and_retry(task, "web_search", already, tools=[], callbacks=None)
-
-    assert out == already
+    assert heuristics._is_grounded_packet_acceptable("test query", already)
     agent._grounded_web_search.assert_not_called()
-
-
-def test_web_task_reflector_never_invokes_legacy_raw_tool():
-    from agent.core import WebTaskReflector
-
-    canonical = MagicMock(return_value="[GROUNDED_SEARCH] accepted=false\nreason=insufficient")
-    raw_tool = SimpleNamespace(name="web_search", invoke=MagicMock(side_effect=AssertionError("raw search bypass")))
-    reflector = WebTaskReflector(SimpleNamespace(_grounded_web_search=canonical))
-
-    out = reflector.reflect_and_retry(
-        {"index": 0, "params": {"q": "current evidence", "original_request": "current evidence"}},
-        "web_search",
-        "short ungrounded provider output",
-        tools=[raw_tool],
-        callbacks=None,
-    )
-
-    assert "GROUNDED_SEARCH" in out
-    canonical.assert_called_once()
-    raw_tool.invoke.assert_not_called()
-
-
-def test_generic_reflection_excludes_web_search_retries():
-    from agent.reflection import ReflectionEngine
-
-    engine = ReflectionEngine(SimpleNamespace())
-    assert engine.should_reflect(
-        {"index": 0, "tool": "web_search"},
-        "error: provider unavailable",
-        plan_size=3,
-    ) is False
 
 
 def test_lc_tool_wrapper_routes_to_grounded_helper():

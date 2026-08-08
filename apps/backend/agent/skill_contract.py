@@ -37,6 +37,19 @@ class SkillOrigin(str, Enum):
     VIDEO_DOMAIN = "video_domain"
 
 
+class SkillWorkflowStage(str, Enum):
+    SELECTING = "selecting"
+    VALIDATING_INPUTS = "validating_inputs"
+    AUTHORIZING = "authorizing"
+    EXECUTING = "executing"
+    AWAITING_APPROVAL = "awaiting_approval"
+    VERIFYING = "verifying"
+    COMPLETE = "complete"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
 class SkillManifest(BaseModel):
     """Authoritative skill declaration. A prompt file alone is not enough."""
 
@@ -52,6 +65,7 @@ class SkillManifest(BaseModel):
     supported_modes: list[str] = Field(default_factory=list)  # chat | coding | research | video
     required_project_state: list[str] = Field(default_factory=list)
     required_context_fields: list[str] = Field(default_factory=list)
+    permitted_tools: list[str] = Field(default_factory=list)
     required_tools: list[str] = Field(default_factory=list)
     optional_tools: list[str] = Field(default_factory=list)
     required_capabilities: list[str] = Field(default_factory=list)
@@ -63,6 +77,7 @@ class SkillManifest(BaseModel):
     permissions: list[str] = Field(default_factory=list)
     approval_policy: dict[str, Any] = Field(default_factory=dict)
     verification_rules: list[str] = Field(default_factory=list)
+    completion_criteria: list[str] = Field(default_factory=list)
     retry_policy: dict[str, Any] = Field(default_factory=dict)
     resource_limits: dict[str, Any] = Field(default_factory=dict)
     dependency_metadata: dict[str, Any] = Field(default_factory=dict)
@@ -79,7 +94,12 @@ class SkillManifest(BaseModel):
     updated_at: float = Field(default_factory=time.time)
 
     def tool_allowlist(self) -> list[str]:
-        return list(dict.fromkeys([*self.required_tools, *self.optional_tools, *self.tools_reachable]))
+        return list(dict.fromkeys([
+            *self.permitted_tools,
+            *self.required_tools,
+            *self.optional_tools,
+            *self.tools_reachable,
+        ]))
 
 
 class SkillSelectionOutcome(str, Enum):
@@ -136,6 +156,13 @@ class SkillExecutionRecord(BaseModel):
     child_skill_ids: list[str] = Field(default_factory=list)
     child_execution_ids: list[str] = Field(default_factory=list)
     input_context_identity: dict[str, Any] = Field(default_factory=dict)
+    workflow_stage: SkillWorkflowStage = SkillWorkflowStage.SELECTING
+    permitted_tool_ids: list[str] = Field(default_factory=list)
+    required_inputs: list[str] = Field(default_factory=list)
+    collected_inputs: dict[str, Any] = Field(default_factory=dict)
+    missing_inputs: list[str] = Field(default_factory=list)
+    verification_rules: list[str] = Field(default_factory=list)
+    completion_criteria: list[str] = Field(default_factory=list)
     selected_tool_ids: list[str] = Field(default_factory=list)
     operation_ids: list[str] = Field(default_factory=list)
     job_ids: list[str] = Field(default_factory=list)

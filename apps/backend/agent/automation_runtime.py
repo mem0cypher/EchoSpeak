@@ -186,7 +186,7 @@ class AutomationCheckpoint(BaseModel):
 
 
 class AutomationRun(BaseModel):
-    """One historical attempt to execute a finite Task or Routine occurrence."""
+    """One historical trigger/lease record projected from canonical TaskRun truth."""
 
     schema_version: Literal[1] = AUTOMATION_RUN_SCHEMA_VERSION
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -194,6 +194,8 @@ class AutomationRun(BaseModel):
     project_id: str = Field(min_length=1)
     session_id: str = Field(min_length=1)
     task_id: str = ""
+    task_run_id: str = ""
+    completion_authority: Literal["task_run"] = "task_run"
     routine_id: str = ""
     trigger_id: str = ""
     source: str = "manual"
@@ -588,6 +590,7 @@ class AutomationRunStore:
         artifact_ids: Optional[list[str]] = None,
         outcome: Optional[dict[str, Any]] = None,
         error: Optional[str] = None,
+        task_run_id: Optional[str] = None,
     ) -> AutomationRun:
         current = float(time.time() if now is None else now)
         next_status = AutomationRunStatus(target)
@@ -614,6 +617,11 @@ class AutomationRunStore:
             run.status = next_status
             if execution_id is not None:
                 run.execution_id = str(execution_id or "")
+            if task_run_id is not None:
+                bound_task_run_id = str(task_run_id or "").strip()
+                if run.task_run_id and run.task_run_id != bound_task_run_id:
+                    raise AutomationConflictError("Automation Run is already bound to another TaskRun")
+                run.task_run_id = bound_task_run_id
             if tool_run_ids is not None:
                 run.tool_run_ids = list(
                     dict.fromkeys([*run.tool_run_ids, *(str(item) for item in tool_run_ids if str(item))])

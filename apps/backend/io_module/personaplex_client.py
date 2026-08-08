@@ -4,6 +4,8 @@ Full-duplex audio streaming with Opus encoding via sphn.
 Supports mic pause/resume for tool mode and PCM callbacks for local STT.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import struct
@@ -47,6 +49,14 @@ FRAME_HANDSHAKE = 0x00
 FRAME_AUDIO = 0x01
 FRAME_TEXT = 0x02
 FRAME_CONTROL = 0x03
+
+
+_DISABLED_REASON = (
+    "PersonaPlex is an experimental conversational model, not a passive audio "
+    "transport. It remains disabled until an adapter can preserve EchoSpeak's "
+    "selected Session model, canonical TaskRun loop, exact cancellation, and "
+    "single finalization authority."
+)
 
 
 class AudioPlaybackQueue:
@@ -172,6 +182,7 @@ class PersonaPlexClient:
 
     async def connect(self):
         """Connect to PersonaPlex WebSocket."""
+        raise RuntimeError(_DISABLED_REASON)
         if not WS_AVAILABLE:
             raise RuntimeError("websockets library not available")
         if not SPHN_AVAILABLE:
@@ -246,6 +257,8 @@ class PersonaPlexClient:
 
     def start_mic(self):
         """Start microphone streaming."""
+        if not self._running or self._ws is None:
+            raise RuntimeError(_DISABLED_REASON)
         if not SD_AVAILABLE or not NUMPY_AVAILABLE:
             logger.error("Cannot start mic: sounddevice or numpy not available")
             return
@@ -365,8 +378,11 @@ class PersonaPlexClient:
 
 class PersonaPlexOrchestrator:
     """
-    High-level orchestrator for PersonaPlex integration.
-    Manages the client lifecycle and tool routing.
+    Archived experimental wrapper retained for configuration compatibility.
+
+    It is deliberately not an Echo agent, intent router, or tool owner. The
+    canonical semantic runtime is the only component allowed to interpret a
+    transcript or create work.
     """
 
     def __init__(self, config: Any, agent: Any = None, transcribe_fn: Optional[Callable] = None):
@@ -379,80 +395,19 @@ class PersonaPlexOrchestrator:
         self._tool_mode = False
 
     def _on_text(self, text: str):
-        """Handle text events from PersonaPlex."""
+        """Buffer provider text as transport data only."""
         self._text_buffer.append(text)
-        # Check for tool-intent keywords
-        combined = "".join(self._text_buffer)
-        if self._detect_tool_intent(combined):
-            self._trigger_tool_mode()
-
-    def _detect_tool_intent(self, text: str) -> bool:
-        """Detect if text contains tool-intent keywords."""
-        keywords = ["search", "look up", "find", "calculate", "run", "open", "browse"]
-        text_lower = text.lower()
-        return any(kw in text_lower for kw in keywords)
-
-    def _trigger_tool_mode(self):
-        """Pause mic and run local tool processing."""
-        if self._tool_mode:
-            return
-        self._tool_mode = True
-        logger.info("Tool mode triggered")
-        if self.client:
-            self.client.pause_mic()
-        # Process with local STT if available
-        # (This would integrate with transcribe_bytes)
-        # For now, just log
-        logger.info(f"Tool intent detected: {''.join(self._text_buffer)}")
 
     def end_tool_mode(self):
-        """Resume mic after tool processing."""
+        """Compatibility no-op; this wrapper never owns canonical tool mode."""
         self._tool_mode = False
         self._text_buffer.clear()
-        if self.client:
-            self.client.resume_mic()
-        logger.info("Tool mode ended, mic resumed")
 
     async def run(self):
         """Run the PersonaPlex voice mode."""
-        self.client = PersonaPlexClient(
-            url=self.cfg.url,
-            sample_rate=self.cfg.sample_rate,
-            channels=self.cfg.channels,
-            frame_ms=self.cfg.frame_ms,
-            text_prompt=self.cfg.text_prompt,
-            voice_prompt=self.cfg.voice_prompt,
-            voice=self.cfg.voice,
-            audio_temperature=self.cfg.audio_temperature,
-            text_temperature=self.cfg.text_temperature,
-            audio_topk=self.cfg.audio_topk,
-            text_topk=self.cfg.text_topk,
-            input_device=self.cfg.input_device,
-            output_device=self.cfg.output_device,
-            handshake_json=self.cfg.handshake_json,
-            ssl_verify=self.cfg.ssl_verify,
-            connect_timeout=self.cfg.connect_timeout,
-            ping_interval=self.cfg.ping_interval,
-            ping_timeout=self.cfg.ping_timeout,
-            on_text=self._on_text,
-        )
-
-        await self.client.connect()
-        self.client.start_mic()
-
-        try:
-            await self.client.run()
-        finally:
-            await self.client.disconnect()
+        raise RuntimeError(_DISABLED_REASON)
 
 
 def run_personaplex_voice_mode(agent: Any = None):
     """Entry point for PersonaPlex voice mode."""
-    from config import config
-
-    if not config.personaplex.enabled:
-        logger.warning("PersonaPlex is not enabled in config")
-        return
-
-    orchestrator = PersonaPlexOrchestrator(config.personaplex, agent)
-    asyncio.run(orchestrator.run())
+    raise RuntimeError(_DISABLED_REASON)

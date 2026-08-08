@@ -3,8 +3,7 @@ Google Calendar tools — list events, create meetings, check today's schedule.
 
 Requires:
   pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
-  ALLOW_CALENDAR=true
-  GOOGLE_CALENDAR_CREDENTIALS_PATH=path/to/credentials.json
+  Active scoped Google Calendar Connection
 """
 
 from __future__ import annotations
@@ -31,9 +30,6 @@ def _get_calendar_service():
         from config import config
     except ImportError:
         raise RuntimeError("Config not available")
-
-    if not getattr(config, "allow_calendar", False):
-        raise RuntimeError("Calendar integration is disabled. Set ALLOW_CALENDAR=true in .env")
 
     creds_path = getattr(config, "google_calendar_credentials_path", "")
     token_path = getattr(config, "google_calendar_token_path", "")

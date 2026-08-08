@@ -36,25 +36,43 @@ def ensure_playwright_browsers():
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import config, ModelProvider
-from agent.core import create_agent, list_available_providers, get_provider_requirements
+from agent.core import EchoSpeakAgent
+from agent.model_runtime import get_provider_requirements, list_available_providers
 from api.server import start_server
+
+
+def create_agent(
+    memory_path: str | None = None,
+    provider: ModelProvider | None = None,
+    model_id: str | None = None,
+) -> EchoSpeakAgent:
+    """CLI-only factory; API Sessions are created by api.server.get_agent."""
+
+    return EchoSpeakAgent(memory_path=memory_path, llm_provider=provider, model_id=model_id)
 
 
 def setup_logging():
     """Configure logging for the application."""
     logger.remove()
+    # Prefer UTF-8 console streams on Windows so pipeline symbols do not become U+FFFD.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception:
+            pass
     log_file = config.logs_path / "echospeak.log"
     logger.add(
         log_file,
         rotation="10 MB",
         retention="10 days",
         level="INFO",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+        encoding="utf-8",
     )
     logger.add(
         sys.stderr,
         level="INFO",
-        format="{time:HH:mm:ss} | {level} | {message}"
+        format="{time:HH:mm:ss} | {level} | {message}",
     )
 
 

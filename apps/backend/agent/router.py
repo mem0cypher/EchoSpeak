@@ -279,7 +279,7 @@ class IntentRouter:
                 query_stripped=query,
             )
 
-        # 8. Default → LLM chat (LangGraph may internally use tool-calling)
+        # 8. Default → the selected Echo model through the canonical control plane.
         return RoutingDecision(intent="chat", query_stripped=query)
 
     # -----------------------------------------------------------------------
@@ -650,7 +650,7 @@ class IntentRouter:
         return s[:idx].strip()
 
     # -----------------------------------------------------------------------
-    # Tool-set filtering for LangGraph
+    # Tool-set filtering for the canonical model control plane.
     # -----------------------------------------------------------------------
 
     def allowed_tool_names(self, user_input: str) -> frozenset:

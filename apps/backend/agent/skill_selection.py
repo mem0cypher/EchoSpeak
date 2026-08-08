@@ -111,12 +111,10 @@ def _validate_executable(
             return SkillSelectionOutcome.UNAVAILABLE, ["prompt_only"]
 
     for tool in manifest.required_tools:
-        if tool not in available_tools and tool not in set(manifest.tools_reachable or []):
-            # Service-owned video tools may be registered but filtered from turn inventory.
-            if tool.startswith("video_") and tool in available_tools:
-                continue
-            if tool not in available_tools:
-                missing.append(f"tool:{tool}")
+        # Registry reachability is availability, not current-Turn authority.
+        # A Skill cannot select a tool that policy removed from this Turn.
+        if tool not in available_tools:
+            missing.append(f"tool:{tool}")
     if any(m.startswith("tool:") for m in missing):
         return SkillSelectionOutcome.BLOCKED_MISSING_TOOL, missing
 

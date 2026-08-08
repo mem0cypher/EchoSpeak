@@ -63,6 +63,11 @@ class GenerationJob(BaseModel):
     prompt: str
     settings: GenerationSettings = Field(default_factory=GenerationSettings)
     input_asset_ids: list[str] = Field(default_factory=list)
+    execution_id: str = ""
+    task_run_id: str = ""
+    requirement_id: str = ""
+    attempt_id: str = ""
+    tool_run_id: str = ""
     status: GenerationJobStatus = "queued"
     progress: float = Field(default=0.0, ge=0.0, le=1.0)
     provider_job_id: str = ""
@@ -286,8 +291,17 @@ def _authority(session_id: str, project_id: str, tool_name: str) -> tuple[Any, A
     permissions = dict(state.permissions or {})
     if not bool(permissions.get("system_actions") and permissions.get("generation_actions")):
         raise GenerationRuntimeError("Current Session permissions block generation actions")
-    if tool_name not in set(state.allowed_tool_names or []):
-        raise GenerationRuntimeError("Current Session tool inventory blocks this generation action")
+    from agent.tools import get_tool_execution_context
+    turn = dict(get_tool_execution_context() or {})
+    if not str(turn.get("execution_id") or ""):
+        raise GenerationRuntimeError("Generation action is not bound to a current Turn Execution")
+    if str(turn.get("thread_id") or "") != session:
+        raise GenerationRuntimeError("Generation action is bound to a different Session")
+    if tool_name not in set(turn.get("allowed_tool_names") or []):
+        raise GenerationRuntimeError("Current Turn tool inventory blocks this generation action")
+    turn_root = str(turn.get("project_root") or "").strip()
+    if not turn_root or Path(turn_root).expanduser().resolve(strict=True) != root:
+        raise GenerationRuntimeError("Current Turn Project root does not match the authoritative Project")
     entry = ToolRegistry.get(tool_name)
     if entry is None or not entry.is_action:
         raise GenerationRuntimeError("Generation action is absent from the canonical ToolRegistry")
@@ -299,6 +313,11 @@ def submit_generation_job(job: GenerationJob, *, store: Optional[GenerationJobSt
     # Current authority and current provider inventory are checked on every
     # replay; mutable snapshots never become identity.
     _authority(job.session_id, job.project_id, "generation_submit")
+    from agent.media_jobs import bind_media_job, current_media_job_binding
+    try:
+        job = bind_media_job(job, current_media_job_binding())
+    except RuntimeError as exc:
+        raise GenerationRuntimeError(str(exc)) from exc
     provider = next((item for item in generation_provider_statuses() if item.id == job.provider_id), None)
     if provider is None:
         raise GenerationRuntimeError(f"Unknown generation provider: {job.provider_id}")

@@ -1,8 +1,9 @@
-"""Typed, secret-free Connection registry and capability projections.
+"""Typed, secret-free transport/auth Connection registry and projections.
 
-Low-level provider, MCP, plugin, and local-application clients keep ownership
+Low-level provider, MCP, API, website, and local-application clients keep ownership
 of their transport processes.  This registry owns the approved capability and
-scope records that Tasks and Routines may reference.
+scope records that Tasks and Routines may reference. Installable packages are
+described separately by ``extension_packages.PackageManifest``.
 """
 
 from __future__ import annotations
@@ -46,6 +47,8 @@ class ConnectionScopeError(ConnectionRegistryError):
 
 
 class ConnectionKind(str, Enum):
+    # Read compatibility for already-saved records only. New extension packages
+    # are not Connections and must use PackageManifest.
     PLUGIN = "plugin"
     MCP_SERVER = "mcp_server"
     API = "api"
@@ -81,6 +84,21 @@ class ConnectionAuthentication(str, Enum):
     CONFIGURED = "configured"
     EXPIRED = "expired"
     ERROR = "error"
+
+
+class ConnectionLifecycle(str, Enum):
+    NOT_CONNECTED = "not_connected"
+    AUTHORIZING = "authorizing"
+    CONNECTED = "connected"
+    DEGRADED = "degraded"
+    RECONNECT_REQUIRED = "reconnect_required"
+    DISABLED = "disabled"
+
+
+class ConnectionCapabilityRisk(str, Enum):
+    READ = "read"
+    WRITE = "write"
+    DESTRUCTIVE = "destructive"
 
 
 _SENSITIVE_KEY = re.compile(
@@ -164,6 +182,7 @@ class ConnectionCapability(BaseModel):
     enabled: bool = True
     available: bool = True
     requires_approval: bool = False
+    risk: ConnectionCapabilityRisk = ConnectionCapabilityRisk.READ
     tool_names: list[str] = Field(default_factory=list)
     resource_types: list[str] = Field(default_factory=list)
     event_types: list[str] = Field(default_factory=list)
@@ -181,6 +200,11 @@ class ConnectionCapability(BaseModel):
         if unsafe:
             raise ValueError(f"Connection capabilities cannot expose unrestricted shell tools: {sorted(unsafe)}")
         _validate_secret_free_mapping(self.metadata, path="capability.metadata")
+        if self.risk in {
+            ConnectionCapabilityRisk.WRITE,
+            ConnectionCapabilityRisk.DESTRUCTIVE,
+        } and not self.requires_approval:
+            raise ValueError("write and destructive Connection capabilities require approval")
         return self
 
 
@@ -194,6 +218,8 @@ class ConnectionRecord(BaseModel):
     enabled: bool = True
     health: ConnectionHealth = ConnectionHealth.UNKNOWN
     authentication: ConnectionAuthentication = ConnectionAuthentication.NONE
+    lifecycle: ConnectionLifecycle = ConnectionLifecycle.NOT_CONNECTED
+    credential_refs: list[str] = Field(default_factory=list)
     scope: ConnectionScope
     capabilities: list[ConnectionCapability] = Field(default_factory=list)
     active_job_ids: list[str] = Field(default_factory=list)
@@ -210,6 +236,14 @@ class ConnectionRecord(BaseModel):
     @classmethod
     def normalize_jobs(cls, values: list[str]) -> list[str]:
         return list(dict.fromkeys(str(item or "").strip() for item in values if str(item or "").strip()))
+
+    @field_validator("credential_refs")
+    @classmethod
+    def validate_credential_refs(cls, values: list[str]) -> list[str]:
+        refs = list(dict.fromkeys(str(item or "").strip() for item in values if str(item or "").strip()))
+        if any(not ref.startswith("credential://") for ref in refs):
+            raise ValueError("Connection credentials must use opaque credential references")
+        return refs
 
     @field_validator("errors")
     @classmethod
@@ -233,6 +267,14 @@ class ConnectionRecord(BaseModel):
         _validate_secret_free_mapping(self.metadata, path="metadata")
         if not self.enabled and self.health != ConnectionHealth.DISABLED:
             raise ValueError("disabled Connections must report disabled health")
+        if not self.enabled and self.lifecycle != ConnectionLifecycle.DISABLED:
+            raise ValueError("disabled Connections must report disabled lifecycle")
+        if self.lifecycle == ConnectionLifecycle.CONNECTED and self.health in {
+            ConnectionHealth.UNHEALTHY,
+            ConnectionHealth.DISABLED,
+            ConnectionHealth.MISSING_CONFIGURATION,
+        }:
+            raise ValueError("connected lifecycle conflicts with unavailable health")
         return self
 
 
@@ -251,6 +293,8 @@ class ConnectionProjection(BaseModel):
     enabled: bool
     health: ConnectionHealth
     authentication: ConnectionAuthentication
+    lifecycle: ConnectionLifecycle
+    credential_configured: bool = False
     scope: dict[str, Any]
     capabilities: list[dict[str, Any]]
     active_job_ids: list[str]
@@ -364,6 +408,10 @@ class ConnectionRegistry:
         errors: Optional[list[str]] = None,
         last_checked_at: Optional[float] = None,
         last_used_at: Optional[float] = None,
+        lifecycle: Optional[ConnectionLifecycle | str] = None,
+        capabilities: Optional[list[ConnectionCapability | dict[str, Any]]] = None,
+        credential_refs: Optional[list[str]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> ConnectionRecord:
         with self._lock:
             record = self._envelope.connections.get(str(connection_id or ""))
@@ -390,6 +438,17 @@ class ConnectionRegistry:
                 changes["last_checked_at"] = float(last_checked_at)
             if last_used_at is not None:
                 changes["last_used_at"] = float(last_used_at)
+            if lifecycle is not None:
+                changes["lifecycle"] = ConnectionLifecycle(lifecycle)
+            if capabilities is not None:
+                changes["capabilities"] = [
+                    ConnectionCapability.model_validate(item)
+                    for item in capabilities
+                ]
+            if credential_refs is not None:
+                changes["credential_refs"] = list(credential_refs)
+            if metadata is not None:
+                changes["metadata"] = dict(metadata)
             changes["revision"] = record.revision + 1
             changes["updated_at"] = time.time()
             updated = ConnectionRecord.model_validate(record.model_copy(update=changes).model_dump())
@@ -397,6 +456,31 @@ class ConnectionRegistry:
             self._envelope.revision += 1
             self._persist()
             return self._copy(updated)
+
+    def remove(self, connection_id: str, *, expected_revision: int) -> ConnectionRecord:
+        with self._lock:
+            record = self._envelope.connections.get(str(connection_id or ""))
+            if record is None:
+                raise ConnectionRegistryError("Connection not found")
+            if record.revision != int(expected_revision):
+                raise ConnectionConflictError(
+                    f"Connection revision changed (expected {expected_revision}, current {record.revision})"
+                )
+            removed = self._envelope.connections.pop(record.id)
+            self._envelope.revision += 1
+            self._persist()
+            return self._copy(removed)
+
+    def get_unscoped(self, connection_id: str) -> Optional[ConnectionRecord]:
+        """Internal lifecycle lookup; public callers must use exact-scope get()."""
+        with self._lock:
+            record = self._envelope.connections.get(str(connection_id or ""))
+            return self._copy(record) if record is not None else None
+
+    def list_unscoped(self) -> list[ConnectionRecord]:
+        """Internal lifecycle snapshot, never a public API projection."""
+        with self._lock:
+            return [self._copy(record) for record in self._envelope.connections.values()]
 
     def get(self, connection_id: str, *, project_id: str, session_id: str = "") -> Optional[ConnectionRecord]:
         with self._lock:
@@ -415,6 +499,28 @@ class ConnectionRegistry:
                 if record.scope.allows(project_id, session_id)
             ]
         return [self._project(record) for record in sorted(records, key=lambda item: item.display_name.lower())]
+
+    def readiness_status(self) -> dict[str, Any]:
+        """Secret-free aggregate health for startup diagnostics."""
+        with self._lock:
+            records = list(self._envelope.connections.values())
+            unavailable = [
+                record.id for record in records
+                if not record.enabled or record.health in {
+                    ConnectionHealth.UNHEALTHY,
+                    ConnectionHealth.BLOCKED,
+                    ConnectionHealth.MISSING_CONFIGURATION,
+                    ConnectionHealth.DISABLED,
+                }
+            ]
+            return {
+                "configured_count": len(records),
+                "available_count": len(records) - len(unavailable),
+                "unavailable_count": len(unavailable),
+                "unavailable_ids": unavailable,
+                "revision": self._envelope.revision,
+                "path": str(self.path),
+            }
 
     def resolve_references(
         self,
@@ -490,6 +596,8 @@ class ConnectionRegistry:
             enabled=record.enabled,
             health=record.health,
             authentication=record.authentication,
+            lifecycle=record.lifecycle,
+            credential_configured=bool(record.credential_refs),
             scope=_safe_projection(scope),
             capabilities=capabilities,
             active_job_ids=list(record.active_job_ids),
@@ -509,3 +617,107 @@ def get_connection_registry() -> ConnectionRegistry:
     if _REGISTRY is None:
         _REGISTRY = ConnectionRegistry()
     return _REGISTRY
+
+
+def register_connection_tool(
+    *,
+    connection_id: str,
+    capability_id: str,
+    tool: Any,
+    project_id: str,
+    session_id: str = "",
+    name: str = "",
+    input_schema: Optional[dict[str, Any]] = None,
+) -> Any:
+    """Project one narrow Connection capability into the canonical ToolRegistry.
+
+    The wrapper re-resolves Connection health and Project/Session scope on every
+    invocation, so registry discovery never becomes durable execution authority.
+    """
+    from agent.tool_registry import ToolEntry, ToolRegistry
+
+    registry = get_connection_registry()
+    resolved = registry.resolve_references(
+        [{"connection_id": connection_id, "capability_ids": [capability_id]}],
+        project_id=project_id,
+        session_id=session_id,
+    )[0]
+    capability = next(
+        item for item in resolved.capabilities if str(item.get("id") or "") == capability_id
+    )
+    tool_name = str(name or getattr(tool, "name", "") or (capability.get("tool_names") or [""])[0]).strip()
+    if not tool_name:
+        raise ConnectionRegistryError("Connection capability has no tool name")
+    description = str(
+        getattr(tool, "description", "")
+        or capability.get("description")
+        or f"{resolved.display_name}: {capability.get('name') or capability_id}"
+    )
+
+    class _ConnectionTool:
+        def __init__(self) -> None:
+            self.name = tool_name
+            self.description = description
+            self.args_schema = getattr(tool, "args_schema", None)
+
+        def invoke(self, input: Any = None, config: Any = None, **kwargs: Any) -> Any:  # noqa: A002
+            from agent.tools import get_tool_execution_context
+
+            context = dict(get_tool_execution_context() or {})
+            current_project = str(context.get("active_project_id") or context.get("project_id") or "")
+            current_session = str(context.get("session_id") or context.get("thread_id") or "")
+            try:
+                registry.resolve_references(
+                    [{"connection_id": connection_id, "capability_ids": [capability_id]}],
+                    project_id=current_project,
+                    session_id=current_session,
+                )
+            except Exception as exc:
+                if isinstance(exc, ConnectionScopeError):
+                    raise
+                else:
+                    ToolRegistry.set_owner_availability(
+                        f"connection:{connection_id}",
+                        available=False,
+                        health="unhealthy",
+                        reason=str(exc),
+                    )
+                    raise ConnectionRegistryError(f"Connection authority revalidation failed: {exc}") from exc
+            payload = input if isinstance(input, dict) else dict(kwargs)
+            if hasattr(tool, "invoke"):
+                return tool.invoke(payload, config=config) if config is not None else tool.invoke(payload)
+            if isinstance(payload, dict):
+                return tool(**payload)
+            return tool(payload)
+
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            payload = args[0] if args else kwargs
+            return self.invoke(payload)
+
+    wrapped = _ConnectionTool()
+    scope = dict(resolved.scope or {})
+    entry = ToolEntry(
+        name=tool_name,
+        func=wrapped,
+        description=description,
+        category="connection",
+        is_action=bool(capability.get("requires_approval")),
+        risk_level=(
+            "destructive"
+            if capability.get("risk") == ConnectionCapabilityRisk.DESTRUCTIVE.value
+            else "moderate"
+            if capability.get("requires_approval")
+            else "safe"
+        ),
+        owner=f"connection:{connection_id}",
+        origin="connection",
+        connection_id=connection_id,
+        health=resolved.health.value,
+        input_schema=dict(input_schema or {}),
+        approval_required=bool(capability.get("requires_approval")),
+        available=bool(capability.get("available", True)),
+        project_ids=tuple(scope.get("project_ids") or ()),
+        session_ids=tuple(scope.get("session_ids") or ()),
+    )
+    ToolRegistry.register_entry(entry, reject_conflicts=True)
+    return wrapped

@@ -111,7 +111,6 @@ ALLOW_TERMINAL_COMMANDS=false
 # Multi-step planning + web retry (optional)
 MULTI_TASK_PLANNER_ENABLED=true
 WEB_TASK_REFLECTION_ENABLED=true
-WEB_TASK_MAX_RETRIES=2
 
 # Discord bot (optional)
 ALLOW_DISCORD_BOT=false

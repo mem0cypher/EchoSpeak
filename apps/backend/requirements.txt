@@ -4,14 +4,13 @@ langchain-community>=0.3,<0.4
 langchain-core>=0.3,<0.4
 langchain-openai>=0.3,<0.4
 langchain-google-genai>=2.0,<3.0
-langgraph>=0.2,<0.3
-
 # Vector store for memory
 faiss-cpu>=1.7.4
 
 sentence-transformers>=2.2.2
+langchain-huggingface>=0.1,<0.2
 
-# PersonaPlex compatible versions (torch 2.4.x)
+# Shared local-embedding / PersonaPlex runtime.
 torch>=2.9.0
 huggingface-hub>=0.24.0
 transformers>=4.40.0
@@ -25,6 +24,9 @@ pypdf>=4.0.0
 # Web search
 requests>=2.31.0
 httpx>=0.27.0
+
+# Official Model Context Protocol client (stable 1.x SDK boundary).
+mcp>=1.27,<2
 
 youtube-transcript-api>=0.6.2
 

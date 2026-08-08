@@ -12,10 +12,13 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
+import wave
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -38,6 +41,7 @@ class VoiceProviderStatus(BaseModel):
     id: str
     locality: Literal["local", "cloud"]
     operations: list[VoiceOperation]
+    operation_readiness: dict[VoiceOperation, bool] = Field(default_factory=dict)
     detected: bool
     configured: bool
     execution_ready: bool
@@ -46,6 +50,17 @@ class VoiceProviderStatus(BaseModel):
     supports_cancel: bool = False
     requires_microphone_permission: bool = False
     detail: str = ""
+
+
+class VoiceTranscriptResult(BaseModel):
+    """Provider-neutral final transcript produced from one bounded audio clip."""
+
+    text: str
+    provider_id: str
+    model: str = ""
+    language: str = ""
+    duration_seconds: float = 0.0
+    confidence: Optional[float] = None
 
 
 class VoiceJob(BaseModel):
@@ -60,6 +75,14 @@ class VoiceJob(BaseModel):
     text: str = ""
     input_asset_id: str = ""
     settings: dict[str, Any] = Field(default_factory=dict)
+    origin: Literal["canonical_tool", "voice_transport"] = "canonical_tool"
+    transport_turn_id: str = ""
+    transcript: str = ""
+    execution_id: str = ""
+    task_run_id: str = ""
+    requirement_id: str = ""
+    attempt_id: str = ""
+    tool_run_id: str = ""
     status: VoiceJobStatus = "queued"
     progress: float = Field(default=0.0, ge=0.0, le=1.0)
     output_asset_id: str = ""
@@ -147,6 +170,16 @@ class VoiceJobStore:
                     return job
         return None
 
+    def claim_idempotent(self, candidate: VoiceJob) -> tuple[VoiceJob, bool]:
+        """Atomically claim one Session/idempotency identity."""
+
+        with self._lock:
+            existing = self.find_idempotent(candidate.session_id, candidate.idempotency_key)
+            if existing is not None:
+                return existing, False
+            self.save(candidate)
+            return candidate, True
+
     def recover_incomplete(self) -> int:
         recovered = 0
         jobs: list[VoiceJob] = []
@@ -167,76 +200,387 @@ class VoiceJobStore:
 
 def voice_provider_statuses() -> list[VoiceProviderStatus]:
     is_windows = sys.platform == "win32"
-    sapi = is_windows and importlib.util.find_spec("win32com.client") is not None
+    sapi_tts = is_windows and bool(shutil.which("powershell.exe"))
+    sapi_stt = sapi_tts and _windows_sapi_recognizer_installed()
     faster_whisper = importlib.util.find_spec("faster_whisper") is not None
     whisper_cpp = bool(shutil.which("whisper-cli") or shutil.which("whisper-cpp"))
     piper = bool(shutil.which("piper"))
+    faster_whisper_model = _existing_path(getattr(config, "voice_faster_whisper_model_path", ""))
+    whisper_cpp_model = _existing_file(getattr(config, "voice_whisper_cpp_model_path", ""))
+    piper_model = _existing_file(getattr(config, "voice_piper_model_path", ""))
     openai_key = bool(str(getattr(config.openai, "api_key", "") or "").strip())
     persona_enabled = bool(getattr(config.personaplex, "enabled", False))
     return [
         VoiceProviderStatus(
             id="windows-sapi",
             locality="local",
-            operations=["text_to_speech"],
-            detected=sapi,
-            configured=sapi,
-            execution_ready=sapi,
-            detail="Windows SAPI WAV synthesis through the installed pywin32 bridge." if sapi else "Windows SAPI/pywin32 is unavailable.",
+            operations=["speech_to_text", "text_to_speech"],
+            operation_readiness={"speech_to_text": sapi_stt, "text_to_speech": sapi_tts},
+            detected=sapi_tts or sapi_stt,
+            configured=sapi_tts or sapi_stt,
+            execution_ready=sapi_tts or sapi_stt,
+            supports_cancel=True,
+            requires_microphone_permission=sapi_stt,
+            detail=(
+                "Local Windows speech recognition and WAV synthesis are available."
+                if sapi_tts and sapi_stt
+                else "Local Windows speech recognition is available; text-to-speech is unavailable."
+                if sapi_stt
+                else "Local Windows text-to-speech is available; speech recognition is unavailable."
+                if sapi_tts
+                else "Windows speech services are unavailable."
+            ),
         ),
         VoiceProviderStatus(
             id="faster-whisper-local",
             locality="local",
             operations=["speech_to_text"],
+            operation_readiness={"speech_to_text": bool(faster_whisper and faster_whisper_model)},
             detected=faster_whisper,
-            configured=faster_whisper,
-            execution_ready=False,
-            detail="Runtime detected; model selection/download remains an explicit environment gate." if faster_whisper else "faster-whisper is not installed.",
+            configured=bool(faster_whisper and faster_whisper_model),
+            execution_ready=bool(faster_whisper and faster_whisper_model),
+            requires_microphone_permission=True,
+            detail=(
+                f"Ready with the explicitly configured local model {faster_whisper_model.name}."
+                if faster_whisper and faster_whisper_model
+                else "Runtime detected; configure an existing local model path. EchoSpeak will not download one implicitly."
+                if faster_whisper
+                else "faster-whisper is not installed."
+            ),
         ),
         VoiceProviderStatus(
             id="whisper-cpp-local",
             locality="local",
             operations=["speech_to_text"],
+            operation_readiness={"speech_to_text": bool(whisper_cpp and whisper_cpp_model)},
             detected=whisper_cpp,
-            configured=whisper_cpp,
-            execution_ready=False,
-            detail="CLI detected; a governed model-path contract is not configured." if whisper_cpp else "whisper.cpp CLI is not installed.",
+            configured=bool(whisper_cpp and whisper_cpp_model),
+            execution_ready=bool(whisper_cpp and whisper_cpp_model),
+            requires_microphone_permission=True,
+            detail=(
+                f"Ready with the explicitly configured local model {whisper_cpp_model.name}."
+                if whisper_cpp and whisper_cpp_model
+                else "CLI detected; configure an existing local model path."
+                if whisper_cpp
+                else "whisper.cpp CLI is not installed."
+            ),
         ),
         VoiceProviderStatus(
             id="piper-local",
             locality="local",
             operations=["text_to_speech"],
+            operation_readiness={"text_to_speech": bool(piper and piper_model)},
             detected=piper,
-            configured=piper,
-            execution_ready=False,
-            detail="Piper detected; voice-model selection remains an explicit gate." if piper else "Piper is not installed.",
+            configured=bool(piper and piper_model),
+            execution_ready=bool(piper and piper_model),
+            supports_cancel=True,
+            detail=(
+                f"Ready with the explicitly configured local voice {piper_model.name}."
+                if piper and piper_model
+                else "Piper detected; configure an existing local voice model path."
+                if piper
+                else "Piper is not installed."
+            ),
         ),
         VoiceProviderStatus(
             id="personaplex",
             locality="local",
             operations=["realtime"],
+            operation_readiness={"realtime": False},
             detected=persona_enabled,
             configured=persona_enabled,
             execution_ready=False,
-            supports_streaming=True,
-            supports_barge_in=True,
-            supports_cancel=True,
+            supports_streaming=False,
+            supports_barge_in=False,
+            supports_cancel=False,
             requires_microphone_permission=True,
-            detail="Existing experimental client is configured but is not yet attached to governed VoiceJobs." if persona_enabled else "PersonaPlex is disabled.",
+            detail=(
+                "The legacy experiment is configured but hard-disabled because PersonaPlex would become a second conversational model authority."
+                if persona_enabled
+                else "PersonaPlex is disabled and is not part of the canonical Voice transport."
+            ),
         ),
         VoiceProviderStatus(
             id="openai-audio",
             locality="cloud",
             operations=["speech_to_text", "text_to_speech", "realtime"],
+            operation_readiness={
+                "speech_to_text": False,
+                "text_to_speech": False,
+                "realtime": False,
+            },
             detected=openai_key,
             configured=openai_key and getattr(config, "voice_cloud_provider", "") == "openai-audio",
             execution_ready=False,
-            supports_streaming=True,
-            supports_barge_in=True,
-            supports_cancel=True,
+            supports_streaming=False,
+            supports_barge_in=False,
+            supports_cancel=False,
             requires_microphone_permission=True,
             detail="Credentials are present, but cloud audio remains disabled until explicit upload/cost approval is implemented." if openai_key else "OPENAI_API_KEY is not configured.",
         ),
     ]
+
+
+def _existing_file(value: Any) -> Optional[Path]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        path = Path(raw).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    return path if path.is_file() else None
+
+
+def _windows_sapi_recognizer_installed() -> bool:
+    """Conservatively detect a legacy System.Speech recognizer without launching it."""
+
+    if sys.platform != "win32" or not shutil.which("powershell.exe"):
+        return False
+    try:
+        import winreg
+
+        access = winreg.KEY_READ
+        views = [getattr(winreg, "KEY_WOW64_64KEY", 0), getattr(winreg, "KEY_WOW64_32KEY", 0)]
+        keys = [
+            r"SOFTWARE\Microsoft\Speech\Recognizers\Tokens",
+            r"SOFTWARE\WOW6432Node\Microsoft\Speech\Recognizers\Tokens",
+        ]
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for key_name in keys:
+                for view in views:
+                    try:
+                        with winreg.OpenKey(root, key_name, 0, access | view) as key:
+                            if winreg.QueryInfoKey(key)[0] > 0:
+                                return True
+                    except OSError:
+                        continue
+    except (ImportError, OSError):
+        return False
+    return False
+
+
+def _existing_path(value: Any) -> Optional[Path]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        path = Path(raw).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    return path if path.is_file() or path.is_dir() else None
+
+
+def default_voice_provider(operation: VoiceOperation) -> str:
+    """Resolve one explicitly configured provider; credentials never select it."""
+
+    if operation == "speech_to_text":
+        return str(getattr(config, "voice_local_stt_provider", "windows-sapi") or "windows-sapi")
+    if operation == "text_to_speech":
+        return str(getattr(config, "voice_local_tts_provider", "windows-sapi") or "windows-sapi")
+    return ""
+
+
+def _validate_pcm_wav(audio_path: Path) -> float:
+    try:
+        with wave.open(str(audio_path), "rb") as source:
+            channels = int(source.getnchannels())
+            width = int(source.getsampwidth())
+            rate = int(source.getframerate())
+            frames = int(source.getnframes())
+    except (OSError, wave.Error) as exc:
+        raise VoiceRuntimeError("Local speech input must be a valid PCM WAV recording") from exc
+    if channels not in {1, 2} or width not in {1, 2, 3, 4} or rate < 8_000 or rate > 96_000:
+        raise VoiceRuntimeError("Speech input uses an unsupported WAV format")
+    duration = frames / float(rate or 1)
+    if duration <= 0.05 or duration > 180.0:
+        raise VoiceRuntimeError("Speech input must be between 0.05 and 180 seconds")
+    return duration
+
+
+def _windows_sapi_transcribe(audio_path: Path, language: str = "") -> tuple[str, str]:
+    powershell = shutil.which("powershell.exe")
+    if not powershell:
+        raise VoiceRuntimeError("Windows speech recognition is unavailable")
+    script = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Speech
+$path = $env:ECHOSPEAK_VOICE_AUDIO
+$requested = $env:ECHOSPEAK_VOICE_LANGUAGE
+$available = [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()
+if (-not $available -or $available.Count -eq 0) { throw 'No Windows speech recognition language is installed.' }
+$selected = $available | Where-Object { -not $requested -or $_.Culture.Name -eq $requested } | Select-Object -First 1
+if ($null -eq $selected) { throw "The requested Windows speech language is not installed." }
+$engine = New-Object System.Speech.Recognition.SpeechRecognitionEngine($selected)
+$grammar = New-Object System.Speech.Recognition.DictationGrammar
+$engine.LoadGrammar($grammar)
+$engine.SetInputToWaveFile($path)
+$parts = New-Object System.Collections.Generic.List[string]
+while ($true) {
+  $result = $engine.Recognize()
+  if ($null -eq $result) { break }
+  if ($result.Text) { $parts.Add($result.Text) }
+}
+$engine.Dispose()
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+@{ text = ($parts -join ' ').Trim(); language = $selected.Culture.Name } | ConvertTo-Json -Compress
+"""
+    env = os.environ.copy()
+    env["ECHOSPEAK_VOICE_AUDIO"] = str(audio_path)
+    env["ECHOSPEAK_VOICE_LANGUAGE"] = str(language or "").strip()
+    completed = subprocess.run(
+        [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        timeout=90,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode != 0:
+        raise VoiceRuntimeError("Windows could not transcribe this recording")
+    try:
+        payload = json.loads((completed.stdout or "").strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise VoiceRuntimeError("Windows speech recognition returned an invalid result") from exc
+    return str(payload.get("text") or "").strip(), str(payload.get("language") or "").strip()
+
+
+def _faster_whisper_transcribe(audio_path: Path, language: str = "") -> tuple[str, str]:
+    model_path = _existing_path(getattr(config, "voice_faster_whisper_model_path", ""))
+    if model_path is None:
+        raise VoiceRuntimeError("A local faster-whisper model path is not configured")
+    from faster_whisper import WhisperModel
+
+    model = WhisperModel(str(model_path), device="cpu", compute_type="int8")
+    segments, info = model.transcribe(
+        str(audio_path),
+        language=str(language or "").split("-", 1)[0] or None,
+        vad_filter=True,
+    )
+    text = " ".join(str(item.text or "").strip() for item in segments).strip()
+    return text, str(getattr(info, "language", "") or language or "")
+
+
+def _whisper_cpp_transcribe(audio_path: Path, language: str = "") -> tuple[str, str]:
+    executable = shutil.which("whisper-cli") or shutil.which("whisper-cpp")
+    model_path = _existing_file(getattr(config, "voice_whisper_cpp_model_path", ""))
+    if not executable or model_path is None:
+        raise VoiceRuntimeError("whisper.cpp and an explicit local model path are required")
+    with tempfile.TemporaryDirectory(prefix="echospeak-whisper-") as folder:
+        output_stem = Path(folder) / "transcript"
+        command = [executable, "-m", str(model_path), "-f", str(audio_path), "-otxt", "-of", str(output_stem), "-nt"]
+        short_language = str(language or "").split("-", 1)[0].strip()
+        if short_language:
+            command.extend(["-l", short_language])
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if completed.returncode != 0:
+            raise VoiceRuntimeError("whisper.cpp could not transcribe this recording")
+        transcript_path = output_stem.with_suffix(".txt")
+        if not transcript_path.is_file():
+            raise VoiceRuntimeError("whisper.cpp did not produce a transcript")
+        return transcript_path.read_text(encoding="utf-8", errors="replace").strip(), short_language
+
+
+def transcribe_voice_audio(
+    audio_bytes: bytes,
+    *,
+    provider_id: str = "",
+    language: str = "",
+) -> VoiceTranscriptResult:
+    """Transcribe one local PCM WAV without opening a microphone or downloading a model."""
+
+    maximum = int(getattr(config, "voice_max_audio_bytes", 16_777_216) or 16_777_216)
+    if not audio_bytes or len(audio_bytes) > maximum:
+        raise VoiceRuntimeError(f"Speech input must contain between 1 and {maximum} bytes")
+    selected = str(provider_id or default_voice_provider("speech_to_text")).strip()
+    provider = _provider(selected)
+    if provider.locality != "local":
+        raise VoiceRuntimeError("Cloud speech input requires an explicit connected cloud-voice adapter")
+    if not provider.operation_readiness.get("speech_to_text", False):
+        raise VoiceRuntimeError(provider.detail or "The selected local speech provider is not ready")
+    with tempfile.TemporaryDirectory(prefix="echospeak-voice-") as folder:
+        audio_path = Path(folder) / "input.wav"
+        audio_path.write_bytes(audio_bytes)
+        duration = _validate_pcm_wav(audio_path)
+        if selected == "windows-sapi":
+            text, detected_language = _windows_sapi_transcribe(audio_path, language)
+            model = "windows-installed-recognizer"
+        elif selected == "faster-whisper-local":
+            text, detected_language = _faster_whisper_transcribe(audio_path, language)
+            model = Path(str(getattr(config, "voice_faster_whisper_model_path", ""))).name
+        elif selected == "whisper-cpp-local":
+            text, detected_language = _whisper_cpp_transcribe(audio_path, language)
+            model = Path(str(getattr(config, "voice_whisper_cpp_model_path", ""))).name
+        else:
+            raise VoiceRuntimeError("The selected local speech provider has no transcription adapter")
+    if not text:
+        raise VoiceRuntimeError("No speech was recognized in this recording")
+    return VoiceTranscriptResult(
+        text=text,
+        provider_id=selected,
+        model=model,
+        language=detected_language,
+        duration_seconds=duration,
+    )
+
+
+def synthesize_voice_audio(
+    text: str,
+    output: Path,
+    *,
+    provider_id: str = "",
+    settings: Optional[dict[str, Any]] = None,
+) -> str:
+    """Synthesize one bounded local speech chunk to a WAV file."""
+
+    selected = str(provider_id or default_voice_provider("text_to_speech")).strip()
+    provider = _provider(selected)
+    if provider.locality != "local":
+        raise VoiceRuntimeError("Cloud speech output requires an explicit connected cloud-voice adapter")
+    if not provider.operation_readiness.get("text_to_speech", False):
+        raise VoiceRuntimeError(provider.detail or "The selected local speech provider is not ready")
+    value = str(text or "").strip()
+    if not value or len(value) > 1200:
+        raise VoiceRuntimeError("Each speech chunk must contain 1 to 1200 characters")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    options = dict(settings or {})
+    if selected == "windows-sapi":
+        _sapi_synthesize(value, output, options)
+    elif selected == "piper-local":
+        executable = shutil.which("piper")
+        model_path = _existing_file(getattr(config, "voice_piper_model_path", ""))
+        if not executable or model_path is None:
+            raise VoiceRuntimeError("Piper and an explicit local voice model are required")
+        completed = subprocess.run(
+            [executable, "--model", str(model_path), "--output_file", str(output)],
+            input=value,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=90,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if completed.returncode != 0:
+            raise VoiceRuntimeError("Piper could not synthesize this speech chunk")
+    else:
+        raise VoiceRuntimeError("The selected local speech provider has no synthesis adapter")
+    if not output.is_file() or output.stat().st_size <= 44:
+        raise VoiceRuntimeError("The speech provider did not produce a valid WAV clip")
+    return selected
 
 
 def _provider(provider_id: str) -> VoiceProviderStatus:
@@ -265,8 +609,17 @@ def _authority(session_id: str, project_id: str, tool_name: str) -> tuple[Any, A
     permissions = dict(state.permissions or {})
     if not bool(permissions.get("system_actions") and permissions.get("voice_actions")):
         raise VoiceRuntimeError("Current Session permissions block Voice actions")
-    if tool_name not in set(state.allowed_tool_names or []):
-        raise VoiceRuntimeError("Current Session tool inventory blocks this Voice action")
+    from agent.tools import get_tool_execution_context
+    turn = dict(get_tool_execution_context() or {})
+    if not str(turn.get("execution_id") or ""):
+        raise VoiceRuntimeError("Voice action is not bound to a current Turn Execution")
+    if str(turn.get("thread_id") or "") != session:
+        raise VoiceRuntimeError("Voice action is bound to a different Session")
+    if tool_name not in set(turn.get("allowed_tool_names") or []):
+        raise VoiceRuntimeError("Current Turn tool inventory blocks this Voice action")
+    turn_root = str(turn.get("project_root") or "").strip()
+    if not turn_root or Path(turn_root).expanduser().resolve(strict=True) != root:
+        raise VoiceRuntimeError("Current Turn Project root does not match the authoritative Project")
     entry = ToolRegistry.get(tool_name)
     if entry is None or not entry.is_action:
         raise VoiceRuntimeError("Voice action is absent from the canonical ToolRegistry")
@@ -274,25 +627,40 @@ def _authority(session_id: str, project_id: str, tool_name: str) -> tuple[Any, A
 
 
 def _sapi_synthesize(text: str, output: Path, settings: dict[str, Any]) -> None:
-    import pythoncom
-    import win32com.client
-
-    pythoncom.CoInitialize()
-    try:
-        speaker = win32com.client.Dispatch("SAPI.SpVoice")
-        stream = win32com.client.Dispatch("SAPI.SpFileStream")
-        speaker.Rate = max(-10, min(10, int(settings.get("rate", 0) or 0)))
-        speaker.Volume = max(0, min(100, int(settings.get("volume", 100) or 100)))
-        stream.Open(str(output), 3, False)
-        previous = speaker.AudioOutputStream
-        try:
-            speaker.AudioOutputStream = stream
-            speaker.Speak(text)
-        finally:
-            speaker.AudioOutputStream = previous
-            stream.Close()
-    finally:
-        pythoncom.CoUninitialize()
+    powershell = shutil.which("powershell.exe")
+    if not powershell:
+        raise VoiceRuntimeError("Windows speech synthesis is unavailable")
+    env = os.environ.copy()
+    env["ECHOSPEAK_VOICE_TEXT"] = text
+    env["ECHOSPEAK_VOICE_OUTPUT"] = str(output)
+    env["ECHOSPEAK_VOICE_RATE"] = str(max(-10, min(10, int(settings.get("rate", 0) or 0))))
+    env["ECHOSPEAK_VOICE_VOLUME"] = str(max(0, min(100, int(settings.get("volume", 100) or 100))))
+    script = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Speech
+$speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer
+try {
+  $speaker.Rate = [int]$env:ECHOSPEAK_VOICE_RATE
+  $speaker.Volume = [int]$env:ECHOSPEAK_VOICE_VOLUME
+  $speaker.SetOutputToWaveFile($env:ECHOSPEAK_VOICE_OUTPUT)
+  $speaker.Speak($env:ECHOSPEAK_VOICE_TEXT)
+} finally {
+  $speaker.Dispose()
+}
+"""
+    completed = subprocess.run(
+        [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        timeout=90,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if completed.returncode != 0:
+        raise VoiceRuntimeError("Windows could not synthesize this speech chunk")
 
 
 def submit_voice_job(request: VoiceJob, *, store: Optional[VoiceJobStore] = None) -> VoiceJob:
@@ -300,6 +668,11 @@ def submit_voice_job(request: VoiceJob, *, store: Optional[VoiceJobStore] = None
     # Replays match stable request identity only after fresh current Session,
     # Project, configuration, permission, and ToolRegistry validation.
     _authority(request.session_id, request.project_id, "voice_synthesize_speech")
+    from agent.media_jobs import bind_media_job, current_media_job_binding
+    try:
+        request = bind_media_job(request, current_media_job_binding())
+    except RuntimeError as exc:
+        raise VoiceRuntimeError(str(exc)) from exc
     provider = _provider(request.provider_id)
     with store._lock:
         existing = store.find_idempotent(request.session_id, request.idempotency_key)

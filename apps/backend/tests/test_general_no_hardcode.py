@@ -451,27 +451,6 @@ def test_coding_followup_reuses_active_work_skips_full_rescan(tmp_path, monkeypa
     assert any("game.js" in k.replace("\\", "/") for k in parsed)
 
 
-def test_coding_implement_intent_uses_plan_state_hooks(tmp_path, monkeypatch):
-    """Feature edits on Desktop game must be recognized as implement + plan-worthy."""
-    from pathlib import Path
-
-    tid = "test-aw-hooks-" + tempfile.mkdtemp()[-8:]
-    agent, desk = _make_disposable_coding_agent(tmp_path, monkeypatch, tid)
-    q = (
-        f"lets work on {desk.name} and add a health bar "
-        "and scoreboard and a you died screen with restart"
-    )
-    assert agent._is_coding_implement_intent(q) is True
-    assert agent._task_planner.needs_planning(q) is True
-    path = agent._resolve_coding_project_path(q)
-    assert path and desk.name in path.lower().replace("_", "-")
-    files = agent._coding_project_source_files(path)
-    names = {Path(f).name for f in files}
-    assert "game.js" in names
-    # Scan/open-only should NOT be implement (brief path stays)
-    assert agent._is_coding_implement_intent(f"start {desk.name}") is False
-
-
 def test_active_work_store_disk_roundtrip():
     """ActiveWorkStore is the continuity layer independent of agent instance."""
     import tempfile
@@ -544,39 +523,21 @@ def test_file_edit_resolves_desktop_project_not_echospeak_root():
     assert p.name == "index.html"
 
 
-def test_reflector_does_not_retry_accepted_grounded_packet():
-    """Log bug: accepted=true still triggered reflector attempts 1 and 2."""
-    from agent.core import EchoSpeakAgent, WebTaskReflector
+def test_web_evidence_heuristics_accept_grounded_packet():
+    from agent.core import EchoSpeakAgent, WebEvidenceHeuristics
     import tempfile
 
     agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
-    refl = WebTaskReflector(agent)
+    heuristics = WebEvidenceHeuristics(agent)
     packet = (
         "[GROUNDED_SEARCH] accepted=true query=FIFA World Cup matches today\n"
         "France vs Morocco 4:00 PM ET\n"
         "evidence ok"
     )
-    calls = {"n": 0}
-    orig = agent._grounded_web_search
-
-    def _spy(*a, **k):
-        calls["n"] += 1
-        return packet
-
-    agent._grounded_web_search = _spy  # type: ignore
-    out = refl.reflect_and_retry(
-        {
-            "index": "t1",
-            "tool": "web_search",
-            "params": {"q": "FIFA World Cup matches today", "silent": True},
-        },
-        "web_search",
+    assert heuristics._is_grounded_packet_acceptable(
+        "FIFA World Cup matches today",
         packet,
-        tools=[],
-        callbacks=None,
     )
-    assert out == packet
-    assert calls["n"] == 0, "must not re-call grounded search after accepted=true"
 
 
 def test_search_fingerprint_dedupes_tz_word_order():
@@ -773,16 +734,16 @@ def test_product_price_refine_not_live_score():
     from agent.research import build_search_intent
 
     agent = EchoSpeakAgent(memory_path=tempfile.mkdtemp())
-    # Reflector must not treat product price as sports
-    assert agent._task_planner.web_reflector._is_live_score_query(
+    # Evidence heuristics must not treat product price as sports.
+    assert agent._web_evidence_heuristics._is_live_score_query(
         "Hollow Knight Silksong price cost pre-order editions"
     ) is False
-    assert agent._task_planner.web_reflector._is_live_score_query(
+    assert agent._web_evidence_heuristics._is_live_score_query(
         "live price today"
     ) is False
-    assert agent._task_planner.web_reflector._is_live_score_query(
+    assert agent._web_evidence_heuristics._is_live_score_query(
         "oilers score right now"
-    ) is True or agent._task_planner.web_reflector._is_live_score_query(
+    ) is True or agent._web_evidence_heuristics._is_live_score_query(
         "nhl score right now"
     ) is True
 

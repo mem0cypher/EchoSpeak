@@ -40,9 +40,6 @@ def _coding_agent(tmp_path, monkeypatch, project_root, *, session="s1"):
     agent._session_memory = SessionMemoryDistiller(tmp_path / "sessions")
     agent._active_work_store = ActiveWorkStore(tmp_path / "active-work")
     agent._allow_llm_tool_calling = lambda: False
-    agent.graph_agent = None
-    agent.agent_executor = None
-    agent.fallback_executor = None
     agent.select_thread_runtime(session)
     agent.activate_project(project.id)
     return agent, runtime, project, manager
@@ -66,7 +63,7 @@ def test_approval_identity_blocks_stale_source_and_project_switch(tmp_path, monk
         def invoke_with_reasoning(self, prompt: str):
             return self.invoke(prompt), ""
 
-    agent.llm_wrapper = LLM()
+    agent.model_runtime = LLM()
     agent.process_query(
         "Change the title in index.html only. Do not edit game.js.",
         include_memory=False,
@@ -270,7 +267,7 @@ def test_confirm_write_one_toolrun(tmp_path, monkeypatch):
         def invoke_with_reasoning(self, prompt: str):
             return self.invoke(prompt), ""
 
-    agent.llm_wrapper = LLM()
+    agent.model_runtime = LLM()
     agent.process_query("Change the title in index.html.", include_memory=False, thread_id="one-write")
     confirm_resp, ok = agent.process_query("confirm", include_memory=False, thread_id="one-write")
     body = (project_root / "index.html").read_text(encoding="utf-8")

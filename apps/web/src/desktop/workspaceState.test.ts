@@ -1,28 +1,37 @@
 import { describe, expect, it } from "vitest";
-import { desktopVisualizerMode, desktopWorkspaceForView, isDesktopContextualSurface } from "./workspaceState";
+import {
+  desktopExecutionProfile,
+  desktopVisualizerPanelLabel,
+  desktopWorkspaceForView,
+  isDesktopContextualSurface,
+} from "./workspaceState";
 
 describe("desktop workspace owner", () => {
-  it("maps every sidebar view to exactly one primary surface", () => {
+  it("exposes exactly two primary desktop surfaces", () => {
     expect([
       desktopWorkspaceForView("chat"),
       desktopWorkspaceForView("avatar"),
-      desktopWorkspaceForView("research"),
-      desktopWorkspaceForView("code"),
-      desktopWorkspaceForView("media"),
-      desktopWorkspaceForView("tasks"),
-      desktopWorkspaceForView("studio"),
-    ]).toEqual(["chat", "visualizer", "research", "code", "media", "tasks", "studio"]);
+    ]).toEqual(["chat", "visualizer"]);
   });
 
-  it("uses one visualizer mode only for visualizer-backed surfaces", () => {
-    expect(desktopVisualizerMode("visualizer")).toEqual("ring");
-    expect(desktopVisualizerMode("research")).toEqual("research");
-    expect(desktopVisualizerMode("code")).toEqual("coding");
-    expect(desktopVisualizerMode("media")).toEqual(null);
+  it("labels internal Visualizer panels without promoting them to surfaces", () => {
+    expect(desktopVisualizerPanelLabel("ring")).toEqual("Echo Visualizer");
+    expect(desktopVisualizerPanelLabel("work")).toEqual("Work");
+    expect(desktopVisualizerPanelLabel("coding")).toEqual("Code");
   });
 
   it("keeps chat as the only full conversation surface", () => {
     expect(isDesktopContextualSurface("chat")).toEqual(false);
-    expect(isDesktopContextualSurface("studio")).toEqual(true);
+    expect(isDesktopContextualSurface("visualizer")).toEqual(true);
+  });
+
+  it("derives presentation profiles from the Visualizer panel", () => {
+    expect(desktopExecutionProfile("chat")).toEqual("chat");
+    expect(desktopExecutionProfile("visualizer")).toEqual("chat");
+    expect(desktopExecutionProfile("visualizer", "work")).toEqual("work");
+    expect(desktopExecutionProfile("visualizer", "research")).toEqual("work");
+    expect(desktopExecutionProfile("visualizer", "media")).toEqual("work");
+    expect(desktopExecutionProfile("visualizer", "tasks")).toEqual("work");
+    expect(desktopExecutionProfile("visualizer", "coding")).toEqual("code");
   });
 });

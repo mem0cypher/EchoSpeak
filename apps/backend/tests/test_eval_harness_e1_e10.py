@@ -111,10 +111,6 @@ def test_e1_printed_file_write_becomes_pending(tmp_path, monkeypatch):
 
     agent = _disposable_file_agent(tmp_path, monkeypatch)
     agent._allow_llm_tool_calling = lambda: False
-    agent.graph_agent = None
-    agent.agent_executor = None
-    agent.fallback_executor = None
-
     class StubLLM:
         def invoke(self, text: str) -> str:
             return 'file_write(path="hello.html", content="<h1>Hi</h1>")'
@@ -122,7 +118,7 @@ def test_e1_printed_file_write_becomes_pending(tmp_path, monkeypatch):
         def invoke_with_reasoning(self, text: str):
             return self.invoke(text), ""
 
-    agent.llm_wrapper = StubLLM()
+    agent.model_runtime = StubLLM()
     resp, _ = agent.process_query("make a hello.html file", include_memory=False)
     low = resp.lower()
     # Plan text may mention the tool name; raw inert tool-call alone must not be the whole reply.
@@ -205,18 +201,6 @@ def test_e5_deeper_search_keeps_subject():
     assert any("canada" in c.lower() or "morocco" in c.lower() for c in captured)
 
 
-# E6 — Terminal ExitCode=1 fails reflection, not success
-def test_e6_terminal_nonzero_fails_reflection():
-    from agent.reflection import ReflectionEngine
-
-    agent = SimpleNamespace(_verification_telemetry=VerificationTelemetry(enabled=False))
-    engine = ReflectionEngine(agent)
-    task = {"index": 0, "tool": "terminal_run", "description": "run tests"}
-    result = engine._deterministic_reflection(task, "ExitCode=1\nFAILED tests/test_foo.py")
-    assert result is not None
-    assert result.accepted is False
-
-
 # E7 — Provider readiness message shape (LM Studio down)
 def test_e7_provider_readiness_lmstudio_down(monkeypatch):
     from api import server as server_mod
@@ -243,9 +227,6 @@ def test_e8_coding_file_write_pending(tmp_path, monkeypatch):
 
     agent = _disposable_file_agent(tmp_path, monkeypatch)
     agent._allow_llm_tool_calling = lambda: False
-    agent.graph_agent = None
-    agent.agent_executor = None
-    agent.fallback_executor = None
     agent.configure_workspace("coding")
 
     class StubLLM:
@@ -257,7 +238,7 @@ def test_e8_coding_file_write_pending(tmp_path, monkeypatch):
         def invoke_with_reasoning(self, text: str):
             return self.invoke(text), ""
 
-    agent.llm_wrapper = StubLLM()
+    agent.model_runtime = StubLLM()
     resp, _ = agent.process_query("create index.html with hello", include_memory=False)
     assert "file_write(" not in resp or "confirm" in resp.lower()
     assert "confirm" in resp.lower() or agent._pending_action is not None
@@ -366,7 +347,7 @@ def test_e11_long_conversation_memory_and_subject(tmp_path, monkeypatch):
         def invoke_with_reasoning(self, text: str):
             return self.invoke(text), ""
 
-    agent.llm_wrapper = QuietLLM()
+    agent.model_runtime = QuietLLM()
 
     turns = _e11_scripted_turns()
     assert len(turns) >= 18
@@ -866,7 +847,7 @@ def test_e19_general_decompose_novel_compound_and_simple_fp():
     agent._current_subject_text = ""
     agent._last_web_query_context = ""
     agent._active_user_query = novel
-    agent.llm_wrapper = type("W", (), {"invoke_fast": staticmethod(lambda p, max_tokens=180: fake_llm(p))})()
+    agent.model_runtime = type("W", (), {"invoke_fast": staticmethod(lambda p, max_tokens=180: fake_llm(p))})()
     agent._emit_tool_start = MagicMock()
     agent._emit_tool_end = MagicMock()
     agent._emit_tool_error = MagicMock()
@@ -940,82 +921,8 @@ def test_e18_gta_trailer_and_characters_split_not_release_only():
     assert "lucia" in out.lower() or "accepted=true" in out.lower() or "Jason" in out or "jason" in out.lower()
 
 
-def test_e17_coding_loop_multi_file_tool_sequence(tmp_path, monkeypatch):
-    """
-    v7.5.2: multi-file coding path advances the enforced loop
-    inspect → plan → implement (2 files) → verify (terminal status) → confirm path.
-    """
-    from agent.coding_loop import CodingLoop, CodingPhase, CodingExit, parse_terminal_status_block
-    from agent.coding_ledger import CodingLedgerStore
-    from agent.core import EchoSpeakAgent
-    from agent.projects import ProjectManager
-    from agent.state import StateStore
-    import agent.coding_ledger as coding_ledger_module
-    import agent.projects as projects_module
-    from unittest.mock import MagicMock
-
-    agent = EchoSpeakAgent.__new__(EchoSpeakAgent)
-    agent._workspace_id = "coding"
-    agent._current_thread_id = "coding-session"
-    agent._coding_loop = None
-    agent._is_coding_project_intent = lambda u: True  # type: ignore
-    root = tmp_path / "project"
-    root.mkdir()
-    manager = ProjectManager(tmp_path / "projects")
-    project = manager.attach_folder(str(root), trust_state="trusted")
-    monkeypatch.setattr(projects_module, "get_project_manager", lambda: manager)
-    monkeypatch.setattr(coding_ledger_module, "_STORE", CodingLedgerStore(tmp_path / "ledgers"))
-    agent._state_store = StateStore(tmp_path / "state")
-    agent._state_store.update_thread_state(
-        "coding-session",
-        session_id="coding-session",
-        active_project_id=project.id,
-        project_path=str(root),
-        workspace_root=str(root),
-        objective="create a small website with index.html and style.css",
-    )
-
-    agent._ensure_coding_loop("create a small website with index.html and style.css")
-    assert agent._coding_loop is not None
-    assert agent._coding_loop.phase == CodingPhase.INSPECT
-
-    agent._coding_loop_note_tool("file_list", "path=.", "")
-    assert agent._coding_loop.phase == CodingPhase.INSPECT
-
-    agent._coding_loop_note_tool("file_write", "path='index.html'", "", pending_write=True)
-    # implement or confirm depending on transition
-    assert agent._coding_loop.phase in (CodingPhase.IMPLEMENT, CodingPhase.CONFIRM, CodingPhase.PLAN)
-    agent._coding_loop_note_tool("file_write", "path='style.css'", "", pending_write=True)
-    files = agent._coding_loop.state.files_touched
-    assert any("index.html" in f for f in files) or any("style" in f for f in files)
-
-    agent._coding_loop_note_tool(
-        "terminal_run",
-        "command=python -m pytest",
-        "ExitCode=0\nStatus=pass\nMode=host",
-    )
-    assert agent._coding_loop.phase in (CodingPhase.VERIFY, CodingPhase.CONFIRM, CodingPhase.SUMMARIZE)
-    assert agent._coding_loop.state.verify_status in (CodingExit.PASS.value, "pass", CodingExit.PENDING.value)
-
-    # Full machine walk for multi-file project folder naming
-    loop = CodingLoop(project_folder="projects/demo-site")
-    loop.start()
-    loop.advance(CodingPhase.PLAN)
-    loop.advance(CodingPhase.IMPLEMENT)
-    loop.mark_files(["index.html", "style.css", "app.js"])
-    assert len(loop.state.files_touched) == 3
-    loop.advance(CodingPhase.VERIFY)
-    loop.set_verify_status(CodingExit.PASS)
-    loop.advance(CodingPhase.CONFIRM)
-    loop.set_confirm_status(CodingExit.PASS)
-    loop.advance(CodingPhase.SUMMARIZE)
-    loop.complete(exit_status=CodingExit.PASS)
-    assert loop.state.exit_status == "pass"
-    assert parse_terminal_status_block("ExitCode=1\nStatus=fail") == "fail"
-
-
 def test_e15_single_preamble_per_request():
-    """ReAct loops must not emit two spoken first-beats (Doing good… then Pretty good…)."""
+    """Model-loop iterations must not emit two spoken first beats."""
     from api.server import _StreamingHandler
     import queue
 
@@ -1023,7 +930,7 @@ def test_e15_single_preamble_per_request():
     h = _StreamingHandler(q, request_id="req-preamble")
     h._preamble_fn = lambda *a, **k: "Doing good — checking that now."
     h._flush_partial_reply("tool_start", tool_name="web_search", tool_input="q1")
-    h._start_new_generation()  # second ReAct tool loop
+    h._start_new_generation()  # second bounded model-loop iteration
     h._preamble_fn = lambda *a, **k: "Pretty good — let me check that."
     h._flush_partial_reply("tool_start", tool_name="web_search", tool_input="q2")
 
@@ -1226,7 +1133,7 @@ def test_e12_social_plus_gta_trailer_preamble_answers_feeling():
     agent._turn_partial_beats = []
     agent._sanitize_response_text = lambda s: s
     agent._invoke_visible_llm = lambda *a, **k: ""  # force failure path
-    agent.llm_wrapper = SimpleNamespace(invoke_fast=lambda *a, **k: "")
+    agent.model_runtime = SimpleNamespace(invoke_fast=lambda *a, **k: "")
 
     q = "how're you feeling? and i wonder when that new trailer comes out for trailer 3 for gta 6 hey?"
     assert agent._user_has_social_open(q) is True

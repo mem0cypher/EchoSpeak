@@ -38,7 +38,6 @@ npx vitest run
 | `test_reliability_architecture.py` | SearchGrounder, context budget, session memory, telemetry, LC tool wrap, partial tools |
 | `test_reflection.py` | Reflection engine + task planner |
 | `test_phase1_integrity.py` | Routes, readiness, memory doctor, terminal denylist, MCP trust honesty, settings |
-| `test_coding_readiness_final.py` | Authoritative coding readiness, raw failure classification, lossless/truncated reads, safe project status and preview |
 | `test_editor_retirement.py` | Byte-for-byte legacy archive, checksums, missing assets, idempotent Media import plan |
 | `test_phase2_research.py` | Research run parse |
 | `test_router.py` | Intent routing (chat vs search vs Discord vs time vs vision) |
@@ -250,7 +249,6 @@ Unit tests are not a substitute. Until both pass, release docs stay pending live
 | Twitter | Mentions / autonomous approve | Public vs owner roles |
 | Twitch | Chat message | Public role |
 | A2A | `GET /.well-known/agent.json`, `POST /a2a` | Schema / task |
-| Orchestrate | `POST /orchestrate` | Plan id |
 
 ### D10. UI / avatar / stream
 

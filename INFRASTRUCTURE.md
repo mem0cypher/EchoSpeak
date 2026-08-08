@@ -1,5 +1,12 @@
 # EchoSpeak Backend Infrastructure
 
+> **Superseded historical document.** This file records the pre-8.0 backend
+> and still names retired AgentExecutor, LangGraph, TaskPlanner, reflection,
+> and coding-loop paths. The authoritative production description is
+> [`docs/SYSTEM_ARCHITECTURE.md`](docs/SYSTEM_ARCHITECTURE.md) with binding
+> invariants in [`docs/RUNTIME_CONTRACTS.md`](docs/RUNTIME_CONTRACTS.md).
+> Historical sections below are retained only for migration archaeology.
+
 This document explains how EchoSpeak's backend is currently wired, how requests move through the system, where tools and memory attach, and what the next architecture upgrades should be.
 
 It is written for Ty and future contributors who need to understand the full backend, not just one feature at a time.
@@ -65,7 +72,7 @@ apps/backend/
     voice.py                     Voice I/O helpers
     stt_engine.py                Speech-to-text
     pocket_tts_engine.py         Local TTS
-    personaplex_client.py        PersonaPlex WebSocket client
+    personaplex_client.py        Hard-disabled PersonaPlex compatibility client
     vision.py                    Screen capture/OCR helpers
   skills/                        Installed local skills
   workspaces/                    Workspace prompts/tool scopes: chat, coding, research
